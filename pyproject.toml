@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "soloscale-ai-os"
+version = "0.1.0"
+description = "Human-controlled AI workflow router and agent orchestration starter"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.8,<3",
+  "typer>=0.12,<1",
+  "rich>=13.7,<16",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<10",
+  "ruff>=0.6,<1",
+  "mypy>=1.11,<2",
+]
+
+[project.scripts]
+soloscale = "soloscale.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["soloscale"]

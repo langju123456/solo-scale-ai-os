@@ -1,0 +1,37 @@
+{
+  "id": "task-research-citations-001",
+  "title": "Add source-grounded citations to the Research Agent",
+  "goal": "Every externally verifiable claim in the generated report must link to inspectable source evidence.",
+  "repository": "../AI-Research-Assistant-LangJu-Edition",
+  "requested_paths": [
+    "app/",
+    "tests/"
+  ],
+  "reasoning_depth": "high",
+  "latency_tolerance": "batch",
+  "risk": "medium",
+  "requires_local_files": true,
+  "requires_terminal": true,
+  "requires_realtime": false,
+  "requires_scheduled_execution": false,
+  "plugin_can_complete": false,
+  "plugin_name": null,
+  "high_risk_action": false,
+  "irreversible_action": false,
+  "public_action": false,
+  "constraints": [
+    "Preserve the existing user-facing workflow.",
+    "Do not add a production dependency without approval."
+  ],
+  "acceptance_criteria": [
+    "Each report claim can be traced to a source identifier.",
+    "Missing sources are represented honestly rather than invented.",
+    "Unit tests cover successful and missing-citation paths."
+  ],
+  "non_goals": [
+    "Redesigning the entire Research Agent UI.",
+    "Adding autonomous publishing."
+  ],
+  "status": "NEW",
+  "created_at": "2026-08-06T00:00:00Z"
+}
