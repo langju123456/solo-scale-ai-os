@@ -39,3 +39,7 @@ Which phrases or diagrams are suitable for public narrative?
 ```
 
 Store private raw exports outside Git. Commit only reviewed distillations.
+
+## Public distillations
+
+- [From agent swarm to surface routing](2026-08-06-agent-swarm-to-surface-routing.md)

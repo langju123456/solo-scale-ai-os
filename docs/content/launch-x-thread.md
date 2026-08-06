@@ -1,64 +1,70 @@
 # Draft X Thread — v0.1 Thesis
 
-1/ I realized I was using coding agents for work that had nothing to do with coding.
+1/ I nearly built a multi-agent runtime to solve a personal workflow problem.
 
-Product research. Architecture. Trade-off analysis. Figma. Vercel. Final review.
+The real bottleneck wasn’t agent intelligence. It was routing work to the right stateful surface.
 
-That was wasting the most limited execution surface.
+So I changed the question.
 
-2/ My new model is simple:
+2/ Route by required state, not by whether a task looks technical.
 
-One strong reasoning core.
-Many bounded execution surfaces.
+No local/live state → reasoning
+Supported online action → connector
+Repo/terminal/tests/Git → local coding
+Realtime/scheduled → runtime
+Irreversible → human
 
-ChatGPT handles non-local reasoning.
-Plugins handle cloud actions.
-Codex handles local repos and terminals.
-APIs handle realtime runtime work.
-Humans approve irreversible actions.
+3/ The routing questions are concrete:
 
-3/ The key distinction is not “technical vs non-technical.”
-
-It is:
-
-Does this task require local state?
-Does it require realtime execution?
-Can an existing plugin complete it?
+Does it require local state?
+Does it require realtime or scheduled execution?
+Can a connected action surface complete it?
 Is the action risky or irreversible?
 
-4/ I am turning this into an open engineering project: SoloScale AI OS.
+4/ The first local baseline was useful because it was imperfect:
 
-The first version is intentionally not an agent swarm.
+8 tests passed
+type check passed
+CLI demo passed
+Ruff found 8 issues
 
-It has:
-- a typed Task Envelope
-- deterministic routing
-- a Codex Execution Packet
-- explicit approval gates
-- append-only run evidence
-- independent review
+That red result became the hardening backlog—not something to hide.
 
-5/ The multi-agent part only appears when roles have real boundaries.
+5/ At hardening revision 9fd720b, local verification recorded:
 
-Planner: freezes decisions.
-Executor: changes code.
-Reviewer: checks evidence.
-Human: controls risk.
+28 tests passed
+Ruff passed
+mypy passed across 17 source/test files
+CLI demo passed from /private/tmp
+isolated build produced sdist + wheel
+diff check passed
 
-No six-agent meeting to discuss the same prompt.
+6/ The hardened v0.1 adds strict versioned contracts, evidence-backed transitions, persisted state continuity, approval receipts, complete execution packets, and broader CLI/orchestration tests.
 
-6/ Every run also produces structured engineering evidence.
+[Proof placeholder: public commit/PR and CI URLs.]
 
-That evidence flows into my BuildLog system, which turns real decisions, diffs, tests, results, and lessons into reviewed X and LinkedIn assets.
+7/ What this does not prove:
 
-Build once.
-Learn once.
-Publish from evidence.
+No public CI or PR receipt yet.
+No deployment.
+No external surfaces invoked.
+No measured improvement in turns, time, tokens, cost, or output quality.
 
-7/ The first dogfood workload is my Research Agent.
+Local green checks are not product impact.
 
-The goal is to run one feature through:
+8/ Hypothesis—not measured: routing by required state will reduce repeated context and unnecessary use of stateful execution surfaces.
 
-Chat plan → GitHub contract → Codex implementation → tests → review → BuildLog narrative.
+The first dogfood run will measure route accuracy, turns, handoff size, elapsed time, failures, and human interventions.
 
-I’ll publish the architecture, failures, metrics, and code as I build it.
+9/ The loop I’m testing:
+
+Task → route → contract → execution → evidence → review → narrative
+
+The evidence schema, export, and content templates exist. A complete dogfood run and low-edit multichannel reuse are still planned.
+
+## Editorial notes
+
+- Baseline proof: link the `dd2a5cd` baseline devlog in post 4.
+- Hardening proof: link revision `9fd720b`, the evidence manifest, public PR, and public CI in posts 5–6 when available.
+- Editable architecture reference: [SoloScale AI OS Figma board](https://www.figma.com/board/psWfF0mEOdHqUvyOWrJWeF).
+- Source of truth: [launch claim ledger](launch-claim-ledger.md).

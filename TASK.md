@@ -17,7 +17,7 @@ Chat planning
 ## In scope
 
 - [ ] Initialize the new public repository.
-- [ ] Run and understand the deterministic starter.
+- [x] Run and understand the deterministic starter.
 - [ ] Create GitHub Project fields and Issue Forms.
 - [ ] Select one narrow Research Assistant feature.
 - [ ] Create the first Task Envelope.
@@ -26,6 +26,16 @@ Chat planning
 - [ ] Capture tests, diff, decisions, and lessons.
 - [ ] Export the run to BuildLog.
 - [ ] Publish the first architecture narrative.
+
+## Local preparation completed
+
+- Baseline commit created on local `main`.
+- Hardening revision `9fd720b` passes locally across Ruff, `mypy src tests`, 28 tests, the installed demo, and isolated package builds.
+- Planning contracts, evidence-backed transitions, and approval enforcement are covered by tests.
+- GitHub Project setup and Vercel evolution are documented.
+- Public-safe conversation distillation, X/LinkedIn drafts, and editable architecture source are prepared.
+
+Public repository creation, push, Project fields, labels, Issue, PR, release, and publishing remain explicit human-gated actions.
 
 ## Definition of done
 

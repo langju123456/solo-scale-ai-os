@@ -59,10 +59,16 @@ stateDiagram-v2
     NEW --> BLOCKED
     TRIAGED --> BLOCKED
     PLANNED --> BLOCKED
+    APPROVED --> BLOCKED
     EXECUTING --> BLOCKED
+    VERIFYING --> BLOCKED
+    REVIEWING --> BLOCKED
+    FIXING --> BLOCKED
+    BLOCKED --> TRIAGED
+    BLOCKED --> FAILED
 ```
 
-The repair loop is bounded. A later policy module will enforce retry, time, cost, and file-change budgets.
+Blocked work must return through triage before it can be planned and approved again; it cannot jump directly back into planning, fixing, or execution. Failure edges from active states are omitted from the diagram for readability. The repair loop is bounded structurally; a later policy module will enforce retry, time, cost, and file-change budgets.
 
 ## 4. Personal-mode routing
 

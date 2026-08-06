@@ -1,48 +1,54 @@
 # Draft LinkedIn Post — One strong brain, many execution surfaces
 
-I recently noticed that I was using coding agents for work that did not require a local codebase.
+I nearly built a multi-agent runtime to solve a personal workflow problem.
 
-I was asking them to define product requirements, compare architectures, reason about business trade-offs, inspect online tools, and only then write code.
+The real bottleneck wasn’t agent intelligence. It was routing work to the right stateful surface.
 
-That worked, but it coupled two very different jobs:
+The false start treated orchestration topology as the first decision before establishing whether each step needed distinct state, tools, permissions, or independent evaluation.
 
-1. deciding what should be built;
-2. operating on local files, terminals, tests, and Git state.
+That observation led to a different rule:
 
-The result was repeated context, duplicated reasoning, and unnecessary coding-agent usage.
+**Route by required state, not by whether a task looks technical.**
 
-I am now building a different workflow.
+The current model uses:
 
-The core model is:
+- a reasoning surface for work with no local or live system state;
+- connected action surfaces for supported online operations;
+- a local coding surface for repositories, terminals, tests, builds, and Git;
+- a runtime surface for realtime, scheduled, repeated, or unattended work;
+- a human approval gate for public, costly, privileged, destructive, or irreversible actions.
 
 **One strong reasoning core. Many bounded execution surfaces.**
 
-ChatGPT handles research, product thinking, architecture, and final review.
+I am implementing this model in an open engineering project called **SoloScale AI OS**.
 
-Connected plugins handle actions in cloud systems such as Figma, Vercel, and GitHub.
+The first local baseline was deliberately honest: eight tests passed, the type check and CLI demo passed, and Ruff found eight issues. That red result became the hardening backlog rather than disappearing from the story.
 
-Codex appears only when the task requires local repository state, terminal commands, dependencies, tests, builds, or uncommitted changes.
+At hardening revision `9fd720b`, local verification recorded:
 
-API-backed agents appear only when the product itself needs realtime, scheduled, repeated, or unattended execution.
+- 28 passing tests;
+- a passing Ruff check;
+- a passing strict mypy check across 17 source and test files;
+- a CLI demo that passed from `/private/tmp`, outside the repository;
+- an isolated package build that produced an sdist and wheel;
+- a passing diff check.
 
-A human remains the approval gate for spending, production changes, public publishing, security boundaries, and irreversible actions.
+The hardened v0.1 also adds strict versioned contracts, evidence-backed transitions, persisted state continuity, explicit approval receipts, complete execution packets, and broader CLI and orchestration coverage.
 
-I am turning this workflow into an open engineering project called **SoloScale AI OS**.
+[Proof before publication: link the hardening commit, evidence manifest, public PR, and public CI run.]
 
-The first version will not be a large “agent company.” It will use a small number of bounded roles:
+That is local implementation evidence, not product impact. There is no public CI or PR receipt yet, no deployment, and no measured efficiency comparison. v0.1 still recommends routes, generates handoffs, and records evidence; it does not invoke external reasoning, connected action, local coding, or runtime services on the operator’s behalf.
 
-- a planner that freezes decisions;
-- an executor that performs constrained work;
-- an independent reviewer that checks evidence;
-- deterministic code that controls state, retries, budgets, and completion;
-- a human who approves risk.
+My hypothesis is that routing by required state will reduce repeated context and unnecessary use of stateful execution surfaces. That is not a measured result yet. The dogfood run will capture route accuracy, handoff size, turns, elapsed time, failures, and human interventions before I make an efficiency claim.
 
-The project will record every meaningful run as structured evidence: the problem, alternatives, decision, implementation, commands, tests, result, and lesson.
+The project’s bounded roles exist only where their responsibilities can be evaluated independently:
 
-That evidence will then flow into my existing BuildLog project, which turns real engineering work into reviewed portfolio and publishing assets.
+- a planner freezes decisions;
+- an executor performs constrained work;
+- a reviewer checks evidence independently;
+- deterministic code controls state and limits;
+- a human approves risk.
 
-The first experiment is concrete: run one Research Agent feature through the entire loop, from Chat planning to GitHub Issue, Codex implementation, tests, review, and a public technical narrative.
+The longer-term content loop is also a hypothesis under test: build once, preserve the evidence, and adapt it into reviewed channel-specific narratives without inventing outcomes. The evidence schema, export, and templates exist; a complete dogfood run and measured multichannel reuse do not.
 
-The larger hypothesis is that a solo builder does not need more AI personalities.
-
-A solo builder needs better routing, stronger contracts, clearer permissions, and evidence that compounds.
+Editorial source: [launch claim ledger](launch-claim-ledger.md)

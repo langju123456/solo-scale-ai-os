@@ -82,7 +82,9 @@ The starter implements the deterministic foundations:
 - typed Task Envelope
 - route classification: `CHAT`, `PLUGIN`, `CODEX`, `RUNTIME`, `HUMAN`
 - guarded state transitions
-- append-only JSONL run events
+- append-only JSONL run events with from/to state and evidence receipts
+- persisted run/task continuity checks before every transition
+- approval-receipt enforcement before every `EXECUTING` transition
 - Markdown Execution Packet generation
 - BuildLog-compatible evidence export
 - GitHub Issue Forms and PR template
@@ -109,6 +111,12 @@ soloscale task-create \
   --title "Add source-grounded citations to the Research Agent" \
   --goal "Every research claim must link to inspectable source evidence" \
   --repo "../AI-Research-Assistant-LangJu-Edition" \
+  --branch "feat/source-grounded-citations" \
+  --constraint "Preserve the existing user-facing workflow" \
+  --frozen-decision "Missing source evidence must never be invented" \
+  --required-change "Return structured source receipts" \
+  --acceptance-criterion "Every claim has inspectable evidence" \
+  --test-to-run "pytest" \
   --reasoning-depth high \
   --requires-local \
   --latency-tolerance batch
@@ -142,6 +150,7 @@ soloscale buildlog-export .soloscale/tasks/<task-id>/run-summary.json
 │   ├── router.py                     deterministic route policy
 │   ├── state_machine.py              guarded workflow transitions
 │   ├── event_store.py                append-only evidence
+│   ├── orchestration.py              validated, receipt-backed transitions
 │   ├── handoff.py                    Execution Packet
 │   ├── buildlog_adapter.py           evidence-to-content bridge
 │   └── cli.py                        local CLI
@@ -182,6 +191,18 @@ This project demonstrates more than prompt engineering:
 - **BuildLog** — downstream evidence-to-story and publishing system.
 
 Keeping them separate makes each portfolio artifact clearer while creating a compounding ecosystem.
+
+## Project operations
+
+- [GitHub evidence-plane setup](docs/github-project.md)
+- [Local-to-cloud and Vercel path](docs/deployment.md)
+- [Conversation distillation policy](docs/conversations/README.md)
+- [Evidence-to-multichannel content template](docs/content/TEMPLATE.md)
+- [Editable Figma architecture board](https://www.figma.com/board/psWfF0mEOdHqUvyOWrJWeF)
+
+Local hardening revision `9fd720b` passed 28 tests, Ruff, `mypy src tests`, the installed CLI demo from outside the repository, and isolated wheel/source-distribution builds. Public GitHub CI and a real dogfood pull request remain future evidence gates.
+
+The current repository is still a local v0.1 control plane. It does not invoke ChatGPT, plugins, Codex, or a hosted runtime automatically, and it makes no measured efficiency claim yet.
 
 ## Public-development rule
 

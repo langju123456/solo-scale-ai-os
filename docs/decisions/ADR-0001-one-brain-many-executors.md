@@ -22,13 +22,15 @@ Use one default reasoning core. Add a specialist only when at least one of these
 
 ## Consequences
 
-### Positive
+### Expected positive effects — not yet measured
 
 - less repeated context
 - simpler observability
 - lower token cost
 - clearer responsibility
 - easier evaluation
+
+These are design hypotheses until comparative dogfood runs produce inspectable measurements.
 
 ### Negative
 
