@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -30,22 +31,74 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
 
 @app.command("task-create")
 def task_create(
-    title: str = typer.Option(..., help="Task title"),
-    goal: str = typer.Option(..., help="Desired outcome"),
-    repo: str | None = typer.Option(None, help="Local or GitHub repository reference"),
-    reasoning_depth: ReasoningDepth = typer.Option(ReasoningDepth.MEDIUM),
-    latency_tolerance: LatencyTolerance = typer.Option(LatencyTolerance.BATCH),
-    risk: RiskLevel = typer.Option(RiskLevel.MEDIUM),
-    requires_local: bool = typer.Option(False, help="Requires local files or terminal"),
-    requires_realtime: bool = typer.Option(False),
-    requires_scheduled: bool = typer.Option(False),
-    plugin: str | None = typer.Option(None, help="Connected plugin that can complete the action"),
-    public_action: bool = typer.Option(False),
+    title: Annotated[str, typer.Option(help="Task title")],
+    goal: Annotated[str, typer.Option(help="Desired outcome")],
+    repo: Annotated[
+        str | None, typer.Option(help="Local or GitHub repository reference")
+    ] = None,
+    branch: Annotated[str | None, typer.Option(help="Approved working branch")] = None,
+    requested_path: Annotated[
+        list[str] | None,
+        typer.Option("--requested-path", help="In-scope path; repeat for multiple paths"),
+    ] = None,
+    constraint: Annotated[
+        list[str] | None,
+        typer.Option("--constraint", help="Task constraint; repeat for multiple constraints"),
+    ] = None,
+    frozen_decision: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--frozen-decision",
+            help="Approved decision; repeat for multiple decisions",
+        ),
+    ] = None,
+    required_change: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--required-change",
+            help="Required implementation change; repeat for multiple changes",
+        ),
+    ] = None,
+    acceptance_criterion: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--acceptance-criterion",
+            help="Acceptance criterion; repeat for multiple criteria",
+        ),
+    ] = None,
+    test_to_run: Annotated[
+        list[str] | None,
+        typer.Option("--test-to-run", help="Verification command; repeat for multiple tests"),
+    ] = None,
+    non_goal: Annotated[
+        list[str] | None,
+        typer.Option("--non-goal", help="Explicit non-goal; repeat for multiple non-goals"),
+    ] = None,
+    reasoning_depth: Annotated[ReasoningDepth, typer.Option()] = ReasoningDepth.MEDIUM,
+    latency_tolerance: Annotated[LatencyTolerance, typer.Option()] = LatencyTolerance.BATCH,
+    risk: Annotated[RiskLevel, typer.Option()] = RiskLevel.MEDIUM,
+    requires_local: Annotated[
+        bool, typer.Option(help="Requires local files or terminal")
+    ] = False,
+    requires_realtime: Annotated[bool, typer.Option()] = False,
+    requires_scheduled: Annotated[bool, typer.Option()] = False,
+    plugin: Annotated[
+        str | None, typer.Option(help="Connected plugin that can complete the action")
+    ] = None,
+    public_action: Annotated[bool, typer.Option()] = False,
 ) -> None:
     task = TaskEnvelope(
         title=title,
         goal=goal,
         repository=repo,
+        branch=branch,
+        requested_paths=requested_path or [],
+        constraints=constraint or [],
+        frozen_decisions=frozen_decision or [],
+        required_changes=required_change or [],
+        acceptance_criteria=acceptance_criterion or [],
+        tests_to_run=test_to_run or [],
+        non_goals=non_goal or [],
         reasoning_depth=reasoning_depth,
         latency_tolerance=latency_tolerance,
         risk=risk,
@@ -65,7 +118,7 @@ def task_create(
 
 
 @app.command("task-route")
-def task_route(task_file: Path) -> None:
+def task_route(task_file: Annotated[Path, typer.Argument(help="Task Envelope JSON")]) -> None:
     task = TaskEnvelope.model_validate_json(task_file.read_text(encoding="utf-8"))
     decision = route_task(task)
     table = Table(title=f"Route — {task.id}")
@@ -79,7 +132,7 @@ def task_route(task_file: Path) -> None:
 
 
 @app.command("packet-create")
-def packet_create(task_file: Path) -> None:
+def packet_create(task_file: Annotated[Path, typer.Argument(help="Task Envelope JSON")]) -> None:
     task = TaskEnvelope.model_validate_json(task_file.read_text(encoding="utf-8"))
     packet = packet_from_task(task)
     out = task_file.parent / "execution-packet.md"
@@ -88,7 +141,9 @@ def packet_create(task_file: Path) -> None:
 
 
 @app.command("buildlog-export")
-def buildlog_export(summary_file: Path) -> None:
+def buildlog_export(
+    summary_file: Annotated[Path, typer.Argument(help="Run Summary JSON")],
+) -> None:
     summary = RunSummary.model_validate_json(summary_file.read_text(encoding="utf-8"))
     payload = export_buildlog_iteration(summary)
     out = summary_file.parent / "buildlog-iteration.json"
@@ -98,8 +153,36 @@ def buildlog_export(summary_file: Path) -> None:
 
 @app.command("demo")
 def demo() -> None:
-    example = Path("examples/research_agent_task.json")
-    task = TaskEnvelope.model_validate_json(example.read_text(encoding="utf-8"))
+    task = TaskEnvelope(
+        id="task-research-citations-001",
+        title="Add source-grounded citations to the Research Agent",
+        goal=(
+            "Every externally verifiable claim in the generated report must link to "
+            "inspectable source evidence."
+        ),
+        repository="../AI-Research-Assistant-LangJu-Edition",
+        branch="feat/source-grounded-citations",
+        requested_paths=["app/", "tests/"],
+        reasoning_depth=ReasoningDepth.HIGH,
+        requires_local_files=True,
+        requires_terminal=True,
+        frozen_decisions=["Missing source evidence must never be invented."],
+        required_changes=["Trace every externally verifiable claim to a source identifier."],
+        constraints=[
+            "Preserve the existing user-facing workflow.",
+            "Do not add a production dependency without approval.",
+        ],
+        acceptance_criteria=[
+            "Each report claim can be traced to a source identifier.",
+            "Missing sources are represented honestly rather than invented.",
+            "Unit tests cover successful and missing-citation paths.",
+        ],
+        tests_to_run=["pytest"],
+        non_goals=[
+            "Redesigning the entire Research Agent UI.",
+            "Adding autonomous publishing.",
+        ],
+    )
     decision = route_task(task)
     packet = packet_from_task(task)
     console.print(Panel(task.model_dump_json(indent=2), title="Task Envelope"))

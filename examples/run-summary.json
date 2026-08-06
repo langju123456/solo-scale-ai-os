@@ -1,9 +1,10 @@
 {
+  "schema_version": "0.1",
   "id": "soloscale-router-001",
   "title": "Separating one AI brain from multiple execution surfaces",
-  "goal": "Reduce duplicate reasoning and reserve coding-agent usage for local execution.",
+  "goal": "Test a workflow that reserves stateful coding execution for work that needs local state.",
   "context": "ChatGPT Chat, plugins, Codex, and API runtimes can overlap, but they have different state and latency boundaries.",
-  "problem": "Defaulting every technical task to Codex wastes usage on product reasoning and online actions that do not require a local repository.",
+  "problem": "The previous workflow did not distinguish product reasoning and online actions from work that required a local repository.",
   "actions": [
     "Defined five task surfaces: Chat, Plugin, Codex, Runtime, and Human.",
     "Created a typed Task Envelope.",
@@ -12,6 +13,7 @@
   ],
   "decisions": [
     {
+      "schema_version": "0.1",
       "decision": "Use one strong reasoning core before adding specialist agents.",
       "reason": "Multiple weak agents often repeat context and require another synthesis step.",
       "alternatives_considered": [

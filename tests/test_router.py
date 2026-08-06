@@ -3,10 +3,12 @@ from soloscale.router import route_task
 
 
 def task(**kwargs: object) -> TaskEnvelope:
-    return TaskEnvelope(
-        title="Representative task",
-        goal="Produce a verifiable and useful outcome for the workflow.",
-        **kwargs,
+    return TaskEnvelope.model_validate(
+        {
+            "title": "Representative task",
+            "goal": "Produce a verifiable and useful outcome for the workflow.",
+            **kwargs,
+        }
     )
 
 

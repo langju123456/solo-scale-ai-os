@@ -24,4 +24,7 @@ def test_buildlog_contract() -> None:
     )
     payload = export_buildlog_iteration(summary)
     assert payload["id"] == "run-001"
-    assert payload["decisions"][0]["decision"] == "Use code-based routing."
+    decisions = payload["decisions"]
+    assert isinstance(decisions, list)
+    assert decisions[0]["decision"] == "Use code-based routing."
+    assert "schema_version" not in decisions[0]

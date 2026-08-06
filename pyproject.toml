@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "build>=1.2,<2",
   "pytest>=8,<10",
   "ruff>=0.6,<1",
   "mypy>=1.11,<2",
@@ -36,6 +37,10 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "ISC", "UP"]
 
 [tool.mypy]
 python_version = "3.11"

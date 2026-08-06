@@ -29,9 +29,10 @@ Before changing code, read:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[dev]'
-pytest
 ruff check .
-mypy src
+mypy src tests
+pytest -q
+python -m build
 ```
 
 ## Definition of done

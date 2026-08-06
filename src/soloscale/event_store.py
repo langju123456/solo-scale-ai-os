@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+
 from soloscale.models import RunEvent
 
 
@@ -25,3 +26,11 @@ class JsonlEventStore:
                 if stripped:
                     events.append(RunEvent.model_validate_json(stripped))
         return events
+
+    def replay(self, run_id: str | None = None) -> list[RunEvent]:
+        """Replay persisted events, optionally limiting them to one run."""
+
+        events = self.read_all()
+        if run_id is None:
+            return events
+        return [event for event in events if event.run_id == run_id]

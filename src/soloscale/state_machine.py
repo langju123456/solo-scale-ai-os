@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 from soloscale.models import TaskStatus
 
-
 ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.NEW: {TaskStatus.TRIAGED, TaskStatus.BLOCKED, TaskStatus.FAILED},
     TaskStatus.TRIAGED: {TaskStatus.PLANNED, TaskStatus.BLOCKED, TaskStatus.FAILED},
@@ -33,14 +32,7 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
         TaskStatus.FAILED,
     },
     TaskStatus.ACCEPTED: {TaskStatus.CLOSED},
-    TaskStatus.BLOCKED: {
-        TaskStatus.TRIAGED,
-        TaskStatus.PLANNED,
-        TaskStatus.APPROVED,
-        TaskStatus.EXECUTING,
-        TaskStatus.FIXING,
-        TaskStatus.FAILED,
-    },
+    TaskStatus.BLOCKED: {TaskStatus.TRIAGED, TaskStatus.FAILED},
     TaskStatus.FAILED: set(),
     TaskStatus.CLOSED: set(),
 }
@@ -57,6 +49,8 @@ class Transition:
 
 
 def validate_transition(current: TaskStatus, target: TaskStatus) -> Transition:
+    current = TaskStatus(current)
+    target = TaskStatus(target)
     allowed = ALLOWED_TRANSITIONS[current]
     if target not in allowed:
         raise InvalidTransition(f"Invalid transition: {current} -> {target}")

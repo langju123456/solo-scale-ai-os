@@ -13,7 +13,9 @@ def export_buildlog_iteration(summary: RunSummary) -> dict[str, object]:
         "context": summary.context,
         "problem": summary.problem,
         "actions": summary.actions,
-        "decisions": [decision.model_dump() for decision in summary.decisions],
+        "decisions": [
+            decision.model_dump(exclude={"schema_version"}) for decision in summary.decisions
+        ],
         "trade_offs": summary.trade_offs,
         "result": summary.result,
         "lessons": summary.lessons,
