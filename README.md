@@ -194,6 +194,7 @@ Keeping them separate makes each portfolio artifact clearer while creating a com
 
 ## Project operations
 
+- [SoloScale Execution Manual v1](docs/operating-manual/README.md)
 - [GitHub evidence-plane setup](docs/github-project.md)
 - [Local-to-cloud and Vercel path](docs/deployment.md)
 - [Conversation distillation policy](docs/conversations/README.md)
