@@ -81,6 +81,30 @@ Production, spending, publishing, destructive changes, secrets, and permission c
 
 Every meaningful run should be capable of producing a BuildLog iteration without inventing a story.
 
+### Learn from the work, not only ship it
+
+Agent speed must not create hidden understanding debt. Selected local evidence should be
+preserved with integrity receipts, while engineering completion and human mastery remain
+separate, inspectable states.
+
+## 5.1 Current dogfood product slice: Casebook v0.1
+
+SoloScale Casebook turns one resolved AI-assisted engineering incident into a private,
+evidence-backed interview practice case:
+
+```text
+selected chat / log / diff / test evidence
+→ checksum-backed local case
+→ deterministic interview packet
+→ Explain → Trace → Rebuild → Debug → Defend receipts
+→ local Control Tower with one exact next action
+```
+
+The first slice is deliberately local and deterministic. It does not automatically ingest
+account history, call an LLM, grade answer quality, publish content, or claim commercial
+validation. Its product gate is observed dogfood: create a real case in under ten minutes
+and complete at least three practice stages with saved receipts.
+
 ## 6. v0.1 success criteria
 
 - A task is represented by a validated Task Envelope.
@@ -106,6 +130,10 @@ Every meaningful run should be capable of producing a BuildLog iteration without
 - automatic billing
 - arbitrary shell execution from untrusted users
 - claiming ChatGPT subscription access through an API
+- automatic ChatGPT, Codex, or Claude Code history ingestion
+- semantic grading of interview answers
+- cloud synchronization of private Casebook evidence
+- claiming self-assessed practice is externally verified mastery
 
 ## 8. Key metrics
 

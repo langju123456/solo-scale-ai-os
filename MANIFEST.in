@@ -1,0 +1,2 @@
+include docs/casebook.md
+recursive-include examples/casebook *
