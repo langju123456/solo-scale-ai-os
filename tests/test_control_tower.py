@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import stat
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,14 @@ import pytest
 from soloscale.casebook_models import AttemptOutcome, EvidenceKind, LearningCase, PracticeStage
 from soloscale.casebook_store import CasebookStore
 from soloscale.control_tower import build_control_tower
+from soloscale.knowledge_models import (
+    ContentRole,
+    NormalizedChunk,
+    NormalizedDocument,
+    ParsedSource,
+    SourceKind,
+)
+from soloscale.knowledge_store import KnowledgeStore
 
 
 def _create_case(
@@ -102,6 +111,56 @@ def test_control_tower_reports_separate_states_and_summary_metrics(tmp_path: Pat
     assert "not externally verified mastery" in document
     assert document.index('class="focus-panel"') < document.index('class="tracks"')
     assert ".stage--waiting { color: var(--muted); }" in document
+
+
+def test_control_tower_visualizes_private_rag_position_without_embedding_bodies(
+    tmp_path: Path,
+) -> None:
+    casebook = CasebookStore(tmp_path / ".soloscale")
+    knowledge = KnowledgeStore(casebook.root)
+    private_body = "PRIVATE CONVERSATION BODY MUST NOT RENDER"
+    digest = hashlib.sha256(private_body.encode()).hexdigest()
+    knowledge.sync(
+        [
+            ParsedSource(
+                document=NormalizedDocument(
+                    id="doc-control-tower-rag",
+                    source_kind=SourceKind.CODEX_SESSION,
+                    external_id="thread-control-tower-rag",
+                    locator="/private/codex/session.jsonl",
+                    title="Conversation evidence",
+                    content_sha256=digest,
+                    byte_size=len(private_body),
+                    observed_at=datetime(2026, 8, 9, tzinfo=UTC),
+                ),
+                chunks=[
+                    NormalizedChunk(
+                        id="chunk-control-tower-rag",
+                        document_id="doc-control-tower-rag",
+                        ordinal=0,
+                        role=ContentRole.USER,
+                        text=private_body,
+                        text_sha256=digest,
+                    )
+                ],
+            )
+        ]
+    )
+    failed_run = casebook.root / "knowledge" / "agent-runs" / "failed-run"
+    failed_run.mkdir(parents=True)
+    (failed_run / "failure.json").write_text("{}\n", encoding="utf-8")
+
+    document = build_control_tower(casebook).read_text(encoding="utf-8")
+
+    assert "Conversation RAG" in document
+    assert "Selected conversations" in document
+    assert "Bounded Evidence Agent" in document
+    assert "Recovery review" in document
+    assert "<dt>Documents</dt><dd>1</dd>" in document
+    assert "<dt>Chunks</dt><dd>1</dd>" in document
+    assert "codex_session: 1" in document
+    assert private_body not in document
+    assert "/private/codex/session.jsonl" not in document
 
 
 def test_control_tower_escapes_fields_and_excludes_private_evidence(tmp_path: Path) -> None:

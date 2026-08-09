@@ -87,7 +87,7 @@ Agent speed must not create hidden understanding debt. Selected local evidence s
 preserved with integrity receipts, while engineering completion and human mastery remain
 separate, inspectable states.
 
-## 5.1 Current dogfood product slice: Casebook v0.1
+## 5.1 Shipped foundation: deterministic workflow + Casebook v0.1
 
 SoloScale Casebook turns one resolved AI-assisted engineering incident into a private,
 evidence-backed interview practice case:
@@ -100,42 +100,103 @@ selected chat / log / diff / test evidence
 → local Control Tower with one exact next action
 ```
 
-The first slice is deliberately local and deterministic. It does not automatically ingest
+The v0.1 slice is deliberately local and deterministic. It does not automatically ingest
 account history, call an LLM, grade answer quality, publish content, or claim commercial
-validation. Its product gate is observed dogfood: create a real case in under ten minutes
-and complete at least three practice stages with saved receipts.
+validation. Delivery and human mastery remain separate states.
 
-## 6. v0.1 success criteria
+## 5.2 Current slice: private Conversation RAG v0.2
 
-- A task is represented by a validated Task Envelope.
-- The router recommends the correct surface for representative scenarios.
-- Invalid state transitions are rejected.
-- Every transition writes an append-only event.
-- A task can generate a concise Codex Execution Packet.
-- A completed run can export BuildLog-compatible evidence.
-- Unit tests pass in CI.
-- One real feature in the Research Assistant is completed using the workflow.
-- One X thread, one LinkedIn post, and one architecture visual are published from verified evidence.
+Casebook is extended with a local knowledge plane that can repeatedly discover and search
+AI-assisted engineering history through explicit full-source rescans:
 
-## 7. Non-goals for v0.1
+```text
+observed Codex local JSONL + operator-supplied ChatGPT active branch
++ BuildLog narrative files and schema-specific safe projections
+→ defensive parsing and best-effort redaction
+→ private checksum-backed knowledge index
+→ FTS + exact metadata + bounded CJK retrieval
+→ custom code-controlled Evidence Agent query/refinement loop
+→ citation-backed case/content/learning candidates
+→ Control Tower position + human promotion gate
+```
+
+The LLM does not control persistence, retry budgets, evidence identity, or promotion.
+It can only request searches and draft claims from the chunks returned by those searches.
+Every declared claim must cite an in-context same-run chunk. Raw conversations and the
+private index stay ignored under `.soloscale/`; derived local directories and files are
+created with `0700` and `0600` modes on POSIX systems.
+
+Retrieved text is untrusted. Code limits its possible effects to bounded local search and
+verifies that each declared claim cites an in-context chunk from the same run. Prompt
+injection, irrelevant citations, and omitted gaps remain possible, so human review is
+required.
+
+## 6. v0.2 success criteria
+
+- Repeated sync preserves stable source/document/chunk identities and does not duplicate a
+  Codex thread moved into archives.
+- The default Codex adapter and explicit ChatGPT/BuildLog scopes are inspectable and
+  operator-controlled.
+- A valid ChatGPT `current_node` selects only its root-to-current active ancestry; sibling
+  branches are excluded. Long messages and artifacts use deterministic overlapping
+  segments.
+- BuildLog narrative Markdown is joined by schema-specific safe projections from
+  `events.jsonl`, `02_plan.json`, `04_evaluation.json`, `run_metadata.json`, and
+  `timeline.json`; raw prompt/tool/stdout/stderr bodies remain excluded from structured
+  projections, while narrative Markdown remains operator-reviewed searchable text.
+- Search is deterministic and every hit resolves to stored hash lineage.
+- Bounded CJK bigrams and mixed Latin/CJK script splitting support bilingual exact/FTS
+  retrieval without adding a vector service.
+- Retrieval verifies both stored chunk bodies and their FTS projection; an approved resync
+  rebuilds a mismatched projection even when the raw source hash is unchanged.
+- Agent rounds, searches, hits, and context are bounded by code.
+- Run manifests and references retain the exact fitted excerpt visible to the model, while
+  final cited chunks are rechecked against the current index before the result is accepted.
+- Unsupported conclusions remain explicit gaps.
+- The Control Tower exposes Conversation RAG counts, run state, and one deterministic exact
+  next action without rendering private bodies or locators.
+- A candidate cannot update Casebook, BuildLog, a resume, or a publishing surface without
+  a separate human action.
+- Private index files and run receipts remain ignored and local by default.
+
+## 7. Non-goals for v0.2
 
 - autonomous production deployment
 - automatic social publishing
 - multi-tenant SaaS
 - six or more persistent agents
 - free-form agent voting
-- vector memory
+- vector or embedding retrieval
 - browser computer use
 - Figma or Vercel write adapters
 - automatic billing
 - arbitrary shell execution from untrusted users
 - claiming ChatGPT subscription access through an API
-- automatic ChatGPT, Codex, or Claude Code history ingestion
+- a live ChatGPT history API, browser-cookie scraping, or account-database access
+- a stable-public-API claim for Codex's observed local JSONL format
+- unattended file watching or scheduled sync
+- semantic entailment validation for citations
+- concurrent writers, source-level pruning, or automatic cloud synchronization
 - semantic grading of interview answers
-- cloud synchronization of private Casebook evidence
 - claiming self-assessed practice is externally verified mastery
 
-## 8. Key metrics
+## 8. Retrieval-only golden gate
+
+The public synthetic bilingual fixture evaluates eight queries and three bounded context
+cases at top-k five. The current recorded metrics are:
+
+- Recall@5: `1.0`
+- MRR: `1.0`
+- store neighbor-expansion recall: `1.0`
+- neighbor-expansion forbidden-context precision: `1.0`
+- deterministic repeated and rebuilt rankings: `true`
+
+One targeted local run observed a maximum search latency of `1.863 ms`. That number is
+only the maximum among calls in that local run; no percentile or service commitment was
+measured. Semantic faithfulness, answer relevancy, and reasoner-output quality are **not**
+evaluated. They remain human-gated and can become future opt-in evaluation layers.
+
+## 9. Key metrics
 
 ### Workflow
 
@@ -161,3 +222,11 @@ and complete at least three practice stages with saved receipts.
 - human edit distance
 - GitHub visits and demo engagement
 - qualified conversations generated by public posts
+
+## 10. Version sequence
+
+- **v0.1** — deterministic workflow foundations and local Casebook.
+- **v0.2** — private Conversation RAG and the custom bounded Evidence Agent.
+- **v0.3** — Codex SDK execution integration.
+- **v0.4** — Agents SDK planner/reviewer roles behind deterministic policy.
+- **v0.5** — queue workers, sandboxes, observability, and cloud deployment.

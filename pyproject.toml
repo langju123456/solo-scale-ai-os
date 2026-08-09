@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soloscale-ai-os"
-version = "0.1.0"
-description = "Human-controlled AI workflow router and agent orchestration starter"
+version = "0.2.0"
+description = "Human-controlled AI workflow, evidence, and private retrieval system"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
