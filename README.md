@@ -278,6 +278,15 @@ Use `BUILDLOG_MODEL_DIGEST` when an immutable local model digest is available.
 Without it, generation still works, but BuildLog honestly marks the replay
 manifest as partial.
 
+Structured model responses remain metadata-only in normal observability. For a
+local diagnosis of a parse or schema failure, explicitly set
+`BUILDLOG_CAPTURE_FAILED_STRUCTURED_OUTPUT=true`. BuildLog then writes only the
+failed response, bounded to 32 KiB, under the current run's `debug/` directory.
+The sensitive payload is not copied into events, SQLite, run metadata, or the
+terminal error. The feature is off by default and remains disabled outside the
+`development` environment. Review and remove diagnostic artifacts when the
+investigation is complete.
+
 ## Run the Internal Product
 
 Install the hosted-product dependencies, apply the schema, and start the API:

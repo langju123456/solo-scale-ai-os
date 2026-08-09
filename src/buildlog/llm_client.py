@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from time import perf_counter_ns
-from typing import Any, Callable, TypeVar
+from typing import Callable, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from buildlog.config import Settings
 from buildlog.exceptions import ModelResponseError, StructuredOutputError
 from buildlog.observer import ActiveStep, PendingLLMCall, get_active_step
+from buildlog.structured_diagnostics import capture_failed_structured_output
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 ResultT = TypeVar("ResultT")
@@ -29,10 +30,40 @@ class LLMClient:
 
     def complete_json(self, prompt: str, schema: type[SchemaT]) -> SchemaT:
         """Return a Pydantic-validated JSON model completion."""
+
+        def parse(response: object) -> SchemaT:
+            try:
+                return _parse_json_response(response, schema)
+            except StructuredOutputError:
+                self._capture_failed_structured_output(response)
+                raise
+
         return self._observed_completion(
             prompt,
-            lambda response: _parse_json_response(response, schema),
+            parse,
         )
+
+    def _capture_failed_structured_output(self, response: object) -> None:
+        if (
+            not self._settings.capture_failed_structured_output
+            or self._settings.environment != "development"
+        ):
+            return
+        active = get_active_step()
+        if active is None:
+            return
+        try:
+            content = _extract_content(response)
+            capture_failed_structured_output(
+                active.observer.run_dir,
+                active.step_name,
+                content,
+            )
+        except Exception as exc:
+            active.observer.record_observability_issue(
+                "could not capture failed structured output: "
+                f"{type(exc).__name__}"
+            )
 
     def _observed_completion(
         self,
@@ -105,12 +136,16 @@ def _parse_json_response(response: object, schema: type[SchemaT]) -> SchemaT:
     try:
         data = json.loads(_strip_json_fence(raw))
     except json.JSONDecodeError as exc:
-        raise StructuredOutputError(f"model returned invalid JSON: {exc.msg}") from exc
+        raise StructuredOutputError(
+            f"model returned invalid JSON: {exc.msg}"
+        ) from exc
 
     try:
         return schema.model_validate(data)
     except ValidationError as exc:
-        raise StructuredOutputError(str(exc)) from exc
+        raise StructuredOutputError(
+            "model returned schema-invalid structured output"
+        ) from exc
 
 
 def _start_observation(
@@ -173,7 +208,9 @@ def _extract_usage(response: object) -> dict[str, int | None] | None:
         return None
     return {
         "prompt_tokens": _optional_int(_read_value(usage, "prompt_tokens")),
-        "completion_tokens": _optional_int(_read_value(usage, "completion_tokens")),
+        "completion_tokens": _optional_int(
+            _read_value(usage, "completion_tokens")
+        ),
         "total_tokens": _optional_int(_read_value(usage, "total_tokens")),
     }
 
@@ -208,9 +245,13 @@ def _extract_content(response: object) -> str:
         message = _read_value(choices[0], "message")
         content = _read_value(message, "content")
     except (IndexError, TypeError) as exc:
-        raise ModelResponseError("model response did not contain message content") from exc
+        raise ModelResponseError(
+            "model response did not contain message content"
+        ) from exc
     if content is None:
-        raise ModelResponseError("model response did not contain message content")
+        raise ModelResponseError(
+            "model response did not contain message content"
+        )
     return str(content)
 
 

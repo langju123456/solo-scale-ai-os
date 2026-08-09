@@ -27,6 +27,7 @@ class Settings:
     runs_dir: Path
     database_url: str
     environment: str = "development"
+    capture_failed_structured_output: bool = False
     web_api_key: str | None = None
     web_worker_enabled: bool = True
     web_worker_poll_seconds: float = 1.0
@@ -67,6 +68,9 @@ def load_settings(project_root: Path | None = None) -> Settings:
         runs_dir=runs_dir,
         database_url=os.getenv("BUILDLOG_DATABASE_URL", f"sqlite:///{root / 'buildlog.db'}"),
         environment=os.getenv("BUILDLOG_ENV", "development").strip().lower(),
+        capture_failed_structured_output=_env_bool(
+            os.getenv("BUILDLOG_CAPTURE_FAILED_STRUCTURED_OUTPUT", "false")
+        ),
         web_api_key=os.getenv("BUILDLOG_WEB_API_KEY") or None,
         web_worker_enabled=_env_bool(os.getenv("BUILDLOG_WEB_WORKER_ENABLED", "true")),
         web_worker_poll_seconds=float(

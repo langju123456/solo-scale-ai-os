@@ -29,3 +29,14 @@ def test_settings_load_dotenv_from_explicit_project_root(
     assert settings.prompt_version == "project-root-version"
     assert settings.prompts_dir == project_root / "prompts"
     assert settings.runs_dir == project_root / "runs"
+
+
+def test_failed_structured_output_capture_is_explicitly_enabled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BUILDLOG_CAPTURE_FAILED_STRUCTURED_OUTPUT", "true")
+
+    settings = load_settings(tmp_path)
+
+    assert settings.capture_failed_structured_output
