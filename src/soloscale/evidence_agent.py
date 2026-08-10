@@ -1542,8 +1542,6 @@ def _validate_loopback_endpoint(endpoint: str) -> None:
     ):
         raise ValueError("Ollama endpoint must be an unauthenticated local HTTP endpoint")
     host = parsed.hostname.casefold()
-    if host == "localhost":
-        return
     try:
         address = ipaddress.ip_address(host)
     except ValueError:

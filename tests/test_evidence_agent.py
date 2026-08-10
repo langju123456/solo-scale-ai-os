@@ -1365,12 +1365,36 @@ def test_ollama_http_error_is_sanitized() -> None:
     assert caught.value.__cause__ is None
 
 
-def test_ollama_refuses_to_send_private_context_to_non_loopback_endpoint() -> None:
-    with pytest.raises(ValueError, match="local HTTP|loopback"):
-        OllamaReasoner(endpoint="https://models.example.com")
+@pytest.mark.parametrize("endpoint", ["http://127.0.0.1:11434", "http://[::1]:11434"])
+def test_ollama_accepts_literal_loopback_endpoints(endpoint: str) -> None:
+    reasoner = OllamaReasoner(endpoint=endpoint)
 
-    with pytest.raises(ValueError, match="loopback"):
-        OllamaReasoner(endpoint="http://192.0.2.10:11434")
+    assert reasoner.endpoint == endpoint
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://models.example.com",
+        "http://localhost:11434",
+        "http://models.example.com:11434",
+        "http://192.0.2.10:11434",
+        "http://[::2]:11434",
+    ],
+)
+def test_ollama_rejects_nonliteral_or_nonloopback_endpoints_without_request(
+    endpoint: str,
+) -> None:
+    request_attempted = False
+
+    def reject_request(*_args: object, **_kwargs: object) -> None:
+        nonlocal request_attempted
+        request_attempted = True
+
+    with pytest.raises(ValueError, match="local HTTP|loopback"):
+        OllamaReasoner(endpoint=endpoint, opener=reject_request)
+
+    assert request_attempted is False
 
 
 def test_private_artifacts_have_lineage_hashes_and_restrictive_permissions(

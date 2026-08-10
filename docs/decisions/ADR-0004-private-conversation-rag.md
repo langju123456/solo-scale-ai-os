@@ -1,7 +1,7 @@
 # ADR-0004: Add a private, evidence-bound Conversation RAG plane
 
-**Status:** Accepted  
-**Date:** 2026-08-09  
+**Status:** Accepted
+**Date:** 2026-08-09
 **Target:** SoloScale v0.2
 
 ## Context
