@@ -2,7 +2,7 @@
 
 ## 1. System boundaries
 
-SoloScale has two distinct planes.
+SoloScale has three related planes with separate execution and trust boundaries.
 
 ### Personal control plane
 
@@ -13,6 +13,25 @@ The operator uses ChatGPT Chat and plugins directly. Chat outputs a compact arti
 API-backed agents and Codex SDK execute workflows when realtime, scheduled, or unattended operation is required.
 
 Both planes share the same contracts and evidence model.
+
+### Local learning plane
+
+Casebook is a third, local-only projection over deliberately selected evidence. It keeps
+the delivery state and the operator's learning state independent:
+
+```mermaid
+flowchart LR
+    E[Selected evidence files] --> H[Hash and private archive]
+    H --> C[Strict LearningCase]
+    C --> P[Interview packet]
+    C --> T[Control Tower]
+    A[Append-only practice attempts] --> M[Derived mastery snapshot]
+    M --> P
+    M --> T
+```
+
+The JSON case and JSONL attempts are the source of truth. Markdown and HTML are derived
+artifacts. Raw evidence bodies are never embedded in those derived views.
 
 ## 2. Core contracts
 
@@ -39,6 +58,18 @@ Independent findings with severity, evidence, and required remediation.
 ### BuildLog Iteration
 
 A distilled engineering story grounded in the completed run.
+
+### Learning Case
+
+Operator-confirmed engineering facts plus checksummed evidence receipts. It may state
+unknowns explicitly and does not infer facts from transcript content.
+
+### Practice Attempt
+
+An append-only self-assessment for one of Explain, Trace, Rebuild, Debug, or Defend.
+Passing attempts require an archived receipt; `needs-work` attempts require an explicit
+note and may optionally include one. Mastery status is derived from the latest attempt
+for each stage.
 
 ## 3. Bounded topology
 

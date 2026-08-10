@@ -87,6 +87,9 @@ The starter implements the deterministic foundations:
 - approval-receipt enforcement before every `EXECUTING` transition
 - Markdown Execution Packet generation
 - BuildLog-compatible evidence export
+- private Casebook evidence archives with SHA-256 integrity receipts
+- append-only interview practice attempts; passing gates require integrity receipts
+- deterministic interview packets and a local Control Tower
 - GitHub Issue Forms and PR template
 - CI and unit tests
 - content/narrative templates
@@ -136,6 +139,51 @@ Export an engineering iteration for the existing BuildLog project:
 soloscale buildlog-export .soloscale/tasks/<task-id>/run-summary.json
 ```
 
+### Preserve a case and practice it
+
+Casebook keeps selected evidence private under ignored `.soloscale/` storage. It does
+not scrape an account, send files to an API, or embed raw evidence in generated views.
+
+```bash
+soloscale case-create \
+  --case-id source-grounded-citations \
+  --title "Adding citations without breaking a legacy AI assistant" \
+  --project "AI Research Assistant" \
+  --problem "Retrieved evidence had no strict public citation contract." \
+  --expected "Answers expose validated provenance without changing legacy callers." \
+  --actual "The legacy response exposed only text and no inspectable source contract." \
+  --root-cause "Generation and public provenance were not joined by one validated contract." \
+  --resolution "Add a structured API over shared orchestration and preserve the legacy API." \
+  --verification "70 local tests and all post-merge main CI jobs passed." \
+  --concept "API evolution without duplicate side effects" \
+  --concept "Provenance normalization and collision policy" \
+  --unknown "Business impact and token cost were not measured." \
+  --evidence document=examples/casebook/source-grounded-citations-case.md \
+  --evidence ci=examples/casebook/citation-verification.txt
+
+soloscale case-status source-grounded-citations
+soloscale control-tower-build
+```
+
+The new case starts at `0/5`. Complete a stage with your own non-empty receipt:
+
+```bash
+soloscale case-attempt source-grounded-citations \
+  --stage explain \
+  --outcome pass \
+  --receipt path/to/my-unaided-explanation.md \
+  --note "Explained the confirmed boundary and unknowns without notes."
+```
+
+The five gates are:
+
+```text
+Explain → Trace → Rebuild → Debug → Defend
+```
+
+Passing all five produces `SELF_ASSESSED_INTERVIEW_READY`; it is deliberately not an
+external certification. See [the Casebook guide](docs/casebook.md).
+
 ## Repository map
 
 ```text
@@ -153,6 +201,10 @@ soloscale buildlog-export .soloscale/tasks/<task-id>/run-summary.json
 │   ├── orchestration.py              validated, receipt-backed transitions
 │   ├── handoff.py                    Execution Packet
 │   ├── buildlog_adapter.py           evidence-to-content bridge
+│   ├── casebook_models.py            learning and evidence contracts
+│   ├── casebook_store.py             private archives and append-only practice
+│   ├── interview_packet.py           deterministic interview exercises
+│   ├── control_tower.py              local visual current-state projection
 │   └── cli.py                        local CLI
 ├── tests/                            deterministic tests
 ├── examples/                         dogfooding inputs
@@ -198,12 +250,16 @@ Keeping them separate makes each portfolio artifact clearer while creating a com
 - [GitHub evidence-plane setup](docs/github-project.md)
 - [Local-to-cloud and Vercel path](docs/deployment.md)
 - [Conversation distillation policy](docs/conversations/README.md)
+- [Casebook local evidence and learning workflow](docs/casebook.md)
 - [Evidence-to-multichannel content template](docs/content/TEMPLATE.md)
 - [Editable Figma architecture board](https://www.figma.com/board/psWfF0mEOdHqUvyOWrJWeF)
 
-Local hardening revision `9fd720b` passed 28 tests, Ruff, `mypy src tests`, the installed CLI demo from outside the repository, and isolated wheel/source-distribution builds. Public GitHub CI and a real dogfood pull request remain future evidence gates.
+Local hardening revision `9fd720b` passed 28 tests, Ruff, `mypy src tests`, the installed CLI demo from outside the repository, and isolated wheel/source-distribution builds. That was the starter baseline: the later Citation Feature completed its external Issue → PR → review → merge → main-CI loop, while this local Casebook branch still requires its own GitHub PR and CI gate.
 
-The current repository is still a local v0.1 control plane. It does not invoke ChatGPT, plugins, Codex, or a hosted runtime automatically, and it makes no measured efficiency claim yet.
+The current repository is still a local v0.1 control plane. It does not invoke ChatGPT,
+plugins, Codex, or a hosted runtime automatically, and it makes no measured efficiency
+or commercial-demand claim yet. Casebook archives only files the operator explicitly
+selects; automatic chat-history capture remains future work.
 
 ## Public-development rule
 
