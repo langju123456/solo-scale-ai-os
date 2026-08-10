@@ -121,6 +121,17 @@ soloscale demo
 pytest
 ```
 
+### 个人本地端（最小版）
+
+```bash
+python -m soloscale.local_ui
+
+# 可选
+python -m soloscale.local_ui --host 127.0.0.1 --port 8765 --data-root .soloscale
+```
+
+打开终端打印的地址（默认 `http://127.0.0.1:8765`）。
+
 Create and route a task:
 
 ```bash
