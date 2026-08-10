@@ -1,30 +1,58 @@
-# Current Sprint — Casebook v0.1 Dogfood
+# Current Sprint — Private Conversation RAG v0.2
+
+## Foundation carried forward
+
+Casebook v0.1 is implemented and locally verified. Its real learning gate remains open:
+
+```text
+source-grounded-citations
+Engineering: RESOLVED
+Evidence integrity: PASS (2/2 files)
+Learning: CAPTURED (0/5)
+Next action: EXPLAIN
+```
+
+Conversation RAG must not mark any practice gate complete or convert an LLM candidate
+into a confirmed case automatically.
 
 ## Sprint goal
 
-Turn one completed AI-assisted engineering incident into a private, evidence-backed
-learning case without confusing agent execution speed with human mastery:
+Turn the operator's growing local AI-assisted work history into a private, searchable,
+citation-backed discovery plane:
 
 ```text
-explicitly selected evidence
-→ byte-for-byte archive + SHA-256 receipts
-→ strict LearningCase
-→ interview practice packet
-→ five append-only practice gates
-→ visual current position + next action
+observed Codex local JSONL + operator-supplied ChatGPT export
++ bounded BuildLog evidence scope
+→ defensive full-source rescan and normalization
+→ private checksum-backed index
+→ deterministic retrieval
+→ custom code-controlled LLM search/refinement
+→ evidence-linked candidates and explicit gaps
 ```
 
 ## In scope
 
-- [x] Freeze the local-first Casebook product contract.
-- [x] Add strict case, evidence, attempt, and derived-mastery contracts.
-- [x] Archive explicitly selected evidence with SHA-256 receipts.
-- [x] Generate a deterministic interview practice packet.
-- [x] Record append-only Explain, Trace, Rebuild, Debug, and Defend attempts.
-- [x] Show evidence integrity, mastery position, and the next action.
-- [x] Generate an accessible, zero-JavaScript local Control Tower.
-- [x] Dogfood one sanitized real engineering case at `0/5` without claiming mastery.
-- [x] Verify the full existing and new test suite, Ruff, mypy, and package build.
+- [x] Inspect local source formats without exposing transcript content.
+- [x] Freeze the private ingestion, retrieval, and evidence-agent contract.
+- [x] Add strict document, chunk, sync, retrieval, and agent-run contracts.
+- [x] Rescan observed Codex JSONL defensively with stable thread identity.
+- [x] Accept operator-supplied ChatGPT JSON/ZIP exports; follow valid `current_node`
+  ancestry and exclude sibling branches.
+- [x] Split long messages and artifacts into deterministic overlapping segments.
+- [x] Index BuildLog narrative Markdown and schema-specific safe projections from events,
+  plans, evaluations, run metadata, and timelines.
+- [x] Apply best-effort control-plane and common-secret redaction before persistence.
+- [x] Add an idempotent, permission-restricted SQLite FTS index.
+- [x] Fuse full-text and metadata retrieval with bounded CJK bigrams and mixed-script
+  splitting.
+- [x] Verify stored body/FTS projection integrity and repair it through approved resync.
+- [x] Add a custom bounded Evidence Agent with structured output and citation checks.
+- [x] Persist the exact fitted excerpts actually visible to the model.
+- [x] Expose sync, status, reset, search, and agent commands through the SoloScale CLI.
+- [x] Add Conversation RAG state, counts, run status, and exact next action to Control Tower.
+- [x] Dogfood retrieval over SoloScale and BuildLog history.
+- [x] Add a public synthetic bilingual retrieval/context golden gate.
+- [x] Verify the full suite, Ruff, mypy, package build, privacy, and lineage.
 
 ## Local preparation completed
 
@@ -39,25 +67,47 @@ human-gated actions.
 
 ## Definition of done
 
-- CI is green.
-- One real case can be created in under ten minutes.
-- Archived evidence passes checksum and byte-size verification.
-- The case begins at `0/5` with Explain as its next practice action.
-- Practice attempts are append-only and a later `needs-work` result removes readiness.
-- No secrets or raw private chats are committed.
-- At least three practice stages are completed during dogfood before SaaS expansion.
+- Re-running sync does not duplicate a Codex thread moved into archives.
+- Codex selects observed user/assistant message records. A valid ChatGPT `current_node`
+  selects only active ancestry; known hidden flags and sibling branches are excluded.
+- BuildLog indexes three narrative Markdown bodies plus schema-specific projections from
+  `events.jsonl`, `02_plan.json`, `04_evaluation.json`, `run_metadata.json`, and
+  `timeline.json`; raw prompt/tool/stdout/stderr bodies are excluded from structured
+  projections, while narrative Markdown remains operator-reviewed searchable text.
+- Control-plane blocks and common credential shapes receive best-effort redaction; this is
+  not a completeness guarantee, so promotion still requires human review.
+- Every stored chunk has document and content-hash lineage.
+- Search results resolve to stored chunks and use stable deterministic ordering.
+- CJK bigrams and mixed Latin/CJK splitting stay within the query-token budget.
+- Search detects stored-body or FTS-projection corruption; an approved source resync
+  rebuilds the affected projection.
+- Agent loops stop within their configured budgets.
+- Every candidate factual claim cites an in-context chunk from the same agent run, and the
+  receipt retains the exact fitted excerpt visible to the model.
+- Unsupported conclusions remain explicit gaps.
+- No raw conversation, private index, or agent run is committed.
+- No candidate is promoted, published, deployed, or written to a resume automatically.
 
 ## Current gate
 
-Implementation is complete locally. The real learning gate remains open:
+Implementation and real local dogfood attempts exist on a separate local branch. Final
+verification and review are still open. Push, PR, model download, hosted service,
+deployment, publishing, and automatic promotion are not part of this gate.
 
 ```text
-source-grounded-citations
-Engineering: RESOLVED
-Evidence integrity: PASS (2/2 files)
-Learning: CAPTURED (0/5)
-Next action: EXPLAIN
+Source adapters → IMPLEMENTED
+Private index → IMPLEMENTED
+Evidence Agent → IMPLEMENTED; FRESH REVIEWS PASS
+Dogfood sync/search → COMPLETED LOCALLY
+Retrieval-only golden gate → PASS; SEMANTIC QUALITY NOT EVALUATED
+Full verification → PASS — 229 tests, Ruff, strict mypy, sdist and wheel
+Human promotion → BLOCKED
 ```
 
-No practice gate was marked complete by the implementing agent. The operator must produce
-the receipt for each pass.
+The synthetic bilingual retrieval-only gate currently records Recall@5 `1.0`, MRR `1.0`,
+store neighbor-expansion recall `1.0`, neighbor-expansion forbidden-context precision
+`1.0`, and deterministic repeated/rebuilt
+rankings. One targeted local run measured a maximum search latency of `1.863 ms`; it is a
+single local maximum, not a percentile or service commitment. Semantic faithfulness,
+answer relevancy, and reasoner-output quality are not evaluated and remain human-gated or
+future opt-in evaluation work.

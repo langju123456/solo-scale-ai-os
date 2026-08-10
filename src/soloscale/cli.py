@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Annotated
 
@@ -20,7 +21,21 @@ from soloscale.casebook_models import (
 )
 from soloscale.casebook_store import CasebookStore
 from soloscale.control_tower import build_control_tower
+from soloscale.conversation_intake import (
+    discover_buildlog_runs,
+    discover_codex_sources,
+    parse_buildlog_run,
+    parse_chatgpt_export,
+    parse_codex_session,
+)
+from soloscale.evidence_agent import (
+    BoundedEvidenceAgent,
+    EvidenceAgentError,
+    OllamaReasoner,
+)
 from soloscale.handoff import packet_from_task, render_packet_markdown
+from soloscale.knowledge_models import ParsedSource, SourceFailure, SourceKind, SyncReport
+from soloscale.knowledge_store import KnowledgeStore, KnowledgeStoreError
 from soloscale.models import (
     LatencyTolerance,
     ReasoningDepth,
@@ -32,6 +47,7 @@ from soloscale.router import route_task
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
+_DEFAULT_CODEX_HOME = Path.home() / ".codex"
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -85,9 +101,7 @@ def _resolve_case_target(target: str, data_root: Path) -> tuple[str, Path]:
 
     directory_case_id = candidate.parent.name
     try:
-        learning_case = LearningCase.model_validate_json(
-            candidate.read_text(encoding="utf-8")
-        )
+        learning_case = LearningCase.model_validate_json(candidate.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(
             "case.json is not a valid Casebook manifest",
@@ -164,13 +178,72 @@ def _git_ignores_path(worktree: Path, data_root: Path) -> bool:
     return result.returncode == 0
 
 
+def _combine_sync_reports(reports: Iterable[SyncReport]) -> SyncReport:
+    totals = {
+        "discovered": 0,
+        "imported": 0,
+        "updated": 0,
+        "skipped": 0,
+        "documents": 0,
+        "chunks_written": 0,
+    }
+    failures: list[SourceFailure] = []
+    for report in reports:
+        for field in totals:
+            totals[field] += int(getattr(report, field))
+        failures.extend(report.failures)
+    return SyncReport(
+        discovered=totals["discovered"],
+        imported=totals["imported"],
+        updated=totals["updated"],
+        skipped=totals["skipped"],
+        failed=len(failures),
+        documents=totals["documents"],
+        chunks_written=totals["chunks_written"],
+        failures=failures,
+    )
+
+
+def _sanitized_sync_failure(
+    locator: Path,
+    source_kind: SourceKind,
+    error: Exception,
+) -> SyncReport:
+    return SyncReport(
+        discovered=1,
+        failed=1,
+        failures=[
+            SourceFailure(
+                source_locator=str(locator),
+                source_kind=source_kind,
+                code=type(error).__name__,
+            )
+        ],
+    )
+
+
+def _sync_parsed_sources(
+    store: KnowledgeStore,
+    parsed_sources: Iterable[ParsedSource],
+) -> list[SyncReport]:
+    return [store.sync([parsed_source]) for parsed_source in parsed_sources]
+
+
+def _auto_buildlog_roots(start: Path) -> list[Path]:
+    """Find an enclosing BuildLog checkout without searching unrelated directories."""
+
+    resolved = start.resolve(strict=False)
+    for candidate in (resolved, *resolved.parents):
+        if (candidate / "src" / "buildlog").is_dir() and (candidate / "runs").is_dir():
+            return [candidate]
+    return []
+
+
 @app.command("task-create")
 def task_create(
     title: Annotated[str, typer.Option(help="Task title")],
     goal: Annotated[str, typer.Option(help="Desired outcome")],
-    repo: Annotated[
-        str | None, typer.Option(help="Local or GitHub repository reference")
-    ] = None,
+    repo: Annotated[str | None, typer.Option(help="Local or GitHub repository reference")] = None,
     branch: Annotated[str | None, typer.Option(help="Approved working branch")] = None,
     requested_path: Annotated[
         list[str] | None,
@@ -212,9 +285,7 @@ def task_create(
     reasoning_depth: Annotated[ReasoningDepth, typer.Option()] = ReasoningDepth.MEDIUM,
     latency_tolerance: Annotated[LatencyTolerance, typer.Option()] = LatencyTolerance.BATCH,
     risk: Annotated[RiskLevel, typer.Option()] = RiskLevel.MEDIUM,
-    requires_local: Annotated[
-        bool, typer.Option(help="Requires local files or terminal")
-    ] = False,
+    requires_local: Annotated[bool, typer.Option(help="Requires local files or terminal")] = False,
     requires_realtime: Annotated[bool, typer.Option()] = False,
     requires_scheduled: Annotated[bool, typer.Option()] = False,
     plugin: Annotated[
@@ -510,6 +581,275 @@ def control_tower_build(
     except (OSError, ValueError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--output") from exc
     console.print(f"[green]Created[/green] {out}")
+
+
+@app.command("knowledge-sync")
+def knowledge_sync(
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private ignored SoloScale data root"),
+    ] = Path(".soloscale"),
+    codex_home: Annotated[
+        Path,
+        typer.Option(help="Local Codex home containing sessions/ and archived_sessions/"),
+    ] = _DEFAULT_CODEX_HOME,
+    include_codex: Annotated[
+        bool,
+        typer.Option("--codex/--no-codex", help="Discover local Codex sessions"),
+    ] = True,
+    chatgpt_export: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--chatgpt-export",
+            help="ChatGPT conversations.json or export ZIP; repeat as needed",
+        ),
+    ] = None,
+    buildlog_root: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--buildlog-root",
+            help="BuildLog repository/run root; repeat as needed (auto-detected if omitted)",
+        ),
+    ] = None,
+) -> None:
+    """Incrementally index private, user-visible engineering conversations."""
+
+    _validate_private_data_root(data_root)
+    reports: list[SyncReport] = []
+    try:
+        store = KnowledgeStore(data_root)
+    except (KnowledgeStoreError, OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--data-root") from exc
+
+    if include_codex:
+        try:
+            codex_sources = discover_codex_sources(codex_home)
+        except (OSError, ValueError) as exc:
+            reports.append(_sanitized_sync_failure(codex_home, SourceKind.CODEX_SESSION, exc))
+        else:
+            for source_path in codex_sources:
+                try:
+                    reports.extend(_sync_parsed_sources(store, [parse_codex_session(source_path)]))
+                except (KnowledgeStoreError, OSError, ValueError) as exc:
+                    reports.append(
+                        _sanitized_sync_failure(
+                            source_path,
+                            SourceKind.CODEX_SESSION,
+                            exc,
+                        )
+                    )
+
+    for export_path in chatgpt_export or []:
+        try:
+            parsed_exports = parse_chatgpt_export(export_path)
+            reports.extend(_sync_parsed_sources(store, parsed_exports))
+        except (KnowledgeStoreError, OSError, ValueError) as exc:
+            reports.append(_sanitized_sync_failure(export_path, SourceKind.CHATGPT_EXPORT, exc))
+
+    selected_buildlog_roots = (
+        list(buildlog_root) if buildlog_root else _auto_buildlog_roots(Path.cwd())
+    )
+    for root in selected_buildlog_roots:
+        try:
+            run_directories = discover_buildlog_runs(root)
+        except (OSError, ValueError) as exc:
+            reports.append(_sanitized_sync_failure(root, SourceKind.BUILDLOG_RUN, exc))
+            continue
+        for run_directory in run_directories:
+            try:
+                reports.extend(_sync_parsed_sources(store, [parse_buildlog_run(run_directory)]))
+            except (KnowledgeStoreError, OSError, ValueError) as exc:
+                reports.append(
+                    _sanitized_sync_failure(
+                        run_directory,
+                        SourceKind.BUILDLOG_RUN,
+                        exc,
+                    )
+                )
+
+    if not reports:
+        console.print("[yellow]No supported conversation sources were discovered.[/yellow]")
+        return
+
+    report = _combine_sync_reports(reports)
+    table = Table(title="Private knowledge sync")
+    table.add_column("Result")
+    table.add_column("Count", justify="right")
+    table.add_row("Discovered", str(report.discovered))
+    table.add_row("Imported", str(report.imported))
+    table.add_row("Updated", str(report.updated))
+    table.add_row("Unchanged", str(report.skipped))
+    table.add_row("Failed", str(report.failed))
+    table.add_row("Chunks written", str(report.chunks_written))
+    console.print(table)
+    if report.failures:
+        console.print(
+            "[yellow]Some sources were deferred.[/yellow] Failure receipts contain only "
+            "source locators and error types; rerun sync after inspecting the local source."
+        )
+    console.print(f"Private index: {store.database_path}")
+    successful_sources = report.imported + report.updated + report.skipped
+    if report.failed and successful_sources == 0:
+        console.print("[red]Knowledge sync failed for every discovered source.[/red]")
+        raise typer.Exit(code=1)
+
+
+@app.command("knowledge-status")
+def knowledge_status(
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private ignored SoloScale data root"),
+    ] = Path(".soloscale"),
+) -> None:
+    """Show metadata-only index coverage without printing conversation bodies."""
+
+    _validate_private_data_root(data_root)
+    try:
+        status = KnowledgeStore(data_root).status()
+    except (KnowledgeStoreError, OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--data-root") from exc
+    table = Table(title="Conversation knowledge")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Documents", str(status.documents))
+    table.add_row("Chunks", str(status.chunks))
+    for source_kind, count in sorted(status.source_counts.items()):
+        table.add_row(source_kind, str(count))
+    table.add_row(
+        "Last sync",
+        status.last_synced_at.isoformat() if status.last_synced_at else "NEVER",
+    )
+    console.print(table)
+
+
+@app.command("knowledge-reset")
+def knowledge_reset(
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private ignored SoloScale data root"),
+    ] = Path(".soloscale"),
+    confirmed: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Confirm deletion of the derived conversation index",
+        ),
+    ] = False,
+) -> None:
+    """Reset the derived search index while preserving Evidence Agent run receipts."""
+
+    if not confirmed:
+        raise typer.BadParameter(
+            "knowledge reset requires --yes; agent-run receipts are preserved",
+            param_hint="--yes",
+        )
+    _validate_private_data_root(data_root)
+    try:
+        KnowledgeStore.reset_derived_index(data_root)
+    except (KnowledgeStoreError, OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="--data-root") from exc
+    console.print("[green]Reset[/green] derived conversation index.")
+    console.print("Private Evidence Agent run receipts were preserved.")
+
+
+@app.command("knowledge-search")
+def knowledge_search(
+    query: Annotated[str, typer.Argument(help="Private evidence search query")],
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private ignored SoloScale data root"),
+    ] = Path(".soloscale"),
+    limit: Annotated[int, typer.Option(min=1, max=50)] = 10,
+    source_kind: Annotated[
+        list[SourceKind] | None,
+        typer.Option("--source-kind", help="Restrict source kind; repeat as needed"),
+    ] = None,
+) -> None:
+    """Search the private index deterministically without calling an LLM."""
+
+    _validate_private_data_root(data_root)
+    try:
+        hits = KnowledgeStore(data_root).search(
+            query,
+            limit=limit,
+            source_kinds=source_kind,
+        )
+    except (KnowledgeStoreError, OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="query") from exc
+    if not hits:
+        console.print("[yellow]No evidence chunks matched.[/yellow]")
+        return
+    table = Table(title=f"Knowledge search — {query}")
+    table.add_column("Chunk")
+    table.add_column("Source")
+    table.add_column("Score", justify="right")
+    table.add_column("Excerpt")
+    for hit in hits:
+        display_excerpt = hit.excerpt
+        if len(display_excerpt) > 360:
+            display_excerpt = f"{display_excerpt[:359]}…"
+        table.add_row(
+            hit.chunk_id,
+            hit.source_kind.value,
+            f"{hit.score:.4f}",
+            display_excerpt,
+        )
+    console.print(table)
+
+
+@app.command("evidence-agent")
+def evidence_agent(
+    question: Annotated[str, typer.Argument(help="Question to investigate from local evidence")],
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private ignored SoloScale data root"),
+    ] = Path(".soloscale"),
+    model: Annotated[
+        str,
+        typer.Option(help="Already-installed local Ollama model"),
+    ] = "qwen3:8b",
+    ollama_url: Annotated[
+        str,
+        typer.Option(help="Loopback-only Ollama base URL"),
+    ] = "http://127.0.0.1:11434",
+    max_rounds: Annotated[int, typer.Option(min=1, max=3)] = 2,
+    source_kind: Annotated[
+        list[SourceKind] | None,
+        typer.Option("--source-kind", help="Restrict source kind; repeat as needed"),
+    ] = None,
+) -> None:
+    """Run a bounded, citation-enforced local evidence investigation."""
+
+    _validate_private_data_root(data_root)
+    try:
+        store = KnowledgeStore(data_root)
+        reasoner = OllamaReasoner(endpoint=ollama_url, model=model)
+        agent = BoundedEvidenceAgent(
+            store,
+            reasoner,
+            data_root,
+            max_rounds=max_rounds,
+        )
+        result = agent.run(question, source_kinds=source_kind)
+    except (EvidenceAgentError, KnowledgeStoreError, OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(Panel(result.answer, title="Evidence candidate — human confirmation required"))
+    summary = Table(title="Agent run receipt")
+    summary.add_column("Field")
+    summary.add_column("Value")
+    summary.add_row("Run", result.run_id)
+    summary.add_row("Model", result.model)
+    summary.add_row("Queries", str(len(result.queries)))
+    summary.add_row("Retrieved chunks", str(len(result.retrieved_chunk_ids)))
+    summary.add_row("Cited chunks", str(len(result.refs)))
+    summary.add_row("Open/unsupported", str(len(result.open_questions) + len(result.unsupported)))
+    summary.add_row("Status", result.status)
+    console.print(summary)
+    console.print(
+        "Private result: "
+        f"{data_root / 'knowledge' / 'agent-runs' / result.run_id / '04_result.json'}"
+    )
+    console.print("No Casebook, BuildLog, resume, or publishing record was changed.")
 
 
 @app.command("demo")

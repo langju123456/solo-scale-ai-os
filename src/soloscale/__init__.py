@@ -1,3 +1,3 @@
-"""SoloScale AI OS deterministic workflow foundations."""
+"""SoloScale AI OS local workflow and evidence foundations."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

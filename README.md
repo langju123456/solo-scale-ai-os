@@ -75,9 +75,9 @@ Task Envelope
   → final evidence package
 ```
 
-## Current scope: v0.1
+## Current scope: v0.2
 
-The starter implements the deterministic foundations:
+v0.1 established the deterministic workflow and Casebook foundations:
 
 - typed Task Envelope
 - route classification: `CHAT`, `PLUGIN`, `CODEX`, `RUNTIME`, `HUMAN`
@@ -94,7 +94,21 @@ The starter implements the deterministic foundations:
 - CI and unit tests
 - content/narrative templates
 
-It intentionally does **not** yet invoke ChatGPT, Codex, Vercel, Figma, or any paid API.
+v0.2 adds a private Conversation RAG slice:
+
+- defensive adapters for the locally observed Codex JSONL format and
+  operator-supplied ChatGPT exports;
+- a narrow BuildLog boundary over three narrative Markdown files plus schema-specific safe
+  projections of events, plans, evaluations, run metadata, and timelines;
+- a private, idempotent SQLite knowledge index with FTS and metadata rank fusion;
+- a custom, code-controlled bounded Evidence Agent that can use an already-running local
+  Ollama model; and
+- exact model-visible excerpt receipts, citation checks, explicit gaps, and a human
+  promotion gate.
+
+SoloScale still does **not** use a ChatGPT subscription as an API, scrape a signed-in
+account, invoke Codex/Vercel/Figma as a runtime, or call a paid API. Sync, status, reset,
+and deterministic search do not call a model or network service.
 
 ## Quick start
 
@@ -184,6 +198,73 @@ Explain → Trace → Rebuild → Debug → Defend
 Passing all five produces `SELF_ASSESSED_INTERVIEW_READY`; it is deliberately not an
 external certification. See [the Casebook guide](docs/casebook.md).
 
+### Search the engineering conversations that produced the evidence
+
+The private knowledge plane scans local Codex sessions defensively and can auto-detect an
+enclosing BuildLog checkout. ChatGPT input is always an operator-supplied export. Codex
+ingestion selects observed user/assistant message records. For a valid ChatGPT
+`current_node`, ingestion follows only its active ancestry and excludes sibling branches;
+known hidden-message flags are also filtered. Long messages and artifacts are split into
+deterministic overlapping retrieval segments.
+
+BuildLog ingestion indexes the narrative bodies in `ingestion-report.md`, `03_draft.md`,
+and `05_final.md`. It also indexes schema-specific safe projections from `events.jsonl`,
+`02_plan.json`, `04_evaluation.json`, `run_metadata.json`, and `timeline.json`. Raw prompts,
+responses, tool arguments, stdout, stderr, and arbitrary nested payloads remain excluded
+from those structured projections. The three narrative Markdown bodies are searchable as
+written after best-effort redaction, so they still require operator review.
+
+Control-plane blocks and common credential shapes are removed with best-effort filters
+before persistence. This is not a proof that all sensitive content has been found. Review
+source scope and candidate output before promotion or publication.
+
+```bash
+# Full selected-source rescans with idempotent snapshot updates.
+# Private data stays under ignored .soloscale/.
+soloscale knowledge-sync
+
+soloscale knowledge-status
+soloscale knowledge-search "SoloScale BuildLog evaluator recovery"
+soloscale control-tower-build
+```
+
+The Control Tower shows Conversation RAG document/chunk/run counts, current state, and one
+deterministic exact next action without embedding conversation bodies or source locators.
+
+ChatGPT does not have a live signed-in-history adapter in this project. Supply an exported
+`conversations.json`, or an export ZIP containing it:
+
+```bash
+soloscale knowledge-sync \
+  --chatgpt-export /private/path/to/chatgpt-export.zip
+```
+
+Once an already-installed Ollama model is running locally, the Evidence Agent can plan and
+refine searches over that index:
+
+```bash
+soloscale evidence-agent \
+  "Find the strongest SoloScale and BuildLog incidents for interview practice"
+```
+
+The agent has one read-only search tool and fixed query, round, hit, and context budgets.
+Its output is a private citation-backed candidate. It cannot confirm Casebook facts,
+rewrite BuildLog, update a resume, publish content, or deploy anything. See
+[the Conversation RAG guide](docs/conversation-rag.md).
+
+Retrieved text is untrusted. Code limits its possible effects to bounded local search and
+verifies that each declared claim cites an in-context chunk from the same run. Prompt
+injection, irrelevant citations, and omitted gaps remain possible, so human review is
+required.
+
+A synthetic bilingual retrieval-only golden fixture currently records Recall@5 `1.0`,
+MRR `1.0`, store neighbor-expansion recall `1.0`, neighbor-expansion forbidden-context
+precision `1.0`, and deterministic
+repeated/rebuilt rankings. One targeted local run measured a maximum search latency of
+`1.863 ms`; this is a single workstation observation, not a percentile or service
+commitment. Semantic faithfulness, answer relevancy, and reasoner-output quality are not
+evaluated and remain human-gated or future opt-in evaluations.
+
 ## Repository map
 
 ```text
@@ -205,6 +286,10 @@ external certification. See [the Casebook guide](docs/casebook.md).
 │   ├── casebook_store.py             private archives and append-only practice
 │   ├── interview_packet.py           deterministic interview exercises
 │   ├── control_tower.py              local visual current-state projection
+│   ├── knowledge_models.py           conversation/retrieval contracts
+│   ├── conversation_intake.py        defensive source adapters and redaction
+│   ├── knowledge_store.py             private SQLite/FTS evidence index
+│   ├── evidence_agent.py              custom code-controlled Evidence Agent
 │   └── cli.py                        local CLI
 ├── tests/                            deterministic tests
 ├── examples/                         dogfooding inputs
@@ -251,15 +336,19 @@ Keeping them separate makes each portfolio artifact clearer while creating a com
 - [Local-to-cloud and Vercel path](docs/deployment.md)
 - [Conversation distillation policy](docs/conversations/README.md)
 - [Casebook local evidence and learning workflow](docs/casebook.md)
+- [Private Conversation RAG and Evidence Agent](docs/conversation-rag.md)
 - [Evidence-to-multichannel content template](docs/content/TEMPLATE.md)
 - [Editable Figma architecture board](https://www.figma.com/board/psWfF0mEOdHqUvyOWrJWeF)
 
 Local hardening revision `9fd720b` passed 28 tests, Ruff, `mypy src tests`, the installed CLI demo from outside the repository, and isolated wheel/source-distribution builds. That was the starter baseline: the later Citation Feature completed its external Issue → PR → review → merge → main-CI loop, while this local Casebook branch still requires its own GitHub PR and CI gate.
 
-The current repository is still a local v0.1 control plane. It does not invoke ChatGPT,
-plugins, Codex, or a hosted runtime automatically, and it makes no measured efficiency
-or commercial-demand claim yet. Casebook archives only files the operator explicitly
-selects; automatic chat-history capture remains future work.
+The current repository remains a local control plane. It does not use a ChatGPT
+subscription as an API, invoke plugins or Codex as a runtime, or claim measured efficiency
+or commercial demand. Conversation sync can read local Codex transcripts and supplied
+ChatGPT exports; it does not scrape accounts, read browser cookies, ingest attachments by
+default, or send the private index to a hosted service. Removed source files are not pruned
+incrementally in v0.2; `soloscale knowledge-reset --yes` deletes only the derived index and
+preserves private Evidence Agent run receipts.
 
 ## Public-development rule
 

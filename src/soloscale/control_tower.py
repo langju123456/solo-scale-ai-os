@@ -15,6 +15,7 @@ from soloscale.casebook_models import (
     PracticeStage,
 )
 from soloscale.casebook_store import CasebookStore, IntegrityReport, derive_mastery
+from soloscale.knowledge_store import KnowledgeStore, KnowledgeStoreError
 from soloscale.models import SCHEMA_VERSION
 
 
@@ -32,6 +33,19 @@ class _Summary:
     evidence_gaps: int
     practices_waiting: int
     interview_ready: int
+
+
+@dataclass(frozen=True)
+class _KnowledgeView:
+    state: str
+    documents: int
+    chunks: int
+    source_counts: dict[str, int]
+    last_synced_at: datetime | None
+    completed_runs: int
+    failed_runs: int
+    pending_runs: int
+    next_action: str
 
 
 _STAGE_FOCUS = {
@@ -132,12 +146,136 @@ def _render_summary(summary: _Summary) -> str:
                 (
                     '<div class="metric">',
                     f"<dt>{_e(label)}</dt>",
-                    f'<dd><strong>{_e(value)}</strong><span>{_e(description)}</span></dd>',
+                    f"<dd><strong>{_e(value)}</strong><span>{_e(description)}</span></dd>",
                     "</div>",
                 )
             )
         )
     return "\n".join(rendered)
+
+
+def _knowledge_view(root: Path) -> _KnowledgeView:
+    knowledge_root = root / "knowledge"
+    database = knowledge_root / "index.sqlite3"
+    if database.is_symlink() or knowledge_root.is_symlink():
+        return _KnowledgeView(
+            state="Attention required",
+            documents=0,
+            chunks=0,
+            source_counts={},
+            last_synced_at=None,
+            completed_runs=0,
+            failed_runs=0,
+            pending_runs=0,
+            next_action="Repair the private knowledge storage path before syncing again.",
+        )
+    if not database.is_file():
+        return _KnowledgeView(
+            state="Not synced",
+            documents=0,
+            chunks=0,
+            source_counts={},
+            last_synced_at=None,
+            completed_runs=0,
+            failed_runs=0,
+            pending_runs=0,
+            next_action="Run soloscale knowledge-sync to build the private evidence index.",
+        )
+    try:
+        status = KnowledgeStore(root).status()
+    except (KnowledgeStoreError, OSError, ValueError):
+        return _KnowledgeView(
+            state="Attention required",
+            documents=0,
+            chunks=0,
+            source_counts={},
+            last_synced_at=None,
+            completed_runs=0,
+            failed_runs=0,
+            pending_runs=0,
+            next_action="Inspect or reset the derived knowledge index before running an agent.",
+        )
+
+    completed = failed = pending = 0
+    agent_runs = knowledge_root / "agent-runs"
+    if agent_runs.is_dir() and not agent_runs.is_symlink():
+        for run in agent_runs.iterdir():
+            if not run.is_dir() or run.is_symlink():
+                continue
+            result = run / "04_result.json"
+            failure = run / "failure.json"
+            if failure.is_file() and not failure.is_symlink():
+                failed += 1
+            elif result.is_file() and not result.is_symlink():
+                completed += 1
+            else:
+                pending += 1
+
+    if failed:
+        state = "Recovery review"
+        next_action = "Review failed private agent receipts, then rerun only after remediation."
+    elif completed:
+        state = "Human confirmation"
+        next_action = (
+            "Review the latest candidate and its cited excerpts before promoting a Casebook record."
+        )
+    elif status.documents:
+        state = "Ready for question"
+        next_action = "Run soloscale evidence-agent with one concrete engineering question."
+    else:
+        state = "Empty index"
+        next_action = "Select sources and run soloscale knowledge-sync."
+    return _KnowledgeView(
+        state=state,
+        documents=status.documents,
+        chunks=status.chunks,
+        source_counts=status.source_counts,
+        last_synced_at=status.last_synced_at,
+        completed_runs=completed,
+        failed_runs=failed,
+        pending_runs=pending,
+        next_action=next_action,
+    )
+
+
+def _render_knowledge(view: _KnowledgeView) -> str:
+    source_summary = (
+        ", ".join(f"{kind}: {count}" for kind, count in sorted(view.source_counts.items()))
+        or "No indexed sources"
+    )
+    last_sync = (
+        view.last_synced_at.replace(microsecond=0).isoformat()
+        if view.last_synced_at is not None
+        else "Never"
+    )
+    return f"""
+<section class="knowledge-plane shell" aria-labelledby="knowledge-title">
+  <div class="knowledge-heading">
+    <div>
+      <p class="section-label">Private retrieval plane</p>
+      <h2 id="knowledge-title">Conversation RAG</h2>
+    </div>
+    <span class="knowledge-state">{_e(view.state)}</span>
+  </div>
+  <div class="knowledge-flow" aria-label="Conversation evidence workflow">
+    <span>Selected conversations</span><b aria-hidden="true">→</b>
+    <span>Private index</span><b aria-hidden="true">→</b>
+    <span>Bounded Evidence Agent</span><b aria-hidden="true">→</b>
+    <span>Human confirmation</span><b aria-hidden="true">→</b>
+    <span>Casebook</span>
+  </div>
+  <dl class="knowledge-metrics">
+    <div><dt>Documents</dt><dd>{_e(view.documents)}</dd></div>
+    <div><dt>Chunks</dt><dd>{_e(view.chunks)}</dd></div>
+    <div><dt>Completed runs</dt><dd>{_e(view.completed_runs)}</dd></div>
+    <div><dt>Failed runs</dt><dd>{_e(view.failed_runs)}</dd></div>
+  </dl>
+  <p class="knowledge-meta">
+    {_e(source_summary)} · Last sync: {_e(last_sync)} · Pending: {_e(view.pending_runs)}
+  </p>
+  <div class="knowledge-next"><strong>Exact next action</strong><p>{_e(view.next_action)}</p></div>
+</section>
+""".strip()
 
 
 def _integrity_copy(report: IntegrityReport) -> tuple[str, str, str]:
@@ -368,13 +506,16 @@ def _render_empty_state() -> str:
 """.strip()
 
 
-def _render_document(views: list[_CaseView]) -> str:
+def _render_document(views: list[_CaseView], knowledge: _KnowledgeView) -> str:
     summary = _summarize(views)
     cases = "\n".join(_render_case(view, index) for index, view in enumerate(views, start=1))
     if not cases:
         cases = _render_empty_state()
     source_snapshot_at = max(
-        (view.latest_recorded_at for view in views),
+        (
+            *(_as_utc(view.latest_recorded_at) for view in views),
+            *([_as_utc(knowledge.last_synced_at)] if knowledge.last_synced_at is not None else []),
+        ),
         default=None,
     )
     if source_snapshot_at is None:
@@ -716,6 +857,62 @@ def _render_document(views: list[_CaseView]) -> str:
       text-align: center;
     }}
 
+    .knowledge-plane {{
+      margin-top: 2rem;
+      padding: 1.5rem;
+      border: 1px solid var(--line);
+      border-radius: 1rem;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }}
+    .knowledge-heading {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }}
+    .knowledge-heading h2 {{ margin: 0; }}
+    .knowledge-state {{
+      padding: 0.35rem 0.65rem;
+      border-radius: 999px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-weight: 800;
+    }}
+    .knowledge-flow {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem;
+      align-items: center;
+      margin-top: 1.25rem;
+      color: var(--muted);
+    }}
+    .knowledge-flow span {{
+      padding: 0.4rem 0.65rem;
+      border: 1px solid var(--line);
+      border-radius: 0.5rem;
+    }}
+    .knowledge-metrics {{
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1px;
+      margin: 1.25rem 0 0;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 0.75rem;
+      background: var(--line);
+    }}
+    .knowledge-metrics div {{ padding: 0.8rem; background: var(--panel); }}
+    .knowledge-metrics dt {{ color: var(--muted); font-size: 0.75rem; font-weight: 750; }}
+    .knowledge-metrics dd {{ margin: 0.1rem 0 0; font-size: 1.35rem; font-weight: 800; }}
+    .knowledge-meta {{ color: var(--muted); font-size: 0.82rem; }}
+    .knowledge-next {{
+      padding: 1rem;
+      border-left: 3px solid var(--blue);
+      background: var(--blue-soft);
+    }}
+    .knowledge-next p {{ margin: 0.25rem 0 0; }}
+
     .empty-state h2 {{ margin: 0; }}
     .empty-state p:last-child {{ color: var(--muted); }}
 
@@ -729,6 +926,7 @@ def _render_document(views: list[_CaseView]) -> str:
       .metric:nth-child(even) {{ border-left: 1px solid var(--line); }}
       .metric:nth-child(n + 3) {{ border-top: 1px solid var(--line); }}
       .stages {{ grid-template-columns: 1fr 1fr; }}
+      .knowledge-metrics {{ grid-template-columns: 1fr 1fr; }}
     }}
 
     @media (max-width: 640px) {{
@@ -787,6 +985,8 @@ def _render_document(views: list[_CaseView]) -> str:
       </dl>
     </section>
 
+    {_render_knowledge(knowledge)}
+
     <div class="case-list shell">
       {cases}
     </div>
@@ -798,8 +998,9 @@ def _render_document(views: list[_CaseView]) -> str:
         {snapshot_metadata}
       </p>
       <p>
-        Source of truth: local case JSON and append-only practice JSONL. Raw evidence bodies
-        and original source paths are not embedded in this page.
+        Source of truth: local case JSON and append-only practice JSONL, plus private knowledge
+        index metadata. Raw conversation/evidence bodies and original source paths are not
+        embedded in this page.
       </p>
       <p>
         All learning outcomes shown here are self-assessed, not externally verified mastery.
@@ -823,17 +1024,11 @@ def _resolve_output_target(
         raise ValueError("Control Tower directory must not be a symlink")
 
     requested_target = (
-        Path(output_path)
-        if output_path is not None
-        else requested_dashboard_root / "index.html"
+        Path(output_path) if output_path is not None else requested_dashboard_root / "index.html"
     )
     resolved_target = requested_target.resolve(strict=False)
-    if resolved_target == dashboard_root or not resolved_target.is_relative_to(
-        dashboard_root
-    ):
-        raise ValueError(
-            f"Control Tower output must stay within {requested_dashboard_root}"
-        )
+    if resolved_target == dashboard_root or not resolved_target.is_relative_to(dashboard_root):
+        raise ValueError(f"Control Tower output must stay within {requested_dashboard_root}")
 
     cases_root = store.cases_root.resolve(strict=False)
     if resolved_target.is_relative_to(cases_root):
@@ -904,6 +1099,7 @@ def build_control_tower(store: CasebookStore, output_path: Path | None = None) -
             )
         )
 
+    knowledge = _knowledge_view(store.root)
     _prepare_private_output_parent(dashboard_root, target.parent)
-    _atomic_write_private_html(target, _render_document(views))
+    _atomic_write_private_html(target, _render_document(views, knowledge))
     return requested_target
