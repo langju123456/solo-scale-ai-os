@@ -1,4 +1,24 @@
-# Current Sprint — Private Conversation RAG v0.2
+# Current Sprint — Resume Workspace boundary hardening
+
+Conversation RAG v0.2 is merged and remains the knowledge-plane foundation. The current
+local follow-up gate is the separately human-triggered Resume Workspace candidate slice.
+
+## Resume Workspace gate
+
+- [x] Resume facts derive only from an operator-supplied Candidate Profile.
+- [x] Retrieval matches are labeled lexical candidates and retain full hash/source lineage.
+- [x] The legacy Evidence-Agent-to-resume action is disabled.
+- [x] Internal and external destinations use private, symlink-rejecting, atomic writes.
+- [x] External bundles publish from staging without overwriting an existing application.
+- [x] `delivery.json` records internal-ready, pending, saved,
+      published-but-durability-uncertain, or failed state with the exact published path.
+- [x] Application libraries inside the Git repository are rejected by the UI workflow.
+- [ ] Fresh review and human Push gate.
+
+No Resume candidate may update Casebook, BuildLog, an application system, or a publishing
+surface automatically.
+
+## Foundation — Private Conversation RAG v0.2
 
 ## Foundation carried forward
 

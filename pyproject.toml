@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 soloscale = "soloscale.cli:app"
+soloscale-ui = "soloscale.local_ui:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

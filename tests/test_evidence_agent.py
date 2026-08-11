@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import urllib.error
 import urllib.request
@@ -628,9 +629,7 @@ def test_max_load_elides_display_metadata_but_keeps_required_records_and_receipt
         ]
     )
 
-    result = _agent(tmp_path, store, reasoner, max_rounds=1, max_hits=12).run(
-        "MAX_METADATA_LOAD"
-    )
+    result = _agent(tmp_path, store, reasoner, max_rounds=1, max_hits=12).run("MAX_METADATA_LOAD")
 
     model_records = json.loads(reasoner.calls[-1][2])["evidence_records"]
     records_by_id = {record["chunk_id"]: record for record in model_records}
@@ -652,8 +651,7 @@ def test_max_load_elides_display_metadata_but_keeps_required_records_and_receipt
         for chunk_id, record in records_by_id.items()
     )
     assert all(
-        receipts[chunk_id]["external_id"] == all_hits[chunk_id].external_id
-        for chunk_id in all_hits
+        receipts[chunk_id]["external_id"] == all_hits[chunk_id].external_id for chunk_id in all_hits
     )
     assert all(receipts[chunk_id]["title"] == all_hits[chunk_id].title for chunk_id in all_hits)
     assert result.refs[0].external_id == all_hits[cited_id].external_id
@@ -688,9 +686,7 @@ def test_fair_context_preserves_distant_query_windows_across_twelve_primaries(
         ]
     )
 
-    result = _agent(tmp_path, store, reasoner, max_rounds=1, max_hits=12).run(
-        "Compare ALPHA BETA"
-    )
+    result = _agent(tmp_path, store, reasoner, max_rounds=1, max_hits=12).run("Compare ALPHA BETA")
 
     model_records = json.loads(reasoner.calls[-1][2])["evidence_records"]
     assert len(model_records) == 12
@@ -795,10 +791,7 @@ def test_fair_context_focus_matches_store_token_normalization(
 
     records = json.loads(reasoner.calls[-1][2])["evidence_records"]
     assert len(records) == 12
-    assert all(
-        all(term in record["excerpt"] for term in expected_terms)
-        for record in records
-    )
+    assert all(all(term in record["excerpt"] for term in expected_terms) for record in records)
 
 
 def test_repeated_chunk_identity_attaches_later_query_focus(
@@ -901,12 +894,7 @@ def test_actual_twelve_chatgpt_answers_preserve_head_middle_and_tail_representat
     export_path.write_text(json.dumps(conversations), encoding="utf-8")
     sources = parse_chatgpt_export(export_path)
     representative_ids = {
-        signal: {
-            chunk.id
-            for source in sources
-            for chunk in source.chunks
-            if signal in chunk.text
-        }
+        signal: {chunk.id for source in sources for chunk in source.chunks if signal in chunk.text}
         for signal in ("DECISIVE_HEAD_", "DECISIVE_MIDDLE_", "DECISIVE_TAIL_")
     }
     assert all(len(chunk_ids) == 12 for chunk_ids in representative_ids.values())
@@ -941,10 +929,7 @@ def test_actual_twelve_chatgpt_answers_preserve_head_middle_and_tail_representat
     records = json.loads(reasoner.calls[-1][2])["evidence_records"]
     records_by_id = {record["chunk_id"]: record for record in records}
     visible_text = " ".join(record["excerpt"] for record in records)
-    assert all(
-        chunk_ids.issubset(records_by_id)
-        for chunk_ids in representative_ids.values()
-    )
+    assert all(chunk_ids.issubset(records_by_id) for chunk_ids in representative_ids.values())
     assert all(
         f"DECISIVE_{position}_{index}" in visible_text
         for position in ("HEAD", "MIDDLE", "TAIL")
@@ -955,11 +940,7 @@ def test_actual_twelve_chatgpt_answers_preserve_head_middle_and_tail_representat
     assert any("omitted" in limitation.lower() for limitation in result.limitations)
     manifest = json.loads(
         (
-            root
-            / "knowledge"
-            / "agent-runs"
-            / result.run_id
-            / "03_retrieval_manifest.json"
+            root / "knowledge" / "agent-runs" / result.run_id / "03_retrieval_manifest.json"
         ).read_text(encoding="utf-8")
     )
     receipts = {hit["chunk_id"]: hit for hit in manifest["hits"]}
@@ -1444,6 +1425,31 @@ def test_private_artifacts_have_lineage_hashes_and_restrictive_permissions(
     for field in ("title", "role", "timestamp", "external_id", "excerpt"):
         assert retrieval_manifest["hits"][0][field] == model_record[field]
     assert result.refs[0].excerpt == "A verified engineering observation."
+
+
+def test_post_replace_fsync_failure_preserves_final_evidence_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from soloscale import evidence_agent
+
+    target = tmp_path / "receipt.json"
+    target.write_text("old", encoding="utf-8")
+    original_fsync = os.fsync
+    calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated directory durability failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="durability"):
+        evidence_agent._atomic_private_write(target, "new")
+
+    assert target.read_text(encoding="utf-8") == "new"
 
 
 def test_prompt_injection_in_evidence_cannot_change_system_or_invoke_tools(

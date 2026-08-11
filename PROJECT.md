@@ -131,6 +131,26 @@ verifies that each declared claim cites an in-context chunk from the same run. P
 injection, irrelevant citations, and omitted gaps remain possible, so human review is
 required.
 
+## 5.3 Post-v0.2 candidate slice: Resume Intelligence Workspace
+
+Resume Workspace is a separate, human-triggered projection over the local knowledge plane:
+
+```text
+JD + operator-supplied Candidate Profile + lexical retrieval candidates
+→ deterministic requirements and candidate matching
+→ operator-claim-only resume draft + gaps + evidence graph
+→ private run receipts + optional staged application bundle
+→ human review
+```
+
+Retrieval matches retain source/document/hash lineage but remain lexical candidates; they
+do not semantically verify requirement coverage and cannot become resume facts. Resume
+bullets come only from the Candidate Profile. The legacy Evidence-Agent-to-resume renderer
+is disabled. The optional application library must be outside the Git repository and uses
+an explicit delivery-state receipt. This slice does not update Casebook or BuildLog, apply
+to a job, publish, deploy, or call a network service in local-only mode. ADR-0005 freezes
+this boundary before the candidate slice is promoted into a released roadmap version.
+
 ## 6. v0.2 success criteria
 
 - Repeated sync preserves stable source/document/chunk identities and does not duplicate a

@@ -524,8 +524,7 @@ class BoundedEvidenceAgent:
             )
             context_bytes = len(context_text.encode("utf-8"))
             context_excerpts = {
-                chunk_id: str(record["excerpt"])
-                for chunk_id, record in context_records.items()
+                chunk_id: str(record["excerpt"]) for chunk_id, record in context_records.items()
             }
             if len(context_ids) < len(context_hits):
                 limitations.append(
@@ -649,9 +648,7 @@ class BoundedEvidenceAgent:
         try:
             return self.reasoner.complete(schema, system=system, user=user)
         except ReasonerTransportError:
-            raise EvidenceAgentToolError(
-                f"reasoner transport failed during {stage}"
-            ) from None
+            raise EvidenceAgentToolError(f"reasoner transport failed during {stage}") from None
         except ReasonerInvalidResponseError:
             raise EvidenceAgentContractError(
                 f"reasoner returned invalid structured output during {stage}"
@@ -761,13 +758,9 @@ class BoundedEvidenceAgent:
                 if chunk_id in hit_by_id and chunk_id not in selected_expansion_ids
             ]
             if candidates:
-                preferred_candidates = [
-                    hit for hit in candidates if hit.role is preferred_role
-                ]
+                preferred_candidates = [hit for hit in candidates if hit.role is preferred_role]
                 required_neighbors = (
-                    preferred_candidates[:3]
-                    if preferred_candidates
-                    else candidates[:1]
+                    preferred_candidates[:3] if preferred_candidates else candidates[:1]
                 )
                 for required_neighbor in required_neighbors:
                     required_hits.append(required_neighbor)
@@ -1011,9 +1004,7 @@ def _normalize_texts(items: Sequence[str]) -> list[str]:
 def _merge_optional_evidence_text(first: str | None, second: str | None) -> str | None:
     values = list(
         dict.fromkeys(
-            value.strip()
-            for value in (first, second)
-            if isinstance(value, str) and value.strip()
+            value.strip() for value in (first, second) if isinstance(value, str) and value.strip()
         )
     )
     return " | ".join(values) if values else None
@@ -1270,8 +1261,7 @@ def _distributed_spans(
         return [spans[len(spans) // 2]]
     last_index = len(spans) - 1
     return [
-        spans[(selection_index * last_index) // (count - 1)]
-        for selection_index in range(count)
+        spans[(selection_index * last_index) // (count - 1)] for selection_index in range(count)
     ]
 
 
@@ -1304,11 +1294,7 @@ def _fit_focused_windows(
         return _truncate_utf8(text[start:], max_bytes)
 
     required_bytes = sum(end - start for start, end in selected_byte_spans)
-    remaining_bytes = (
-        max_bytes
-        - required_bytes
-        - separator_bytes * (len(selected_byte_spans) - 1)
-    )
+    remaining_bytes = max_bytes - required_bytes - separator_bytes * (len(selected_byte_spans) - 1)
     shared_context, context_remainder = divmod(
         remaining_bytes,
         len(selected_byte_spans),
@@ -1332,9 +1318,7 @@ def _fit_focused_windows(
         else:
             windows.append((start, end))
 
-    snippets = [
-        encoded[start:end].decode("utf-8", errors="ignore") for start, end in windows
-    ]
+    snippets = [encoded[start:end].decode("utf-8", errors="ignore") for start, end in windows]
     return separator.join(snippets)
 
 
@@ -1422,9 +1406,7 @@ def _retrieval_manifest(
                 "in_context": hit.chunk_id in context_records,
                 "context_expansion": hit.chunk_id not in retrieved_ids,
                 "model_visible_record": (
-                    dict(context_records[hit.chunk_id])
-                    if hit.chunk_id in context_records
-                    else None
+                    dict(context_records[hit.chunk_id]) if hit.chunk_id in context_records else None
                 ),
             }
             for hit in hits
@@ -1578,7 +1560,6 @@ def _atomic_private_write(path: Path, text: str) -> None:
         raise OSError("unsafe artifact directory")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
     temporary_path = Path(temporary_name)
-    replaced = False
     try:
         os.fchmod(descriptor, _PRIVATE_FILE_MODE)
         data = text.encode("utf-8")
@@ -1592,19 +1573,11 @@ def _atomic_private_write(path: Path, text: str) -> None:
         os.close(descriptor)
         descriptor = -1
         os.replace(temporary_path, path)
-        replaced = True
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-    except BaseException:
-        if replaced:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
