@@ -1,5 +1,6 @@
 import io
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from soloscale.local_ui import (
     UploadedFile,
     _build_jd_resume_command,
     _build_resume_sections,
+    _create_resume_pdf_preview,
     _page,
     _parse_submission,
     _result_card,
@@ -149,6 +151,32 @@ def test_job_evidence_search_processes_every_normal_jd_term(
     assert len(hits) == len(accepted_queries)
 
 
+def test_create_resume_pdf_preview_uses_isolated_local_renderer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "resume.docx"
+    target = tmp_path / "preview.pdf"
+    source.write_bytes(_uploaded_resume_docx())
+
+    def fake_run(
+        command: list[str], *, capture_output: bool, check: bool, timeout: int
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert capture_output is True
+        assert check is False
+        assert timeout == 30
+        assert any(item.startswith("-env:UserInstallation=file:") for item in command)
+        output_dir = Path(command[command.index("--outdir") + 1])
+        (output_dir / "resume.pdf").write_bytes(b"%PDF-1.7\n%%EOF\n")
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr("soloscale.local_ui._find_soffice", lambda: "/local/soffice")
+    monkeypatch.setattr("soloscale.local_ui.subprocess.run", fake_run)
+
+    assert _create_resume_pdf_preview(source, target) is True
+    assert target.read_bytes().startswith(b"%PDF-")
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
 def test_user_resume_flow_generates_matching_private_and_application_docx(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -179,8 +207,15 @@ def test_user_resume_flow_generates_matching_private_and_application_docx(
     def no_subprocess(command: list[str], cwd: Path) -> UIActionResult:
         raise AssertionError(f"user resume flow must not run subprocess: {command} {cwd}")
 
+    def fake_preview(source: Path, target: Path) -> bool:
+        assert source.name == "08_resume.docx"
+        target.write_bytes(b"%PDF-1.7\n%%EOF\n")
+        target.chmod(0o600)
+        return True
+
     monkeypatch.setattr("soloscale.local_ui.KnowledgeStore", FakeStore)
     monkeypatch.setattr("soloscale.local_ui._run_command", no_subprocess)
+    monkeypatch.setattr("soloscale.local_ui._create_resume_pdf_preview", fake_preview)
     library_root = tmp_path / "Resume Applications"
     result = _run_user_resume(
         {
@@ -213,13 +248,20 @@ def test_user_resume_flow_generates_matching_private_and_application_docx(
     assert metadata["claims_preserved"] is True
     assert metadata["network_used"] is False
     assert metadata["download_url"].endswith("/resume.docx")
+    assert metadata["preview_url"].endswith("/resume.pdf")
+    assert (run_dir / "10_resume_preview.pdf").is_file()
     run_payload = json.loads((run_dir / "run.json").read_text())
-    assert {"08_resume.docx", "09_user_ui.json"} <= set(run_payload["artifact_paths"])
+    assert {"08_resume.docx", "09_user_ui.json", "10_resume_preview.pdf"} <= set(
+        run_payload["artifact_paths"]
+    )
     application_metadata = json.loads((external_docx.parent / "application.json").read_text())
     assert application_metadata["resume_docx_filename"] == external_docx.name
     rendered = _user_page(result, tmp_path / ".soloscale", {})
     assert "针对性简历已生成" in rendered
     assert metadata["download_url"] in rendered
+    assert metadata["preview_url"] in rendered
+    assert 'class="resume-pdf-preview"' in rendered
+    assert "在新窗口打开" in rendered
     assert "没有网络调用" in rendered
 
 

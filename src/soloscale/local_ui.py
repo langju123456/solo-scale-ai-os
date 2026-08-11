@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from dataclasses import dataclass
@@ -414,6 +415,71 @@ def _write_private_bytes(path: Path, content: bytes) -> None:
     os.chmod(path, _PRIVATE_FILE_MODE)
 
 
+def _find_soffice() -> str | None:
+    candidates = [
+        os.environ.get("SOLOSCALE_SOFFICE"),
+        shutil.which("soffice"),
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/Applications/LibreOfficeDev.app/Contents/MacOS/soffice",
+    ]
+    runtime_root = Path.home() / ".cache" / "codex-runtimes"
+    try:
+        candidates.extend(
+            str(path)
+            for path in sorted(
+                runtime_root.glob("*/dependencies/bin/override/soffice"), reverse=True
+            )
+        )
+    except OSError:
+        pass
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return None
+
+
+def _create_resume_pdf_preview(source: Path, target: Path) -> bool:
+    """Render a private PDF preview when a local LibreOffice binary is available."""
+    soffice = _find_soffice()
+    if soffice is None:
+        return False
+    try:
+        with tempfile.TemporaryDirectory(prefix="soloscale-resume-preview-") as temp_dir:
+            temp_root = Path(temp_dir)
+            profile_dir = temp_root / "profile"
+            output_dir = temp_root / "output"
+            profile_dir.mkdir(mode=0o700)
+            output_dir.mkdir(mode=0o700)
+            completed = subprocess.run(
+                [
+                    soffice,
+                    f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
+                    "--headless",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    str(output_dir),
+                    str(source),
+                ],
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            generated = output_dir / f"{source.stem}.pdf"
+            if completed.returncode != 0 or not generated.is_file():
+                return False
+            content = generated.read_bytes()
+            if not content.startswith(b"%PDF-"):
+                return False
+            _write_private_bytes(target, content)
+            return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _safe_filename_component(value: str | None, fallback: str) -> str:
     cleaned = re.sub(r"[^\w.-]+", "-", (value or "").strip(), flags=re.UNICODE)
     return cleaned.strip("-._")[:80] or fallback
@@ -537,6 +603,8 @@ def _run_user_resume(
         external_docx = application_dir / output_name
         _write_private_bytes(internal_docx, tailored.content)
         _write_private_bytes(external_docx, tailored.content)
+        preview_pdf = run_dir / "10_resume_preview.pdf"
+        preview_created = _create_resume_pdf_preview(internal_docx, preview_pdf)
         user_metadata = {
             "schema_version": "1.0",
             "template_filename": upload_name,
@@ -551,6 +619,8 @@ def _run_user_resume(
             "internal_docx": str(internal_docx),
             "external_docx": str(external_docx),
             "download_url": f"/downloads/{run.run_id}/resume.docx",
+            "preview_url": f"/previews/{run.run_id}/resume.pdf" if preview_created else "",
+            "preview_generated": preview_created,
             "network_used": False,
         }
         _write_private_json(run_dir / "09_user_ui.json", user_metadata)
@@ -571,11 +641,15 @@ def _run_user_resume(
         route["user_ui"] = True
         route["docx_saved"] = True
         route["docx_sha256"] = tailored.output_sha256
+        route["preview_generated"] = preview_created
         artifact_paths = run_payload.get("artifact_paths")
         if not isinstance(artifact_paths, list):
             artifact_paths = []
             run_payload["artifact_paths"] = artifact_paths
-        for name in ("08_resume.docx", "09_user_ui.json"):
+        output_artifacts = ["08_resume.docx", "09_user_ui.json"]
+        if preview_created:
+            output_artifacts.append("10_resume_preview.pdf")
+        for name in output_artifacts:
             if name not in artifact_paths:
                 artifact_paths.append(name)
         _write_private_json(run_path, run_payload)
@@ -1038,6 +1112,7 @@ def _user_result_card(result: UIActionResult | None) -> str:
     if not gap_html:
         gap_html = "<li>没有发现明确的未覆盖项。</li>"
     download_url = str(user_metadata.get("download_url", ""))
+    preview_url = str(user_metadata.get("preview_url", ""))
     output_name = str(user_metadata.get("output_filename", "Tailored Resume.docx"))
     internal_path = str(user_metadata.get("internal_docx", run_dir / "08_resume.docx"))
     external_path = str(user_metadata.get("external_docx", ""))
@@ -1052,6 +1127,25 @@ def _user_result_card(result: UIActionResult | None) -> str:
         if download_url
         else ""
     )
+    if preview_url:
+        preview_action = (
+            f'<a class="preview-link" href="{_escape(preview_url)}" target="_blank" '
+            'rel="noopener">在新窗口打开</a>'
+        )
+        preview_content = f"""<div class="resume-pdf-shell">
+        <object class="resume-pdf-preview" data="{_escape(preview_url)}" type="application/pdf">
+          <p>浏览器无法内嵌 PDF。<a href="{_escape(preview_url)}" target="_blank"
+            rel="noopener">打开简历预览</a></p>
+        </object>
+      </div>"""
+        preview_note = "这是最终 DOCX 的本地 PDF 渲染；确认内容和版式后再下载。"
+    else:
+        preview_action = ""
+        fallback_preview = resume or "DOCX 已生成；文字预览不可用。"
+        preview_content = (
+            f'<pre class="resume-preview">{_escape(fallback_preview)}</pre>'
+        )
+        preview_note = "本机未找到 DOCX 渲染器，当前显示内容预览；最终版式保留上传模板。"
     return f"""<section class="result-card success-state" aria-live="polite">
   <div class="result-header">
     <div>
@@ -1069,8 +1163,9 @@ def _user_result_card(result: UIActionResult | None) -> str:
   </div>
   <div class="result-grid">
     <div>
-      <h3>简历内容预览</h3>
-      <pre class="resume-preview">{_escape(resume or "DOCX 已生成；Markdown 预览不可用。")}</pre>
+      <div class="preview-heading"><h3>简历预览</h3>{preview_action}</div>
+      {preview_content}
+      <p class="preview-note">{_escape(preview_note)}</p>
     </div>
     <aside>
       <h3>建议人工复核</h3>
@@ -1094,6 +1189,11 @@ def _user_page(
     company_url = _escape(form.get("company_url", ""))
     job_title = _escape(form.get("job_title", ""))
     job_id = _escape(form.get("job_id", ""))
+    workspace_class = (
+        "workspace has-result"
+        if action_result is not None and action_result.return_code == 0
+        else "workspace"
+    )
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1136,6 +1236,7 @@ def _user_page(
       max-width:680px;
     }}
     .workspace {{ display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:22px; }}
+    .workspace.has-result {{ grid-template-columns:minmax(320px,.72fr) minmax(0,1.28fr); }}
     .input-card,.result-card {{
       background:color-mix(in srgb,var(--panel) 94%,transparent); border:1px solid #fff;
       border-radius:24px; padding:28px; box-shadow:0 18px 55px #25304b14,0 1px 2px #25304b14;
@@ -1186,6 +1287,17 @@ def _user_page(
       display:grid; grid-template-columns:minmax(0,1.45fr) minmax(180px,.55fr); gap:18px;
     }}
     h3 {{ margin:0 0 10px; font-size:15px; }}
+    .preview-heading {{
+      display:flex; align-items:center; justify-content:space-between; gap:14px; margin-bottom:10px;
+    }}
+    .preview-heading h3 {{ margin:0; }}
+    .preview-link {{ font-size:12px; font-weight:700; text-decoration:none; }}
+    .resume-pdf-shell {{
+      height:680px; overflow:hidden; border:1px solid var(--line); border-radius:14px;
+      background:#dfe3ea; box-shadow:inset 0 1px 3px #17203318;
+    }}
+    .resume-pdf-preview {{ width:100%; height:100%; border:0; background:white; }}
+    .preview-note {{ margin:9px 0 0; font-size:12px; }}
     .resume-preview {{
       margin:0; max-height:450px; overflow:auto; white-space:pre-wrap; padding:18px;
       border:1px solid var(--line); border-radius:14px; background:#fbfbfc;
@@ -1201,6 +1313,7 @@ def _user_page(
     code {{ word-break:break-all; }}
     @media(max-width:900px) {{
       .workspace {{ grid-template-columns:1fr; }} .result-grid {{ grid-template-columns:1fr; }}
+      .workspace.has-result {{ grid-template-columns:1fr; }}
       nav {{ margin-bottom:36px; }}
     }}
     @media(max-width:560px) {{
@@ -1208,6 +1321,7 @@ def _user_page(
       .input-card,.result-card {{ padding:21px; border-radius:19px; }}
       .metadata,.metrics {{ grid-template-columns:1fr 1fr; }} .result-header {{ display:block; }}
       .download {{ display:block; margin-top:16px; }} h1 {{ font-size:40px; }}
+      .resume-pdf-shell {{ height:560px; }}
     }}
   </style>
 </head>
@@ -1225,7 +1339,7 @@ def _user_page(
         SoloScale 会在本地完成要求提取、证据核对、针对性排序和双重保存。
       </p>
     </header>
-    <div class="workspace">
+    <div class="{workspace_class}">
       <section class="input-card">
         <span class="result-kicker">输入</span>
         <h2>简历模板 + Job Description</h2>
@@ -2048,18 +2162,25 @@ def _serve_control_tower(handler: BaseHTTPRequestHandler, data_root: Path) -> No
     handler.wfile.write(body)
 
 
+def _resume_run_artifact(data_root: Path, run_id: str, filename: str) -> Path | None:
+    if _RUN_ID_RE.fullmatch(run_id) is None:
+        return None
+    runs_root = (data_root / "resume-runs").resolve()
+    run_dir = (runs_root / run_id).resolve()
+    target = run_dir / filename
+    if run_dir.parent != runs_root or target.is_symlink() or not target.is_file():
+        return None
+    return target
+
+
 def _serve_resume_download(
     handler: BaseHTTPRequestHandler, data_root: Path, run_id: str
 ) -> None:
-    if _RUN_ID_RE.fullmatch(run_id) is None:
+    target = _resume_run_artifact(data_root, run_id, "08_resume.docx")
+    if target is None:
         handler.send_error(404, "Resume not found")
         return
-    runs_root = (data_root / "resume-runs").resolve()
-    run_dir = (runs_root / run_id).resolve()
-    target = run_dir / "08_resume.docx"
-    if run_dir.parent != runs_root or target.is_symlink() or not target.is_file():
-        handler.send_error(404, "Resume not found")
-        return
+    run_dir = target.parent
     metadata = _load_json_file(run_dir / "09_user_ui.json") or {}
     filename = str(metadata.get("output_filename", "Tailored_Resume.docx"))
     safe_ascii = _safe_filename_component(Path(filename).stem, "Tailored_Resume") + ".docx"
@@ -2071,6 +2192,24 @@ def _serve_resume_download(
         "Content-Disposition",
         f"attachment; filename=\"{safe_ascii}\"; filename*=UTF-8''{urllib.parse.quote(filename)}",
     )
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.end_headers()
+    handler.wfile.write(content)
+
+
+def _serve_resume_preview(
+    handler: BaseHTTPRequestHandler, data_root: Path, run_id: str
+) -> None:
+    target = _resume_run_artifact(data_root, run_id, "10_resume_preview.pdf")
+    if target is None:
+        handler.send_error(404, "Resume preview not found")
+        return
+    content = target.read_bytes()
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/pdf")
+    handler.send_header("Content-Length", str(len(content)))
+    handler.send_header("Content-Disposition", 'inline; filename="resume-preview.pdf"')
+    handler.send_header("Cache-Control", "private, no-store")
     handler.send_header("X-Content-Type-Options", "nosniff")
     handler.end_headers()
     handler.wfile.write(content)
@@ -2179,6 +2318,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         download_match = re.fullmatch(r"/downloads/([^/]+)/resume\.docx", path)
         if download_match is not None:
             _serve_resume_download(self, self.ui_data_root.resolve(), download_match.group(1))
+            return
+        preview_match = re.fullmatch(r"/previews/([^/]+)/resume\.pdf", path)
+        if preview_match is not None:
+            _serve_resume_preview(self, self.ui_data_root.resolve(), preview_match.group(1))
             return
         self.send_error(404, "Not found")
 
