@@ -17,7 +17,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 from soloscale.knowledge_models import RetrievalHit
-from soloscale.knowledge_store import KnowledgeStore, KnowledgeStoreError
+from soloscale.knowledge_store import (
+    InvalidKnowledgeQueryError,
+    KnowledgeStore,
+    KnowledgeStoreError,
+)
 from soloscale.learning_traceability import (
     DEFAULT_TARGET_REQUIREMENT,
     LearningTraceabilityError,
@@ -431,12 +435,40 @@ def _user_resume_filename(
     )
 
 
+def _bisect_evidence_query(query: str) -> tuple[str, ...]:
+    """Split an invalid store query without dropping any JD content."""
+    words = query.split()
+    if len(words) > 1:
+        midpoint = len(words) // 2
+        return (" ".join(words[:midpoint]), " ".join(words[midpoint:]))
+    if len(query) > 1:
+        midpoint = len(query) // 2
+        return (query[:midpoint], query[midpoint:])
+    return ()
+
+
+def _search_evidence_query(store: KnowledgeStore, query: str) -> list[RetrievalHit]:
+    """Search a complete JD fragment, automatically batching store-safe queries."""
+    normalized = " ".join(query.split())
+    if not normalized:
+        return []
+    try:
+        return store.search(normalized, limit=3)
+    except InvalidKnowledgeQueryError:
+        parts = _bisect_evidence_query(normalized)
+        if not parts:
+            return []
+        hits: list[RetrievalHit] = []
+        for part in parts:
+            hits.extend(_search_evidence_query(store, part))
+        return hits
+
+
 def _search_job_evidence(job_description: str, data_root: Path) -> list[RetrievalHit]:
     store = KnowledgeStore(data_root)
-    hits = []
-    for requirement in job_description.splitlines()[:24]:
-        if requirement.strip():
-            hits.extend(store.search(requirement.strip(), limit=3))
+    hits: list[RetrievalHit] = []
+    for requirement in job_description.splitlines():
+        hits.extend(_search_evidence_query(store, requirement))
     return list({hit.chunk_id: hit for hit in hits}.values())
 
 

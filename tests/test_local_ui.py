@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from soloscale.knowledge_models import ContentRole, RetrievalHit, SourceKind
+from soloscale.knowledge_store import InvalidKnowledgeQueryError
 from soloscale.local_ui import (
     UIActionResult,
     UploadedFile,
@@ -17,6 +18,7 @@ from soloscale.local_ui import (
     _resume_graph,
     _run_action,
     _run_user_resume,
+    _search_job_evidence,
     _split_path_list,
     _user_page,
     _workspace_path,
@@ -98,6 +100,53 @@ def test_parse_submission_reads_text_and_docx_upload() -> None:
     assert submission.fields["job_description"] == "Required: Python RAG"
     assert submission.files["resume_template"].filename == "resume.docx"
     assert submission.files["resume_template"].content == template
+
+
+def test_job_evidence_search_processes_every_normal_jd_term(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    accepted_queries: list[str] = []
+
+    class FakeStore:
+        def __init__(self, root: Path) -> None:
+            assert root == tmp_path
+
+        def search(self, query: str, limit: int) -> list[RetrievalHit]:
+            assert limit == 3
+            if len(query.split()) > 4:
+                raise InvalidKnowledgeQueryError("query contains too many searchable terms")
+            accepted_queries.append(query)
+            return [
+                RetrievalHit(
+                    chunk_id=f"chunk-{len(accepted_queries)}",
+                    document_id="doc",
+                    source_kind=SourceKind.CODEX_SESSION,
+                    external_id="thread",
+                    locator="private",
+                    title="local evidence",
+                    role=ContentRole.ASSISTANT,
+                    timestamp=None,
+                    excerpt=query,
+                    chunk_sha256="a" * 64,
+                    document_sha256="b" * 64,
+                    score=1,
+                    channels=["fts"],
+                )
+            ]
+
+    monkeypatch.setattr("soloscale.local_ui.KnowledgeStore", FakeStore)
+    terms = [f"requirement{index}" for index in range(40)]
+    job_description = " ".join(terms) + "\n" + "\n".join(
+        f"line{index} python" for index in range(30)
+    )
+
+    hits = _search_job_evidence(job_description, tmp_path)
+
+    accepted_terms = {term for query in accepted_queries for term in query.split()}
+    assert set(terms).issubset(accepted_terms)
+    assert "line29" in accepted_terms
+    assert all(len(query.split()) <= 4 for query in accepted_queries)
+    assert len(hits) == len(accepted_queries)
 
 
 def test_user_resume_flow_generates_matching_private_and_application_docx(
