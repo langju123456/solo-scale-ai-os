@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import subprocess
 import zipfile
 from pathlib import Path
@@ -12,8 +13,6 @@ from soloscale.learning_traceability import run_learning_traceability
 from soloscale.local_ui import (
     UIActionResult,
     UploadedFile,
-    _build_jd_resume_command,
-    _build_resume_sections,
     _create_resume_pdf_preview,
     _interview_defense_panel,
     _learning_page,
@@ -27,6 +26,8 @@ from soloscale.local_ui import (
     _split_path_list,
     _user_page,
     _workspace_path,
+    _write_private_bytes,
+    _write_private_json,
 )
 from soloscale.resume_models import CandidateProfile
 from soloscale.resume_workspace import (
@@ -283,6 +284,69 @@ def test_create_resume_pdf_preview_uses_isolated_local_renderer(
     assert target.stat().st_mode & 0o777 == 0o600
 
 
+def test_ui_private_artifact_writers_are_atomic_and_reject_symlinks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "run.json"
+    target.write_text("old", encoding="utf-8")
+    original_fsync = os.fsync
+    calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated UI receipt durability failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+    with pytest.raises(OSError, match="durability"):
+        _write_private_json(target, {"state": "new"})
+    assert json.loads(target.read_text(encoding="utf-8")) == {"state": "new"}
+
+    outside = tmp_path / "outside.pdf"
+    outside.write_bytes(b"outside")
+    link = tmp_path / "preview.pdf"
+    link.symlink_to(outside)
+    with pytest.raises(OSError, match="regular file"):
+        _write_private_bytes(link, b"%PDF-new")
+    assert outside.read_bytes() == b"outside"
+
+
+def test_user_resume_rejects_symlinked_data_root_before_search(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    data_root = tmp_path / ".soloscale"
+    data_root.symlink_to(outside, target_is_directory=True)
+
+    class ForbiddenStore:
+        def __init__(self, root: Path) -> None:
+            raise AssertionError(f"KnowledgeStore must not open symlinked root: {root}")
+
+    monkeypatch.setattr("soloscale.local_ui.KnowledgeStore", ForbiddenStore)
+    result = _run_user_resume(
+        {
+            "job_description": "Required: Python",
+            "resume_library_root": str(tmp_path / "Resume Applications"),
+        },
+        {
+            "resume_template": UploadedFile(
+                filename="synthetic.docx",
+                content_type="application/octet-stream",
+                content=_uploaded_resume_docx(),
+            )
+        },
+        data_root,
+        tmp_path / "repo",
+    )
+
+    assert result.return_code == 1
+    assert "symlink" in result.stderr
+    assert list(outside.iterdir()) == []
+
+
 def test_user_resume_flow_generates_matching_private_and_application_docx(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -339,7 +403,7 @@ def test_user_resume_flow_generates_matching_private_and_application_docx(
             )
         },
         tmp_path / ".soloscale",
-        tmp_path,
+        tmp_path / "repo",
     )
 
     assert result.return_code == 0, result.stderr
@@ -369,8 +433,6 @@ def test_user_resume_flow_generates_matching_private_and_application_docx(
     assert 'class="resume-pdf-preview"' in rendered
     assert "在新窗口打开" in rendered
     assert "没有网络调用" in rendered
-
-
 def test_run_action_knowledge_status_builds_expected_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -393,63 +455,6 @@ def test_run_action_knowledge_status_builds_expected_command(
     assert result is not None
     assert result.return_code == 0
     assert calls == [["knowledge-status", "--data-root", ".soloscale"]]
-
-
-def test_build_resume_sections_with_claims_and_refs() -> None:
-    payload = {
-        "claims": [
-            {
-                "text": "实现了基于 evidence 的结构化输出链路。",
-                "evidence_chunk_ids": ["c1", "c2"],
-            },
-            {
-                "text": "补齐了工程恢复流程。",
-                "evidence_chunk_ids": ["c2"],
-            },
-        ],
-        "refs": [
-            {
-                "chunk_id": "c1",
-                "title": "Run 2026 evidence",
-                "source_kind": "chatgpt_conversation",
-                "external_id": "ext-1",
-                "excerpt": "run evidence excerpt",
-            },
-            {
-                "chunk_id": "c2",
-                "title": "BuildLog log",
-                "source_kind": "buildlog_run",
-                "external_id": "ext-2",
-                "excerpt": "another evidence snippet",
-            },
-        ],
-        "unsupported": ["缺失真实证据字段说明"],
-        "open_questions": ["需要确认产品规模化指标"],
-    }
-    output = _build_resume_sections(payload, job_title_hint="AI Engineer JD")
-
-    assert "# AI Engineer JD" in output
-    assert "项目经历 1" in output
-    assert "证据锚点" in output
-    assert "c1（chatgpt_conversation｜Run 2026 evidence）" in output
-    assert "未被证据覆盖 / 需人工补证" in output
-    assert "待补充问题" in output
-
-
-def test_build_jd_resume_command_requires_jd() -> None:
-    command, prompt = _build_jd_resume_command({"job_description": ""}, Path(".soloscale"))
-    assert command == []
-    assert prompt is None
-
-
-def test_build_jd_resume_command_uses_expected_defaults() -> None:
-    command, prompt = _build_jd_resume_command(
-        {"job_description": "AI 工程师", "resume_max_rounds": "2"},
-        Path(".soloscale"),
-    )
-    assert prompt == "AI 工程师"
-    assert command[0] == "evidence-agent"
-    assert "--max-rounds" in command
 
 
 def test_resume_graph_renders_clickable_native_svg(tmp_path: Path) -> None:
@@ -476,6 +481,20 @@ def test_resume_workspace_defaults_to_documents_application_library(tmp_path: Pa
     assert f'value="{expected}"' in page
 
 
+def test_resume_workspace_rejects_unknown_mode_without_crashing(tmp_path: Path) -> None:
+    result = _run_action(
+        {
+            "action": "resume-workspace",
+            "job_description": "Required: Python",
+            "resume_mode": "unknown",
+        },
+        tmp_path / ".soloscale",
+        tmp_path,
+    )
+
+    assert result is not None
+    assert result.return_code == 2
+    assert "Resume mode 无效" in result.stderr
 def test_resume_workspace_is_local_only_and_renders_preview(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -520,7 +539,7 @@ def test_resume_workspace_is_local_only_and_renders_preview(
             "resume_library_root": str(tmp_path / "Resume Applications"),
         },
         tmp_path / ".soloscale",
-        tmp_path,
+        tmp_path / "repo",
     )
     assert result is not None and result.return_code == 0
     page = _result_card(result)
@@ -534,3 +553,48 @@ def test_resume_workspace_is_local_only_and_renders_preview(
     assert len(application_dirs) == 1
     assert (application_dirs[0] / "JD.md").is_file()
     assert (application_dirs[0] / "application.json").is_file()
+
+
+def test_old_jd_resume_action_is_disabled_and_not_rendered(tmp_path: Path) -> None:
+    result = _run_action(
+        {"action": "jd-resume-draft", "job_description": "Required: Python"},
+        tmp_path / ".soloscale",
+        tmp_path,
+    )
+    assert result is not None
+    assert result.return_code == 2
+    assert "Evidence Agent" in result.stderr
+    page = _page(None, tmp_path / ".soloscale", {})
+    assert 'name="action" value="jd-resume-draft"' not in page
+    assert "Evidence discovery（旧 JD 简历入口已停用）" in page
+
+
+def test_resume_workspace_rejects_symlinked_application_library(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeStore:
+        def __init__(self, root: Path) -> None:
+            del root
+
+        def search(self, query: str, limit: int) -> list[RetrievalHit]:
+            del query, limit
+            return []
+
+    monkeypatch.setattr("soloscale.local_ui.KnowledgeStore", FakeStore)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    library = tmp_path / "Resume Applications"
+    library.symlink_to(outside, target_is_directory=True)
+    result = _run_action(
+        {
+            "action": "resume-workspace",
+            "job_description": "Required: Python",
+            "resume_library_root": str(library),
+        },
+        tmp_path / ".soloscale",
+        tmp_path / "repo",
+    )
+    assert result is not None
+    assert result.return_code == 1
+    assert result.stderr == "application library save failed; inspect delivery.json"
+    assert list(outside.iterdir()) == []

@@ -38,6 +38,9 @@ from soloscale.resume_docx import (
 from soloscale.resume_models import CandidateProfile, InterviewDefenseRecord, ResumeMode
 from soloscale.resume_workspace import (
     ResumeWorkspaceStorageError,
+    _atomic_private_write,
+    _atomic_private_write_bytes,
+    _reject_symlink_ancestry,
     load_interview_defense_records,
     map_interview_defense_bullet,
 )
@@ -47,7 +50,6 @@ from soloscale.resume_workspace import (
 
 COMMAND_TIMEOUT_SECONDS = 120
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
-_PRIVATE_FILE_MODE = 0o600
 _DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _RUN_ID_RE = re.compile(r"resume-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10}")
 
@@ -156,8 +158,6 @@ def _extract_private_result_path(raw_stdout: str) -> Path | None:
             if candidate:
                 return Path(candidate).expanduser()
     return None
-
-
 def _load_json_file(path: Path) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -168,182 +168,20 @@ def _load_json_file(path: Path) -> dict[str, object] | None:
     return payload
 
 
-def _build_resume_sections(payload: dict[str, object], *, job_title_hint: str | None) -> str:
-    claims = payload.get("claims", [])
-    refs = payload.get("refs", [])
-    unsupported = payload.get("unsupported", [])
-    open_questions = payload.get("open_questions", [])
-    if not isinstance(claims, list):
-        claims = []
-    if not isinstance(refs, list):
-        refs = []
-    if not isinstance(unsupported, list):
-        unsupported = []
-    if not isinstance(open_questions, list):
-        open_questions = []
-
-    refs_by_id = {}
-    for item in refs:
-        if isinstance(item, dict):
-            chunk_id = item.get("chunk_id")
-            if isinstance(chunk_id, str) and chunk_id:
-                refs_by_id[chunk_id] = item
-
-    title = (job_title_hint or "JD 简历草稿").strip() or "JD 简历草稿"
-    lines: list[str] = []
-    lines.append(f"# {title}")
-    lines.append("## 项目经历（可追溯）")
-
-    if claims:
-        for index, item in enumerate(claims, start=1):
-            text = str(item.get("text", "") if isinstance(item, dict) else "")
-            evidence_ids = [
-                str(evidence_id)
-                for evidence_id in (
-                    item.get("evidence_chunk_ids", []) if isinstance(item, dict) else []
-                )
-                if isinstance(evidence_id, str) and evidence_id.strip()
-            ]
-            lines.append(f"- 项目经历 {index}：{_normalize_for_resume(text)}")
-            if evidence_ids:
-                lines.append("  - 证据锚点：")
-                for evidence_id in evidence_ids:
-                    ref = refs_by_id.get(evidence_id, {})
-                    source_kind = str(ref.get("source_kind", "unknown"))
-                    title_text = _normalize_for_resume(str(ref.get("title", "") or ""), limit=80)
-                    tag = f"{source_kind}" + (f"｜{title_text}" if title_text else "")
-                    lines.append(f"    - {evidence_id}（{tag}）")
-                lines.append("  - 可追溯说明：")
-                for evidence_id in evidence_ids:
-                    ref = refs_by_id.get(evidence_id, {})
-                    excerpt = _normalize_for_resume(str(ref.get("excerpt", "") or ""), limit=220)
-                    external_id = str(ref.get("external_id", "") or "")
-                    prefix = " / ".join(
-                        part
-                        for part in [
-                            str(ref.get("title", "") or ""),
-                            external_id,
-                        ]
-                        if part
-                    )
-                    if prefix:
-                        lines.append(f"    - {evidence_id}（{prefix}）：{excerpt}")
-                    else:
-                        lines.append(f"    - {evidence_id}：{excerpt}")
-            else:
-                lines.append("  - 证据锚点：未命中（请重试）")
-    else:
-        lines.append("- 尚未生成候选经历，请增加 JD 关键词并重试。")
-
-    if unsupported:
-        lines.append("")
-        lines.append("## 未被证据覆盖 / 需人工补证")
-        for item in unsupported:
-            lines.append(f"- {_normalize_for_resume(str(item))}")
-
-    if open_questions:
-        lines.append("")
-        lines.append("## 待补充问题")
-        for item in open_questions:
-            lines.append(f"- {_normalize_for_resume(str(item))}")
-
-    lines.append("")
-    lines.append("## 说明")
-    lines.append(
-        "- 所有“项目经历”条目均来自当前本地证据并保留 chunk_id。\n"
-        "- 本次输出为本地草稿，建议人工改写为与你经历一致的表达。"
-    )
-    return "\n".join(lines).strip() + "\n"
-
-
-def _build_jd_resume_command(form: dict[str, str], data_root: Path) -> tuple[list[str], str | None]:
-    jd = form.get("job_description", "").strip()
-    if not jd:
-        return [], None
-
-    model = form.get("resume_model", "qwen3:8b").strip() or "qwen3:8b"
-    ollama_url = (
-        form.get("resume_ollama_url", "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
-    )
-    source_kind = form.get("resume_source_kind", "").strip()
-    raw_rounds = form.get("resume_max_rounds", "2").strip()
-    safe_rounds = max(1, min(3, int(raw_rounds) if raw_rounds.isdigit() else 2))
-
-    instruction = (
-        "请根据以下 JD，为个人 AI Engineer 简历输出结构化简历草稿：\n"
-        "1) 项目经历（1-6条）；\n"
-        "2) 每条都要关联 evidence chunk_id；\n"
-        "3) 每条给出一句可追溯说明。\n"
-        "4) 不允许发明未检索到的内容；缺证据请直说。"
-        "\n\nJD：\n"
-        f"{jd}"
-    )
-
-    command = [
-        "evidence-agent",
-        instruction,
-        "--data-root",
-        str(data_root),
-        "--model",
-        model,
-        "--ollama-url",
-        ollama_url,
-        "--max-rounds",
-        str(safe_rounds),
-    ]
-    if source_kind:
-        command += ["--source-kind", source_kind]
-    return command, jd
-
-
 def _run_jd_resume_draft(
     form: dict[str, str], data_root: Path, repo_root: Path
 ) -> UIActionResult | None:
-    command, prompt_hint = _build_jd_resume_command(form, data_root)
-    if not command:
-        return UIActionResult(
-            name="jd-resume-draft",
-            command="jd-resume-draft",
-            return_code=2,
-            stdout="",
-            stderr="JD 不能为空。",
-            elapsed_ms=0,
-        )
-
-    base = _run_command(command, repo_root)
-    if base.return_code != 0:
-        return base
-
-    result_path = _extract_private_result_path(base.stdout)
-    if result_path is None or not result_path.is_file():
-        return UIActionResult(
-            name="jd-resume-draft",
-            command=base.command,
-            return_code=1,
-            stdout=base.stdout,
-            stderr="未找到 evidence-agent 产出的 04_result.json，无法生成结构化简历。",
-            elapsed_ms=base.elapsed_ms,
-        )
-
-    payload = _load_json_file(result_path)
-    if payload is None:
-        return UIActionResult(
-            name="jd-resume-draft",
-            command=base.command,
-            return_code=1,
-            stdout=base.stdout,
-            stderr="无法解析 evidence-agent 的 JSON 结果。",
-            elapsed_ms=base.elapsed_ms,
-        )
-
-    structured = _build_resume_sections(payload, job_title_hint=prompt_hint)
+    del form, data_root, repo_root
     return UIActionResult(
         name="jd-resume-draft",
-        command=base.command,
-        return_code=0,
-        stdout=structured,
-        stderr="",
-        elapsed_ms=base.elapsed_ms,
+        command="jd-resume-draft",
+        return_code=2,
+        stdout="",
+        stderr=(
+            "该旧入口已停用：Evidence Agent 结果只能用于证据发现，不能直接生成简历事实。"
+            "请使用 Resume Intelligence Workspace，并显式提供 Candidate Profile。"
+        ),
+        elapsed_ms=0,
     )
 
 
@@ -362,11 +200,20 @@ def _candidate_profile_from_form(form: dict[str, str]) -> CandidateProfile:
 
 
 def _run_resume_workspace(form: dict[str, str], data_root: Path, repo_root: Path) -> UIActionResult:
-    del repo_root
     job_description = form.get("job_description", "").strip()
     if not job_description:
         return UIActionResult("resume-workspace", "resume-workspace", 2, "", "JD 不能为空。", 0)
-    mode = ResumeMode(form.get("resume_mode", ResumeMode.LOCAL_ONLY.value))
+    try:
+        mode = ResumeMode(form.get("resume_mode", ResumeMode.LOCAL_ONLY.value))
+    except ValueError:
+        return UIActionResult(
+            "resume-workspace",
+            "resume-workspace",
+            2,
+            "",
+            "Resume mode 无效。请选择 Local-only 或 Hybrid research。",
+            0,
+        )
     if mode is ResumeMode.HYBRID:
         return UIActionResult(
             "resume-workspace",
@@ -377,11 +224,12 @@ def _run_resume_workspace(form: dict[str, str], data_root: Path, repo_root: Path
             0,
         )
     try:
+        _reject_symlink_ancestry(data_root)
         library_value = form.get("resume_library_root", "").strip()
         library_root = (
             Path(library_value or Path.home() / "Documents" / "Resume Applications")
             .expanduser()
-            .resolve()
+            .absolute()
         )
         store = KnowledgeStore(data_root)
         requirements = form.get("job_description", "").splitlines()
@@ -400,6 +248,7 @@ def _run_resume_workspace(form: dict[str, str], data_root: Path, repo_root: Path
             job_title=form.get("job_title", "").strip() or None,
             job_id=form.get("job_id", "").strip() or None,
             application_library_root=library_root,
+            repository_root=repo_root,
             mode=mode,
         )
     except (KnowledgeStoreError, OSError, ValueError) as exc:
@@ -411,16 +260,14 @@ def _run_resume_workspace(form: dict[str, str], data_root: Path, repo_root: Path
 
 
 def _write_private_json(path: Path, payload: object) -> None:
-    path.write_text(
+    _atomic_private_write(
+        path,
         json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
-        encoding="utf-8",
     )
-    os.chmod(path, _PRIVATE_FILE_MODE)
 
 
 def _write_private_bytes(path: Path, content: bytes) -> None:
-    path.write_bytes(content)
-    os.chmod(path, _PRIVATE_FILE_MODE)
+    _atomic_private_write_bytes(path, content)
 
 
 def _find_soffice() -> str | None:
@@ -553,7 +400,6 @@ def _run_user_resume(
     repo_root: Path,
 ) -> UIActionResult:
     """Run the local upload → evidence → workspace → DOCX flow without a subprocess."""
-    del repo_root
     started = time.perf_counter()
     job_description = form.get("job_description", "").strip()
     if not job_description:
@@ -577,12 +423,19 @@ def _run_user_resume(
         )
 
     try:
+        _reject_symlink_ancestry(data_root)
         profile = extract_candidate_profile(upload.content)
         tailored = tailor_resume_docx(upload.content, job_description)
+        output_name = _user_resume_filename(
+            profile,
+            form.get("company_name", "").strip() or None,
+            form.get("job_title", "").strip() or None,
+            job_description,
+        )
         library_root = Path(
             form.get("resume_library_root", "").strip()
             or Path.home() / "Documents" / "Resume Applications"
-        ).expanduser().resolve()
+        ).expanduser().absolute()
         evidence_hits = _search_job_evidence(job_description, data_root)
         run = execute_resume_workspace(
             data_root=data_root,
@@ -594,6 +447,17 @@ def _run_user_resume(
             job_title=form.get("job_title", "").strip() or None,
             job_id=form.get("job_id", "").strip() or None,
             application_library_root=library_root,
+            repository_root=repo_root,
+            application_resume_bytes=tailored.content,
+            application_resume_filename=output_name,
+            application_resume_metadata={
+                "template_filename": upload_name,
+                "template_sha256": tailored.template_sha256,
+                "claims_preserved": tailored.claims_preserved,
+                "source_paragraph_count": tailored.source_paragraph_count,
+                "project_blocks_reordered": tailored.project_blocks_reordered,
+                "skill_bullets_reordered": tailored.skill_bullets_reordered,
+            },
             mode=ResumeMode.LOCAL_ONLY,
         )
         run_dir = data_root / "resume-runs" / run.run_id
@@ -601,16 +465,15 @@ def _run_user_resume(
         if not isinstance(application_value, str) or not application_value:
             raise OSError("Resume application directory was not created")
         application_dir = Path(application_value)
-        output_name = _user_resume_filename(
-            profile,
-            form.get("company_name", "").strip() or None,
-            form.get("job_title", "").strip() or None,
-            job_description,
-        )
         internal_docx = run_dir / "08_resume.docx"
         external_docx = application_dir / output_name
-        _write_private_bytes(internal_docx, tailored.content)
-        _write_private_bytes(external_docx, tailored.content)
+        if (
+            not internal_docx.is_file()
+            or not external_docx.is_file()
+            or internal_docx.read_bytes() != tailored.content
+            or external_docx.read_bytes() != tailored.content
+        ):
+            raise OSError("Published resume DOCX failed byte-integrity verification")
         preview_pdf = run_dir / "10_resume_preview.pdf"
         preview_created = _create_resume_pdf_preview(internal_docx, preview_pdf)
         user_metadata = {
@@ -633,13 +496,6 @@ def _run_user_resume(
         }
         _write_private_json(run_dir / "09_user_ui.json", user_metadata)
 
-        application_metadata_path = application_dir / "application.json"
-        application_metadata = _load_json_file(application_metadata_path) or {}
-        application_metadata["resume_docx_filename"] = output_name
-        application_metadata["resume_docx_sha256"] = tailored.output_sha256
-        application_metadata["claims_preserved"] = tailored.claims_preserved
-        _write_private_json(application_metadata_path, application_metadata)
-
         run_path = run_dir / "run.json"
         run_payload = _load_json_file(run_path) or {}
         route = run_payload.get("route")
@@ -654,7 +510,7 @@ def _run_user_resume(
         if not isinstance(artifact_paths, list):
             artifact_paths = []
             run_payload["artifact_paths"] = artifact_paths
-        output_artifacts = ["08_resume.docx", "09_user_ui.json"]
+        output_artifacts = ["09_user_ui.json"]
         if preview_created:
             output_artifacts.append("10_resume_preview.pdf")
         for name in output_artifacts:
@@ -767,8 +623,6 @@ def _learning_response_location(stage: str) -> str:
     if stage_slug is None:
         raise ValueError("learning response stage is invalid")
     return f"/learning?response_saved={stage_slug}#exercise-{stage_slug}"
-
-
 def _escape(value: str) -> str:
     return html.escape(value or "", quote=True)
 
@@ -826,8 +680,6 @@ def _parse_submission(raw: bytes, content_type: str) -> FormSubmission:
             raise ValueError("表单文字不是有效的 UTF-8。") from exc
         fields.setdefault(field_name, value)
     return FormSubmission(fields=fields, files=files)
-
-
 def _build_control_tower_path(data_root: Path) -> Path:
     return (data_root / "control-tower" / "index.html").resolve()
 
@@ -974,10 +826,11 @@ def _resume_workspace_result(raw_stdout: str) -> str:
         or "- None"
     )
     summary = (
-        f"Requirements: {coverage.get('total', 0)} · strong: {coverage.get('strong', 0)} · "
-        f"partial: {coverage.get('partial', 0)} · unsupported: {coverage.get('unsupported', 0)} · "
-        "critical covered: "
-        f"{coverage.get('critical_covered', 0)}/{coverage.get('critical_total', 0)}"
+        f"Requirements: {coverage.get('total', 0)} · strong lexical candidates: "
+        f"{coverage.get('lexical_candidate_strong', 0)} · partial lexical candidates: "
+        f"{coverage.get('lexical_candidate_partial', 0)} · no lexical candidate: "
+        f"{coverage.get('no_lexical_candidate', 0)} · critical with candidate: "
+        f"{coverage.get('critical_with_candidate', 0)}/{coverage.get('critical_total', 0)}"
     )
     return f"""<section class=\"graph-card\"><h3>One-page resume preview</h3>
 <pre class=\"success\">{_escape(resume)}</pre><h3>Coverage</h3><p>{_escape(summary)}</p>
@@ -2153,8 +2006,6 @@ def _learning_page(
   </main>
 </body>
 </html>"""
-
-
 def _control_tower_section(data_root: Path) -> str:
     exists, _ = _read_control_tower(data_root)
     if not exists:
@@ -2178,10 +2029,6 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
     ollama_url = _escape(form.get("ollama_url", "http://127.0.0.1:11434"))
     agent_source_kind = form.get("agent_source_kind", "")
     resume_job_description = _escape(form.get("job_description", ""))
-    resume_model = _escape(form.get("resume_model", "qwen3:8b"))
-    resume_ollama_url = _escape(form.get("resume_ollama_url", "http://127.0.0.1:11434"))
-    resume_source_kind = form.get("resume_source_kind", "")
-    resume_max_rounds = _escape(form.get("resume_max_rounds", "2"))
     candidate_name = _escape(form.get("candidate_name", ""))
     candidate_headline = _escape(form.get("candidate_headline", ""))
     candidate_summary = _escape(form.get("candidate_summary", ""))
@@ -2359,42 +2206,11 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
     </section>
 
     <section class="card full">
-      <h2>6）JD 简历草稿（结构化，可追溯）</h2>
-      <form method="post" action="/run">
-        <input type="hidden" name="action" value="jd-resume-draft" />
-        <label>
-          Job Description
-          <textarea name="job_description" rows="8">{resume_job_description}</textarea>
-        </label>
-        <label>
-          Model
-          <input name="resume_model" value="{resume_model}" />
-        </label>
-        <label>
-          Ollama URL
-          <input name="resume_ollama_url" value="{resume_ollama_url}" />
-        </label>
-        <label>
-          每次检索轮次（1-3）
-          <input name="resume_max_rounds" value="{resume_max_rounds}" />
-        </label>
-        <label>
-          Source kind（可选）
-          <select name="resume_source_kind">
-            <option value="" {"selected" if resume_source_kind == "" else ""}></option>
-            <option value="codex_session"
-              {"selected" if resume_source_kind == "codex_session" else ""}
-            >codex_session</option>
-            <option value="buildlog_run"
-              {"selected" if resume_source_kind == "buildlog_run" else ""}
-            >buildlog_run</option>
-            <option value="chatgpt_conversation"
-              {"selected" if resume_source_kind == "chatgpt_conversation" else ""}
-            >chatgpt_conversation</option>
-          </select>
-        </label>
-        <button type="submit">生成 JD 简历草稿</button>
-      </form>
+      <h2>6）Evidence discovery（旧 JD 简历入口已停用）</h2>
+      <p class="muted">
+        Evidence Agent 的 claims 只能作为待人工核验的证据发现结果，不能直接变成简历事实。
+        请使用下方 Resume Intelligence Workspace，并显式提供 Candidate Profile。
+      </p>
     </section>
 
     <section class="card full">
@@ -2553,8 +2369,6 @@ border-radius:12px;padding:18px;line-height:1.55}}</style></head><body>
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
-
-
 class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     ui_data_root: Path = Path(".soloscale")
     repo_root: Path = _repo_root()
@@ -2563,7 +2377,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     latest_learning_form: dict[str, str] = {}
 
     def _send_advanced_page(self, result: UIActionResult | None) -> None:
-        data_root = self.ui_data_root.resolve()
+        data_root = self.ui_data_root.absolute()
         page = _page(result, data_root, self.latest_form)
         body = page.encode("utf-8")
         self.send_response(200)
@@ -2573,7 +2387,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_user_page(self, result: UIActionResult | None) -> None:
-        data_root = self.ui_data_root.resolve()
+        data_root = self.ui_data_root.absolute()
         page = _user_page(result, data_root, self.latest_user_form)
         body = page.encode("utf-8")
         self.send_response(200)
@@ -2586,7 +2400,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     def _send_learning_page(
         self, result: UIActionResult | None, response_saved_stage: str | None = None
     ) -> None:
-        data_root = self.ui_data_root.resolve()
+        data_root = self.ui_data_root.absolute()
         display_form = dict(self.latest_learning_form)
         if response_saved_stage is not None:
             display_form["response_saved_stage"] = response_saved_stage
@@ -2618,18 +2432,18 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/learning/source":
-            _serve_learning_source(self, self.ui_data_root.resolve(), self.repo_root)
+            _serve_learning_source(self, self.ui_data_root.absolute(), self.repo_root)
             return
         if path == "/control-tower":
-            _serve_control_tower(self, self.ui_data_root.resolve())
+            _serve_control_tower(self, self.ui_data_root.absolute())
             return
         download_match = re.fullmatch(r"/downloads/([^/]+)/resume\.docx", path)
         if download_match is not None:
-            _serve_resume_download(self, self.ui_data_root.resolve(), download_match.group(1))
+            _serve_resume_download(self, self.ui_data_root.absolute(), download_match.group(1))
             return
         preview_match = re.fullmatch(r"/previews/([^/]+)/resume\.pdf", path)
         if preview_match is not None:
-            _serve_resume_preview(self, self.ui_data_root.resolve(), preview_match.group(1))
+            _serve_resume_preview(self, self.ui_data_root.absolute(), preview_match.group(1))
             return
         self.send_error(404, "Not found")
 
@@ -2641,7 +2455,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.latest_learning_form = _parse_form(body)
             self._send_learning_page(
                 _run_learning_workspace(
-                    self.latest_learning_form, self.ui_data_root.resolve(), self.repo_root
+                    self.latest_learning_form, self.ui_data_root.absolute(), self.repo_root
                 )
             )
             return
@@ -2654,7 +2468,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     self.latest_learning_form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT),
                 )
             }
-            learning_result = _save_learning_response(response_form, self.ui_data_root.resolve())
+            learning_result = _save_learning_response(response_form, self.ui_data_root.absolute())
             if learning_result.return_code == 0:
                 self.send_response(303)
                 self.send_header(
@@ -2670,7 +2484,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             mapping_form = _parse_form(self.rfile.read(length))
             try:
                 map_interview_defense_bullet(
-                    data_root=self.ui_data_root.resolve(),
+                    data_root=self.ui_data_root.absolute(),
                     repository_root=self.repo_root,
                     resume_run_id=mapping_form.get("resume_run_id", ""),
                     bullet_id=mapping_form.get("bullet_id", ""),
@@ -2717,7 +2531,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self._send_user_page(result)
                 return
             self.latest_user_form = submission.fields
-            data_root = self.ui_data_root.resolve()
+            data_root = self.ui_data_root.absolute()
             result = _run_user_resume(
                 submission.fields,
                 submission.files,
@@ -2728,7 +2542,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             return
         self.latest_form = _parse_form(body)
         data_root = (
-            Path(self.latest_form.get("data_root", str(self.ui_data_root))).expanduser().resolve()
+            Path(self.latest_form.get("data_root", str(self.ui_data_root)))
+            .expanduser()
+            .absolute()
         )
         advanced_result = _run_action(self.latest_form, data_root, self.repo_root)
         self._send_advanced_page(advanced_result)
@@ -2746,7 +2562,7 @@ def main() -> None:
     args = parser.parse_args()
 
     handler = SoloScaleLocalUIHandler
-    handler.ui_data_root = Path(args.data_root).resolve()
+    handler.ui_data_root = Path(args.data_root).expanduser().absolute()
     handler.repo_root = _repo_root()
 
     server = HTTPServer((args.host, args.port), handler)

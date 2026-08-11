@@ -151,7 +151,8 @@ The local UI now includes a bounded Resume Workspace: JD + operator-supplied Can
 Profile + direct local KnowledgeStore lexical candidates produce a one-page draft,
 explicit gaps, and a clickable Skill–Evidence graph. Resume facts come only from the
 operator-supplied Candidate Profile; retrieval candidates never become resume claims. Each
-run is private under `.soloscale/resume-runs/<run-id>/` with ten inspectable artifacts,
+operator-supplied Candidate Profile; retrieval candidates never become resume claims.
+Each baseline run is private under `.soloscale/resume-runs/<run-id>/` with inspectable artifacts,
 including a delivery-state receipt. `Local-only` performs
 no network call. `Hybrid` is intentionally only a provider interface in v0.1; it does not
 send local evidence or Candidate Profile data to any service.
@@ -159,13 +160,19 @@ send local evidence or Candidate Profile data to any service.
 The end-user flow reads candidate facts directly from the uploaded template and only
 reorders intact project blocks and skill bullets by transparent JD keyword relevance; it
 does not rewrite candidate claims. It adds the generated `08_resume.docx` and a local UI
-receipt to the private run. A byte-identical DOCX is also written to the non-overwriting,
+receipt to the private run. A byte-identical DOCX is staged inside the non-overwriting,
 atomically published application bundle under `~/Documents/Resume Applications`, next to
 `JD.md`, the Markdown draft, and `application.json`. The library root must be outside the
 Git repository. The original DOCX package parts remain unchanged except for
 `word/document.xml`, which retains the template's styles and layout while reordering existing
 content. The older Evidence-Agent-to-resume renderer is disabled because retrieval claims
 are evidence-discovery candidates, not operator-confirmed career facts.
+`delivery.json` distinguishes internal-ready, pending, saved,
+published-but-durability-uncertain, and failed states. Managed roots reject symlinks in
+their lexical ancestry rather than silently following them.
+The complete internal evidence/graph/verification artifacts remain in `.soloscale`; the
+external library receives only the application-facing bundle. Publication uses a
+platform-native atomic no-replace rename; unsupported platforms fail closed.
 
 Create and route a task:
 

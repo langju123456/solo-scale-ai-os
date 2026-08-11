@@ -20,11 +20,15 @@ private SoloScale run.
 3. The legacy action that rendered Evidence Agent claims as resume experience is disabled.
 4. Internal runs use private, atomic files under `.soloscale/resume-runs/`.
 5. An optional application bundle is built in a private staging directory and published by
-   rename without overwriting an existing application directory.
+   a platform-native atomic no-replace rename. Existing destinations, including an empty
+   directory created during the preflight-to-publication race, are never replaced. A
+   platform without this primitive fails closed.
 6. `delivery.json` records `INTERNAL_READY`, `APPLICATION_LIBRARY_PENDING`,
-   `APPLICATION_LIBRARY_SAVED`, or `APPLICATION_LIBRARY_FAILED`. It remains the recovery
-   receipt if final `run.json` cannot be written.
-7. UI-triggered application libraries must be outside the Git repository.
+   `APPLICATION_LIBRARY_SAVED`, `APPLICATION_LIBRARY_PUBLISHED_DURABILITY_UNCERTAIN`, or
+   `APPLICATION_LIBRARY_FAILED`. The uncertain state includes the exact published path. The
+   receipt remains available if final `run.json` cannot be written.
+7. Managed roots reject symlinks throughout their lexical ancestry. UI-triggered
+   application libraries must also be outside the Git repository.
 8. No output automatically updates Casebook, BuildLog, a job application, deployment, or a
    publishing surface.
 
@@ -34,5 +38,6 @@ private SoloScale run.
   into personal claims.
 - Dual-save failures are visible and recoverable instead of being reported as success.
 - External application bundles remain intentionally small and human-reviewable.
-- Semantic matching, DOCX generation, job submission, cloud sync, and automatic promotion
-  remain out of scope.
+- Semantic claim rewriting, job submission, cloud sync, and automatic promotion remain out
+  of scope. The end-user flow may reorder intact uploaded-template blocks and stage the
+  byte-identical generated DOCX inside the same atomic application bundle.

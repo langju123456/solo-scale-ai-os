@@ -7,12 +7,15 @@ provider boundary; callers must explicitly supply a provider and its research pa
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -273,9 +276,22 @@ class ResumeWorkspaceStorageError(OSError):
     """Raised when a private Resume Workspace path cannot be handled safely."""
 
 
+class ApplicationBundleDurabilityError(ResumeWorkspaceStorageError):
+    """Raised after bundle publication when directory durability is uncertain."""
+
+    def __init__(self, application_dir: Path) -> None:
+        super().__init__("application bundle was published but directory durability is uncertain")
+        self.application_dir = application_dir
+
+
+def _reject_symlink_ancestry(path: Path) -> None:
+    absolute = path.expanduser().absolute()
+    if any(candidate.is_symlink() for candidate in (absolute, *absolute.parents)):
+        raise ResumeWorkspaceStorageError("private workspace ancestry cannot contain a symlink")
+
+
 def _ensure_private_directory(path: Path, *, parents: bool = False) -> None:
-    if path.is_symlink():
-        raise ResumeWorkspaceStorageError("private workspace path cannot be a symlink")
+    _reject_symlink_ancestry(path)
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -298,7 +314,6 @@ def _atomic_private_write(path: Path, text: str) -> None:
             raise ResumeWorkspaceStorageError("private artifact must be a regular file")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
     temporary_path = Path(temporary_name)
-    replaced = False
     try:
         os.fchmod(descriptor, _FILE_MODE)
         data = text.encode("utf-8")
@@ -312,19 +327,11 @@ def _atomic_private_write(path: Path, text: str) -> None:
         os.close(descriptor)
         descriptor = -1
         os.replace(temporary_path, path)
-        replaced = True
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-    except BaseException:
-        if replaced:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -335,6 +342,88 @@ def _atomic_private_write(path: Path, text: str) -> None:
         else:
             if stat.S_ISREG(temporary_metadata.st_mode):
                 temporary_path.unlink()
+
+
+def _atomic_private_write_bytes(path: Path, data: bytes) -> None:
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        raise ResumeWorkspaceStorageError("unsafe private artifact directory")
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(existing.st_mode):
+            raise ResumeWorkspaceStorageError("private artifact must be a regular file")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, _FILE_MODE)
+        offset = 0
+        while offset < len(data):
+            written = os.write(descriptor, data[offset:])
+            if written <= 0:
+                raise ResumeWorkspaceStorageError("short private artifact write")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary_metadata = temporary_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISREG(temporary_metadata.st_mode):
+                temporary_path.unlink()
+
+
+def _atomic_rename_directory_no_replace(source: Path, destination: Path) -> None:
+    """Publish a directory atomically without ever replacing an existing destination."""
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source.absolute())
+    destination_bytes = os.fsencode(destination.absolute())
+    function: object | None
+    arguments: tuple[object, ...]
+    if sys.platform == "darwin":
+        function = getattr(library, "renameatx_np", None)
+        arguments = (-2, source_bytes, -2, destination_bytes, 0x00000004)
+    elif sys.platform.startswith("linux"):
+        function = getattr(library, "renameat2", None)
+        arguments = (-100, source_bytes, -100, destination_bytes, 0x00000001)
+    else:
+        function = None
+        arguments = ()
+    if function is None:
+        raise ResumeWorkspaceStorageError(
+            "atomic no-replace directory publication is unavailable on this platform"
+        )
+    rename_function = function
+    rename_function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename_function.restype = ctypes.c_int
+    if rename_function(*arguments) == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            "application bundle destination already exists",
+            destination,
+        )
+    raise OSError(error_number, os.strerror(error_number), destination)
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -358,6 +447,7 @@ def _interview_defense_records(draft: ResumeDraft) -> list[InterviewDefenseRecor
 def _safe_resume_run_dir(data_root: Path, run_id: str) -> Path:
     if not re.fullmatch(r"resume-\d{8}T\d{6}Z-[0-9a-f]{10}", run_id):
         raise ResumeWorkspaceStorageError("resume run identity is invalid")
+    _reject_symlink_ancestry(data_root)
     root = data_root / "resume-runs"
     run_dir = root / run_id
     if root.is_symlink() or run_dir.is_symlink() or not run_dir.is_dir():
@@ -493,8 +583,6 @@ def map_interview_defense_bullet(
         },
     )
     return mapped
-
-
 def _resume_markdown(draft: ResumeDraft) -> str:
     lines = ["# Resume Draft"]
     if draft.summary:
@@ -535,6 +623,9 @@ def _application_bundle(
     company_url: str | None,
     job_title: str | None,
     job_id: str | None,
+    resume_docx_bytes: bytes | None,
+    resume_docx_filename: str | None,
+    resume_docx_metadata: dict[str, str | int | bool] | None,
 ) -> Path:
     resolved_title = job_title or next(
         (line.strip() for line in job_description.splitlines() if line.strip()),
@@ -576,10 +667,16 @@ def _application_bundle(
     if company_url:
         jd_lines.append(f"- Source: <{company_url}>")
     jd_lines += [f"- SoloScale run: `{run_id}`", "", "## Job Description", "", job_description, ""]
+    published = False
     try:
         _atomic_private_write(staging_dir / "JD.md", "\n".join(jd_lines))
         _atomic_private_write(staging_dir / resume_filename, resume_markdown)
-        metadata = {
+        if resume_docx_bytes is not None and resume_docx_filename is not None:
+            _atomic_private_write_bytes(
+                staging_dir / resume_docx_filename,
+                resume_docx_bytes,
+            )
+        metadata: dict[str, str | int | bool | None] = {
             "schema_version": "1.0",
             "company": company_name,
             "role": resolved_title,
@@ -591,17 +688,30 @@ def _application_bundle(
             "soloscale_run_id": run_id,
             "status": "DRAFT_REQUIRES_HUMAN_REVIEW",
         }
+        if resume_docx_metadata:
+            metadata.update(resume_docx_metadata)
+        if resume_docx_bytes is not None and resume_docx_filename is not None:
+            metadata.update(
+                {
+                    "resume_docx_filename": resume_docx_filename,
+                    "resume_docx_sha256": hashlib.sha256(resume_docx_bytes).hexdigest(),
+                }
+            )
         _write_json(staging_dir / "application.json", metadata)
-        os.rename(staging_dir, application_dir)
+        _atomic_rename_directory_no_replace(staging_dir, application_dir)
+        published = True
         directory_fd = os.open(applications_root, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-    except BaseException:
-        if staging_dir.exists() and not staging_dir.is_symlink():
-            shutil.rmtree(staging_dir)
+    except BaseException as exc:
+        if published and isinstance(exc, OSError):
+            raise ApplicationBundleDurabilityError(application_dir) from exc
         raise
+    finally:
+        if not published and staging_dir.exists() and not staging_dir.is_symlink():
+            shutil.rmtree(staging_dir)
     return application_dir
 
 
@@ -633,6 +743,9 @@ def run_resume_workspace(
     job_id: str | None = None,
     application_library_root: Path | None = None,
     repository_root: Path | None = None,
+    application_resume_bytes: bytes | None = None,
+    application_resume_filename: str | None = None,
+    application_resume_metadata: dict[str, str | int | bool] | None = None,
     mode: ResumeMode = ResumeMode.LOCAL_ONLY,
     research_provider: JobResearchProvider | None = None,
 ) -> ResumeRun:
@@ -640,6 +753,14 @@ def run_resume_workspace(
         raise ValueError("job_description must not be empty")
     if mode is ResumeMode.HYBRID and research_provider is None:
         raise ValueError("hybrid mode requires an explicit JobResearchProvider")
+    if (application_resume_bytes is None) is not (application_resume_filename is None):
+        raise ValueError("application resume bytes and filename must be supplied together")
+    if application_resume_filename is not None:
+        if (
+            Path(application_resume_filename).name != application_resume_filename
+            or not application_resume_filename.casefold().endswith(".docx")
+        ):
+            raise ValueError("application resume filename must be a safe DOCX basename")
     if application_library_root is not None:
         if (
             repository_root is not None
@@ -759,11 +880,15 @@ def run_resume_workspace(
     resume_markdown = _resume_markdown(draft)
     resume_path = run_dir / "04_resume.md"
     _atomic_private_write(resume_path, resume_markdown)
+    if application_resume_bytes is not None:
+        _atomic_private_write_bytes(run_dir / "08_resume.docx", application_resume_bytes)
     artifact_paths = [name for name, _ in artifacts] + [
         "04_resume.md",
         "delivery.json",
         "run.json",
     ]
+    if application_resume_bytes is not None:
+        artifact_paths.append("08_resume.docx")
     route: dict[str, str | int | bool] = {
         "network_allowed": mode is ResumeMode.HYBRID,
         "max_research_sources": 0 if mode is ResumeMode.LOCAL_ONLY else len(research),
@@ -795,7 +920,24 @@ def run_resume_workspace(
                 company_url=company_url,
                 job_title=job_title,
                 job_id=job_id,
+                resume_docx_bytes=application_resume_bytes,
+                resume_docx_filename=application_resume_filename,
+                resume_docx_metadata=application_resume_metadata,
             )
+        except ApplicationBundleDurabilityError as exc:
+            _write_json(
+                delivery_path,
+                ResumeDeliveryReceipt(
+                    run_id=run_id,
+                    state="APPLICATION_LIBRARY_PUBLISHED_DURABILITY_UNCERTAIN",
+                    application_library_path=str(exc.application_dir),
+                    error_type=type(exc.__cause__).__name__ if exc.__cause__ else type(exc).__name__,
+                    retry_safe=False,
+                ).model_dump(mode="json"),
+            )
+            raise ResumeWorkspaceStorageError(
+                "application library published with uncertain durability; inspect delivery.json"
+            ) from None
         except OSError as exc:
             _write_json(
                 delivery_path,

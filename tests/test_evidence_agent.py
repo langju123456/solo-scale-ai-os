@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import stat
 import urllib.error
 import urllib.request
@@ -1426,6 +1427,29 @@ def test_private_artifacts_have_lineage_hashes_and_restrictive_permissions(
     assert result.refs[0].excerpt == "A verified engineering observation."
 
 
+def test_post_replace_fsync_failure_preserves_final_evidence_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from soloscale import evidence_agent
+
+    target = tmp_path / "receipt.json"
+    target.write_text("old", encoding="utf-8")
+    original_fsync = os.fsync
+    calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated directory durability failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="durability"):
+        evidence_agent._atomic_private_write(target, "new")
+
+    assert target.read_text(encoding="utf-8") == "new"
 def test_prompt_injection_in_evidence_cannot_change_system_or_invoke_tools(
     tmp_path: Path,
 ) -> None:
@@ -1686,8 +1710,6 @@ def test_grounded_draft_schema_rejects_missing_claim_evidence() -> None:
                 "suggested_outputs": [],
             }
         )
-
-
 def test_grounded_draft_schema_rejects_citations_in_suggested_outputs() -> None:
     with pytest.raises(ValueError, match="suggested_outputs"):
         GroundedDraft.model_validate(

@@ -78,8 +78,10 @@ flowchart LR
 
 Only Candidate Profile statements may appear as resume claims. Retrieval candidates are
 not semantic coverage verification. Internal receipts and the optional external bundle
-have separate delivery states; external publication uses a private staging directory and
-must target a location outside the Git repository. This plane does not change Casebook,
+have separate delivery states, including an exact-path durability-uncertain receipt after
+publication; external publication uses a private staging directory, a platform-native
+atomic no-replace operation, and must target a location outside the Git repository.
+Managed storage rejects symlinks throughout the lexical root ancestry. This plane does not change Casebook,
 BuildLog, or publishing state and does not submit an application.
 
 ### Learning traceability projection
@@ -109,7 +111,6 @@ cached by evidence hash. The runtime reads no ignored conversation body and make
 network, publishing, or application call. User-authored Explain and Trace responses are stored as
 private `RAW_STATEMENT` candidates under the selected run. They require review and do not
 modify the mastery snapshot or create a `MASTERY_RECEIPT`.
-
 This is a custom code-controlled loop, not an integration with an external agent
 framework or the OpenAI Agents SDK. Deterministic code owns maximum rounds, maximum
 queries, hit and context budgets, source filters, and citation-membership checks.

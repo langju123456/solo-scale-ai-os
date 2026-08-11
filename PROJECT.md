@@ -164,7 +164,6 @@ target-JD relevance, and the resume-claim gate without advancing mastery or publ
 Private runs and content-hash caches stay under ignored `.soloscale/` storage. This local,
 single-operator MVP adds no authentication, multi-user runtime, cloud service, external
 publishing, or automatic web/model call. ADR-0006 freezes this candidate boundary.
-
 ## 6. v0.2 success criteria
 
 - Repeated sync preserves stable source/document/chunk identities and does not duplicate a

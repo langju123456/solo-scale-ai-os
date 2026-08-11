@@ -127,7 +127,6 @@ class GroundedDraft(_StrictModel):
             raise ValueError("suggested_outputs must not contain evidence or citations")
         return values
 
-
 class AgentToolStep(_StrictModel):
     round_number: int = Field(ge=1, le=3)
     query: str
@@ -1572,7 +1571,6 @@ def _atomic_private_write(path: Path, text: str) -> None:
         raise OSError("unsafe artifact directory")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
     temporary_path = Path(temporary_name)
-    replaced = False
     try:
         os.fchmod(descriptor, _PRIVATE_FILE_MODE)
         data = text.encode("utf-8")
@@ -1586,19 +1584,11 @@ def _atomic_private_write(path: Path, text: str) -> None:
         os.close(descriptor)
         descriptor = -1
         os.replace(temporary_path, path)
-        replaced = True
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-    except BaseException:
-        if replaced:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
