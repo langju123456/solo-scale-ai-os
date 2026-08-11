@@ -5,8 +5,16 @@ from pathlib import Path
 import pytest
 
 from soloscale.knowledge_models import ContentRole, RetrievalHit, SourceKind
+from soloscale.learning_traceability import run_learning_traceability
 from soloscale.resume_models import CandidateProfile, JobResearchSource, ResumeMode, ResumeRun
-from soloscale.resume_workspace import ResumeWorkspaceStorageError, run_resume_workspace
+from soloscale.resume_workspace import (
+    ResumeWorkspaceStorageError,
+    load_interview_defense_records,
+    map_interview_defense_bullet,
+    run_resume_workspace,
+)
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 AI_ENGINEER_JD = """AI Engineer
 - Required: Python and RAG systems
@@ -59,6 +67,7 @@ def test_local_workspace_writes_private_artifacts_and_replayable_lineage(tmp_pat
         "05_gaps.json",
         "06_graph.json",
         "07_verification.json",
+        "interview_defense.json",
         "delivery.json",
         "run.json",
     }
@@ -84,6 +93,89 @@ def test_local_workspace_writes_private_artifacts_and_replayable_lineage(tmp_pat
     assert locator["chunk_sha256"] == "a" * 64
     assert locator["document_sha256"] == "b" * 64
     assert matches[0]["match_quality"].startswith("lexical_candidate_")
+    defense = json.loads((run_dir / "interview_defense.json").read_text(encoding="utf-8"))
+    assert defense["schema_version"] == "0.1"
+    assert defense["resume_run_id"] == run.run_id
+    assert len(defense["records"]) == 1
+    assert defense["records"][0]["bullet_id"] == "PROFILE-01"
+    assert defense["records"][0]["status"] == "NEEDS_MAPPING"
+    assert len(run.artifact_paths) == len(set(run.artifact_paths))
+    assert run.artifact_paths.count("interview_defense.json") == 1
+
+
+def test_interview_defense_mapping_is_explicit_and_validated(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    resume = run_resume_workspace(
+        data_root=data_root,
+        job_description="Required: Python",
+        candidate_profile=CandidateProfile(experience_bullets=["Operator supplied Python work."]),
+        evidence_hits=[],
+    )
+    learning = run_learning_traceability(data_root=data_root, repository_root=REPOSITORY_ROOT)
+
+    mapped = map_interview_defense_bullet(
+        data_root=data_root,
+        repository_root=REPOSITORY_ROOT,
+        resume_run_id=resume.run_id,
+        bullet_id="PROFILE-01",
+        learning_run_id=learning.run_id,
+    )
+
+    assert mapped.status.value == "MAPPED"
+    assert mapped.mapping is not None
+    assert mapped.mapping.learning_run_id == learning.run_id
+    assert mapped.mapping.case_id == "conversation-rag-chunking-retrieval"
+    assert mapped.mapping.mapping_basis == "OPERATOR_CONFIRMED"
+    assert load_interview_defense_records(data_root=data_root, run_id=resume.run_id)[0] == mapped
+
+    with pytest.raises(ResumeWorkspaceStorageError, match="already mapped"):
+        map_interview_defense_bullet(
+            data_root=data_root,
+            repository_root=REPOSITORY_ROOT,
+            resume_run_id=resume.run_id,
+            bullet_id="PROFILE-01",
+            learning_run_id=learning.run_id,
+        )
+
+
+def test_interview_defense_rejects_tampered_bullet_identity(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    resume = run_resume_workspace(
+        data_root=data_root,
+        job_description="Required: Python",
+        candidate_profile=CandidateProfile(
+            experience_bullets=["Operator supplied Python work."]
+        ),
+        evidence_hits=[],
+    )
+    artifact = data_root / "resume-runs" / resume.run_id / "interview_defense.json"
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    payload["records"][0]["bullet_text"] = "Forged claim."
+    artifact.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ResumeWorkspaceStorageError, match="do not match resume input"):
+        load_interview_defense_records(data_root=data_root, run_id=resume.run_id)
+
+
+def test_interview_defense_records_follow_six_bullet_draft_limit(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    resume = run_resume_workspace(
+        data_root=data_root,
+        job_description="Required: Python",
+        candidate_profile=CandidateProfile(
+            experience_bullets=[f"Operator bullet {index}." for index in range(1, 8)]
+        ),
+        evidence_hits=[],
+    )
+
+    records = load_interview_defense_records(data_root=data_root, run_id=resume.run_id)
+
+    assert [record.bullet_id for record in records] == [
+        f"PROFILE-{index:02d}" for index in range(1, 7)
+    ]
+    assert all(record.status.value == "NEEDS_MAPPING" for record in records)
 
 
 def test_profile_and_evidence_truth_boundary_and_repeat_runs(tmp_path: Path) -> None:

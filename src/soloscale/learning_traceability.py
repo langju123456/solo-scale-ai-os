@@ -91,6 +91,19 @@ def _sha256_file(path: Path) -> str:
     return _sha256_bytes(path.read_bytes())
 
 
+def _private_json(path: Path, label: str) -> dict[str, object]:
+    """Read one private artifact without following links or accepting malformed JSON."""
+    if path.is_symlink() or not path.is_file():
+        raise LearningTraceabilityError(f"{label} is unavailable")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LearningTraceabilityError(f"{label} is unreadable") from exc
+    if not isinstance(payload, dict):
+        raise LearningTraceabilityError(f"{label} is invalid")
+    return payload
+
+
 def _canonical_sha256(value: object) -> str:
     payload = json.dumps(
         value,
@@ -116,6 +129,13 @@ def _git(repository_root: Path, *args: str, required: bool = True) -> str | None
     raise LearningTraceabilityError(
         f"repository identity command failed: git {' '.join(args)}"
     )
+
+
+def _git_bytes(repository_root: Path, *args: str) -> bytes | None:
+    completed = subprocess.run(
+        ["git", *args], cwd=repository_root, capture_output=True, check=False
+    )
+    return completed.stdout if completed.returncode == 0 else None
 
 
 def _repository_identity(repository_root: Path) -> _RepositoryIdentity:
@@ -192,6 +212,196 @@ def _resolve_symbol(
         line_start=resolved.lineno,
         line_end=resolved.end_lineno or resolved.lineno,
         file_sha256=_sha256_file(path),
+    )
+
+
+def load_interview_anchor_pack(
+    *, data_root: Path, repository_root: Path, run_id: str
+) -> dict[str, object]:
+    """Fail closed while turning one recorded Learning run into safe, public locators.
+
+    This deliberately reads only the run's structured artifacts and tracked Git objects; it
+    never reads ignored conversation material or creates a Learning run.
+    """
+    if _LEARNING_RUN_ID_PATTERN.fullmatch(run_id) is None:
+        raise LearningTraceabilityError("learning run identity is invalid")
+    runs_root = data_root / "learning-runs"
+    if runs_root.is_symlink() or not runs_root.is_dir():
+        raise LearningTraceabilityError("learning runs are unavailable")
+    run_dir = runs_root / run_id
+    if run_dir.is_symlink() or not run_dir.is_dir():
+        raise LearningTraceabilityError("learning run is unavailable")
+    run = _private_json(run_dir / "run.json", "learning run")
+    case = _private_json(run_dir / "01_case.json", "learning case")
+    anchors = _private_json(run_dir / "03_code_anchors.json", "learning anchors")
+    if (
+        run.get("run_id") != run_id
+        or run.get("case_id") != CASE_ID
+        or case.get("case_id") != CASE_ID
+    ):
+        raise LearningTraceabilityError("learning run identity does not match the supported case")
+    repository = run.get("repository")
+    branch = run.get("branch")
+    commit = run.get("commit")
+    if not all(isinstance(value, str) and value for value in (repository, branch, commit)):
+        raise LearningTraceabilityError("learning run repository identity is invalid")
+    identity = _repository_identity(repository_root.resolve())
+    commit_exists = _git(
+        repository_root,
+        "cat-file",
+        "-e",
+        f"{commit}^{{commit}}",
+        required=False,
+    )
+    if identity.name != repository or commit_exists is None:
+        raise LearningTraceabilityError("learning run repository or commit is unavailable")
+    source_records = case.get("source_records")
+    reasoning = case.get("reasoning")
+    if not isinstance(source_records, list) or not isinstance(reasoning, dict):
+        raise LearningTraceabilityError("learning reasoning anchors are invalid")
+    reasoning_ids = reasoning.get("source_record_ids")
+    if not isinstance(reasoning_ids, list) or not reasoning_ids:
+        raise LearningTraceabilityError("learning reasoning anchors are invalid")
+    source_by_id = {item.get("id"): item for item in source_records if isinstance(item, dict)}
+    reasoning_sources: list[dict[str, str]] = []
+    for source_id in reasoning_ids:
+        source = source_by_id.get(source_id)
+        if not isinstance(source, dict):
+            raise LearningTraceabilityError("learning reasoning source is unavailable")
+        path = source.get("source_path")
+        digest = source.get("content_sha256")
+        if not isinstance(path, str) or not isinstance(digest, str):
+            raise LearningTraceabilityError("learning reasoning source is invalid")
+        tracked = _git(
+            repository_root,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            str(commit),
+            "--",
+            path,
+            required=False,
+        )
+        content = _git_bytes(repository_root, "show", f"{commit}:{path}")
+        if not tracked or content is None or _sha256_bytes(content) != digest:
+            raise LearningTraceabilityError("learning reasoning source hash is invalid")
+        reasoning_sources.append({"path": path, "sha256": digest})
+    raw_code = anchors.get("code_anchors")
+    raw_tests = anchors.get("verification_anchors")
+    if (
+        not isinstance(raw_code, list)
+        or not raw_code
+        or not isinstance(raw_tests, list)
+        or not raw_tests
+    ):
+        raise LearningTraceabilityError("learning anchor categories are incomplete")
+
+    def validate_anchor(raw: object, *, test: bool) -> dict[str, object]:
+        if not isinstance(raw, dict):
+            raise LearningTraceabilityError("learning anchor is invalid")
+        file = raw.get("file")
+        symbol = raw.get("symbol")
+        digest = raw.get("file_sha256")
+        line_start = raw.get("line_start")
+        line_end = raw.get("line_end")
+        anchor_id = raw.get("id")
+        if (
+            not isinstance(anchor_id, str)
+            or not anchor_id
+            or not isinstance(file, str)
+            or not isinstance(symbol, str)
+            or not isinstance(digest, str)
+        ):
+            raise LearningTraceabilityError("learning anchor is invalid")
+        if not isinstance(line_start, int) or not isinstance(line_end, int):
+            raise LearningTraceabilityError("learning anchor is invalid")
+        expected_identity = {
+            "repository": repository,
+            "branch": branch,
+            "commit": commit,
+        }
+        if any(raw.get(key) != value for key, value in expected_identity.items()):
+            raise LearningTraceabilityError("learning anchor identity is invalid")
+        content = _git_bytes(repository_root, "show", f"{commit}:{file}")
+        if content is None or _sha256_bytes(content) != digest:
+            raise LearningTraceabilityError("learning anchor hash is invalid")
+        try:
+            tree = ast.parse(content.decode("utf-8"), filename=file)
+        except (SyntaxError, UnicodeDecodeError) as exc:
+            raise LearningTraceabilityError("learning anchor source is invalid") from exc
+        resolved = _resolve_symbol_from_tree(tree, file, symbol, digest)
+        if (resolved.line_start, resolved.line_end) != (line_start, line_end):
+            raise LearningTraceabilityError("learning anchor line range is invalid")
+        result: dict[str, object] = {
+            "id": anchor_id,
+            "file": file,
+            "symbol": symbol,
+            "line_start": line_start,
+            "line_end": line_end,
+            "sha256": digest,
+        }
+        if test:
+            command = raw.get("verification_command")
+            receipt_state = raw.get("receipt_state")
+            if (
+                not isinstance(command, str)
+                or not command
+                or receipt_state != "committed_test_definition"
+            ):
+                raise LearningTraceabilityError("learning test anchor is invalid")
+            result["command"] = command
+            result["receipt_state"] = receipt_state
+        return result
+
+    code = [validate_anchor(item, test=False) for item in raw_code]
+    tests = [validate_anchor(item, test=True) for item in raw_tests]
+    anchor_ids = [str(item["id"]) for item in [*code, *tests]]
+    if len(set(anchor_ids)) != len(anchor_ids):
+        raise LearningTraceabilityError("learning anchor identities are ambiguous")
+    return {
+        "case_id": CASE_ID,
+        "learning_run_id": run_id,
+        "project": {
+            "repository": repository,
+            "branch": branch,
+            "commit": commit,
+        },
+        "reasoning": reasoning_sources,
+        "code": code,
+        "tests": tests,
+        "keywords": ["Conversation RAG", "chunking", "retrieval", "lineage"],
+    }
+
+
+def _resolve_symbol_from_tree(
+    tree: ast.Module, file: str, symbol: str, digest: str
+) -> _ResolvedSymbol:
+    parts = symbol.split(".")
+    definition_types = (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    candidates: list[ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef] = [
+        node for node in tree.body if isinstance(node, definition_types)
+    ]
+    resolved: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    for index, part in enumerate(parts):
+        resolved = next((node for node in candidates if node.name == part), None)
+        if resolved is None:
+            raise LearningTraceabilityError(f"learning anchor symbol is missing: {file}:{symbol}")
+        candidates = (
+            [
+                node
+                for node in resolved.body
+                if isinstance(node, definition_types)
+            ]
+            if index < len(parts) - 1 and isinstance(resolved, ast.ClassDef)
+            else []
+        )
+    assert resolved is not None
+    return _ResolvedSymbol(
+        file=file,
+        symbol=symbol,
+        line_start=resolved.lineno,
+        line_end=resolved.end_lineno or resolved.lineno,
+        file_sha256=digest,
     )
 
 

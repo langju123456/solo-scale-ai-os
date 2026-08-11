@@ -7,6 +7,7 @@ provider boundary; callers must explicitly supply a provider and its research pa
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -26,6 +27,9 @@ from soloscale.resume_models import (
     EvidenceLocator,
     EvidenceMatch,
     GraphNodeKind,
+    InterviewDefenseMapping,
+    InterviewDefenseRecord,
+    InterviewDefenseStatus,
     JobRequirement,
     JobResearchSource,
     LearningTask,
@@ -340,6 +344,157 @@ def _write_json(path: Path, value: object) -> None:
     )
 
 
+def _interview_defense_records(draft: ResumeDraft) -> list[InterviewDefenseRecord]:
+    return [
+        InterviewDefenseRecord(
+            bullet_id=bullet.profile_entry_ids[0],
+            bullet_text=bullet.text,
+            bullet_sha256=hashlib.sha256(bullet.text.encode("utf-8")).hexdigest(),
+        )
+        for bullet in draft.bullets
+    ]
+
+
+def _safe_resume_run_dir(data_root: Path, run_id: str) -> Path:
+    if not re.fullmatch(r"resume-\d{8}T\d{6}Z-[0-9a-f]{10}", run_id):
+        raise ResumeWorkspaceStorageError("resume run identity is invalid")
+    root = data_root / "resume-runs"
+    run_dir = root / run_id
+    if root.is_symlink() or run_dir.is_symlink() or not run_dir.is_dir():
+        raise ResumeWorkspaceStorageError("resume run is unavailable")
+    return run_dir
+
+
+def _read_private_object(path: Path, label: str) -> dict[str, object]:
+    if path.is_symlink() or not path.is_file():
+        raise ResumeWorkspaceStorageError(f"{label} is unavailable")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ResumeWorkspaceStorageError(f"{label} is unreadable") from exc
+    if not isinstance(payload, dict):
+        raise ResumeWorkspaceStorageError(f"{label} is invalid")
+    return payload
+
+
+def _expected_interview_defense_records(run_dir: Path) -> list[InterviewDefenseRecord]:
+    input_payload = _read_private_object(run_dir / "00_input.json", "resume input")
+    candidate_payload = input_payload.get("candidate_profile")
+    if not isinstance(candidate_payload, dict):
+        raise ResumeWorkspaceStorageError("resume input is invalid")
+    try:
+        candidate = CandidateProfile.model_validate(candidate_payload)
+    except ValueError as exc:
+        raise ResumeWorkspaceStorageError("resume input is invalid") from exc
+    bullets = [*candidate.experience_bullets, *candidate.project_bullets][:6]
+    return [
+        InterviewDefenseRecord(
+            bullet_id=f"PROFILE-{index:02d}",
+            bullet_text=text,
+            bullet_sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        )
+        for index, text in enumerate(bullets, start=1)
+    ]
+
+
+def load_interview_defense_records(
+    *, data_root: Path, run_id: str
+) -> list[InterviewDefenseRecord]:
+    run_dir = _safe_resume_run_dir(data_root, run_id)
+    payload = _read_private_object(
+        run_dir / "interview_defense.json", "interview defense artifact"
+    )
+    raw_records = payload.get("records")
+    if (
+        payload.get("schema_version") != "0.1"
+        or payload.get("resume_run_id") != run_id
+        or not isinstance(raw_records, list)
+    ):
+        raise ResumeWorkspaceStorageError("interview defense artifact is invalid")
+    try:
+        records = [
+            InterviewDefenseRecord.model_validate(value) for value in raw_records
+        ]
+    except ValueError as exc:
+        raise ResumeWorkspaceStorageError(
+            "interview defense artifact is invalid"
+        ) from exc
+    if len({record.bullet_id for record in records}) != len(records):
+        raise ResumeWorkspaceStorageError("interview defense bullet identities are ambiguous")
+    expected = _expected_interview_defense_records(run_dir)
+    expected_by_id = {record.bullet_id: record for record in expected}
+    if set(expected_by_id) != {record.bullet_id for record in records}:
+        raise ResumeWorkspaceStorageError("interview defense bullets do not match resume input")
+    if any(
+        record.bullet_text != expected_by_id[record.bullet_id].bullet_text
+        or record.bullet_sha256 != expected_by_id[record.bullet_id].bullet_sha256
+        for record in records
+    ):
+        raise ResumeWorkspaceStorageError("interview defense bullets do not match resume input")
+    return records
+
+
+def map_interview_defense_bullet(
+    *,
+    data_root: Path,
+    repository_root: Path,
+    resume_run_id: str,
+    bullet_id: str,
+    learning_run_id: str,
+) -> InterviewDefenseRecord:
+    """Explicitly map one untouched Resume bullet to one fully revalidated Learning run."""
+    from soloscale.learning_traceability import (
+        LearningTraceabilityError,
+        load_interview_anchor_pack,
+    )
+
+    run_dir = _safe_resume_run_dir(data_root, resume_run_id)
+    records = load_interview_defense_records(data_root=data_root, run_id=resume_run_id)
+    record = next((item for item in records if item.bullet_id == bullet_id), None)
+    if record is None:
+        raise ResumeWorkspaceStorageError("resume bullet identity is invalid")
+    if record.status is not InterviewDefenseStatus.NEEDS_MAPPING or record.mapping is not None:
+        raise ResumeWorkspaceStorageError("resume bullet is already mapped")
+    resume_path = run_dir / "04_resume.md"
+    if resume_path.is_symlink() or not resume_path.is_file():
+        raise ResumeWorkspaceStorageError("resume bullet identity is invalid")
+    try:
+        resume_text = resume_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ResumeWorkspaceStorageError("resume bullet identity is invalid") from exc
+    if f"- {record.bullet_text}\n" not in resume_text:
+        raise ResumeWorkspaceStorageError("resume bullet identity is invalid")
+    try:
+        anchor_pack = load_interview_anchor_pack(
+            data_root=data_root, repository_root=repository_root, run_id=learning_run_id
+        )
+    except LearningTraceabilityError as exc:
+        raise ResumeWorkspaceStorageError("learning mapping could not be validated") from exc
+    project = anchor_pack.get("project")
+    if not isinstance(project, dict):
+        raise ResumeWorkspaceStorageError("learning mapping could not be validated")
+    mapped = record.model_copy(
+        update={
+            "status": InterviewDefenseStatus.MAPPED,
+            "mapping": InterviewDefenseMapping(
+                case_id=str(anchor_pack["case_id"]), learning_run_id=learning_run_id,
+                repository=str(project["repository"]), branch=str(project["branch"]),
+                commit=str(project["commit"]), anchor_pack=anchor_pack,
+            ),
+        }
+    )
+    replacement = [mapped if item.bullet_id == bullet_id else item for item in records]
+    _write_json(
+        run_dir / "interview_defense.json",
+        {
+            "schema_version": "0.1",
+            "resume_run_id": resume_run_id,
+            "records": [item.model_dump(mode="json") for item in replacement],
+        },
+    )
+    return mapped
+
+
 def _resume_markdown(draft: ResumeDraft) -> str:
     lines = ["# Resume Draft"]
     if draft.summary:
@@ -513,6 +668,7 @@ def run_resume_workspace(
     requirements = parse_requirements(job_description)
     matches = build_matches(requirements, evidence_hits)
     draft = build_resume(candidate_profile, requirements)
+    interview_defense = _interview_defense_records(draft)
     gaps, tasks = _gaps(requirements, matches)
     nodes, edges = build_graph(
         company_name or "Job Description", requirements, matches, gaps, tasks
@@ -589,6 +745,14 @@ def run_resume_workspace(
             },
         ),
         ("07_verification.json", verification),
+        (
+            "interview_defense.json",
+            {
+                "schema_version": "0.1",
+                "resume_run_id": run_id,
+                "records": [item.model_dump(mode="json") for item in interview_defense],
+            },
+        ),
     ]
     for name, value in artifacts:
         _write_json(run_dir / name, value)

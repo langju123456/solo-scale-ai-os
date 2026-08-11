@@ -8,12 +8,15 @@ import pytest
 
 from soloscale.knowledge_models import ContentRole, RetrievalHit, SourceKind
 from soloscale.knowledge_store import InvalidKnowledgeQueryError
+from soloscale.learning_traceability import run_learning_traceability
 from soloscale.local_ui import (
     UIActionResult,
     UploadedFile,
     _build_jd_resume_command,
     _build_resume_sections,
     _create_resume_pdf_preview,
+    _interview_defense_panel,
+    _learning_page,
     _page,
     _parse_submission,
     _result_card,
@@ -25,8 +28,14 @@ from soloscale.local_ui import (
     _user_page,
     _workspace_path,
 )
+from soloscale.resume_models import CandidateProfile
+from soloscale.resume_workspace import (
+    map_interview_defense_bullet,
+    run_resume_workspace,
+)
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _uploaded_resume_docx() -> bytes:
@@ -83,6 +92,103 @@ def test_user_page_is_resume_first_and_keeps_developer_tools_under_advanced(
     assert "knowledge-sync" not in page
     assert 'name="model"' not in page
     assert 'name="source_kind"' not in page
+
+
+def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    resume = run_resume_workspace(
+        data_root=data_root,
+        job_description="Required: Python retrieval",
+        candidate_profile=CandidateProfile(
+            experience_bullets=["Built an operator-supplied retrieval workflow."]
+        ),
+        evidence_hits=[],
+    )
+    before_learning = _interview_defense_panel(
+        data_root=data_root,
+        run_id=resume.run_id,
+        repo_root=REPOSITORY_ROOT,
+    )
+    assert "NEEDS_MAPPING" in before_learning
+    assert "Interview Defense →" not in before_learning
+
+    selected = run_learning_traceability(
+        data_root=data_root,
+        repository_root=REPOSITORY_ROOT,
+    )
+    newer = run_learning_traceability(
+        data_root=data_root,
+        repository_root=REPOSITORY_ROOT,
+    )
+    before_mapping = _interview_defense_panel(
+        data_root=data_root,
+        run_id=resume.run_id,
+        repo_root=REPOSITORY_ROOT,
+    )
+    assert "确认关联 Conversation RAG 锚点" in before_mapping
+    assert max(selected.run_id, newer.run_id) in before_mapping
+    assert "codex/product-mvp-integration" in before_mapping
+    assert "Interview Defense →" not in before_mapping
+
+    map_interview_defense_bullet(
+        data_root=data_root,
+        repository_root=REPOSITORY_ROOT,
+        resume_run_id=resume.run_id,
+        bullet_id="PROFILE-01",
+        learning_run_id=selected.run_id,
+    )
+    mapped_panel = _interview_defense_panel(
+        data_root=data_root,
+        run_id=resume.run_id,
+        repo_root=REPOSITORY_ROOT,
+    )
+    assert "Interview Defense →" in mapped_panel
+    assert selected.run_id in mapped_panel
+    assert "#interview-defense" in mapped_panel
+
+    run_count = len(list((data_root / "learning-runs").iterdir()))
+    page = _learning_page(
+        data_root,
+        REPOSITORY_ROOT,
+        {
+            "run_id": selected.run_id,
+            "resume_run_id": resume.run_id,
+            "bullet_id": "PROFILE-01",
+        },
+    )
+    assert 'id="interview-defense"' in page
+    assert f"Exact Learning run: <code>{selected.run_id}</code>" in page
+    assert "Reasoning anchors" in page
+    assert "Code anchors" in page
+    assert "Test anchors" in page
+    assert "src/soloscale/knowledge_store.py" in page
+    assert "复制锚点包" in page
+    assert "do not prove authorship" in page
+    assert len(list((data_root / "learning-runs").iterdir())) == run_count
+
+    anchors_path = (
+        data_root / "learning-runs" / selected.run_id / "03_code_anchors.json"
+    )
+    anchors = json.loads(anchors_path.read_text(encoding="utf-8"))
+    anchors["code_anchors"][0]["file_sha256"] = "0" * 64
+    anchors_path.write_text(json.dumps(anchors), encoding="utf-8")
+    stale_panel = _interview_defense_panel(
+        data_root=data_root,
+        run_id=resume.run_id,
+        repo_root=REPOSITORY_ROOT,
+    )
+    assert "NEEDS_MAPPING" in stale_panel
+    assert "Interview Defense →" not in stale_panel
+    assert "映射已失效" in stale_panel
+
+    invalid = _learning_page(
+        data_root,
+        REPOSITORY_ROOT,
+        {"run_id": "not-a-learning-run"},
+    )
+    assert "Interactive evidence graph" not in invalid
 
 
 def test_parse_submission_reads_text_and_docx_upload() -> None:

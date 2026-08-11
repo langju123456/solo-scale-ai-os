@@ -31,6 +31,7 @@ from soloscale.learning_traceability import (
     ARTIFACT_FILES,
     CASE_ID,
     LearningTraceabilityError,
+    load_interview_anchor_pack,
     run_learning_traceability,
     save_learning_response,
 )
@@ -202,6 +203,58 @@ def test_learning_run_rejects_symlinked_private_root(tmp_path: Path) -> None:
             repository_root=REPOSITORY_ROOT,
         )
     assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("file_sha256", "0" * 64),
+        ("symbol", "missing_symbol"),
+        ("line_start", 999999),
+    ],
+)
+def test_interview_anchor_pack_rejects_tampered_code_anchor(
+    tmp_path: Path, field: str, replacement: object
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    run = run_learning_traceability(
+        data_root=data_root,
+        repository_root=REPOSITORY_ROOT,
+    )
+    anchor_path = Path(run.private_run_path) / "03_code_anchors.json"
+    payload = _read_json(anchor_path)
+    code_anchors = payload["code_anchors"]
+    assert isinstance(code_anchors, list)
+    assert isinstance(code_anchors[0], dict)
+    code_anchors[0][field] = replacement
+    anchor_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(LearningTraceabilityError):
+        load_interview_anchor_pack(
+            data_root=data_root,
+            repository_root=REPOSITORY_ROOT,
+            run_id=run.run_id,
+        )
+
+
+def test_interview_anchor_pack_rejects_symlinked_artifact(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    run = run_learning_traceability(
+        data_root=data_root,
+        repository_root=REPOSITORY_ROOT,
+    )
+    anchor_path = Path(run.private_run_path) / "03_code_anchors.json"
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(anchor_path.read_bytes())
+    anchor_path.unlink()
+    anchor_path.symlink_to(outside)
+
+    with pytest.raises(LearningTraceabilityError, match="unavailable"):
+        load_interview_anchor_pack(
+            data_root=data_root,
+            repository_root=REPOSITORY_ROOT,
+            run_id=run.run_id,
+        )
 
 
 def test_learning_response_is_private_pending_and_does_not_advance_mastery(
