@@ -39,6 +39,22 @@ W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _expected_repository_ref() -> str:
+    branch = subprocess.run(
+        ["git", "branch", "--show-current"],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if branch:
+        return branch
+    assert os.environ.get("GITHUB_ACTIONS") == "true"
+    github_ref = os.environ.get("GITHUB_REF", "")
+    assert github_ref.startswith("refs/")
+    return github_ref.removeprefix("refs/")
+
+
 def _uploaded_resume_docx() -> bytes:
     def paragraph(text: str, *, bullet: bool = False) -> str:
         numbering = (
@@ -130,7 +146,7 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
     )
     assert "确认关联 Conversation RAG 锚点" in before_mapping
     assert max(selected.run_id, newer.run_id) in before_mapping
-    assert "codex/product-mvp-integration" in before_mapping
+    assert _expected_repository_ref() in before_mapping
     assert "Interview Defense →" not in before_mapping
 
     map_interview_defense_bullet(

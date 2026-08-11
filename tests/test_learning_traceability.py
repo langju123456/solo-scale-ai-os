@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from soloscale import learning_traceability
 from soloscale.learning_models import (
     ClaimEligibility,
     CodeAnchor,
@@ -55,6 +56,17 @@ def _git(*args: str) -> str:
     ).stdout.strip()
 
 
+def _expected_repository_ref() -> str:
+    branch = _git("branch", "--show-current")
+    if branch:
+        return branch
+    assert os.environ.get("GITHUB_ACTIONS") == "true"
+    assert os.environ.get("GITHUB_SHA") == _git("rev-parse", "HEAD")
+    github_ref = os.environ.get("GITHUB_REF", "")
+    assert github_ref.startswith("refs/")
+    return github_ref.removeprefix("refs/")
+
+
 def test_required_contracts_are_public_and_mastery_is_separate() -> None:
     required_contracts = (
         SourceRecord,
@@ -86,6 +98,33 @@ def test_required_contracts_are_public_and_mastery_is_separate() -> None:
         )
 
 
+def test_repository_identity_accepts_only_verified_detached_github_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commit = _git("rev-parse", "HEAD")
+    original_git = learning_traceability._git
+
+    def detached_git(
+        repository_root: Path, *args: str, required: bool = True
+    ) -> str | None:
+        if args == ("branch", "--show-current"):
+            return ""
+        return original_git(repository_root, *args, required=required)
+
+    monkeypatch.setattr(learning_traceability, "_git", detached_git)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_REF", "refs/pull/8/merge")
+    monkeypatch.setenv("GITHUB_SHA", commit)
+
+    identity = learning_traceability._repository_identity(REPOSITORY_ROOT)
+    assert identity.branch == "pull/8/merge"
+    assert identity.commit == commit
+
+    monkeypatch.setenv("GITHUB_SHA", "0" * 40)
+    with pytest.raises(LearningTraceabilityError, match="verified GitHub Actions ref"):
+        learning_traceability._repository_identity(REPOSITORY_ROOT)
+
+
 def test_golden_case_writes_private_grounded_traceability_packet(tmp_path: Path) -> None:
     data_root = tmp_path / ".soloscale"
     run = run_learning_traceability(
@@ -95,7 +134,7 @@ def test_golden_case_writes_private_grounded_traceability_packet(tmp_path: Path)
     run_dir = Path(run.private_run_path)
 
     assert run.case_id == CASE_ID
-    assert run.branch == _git("branch", "--show-current")
+    assert run.branch == _expected_repository_ref()
     assert run.commit == _git("rev-parse", "HEAD")
     assert run.engineering_state == "ENGINEERING_VERIFIED"
     assert run.mastery_level is MasteryLevel.L0_SEEN

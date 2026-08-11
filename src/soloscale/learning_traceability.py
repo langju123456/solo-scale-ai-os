@@ -144,8 +144,21 @@ def _repository_identity(repository_root: Path) -> _RepositoryIdentity:
         raise LearningTraceabilityError("repository_root is not the selected Git worktree")
     branch = _git(repository_root, "branch", "--show-current")
     commit = _git(repository_root, "rev-parse", "HEAD")
-    if not branch or not commit:
-        raise LearningTraceabilityError("a named branch and commit are required")
+    if not commit:
+        raise LearningTraceabilityError("a repository commit is required")
+    if not branch:
+        github_ref = os.environ.get("GITHUB_REF", "")
+        github_sha = os.environ.get("GITHUB_SHA", "")
+        if (
+            os.environ.get("GITHUB_ACTIONS") == "true"
+            and github_sha == commit
+            and github_ref.startswith("refs/")
+        ):
+            branch = github_ref.removeprefix("refs/")
+        else:
+            raise LearningTraceabilityError(
+                "a named branch or verified GitHub Actions ref is required"
+            )
     remote = _git(repository_root, "remote", "get-url", "origin", required=False)
     remote_tail = (remote or "").rstrip("/").rsplit("/", maxsplit=1)[-1]
     remote_tail = remote_tail.rsplit(":", maxsplit=1)[-1]
