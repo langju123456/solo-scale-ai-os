@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from soloscale.knowledge_store import KnowledgeStore, KnowledgeStoreError
+from soloscale.resume_models import CandidateProfile, ResumeMode
+from soloscale.resume_workspace import run_resume_workspace as execute_resume_workspace
 
 COMMAND_TIMEOUT_SECONDS = 120
 
@@ -110,7 +113,7 @@ def _extract_private_result_path(raw_stdout: str) -> Path | None:
     return None
 
 
-def _load_json_file(path: Path) -> dict | None:
+def _load_json_file(path: Path) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
@@ -120,7 +123,7 @@ def _load_json_file(path: Path) -> dict | None:
     return payload
 
 
-def _build_resume_sections(payload: dict, *, job_title_hint: str | None) -> str:
+def _build_resume_sections(payload: dict[str, object], *, job_title_hint: str | None) -> str:
     claims = payload.get("claims", [])
     refs = payload.get("refs", [])
     unsupported = payload.get("unsupported", [])
@@ -129,6 +132,10 @@ def _build_resume_sections(payload: dict, *, job_title_hint: str | None) -> str:
         claims = []
     if not isinstance(refs, list):
         refs = []
+    if not isinstance(unsupported, list):
+        unsupported = []
+    if not isinstance(open_questions, list):
+        open_questions = []
 
     refs_by_id = {}
     for item in refs:
@@ -147,7 +154,9 @@ def _build_resume_sections(payload: dict, *, job_title_hint: str | None) -> str:
             text = str(item.get("text", "") if isinstance(item, dict) else "")
             evidence_ids = [
                 str(evidence_id)
-                for evidence_id in (item.get("evidence_chunk_ids", []) if isinstance(item, dict) else [])
+                for evidence_id in (
+                    item.get("evidence_chunk_ids", []) if isinstance(item, dict) else []
+                )
                 if isinstance(evidence_id, str) and evidence_id.strip()
             ]
             lines.append(f"- 项目经历 {index}：{_normalize_for_resume(text)}")
@@ -162,9 +171,7 @@ def _build_resume_sections(payload: dict, *, job_title_hint: str | None) -> str:
                 lines.append("  - 可追溯说明：")
                 for evidence_id in evidence_ids:
                     ref = refs_by_id.get(evidence_id, {})
-                    excerpt = _normalize_for_resume(
-                        str(ref.get("excerpt", "") or ""), limit=220
-                    )
+                    excerpt = _normalize_for_resume(str(ref.get("excerpt", "") or ""), limit=220)
                     external_id = str(ref.get("external_id", "") or "")
                     prefix = " / ".join(
                         part
@@ -210,7 +217,9 @@ def _build_jd_resume_command(form: dict[str, str], data_root: Path) -> tuple[lis
         return [], None
 
     model = form.get("resume_model", "qwen3:8b").strip() or "qwen3:8b"
-    ollama_url = form.get("resume_ollama_url", "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
+    ollama_url = (
+        form.get("resume_ollama_url", "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
+    )
     source_kind = form.get("resume_source_kind", "").strip()
     raw_rounds = form.get("resume_max_rounds", "2").strip()
     safe_rounds = max(1, min(3, int(raw_rounds) if raw_rounds.isdigit() else 2))
@@ -242,7 +251,9 @@ def _build_jd_resume_command(form: dict[str, str], data_root: Path) -> tuple[lis
     return command, jd
 
 
-def _run_jd_resume_draft(form: dict[str, str], data_root: Path, repo_root: Path) -> UIActionResult | None:
+def _run_jd_resume_draft(
+    form: dict[str, str], data_root: Path, repo_root: Path
+) -> UIActionResult | None:
     command, prompt_hint = _build_jd_resume_command(form, data_root)
     if not command:
         return UIActionResult(
@@ -288,6 +299,79 @@ def _run_jd_resume_draft(form: dict[str, str], data_root: Path, repo_root: Path)
         stdout=structured,
         stderr="",
         elapsed_ms=base.elapsed_ms,
+    )
+
+
+def _candidate_profile_from_form(form: dict[str, str]) -> CandidateProfile:
+    """Keep supplied resume text as operator claims; never infer new personal facts."""
+    base_lines = [
+        line.strip(" -•\t") for line in form.get("candidate_base_resume", "").splitlines()
+    ]
+    return CandidateProfile(
+        full_name=form.get("candidate_name", "").strip() or None,
+        headline=form.get("candidate_headline", "").strip() or None,
+        summary=form.get("candidate_summary", "").strip() or None,
+        skills=_split_path_list(form.get("candidate_skills", "")),
+        experience_bullets=[line for line in base_lines if line],
+    )
+
+
+def _run_resume_workspace(form: dict[str, str], data_root: Path, repo_root: Path) -> UIActionResult:
+    del repo_root
+    job_description = form.get("job_description", "").strip()
+    if not job_description:
+        return UIActionResult("resume-workspace", "resume-workspace", 2, "", "JD 不能为空。", 0)
+    try:
+        mode = ResumeMode(form.get("resume_mode", ResumeMode.LOCAL_ONLY.value))
+    except ValueError:
+        return UIActionResult(
+            "resume-workspace",
+            "resume-workspace",
+            2,
+            "",
+            "Resume mode 无效。请选择 Local-only 或 Hybrid research。",
+            0,
+        )
+    if mode is ResumeMode.HYBRID:
+        return UIActionResult(
+            "resume-workspace",
+            "resume-workspace",
+            2,
+            "",
+            "Hybrid research provider 尚未配置；v0.1 不会执行网络调用。请选择 Local-only。",
+            0,
+        )
+    try:
+        library_value = form.get("resume_library_root", "").strip()
+        library_root = (
+            Path(library_value or Path.home() / "Documents" / "Resume Applications")
+            .expanduser()
+            .resolve()
+        )
+        store = KnowledgeStore(data_root)
+        requirements = form.get("job_description", "").splitlines()
+        hits = []
+        for requirement in requirements[:24]:
+            if requirement.strip():
+                hits.extend(store.search(requirement.strip(), limit=3))
+        unique_hits = {hit.chunk_id: hit for hit in hits}
+        run = execute_resume_workspace(
+            data_root=data_root,
+            job_description=job_description,
+            candidate_profile=_candidate_profile_from_form(form),
+            evidence_hits=list(unique_hits.values()),
+            company_name=form.get("company_name", "").strip() or None,
+            company_url=form.get("company_url", "").strip() or None,
+            job_title=form.get("job_title", "").strip() or None,
+            job_id=form.get("job_id", "").strip() or None,
+            application_library_root=library_root,
+            mode=mode,
+        )
+    except (KnowledgeStoreError, OSError, ValueError) as exc:
+        return UIActionResult("resume-workspace", "local KnowledgeStore search", 1, "", str(exc), 0)
+    run_path = data_root / "resume-runs" / run.run_id
+    return UIActionResult(
+        "resume-workspace", "local KnowledgeStore search", 0, f"Resume workspace: {run_path}", "", 0
     )
 
 
@@ -363,7 +447,9 @@ def _run_action(form: dict[str, str], data_root: Path, repo_root: Path) -> UIAct
                 elapsed_ms=0,
             )
         model = form.get("model", "qwen3:8b").strip() or "qwen3:8b"
-        ollama_url = form.get("ollama_url", "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
+        ollama_url = (
+            form.get("ollama_url", "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
+        )
         source_kind = form.get("agent_source_kind", "").strip()
 
         command = [
@@ -381,6 +467,8 @@ def _run_action(form: dict[str, str], data_root: Path, repo_root: Path) -> UIAct
         return _run_command(command, repo_root)
     if action == "jd-resume-draft":
         return _run_jd_resume_draft(form, data_root, repo_root)
+    if action == "resume-workspace":
+        return _run_resume_workspace(form, data_root, repo_root)
 
     return None
 
@@ -397,26 +485,159 @@ def _result_card(result: UIActionResult | None) -> str:
     body = result.stdout if result.stdout else result.stderr
     if not body:
         body = "无输出"
+    workspace = (
+        _resume_workspace_result(result.stdout)
+        if result.name == "resume-workspace" and result.return_code == 0
+        else ""
+    )
     return f"""
 <section class="card">
   <h2>{_escape(result.name)} · {status}</h2>
   <p>执行耗时：{result.elapsed_ms}ms</p>
   <p>命令：<code>{_escape(result.command)}</code></p>
   <pre class="{banner}">{_escape(body)}</pre>
+  {workspace}
 </section>
 """
+
+
+def _resume_workspace_result(raw_stdout: str) -> str:
+    prefix = "Resume workspace: "
+    path_text = next(
+        (line[len(prefix) :] for line in raw_stdout.splitlines() if line.startswith(prefix)), ""
+    )
+    run_dir = Path(path_text) if path_text else None
+    if run_dir is None:
+        return ""
+    resume = ""
+    try:
+        resume = (run_dir / "04_resume.md").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    verification = _load_json_file(run_dir / "07_verification.json") or {}
+    gaps = _load_json_file(run_dir / "05_gaps.json") or {}
+    run = _load_json_file(run_dir / "run.json") or {}
+    route = run.get("route", {})
+    if not isinstance(route, dict):
+        route = {}
+    application_path = route.get("application_library_path", "")
+    coverage = verification.get("coverage", {})
+    if not isinstance(coverage, dict):
+        coverage = {}
+    gap_items = gaps.get("gaps", [])
+    if not isinstance(gap_items, list):
+        gap_items = []
+    gap_text = (
+        "\n".join(f"- {item.get('skill', '')}" for item in gap_items if isinstance(item, dict))
+        or "- None"
+    )
+    summary = (
+        f"Requirements: {coverage.get('total', 0)} · strong: {coverage.get('strong', 0)} · "
+        f"partial: {coverage.get('partial', 0)} · unsupported: {coverage.get('unsupported', 0)} · "
+        "critical covered: "
+        f"{coverage.get('critical_covered', 0)}/{coverage.get('critical_total', 0)}"
+    )
+    return f"""<section class=\"graph-card\"><h3>One-page resume preview</h3>
+<pre class=\"success\">{_escape(resume)}</pre><h3>Coverage</h3><p>{_escape(summary)}</p>
+<h3>Gaps</h3><pre>{_escape(gap_text)}</pre>
+<p class=\"muted\">Private artifacts: <code>{_escape(str(run_dir))}</code></p>
+<p class=\"muted\">Application library: <code>{_escape(str(application_path))}</code></p>
+{_resume_graph(raw_stdout)}</section>"""
+
+
+def _resume_graph(raw_stdout: str) -> str:
+    """Small native renderer for the frozen graph contract; no frontend dependency."""
+    prefix = "Resume workspace: "
+    path_text = next(
+        (line[len(prefix) :] for line in raw_stdout.splitlines() if line.startswith(prefix)), ""
+    )
+    graph = _load_json_file(Path(path_text) / "06_graph.json") if path_text else None
+    if graph is None:
+        return ""
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return ""
+    # JSON is embedded as a JavaScript expression. Escaping a closing script tag avoids
+    # breaking the page while preserving JSON.parse-compatible node details.
+    node_json = json.dumps(nodes, ensure_ascii=True).replace("</", "<\\/")
+    edge_json = json.dumps(edges, ensure_ascii=True).replace("</", "<\\/")
+    return f"""<section class="graph-card"><h3>Skill–Evidence Graph</h3>
+<p class="muted">点击节点查看详情；双击展开/收起相连节点。</p>
+<div style="overflow:auto"><svg id="resume-graph" role="img"></svg></div>
+<pre id="graph-detail" class="success">请选择节点。</pre>
+<script>
+(function(){{
+  const nodes={node_json};
+  const edges={edge_json};
+  const svg=document.getElementById('resume-graph');
+  const detail=document.getElementById('graph-detail');
+  const hidden=new Set();
+  const columns=6;
+  const height=Math.max(360,110*Math.ceil(nodes.length/columns)+50);
+  svg.setAttribute('viewBox',`0 0 900 ${{height}}`);
+  svg.setAttribute('height',height);
+  const byId=Object.fromEntries(nodes.map((n,i)=>[
+    n.id,
+    {{...n,x:80+(i%columns)*155,y:55+Math.floor(i/columns)*105}},
+  ]));
+  function draw(){{
+    svg.innerHTML='';
+    edges.forEach(e=>{{
+      const a=byId[e.source];
+      const b=byId[e.target];
+      if(!a||!b||hidden.has(a.id)||hidden.has(b.id))return;
+      const line=document.createElementNS('http://www.w3.org/2000/svg','line');
+      line.setAttribute('x1',a.x);
+      line.setAttribute('y1',a.y);
+      line.setAttribute('x2',b.x);
+      line.setAttribute('y2',b.y);
+      line.setAttribute('stroke','#64748b');
+      svg.append(line);
+    }});
+    Object.values(byId).forEach(n=>{{
+      if(hidden.has(n.id))return;
+      const group=document.createElementNS('http://www.w3.org/2000/svg','g');
+      const circle=document.createElementNS('http://www.w3.org/2000/svg','circle');
+      const label=document.createElementNS('http://www.w3.org/2000/svg','text');
+      circle.setAttribute('cx',n.x);
+      circle.setAttribute('cy',n.y);
+      circle.setAttribute('r','31');
+      circle.setAttribute('fill','#1d4ed8');
+      label.setAttribute('x',n.x);
+      label.setAttribute('y',n.y+5);
+      label.setAttribute('text-anchor','middle');
+      label.setAttribute('fill','white');
+      label.setAttribute('font-size','10');
+      label.textContent=n.kind;
+      group.append(circle,label);
+      group.style.cursor='pointer';
+      group.onclick=()=>detail.textContent=JSON.stringify(n,null,2);
+      group.ondblclick=()=>{{
+        edges.filter(e=>e.source===n.id).forEach(e=>{{
+          hidden.has(e.target)?hidden.delete(e.target):hidden.add(e.target);
+        }});
+        draw();
+      }};
+      svg.append(group);
+    }});
+  }}
+  draw();
+}})();
+</script></section>"""
 
 
 def _control_tower_section(data_root: Path) -> str:
     exists, _ = _read_control_tower(data_root)
     if not exists:
         return (
-            "<section class=\"card\"><h2>Control Tower</h2>"
+            '<section class="card"><h2>Control Tower</h2>'
             "<p>还未生成。请先执行下方 <strong>Build Control Tower</strong>。</p></section>"
         )
     return (
-        "<section class=\"card\"><h2>Control Tower</h2>"
-        "<p><a href=\"/control-tower\" target=\"_blank\" rel=\"noopener\">打开 Control Tower</a></p></section>"
+        '<section class="card"><h2>Control Tower</h2>'
+        '<p><a href="/control-tower" target="_blank" rel="noopener">'
+        "打开 Control Tower</a></p></section>"
     )
 
 
@@ -433,6 +654,22 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
     resume_ollama_url = _escape(form.get("resume_ollama_url", "http://127.0.0.1:11434"))
     resume_source_kind = form.get("resume_source_kind", "")
     resume_max_rounds = _escape(form.get("resume_max_rounds", "2"))
+    candidate_name = _escape(form.get("candidate_name", ""))
+    candidate_headline = _escape(form.get("candidate_headline", ""))
+    candidate_summary = _escape(form.get("candidate_summary", ""))
+    candidate_skills = _escape(form.get("candidate_skills", ""))
+    candidate_base_resume = _escape(form.get("candidate_base_resume", ""))
+    company_name = _escape(form.get("company_name", ""))
+    company_url = _escape(form.get("company_url", ""))
+    job_title = _escape(form.get("job_title", ""))
+    job_id = _escape(form.get("job_id", ""))
+    resume_library_root = _escape(
+        form.get(
+            "resume_library_root",
+            str(Path.home() / "Documents" / "Resume Applications"),
+        )
+    )
+    resume_mode = form.get("resume_mode", ResumeMode.LOCAL_ONLY.value)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -440,15 +677,30 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
   <title>SoloScale Local UI</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin: 0; background: #0f172a; color: #e2e8f0; padding: 20px; }}
-    .container {{ max-width: 1120px; margin: 0 auto; display: grid; gap: 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      margin: 0; background: #0f172a; color: #e2e8f0; padding: 20px;
+    }}
+    .container {{
+      max-width: 1120px; margin: 0 auto; display: grid; gap: 16px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }}
     .card {{ background: #111827; border: 1px solid #334155; border-radius: 12px; padding: 16px; }}
     .full {{ grid-column: 1 / -1; }}
     h1, h2 {{ margin: 0 0 10px; }}
     form {{ display: grid; gap: 8px; margin-top: 8px; }}
-    input, textarea, select {{ width: 100%; box-sizing: border-box; background: #0f172a; color: #e2e8f0; border: 1px solid #475569; border-radius: 8px; padding: 8px; }}
-    button {{ cursor: pointer; border-radius: 8px; border: 1px solid #475569; padding: 10px 12px; background: #1d4ed8; color: #fff; font-weight: 600; }}
-    pre {{ background: #0b1120; border: 1px solid #334155; padding: 12px; border-radius: 8px; white-space: pre-wrap; max-height: 280px; overflow: auto; }}
+    input, textarea, select {{
+      width: 100%; box-sizing: border-box; background: #0f172a; color: #e2e8f0;
+      border: 1px solid #475569; border-radius: 8px; padding: 8px;
+    }}
+    button {{
+      cursor: pointer; border-radius: 8px; border: 1px solid #475569;
+      padding: 10px 12px; background: #1d4ed8; color: #fff; font-weight: 600;
+    }}
+    pre {{
+      background: #0b1120; border: 1px solid #334155; padding: 12px;
+      border-radius: 8px; white-space: pre-wrap; max-height: 280px; overflow: auto;
+    }}
     .success {{ border-color: #10b981; color: #a7f3d0; }}
     .error {{ border-color: #ef4444; color: #fecaca; }}
     .small {{ color: #94a3b8; font-size: 0.9rem; }}
@@ -459,7 +711,10 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
 </head>
 <body>
   <h1>SoloScale 本地端（简化版）</h1>
-  <p class="small">这是个人使用最小界面：用于触发 CLI 流程并读取结果。它不会自动更新简历、Casebook 或发布内容。</p>
+  <p class="small">
+    这是个人使用最小界面：用于触发本地流程并读取结果。
+    Resume Workspace 会保存候选简历，但不会自动申请、更新 Casebook 或发布内容。
+  </p>
   <div class="container">
     <section class="card">
       <h2>1）Knowledge 状态</h2>
@@ -498,11 +753,15 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
         </label>
         <label>
           chatgpt-export（逗号分隔，可选）
-          <textarea name="chatgpt_exports" rows="2">{_escape(form.get("chatgpt_exports", ""))}</textarea>
+          <textarea
+            name="chatgpt_exports"
+            rows="2">{_escape(form.get("chatgpt_exports", ""))}</textarea>
         </label>
         <label>
           buildlog-root（逗号分隔，可选）
-          <textarea name="buildlog_roots" rows="2">{_escape(form.get("buildlog_roots", ""))}</textarea>
+          <textarea
+            name="buildlog_roots"
+            rows="2">{_escape(form.get("buildlog_roots", ""))}</textarea>
         </label>
         <button type="submit">Run knowledge-sync</button>
       </form>
@@ -520,9 +779,13 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
           Source kind（可选）
           <select name="source_kind">
             <option value="" {"selected" if source_kind == "" else ""}></option>
-            <option value="codex_session" {"selected" if source_kind == "codex_session" else ""}>codex_session</option>
-            <option value="buildlog_run" {"selected" if source_kind == "buildlog_run" else ""}>buildlog_run</option>
-            <option value="chatgpt_conversation" {"selected" if source_kind == "chatgpt_conversation" else ""}>chatgpt_conversation</option>
+            <option value="codex_session"
+              {"selected" if source_kind == "codex_session" else ""}>codex_session</option>
+            <option value="buildlog_run"
+              {"selected" if source_kind == "buildlog_run" else ""}>buildlog_run</option>
+            <option value="chatgpt_conversation"
+              {"selected" if source_kind == "chatgpt_conversation" else ""}
+            >chatgpt_conversation</option>
           </select>
         </label>
         <button type="submit">Run knowledge-search</button>
@@ -549,9 +812,15 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
           Source kind（可选）
           <select name="agent_source_kind">
             <option value="" {"selected" if agent_source_kind == "" else ""}></option>
-            <option value="codex_session" {"selected" if agent_source_kind == "codex_session" else ""}>codex_session</option>
-            <option value="buildlog_run" {"selected" if agent_source_kind == "buildlog_run" else ""}>buildlog_run</option>
-            <option value="chatgpt_conversation" {"selected" if agent_source_kind == "chatgpt_conversation" else ""}>chatgpt_conversation</option>
+            <option value="codex_session"
+              {"selected" if agent_source_kind == "codex_session" else ""}
+            >codex_session</option>
+            <option value="buildlog_run"
+              {"selected" if agent_source_kind == "buildlog_run" else ""}
+            >buildlog_run</option>
+            <option value="chatgpt_conversation"
+              {"selected" if agent_source_kind == "chatgpt_conversation" else ""}
+            >chatgpt_conversation</option>
           </select>
         </label>
         <button type="submit">Run evidence-agent</button>
@@ -582,12 +851,66 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
           Source kind（可选）
           <select name="resume_source_kind">
             <option value="" {"selected" if resume_source_kind == "" else ""}></option>
-            <option value="codex_session" {"selected" if resume_source_kind == "codex_session" else ""}>codex_session</option>
-            <option value="buildlog_run" {"selected" if resume_source_kind == "buildlog_run" else ""}>buildlog_run</option>
-            <option value="chatgpt_conversation" {"selected" if resume_source_kind == "chatgpt_conversation" else ""}>chatgpt_conversation</option>
+            <option value="codex_session"
+              {"selected" if resume_source_kind == "codex_session" else ""}
+            >codex_session</option>
+            <option value="buildlog_run"
+              {"selected" if resume_source_kind == "buildlog_run" else ""}
+            >buildlog_run</option>
+            <option value="chatgpt_conversation"
+              {"selected" if resume_source_kind == "chatgpt_conversation" else ""}
+            >chatgpt_conversation</option>
           </select>
         </label>
         <button type="submit">生成 JD 简历草稿</button>
+      </form>
+    </section>
+
+    <section class="card full">
+      <h2>7）Resume Intelligence Workspace v0.1</h2>
+      <p class="muted">
+        个人 bullet 只来自下方 Candidate Profile；本地检索命中仅作为图谱证据候选。
+        Hybrid 在 v0.1 仅保留接口。
+      </p>
+      <form method="post" action="/run">
+        <input type="hidden" name="action" value="resume-workspace" />
+        <label>Job Description
+          <textarea name="job_description" rows="7">{resume_job_description}</textarea>
+        </label>
+        <label>公司名称（可选）<input name="company_name" value="{company_name}" /></label>
+        <label>岗位名称（推荐）<input name="job_title" value="{job_title}" /></label>
+        <label>Job ID（推荐）<input name="job_id" value="{job_id}" /></label>
+        <label>Job URL（可选）<input name="company_url" value="{company_url}" /></label>
+        <label>Resume Library Root
+          <input name="resume_library_root" value="{resume_library_root}" />
+        </label>
+        <label>Candidate Name（可选）
+          <input name="candidate_name" value="{candidate_name}" />
+        </label>
+        <label>Headline / Summary（可选）
+          <input name="candidate_headline" value="{candidate_headline}" />
+        </label>
+        <label>Professional Summary（可选）
+          <textarea name="candidate_summary" rows="2">{candidate_summary}</textarea>
+        </label>
+        <label>Skills（逗号分隔）
+          <input name="candidate_skills" value="{candidate_skills}" />
+        </label>
+        <label>Base resume / candidate bullets（每行一条，作为 operator-supplied claim）
+          <textarea
+            name="candidate_base_resume"
+            rows="5">{candidate_base_resume}</textarea>
+        </label>
+        <label>Mode
+          <select name="resume_mode">
+            <option value="local-only"
+              {"selected" if resume_mode == "local-only" else ""}>Local-only</option>
+            <option value="hybrid"
+              {"selected" if resume_mode == "hybrid" else ""}
+            >Hybrid research（provider required）</option>
+          </select>
+        </label>
+        <button type="submit">Generate Resume Workspace</button>
       </form>
     </section>
 
@@ -644,7 +967,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or 0)
         body = self.rfile.read(length)
         self.latest_form = _parse_form(body)
-        data_root = Path(self.latest_form.get("data_root", str(self.ui_data_root))).expanduser().resolve()
+        data_root = (
+            Path(self.latest_form.get("data_root", str(self.ui_data_root))).expanduser().resolve()
+        )
         result = _run_action(self.latest_form, data_root, self.repo_root)
         self._send_page(result)
 
