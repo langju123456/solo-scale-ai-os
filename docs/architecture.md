@@ -58,6 +58,30 @@ flowchart LR
     H --> L[Reviewed BuildLog input]
 ```
 
+### Resume application plane
+
+The Resume Intelligence Workspace is a human-triggered projection, not an automatic RAG
+promotion path:
+
+```mermaid
+flowchart LR
+    J[Job description] --> R[Deterministic requirements]
+    P[Operator Candidate Profile] --> D[Resume draft]
+    K[KnowledgeStore lexical candidates] --> M[Candidate matches + hash lineage]
+    R --> D
+    R --> M
+    M --> G[Skill-evidence graph + gaps]
+    D --> H{Human review}
+    G --> H
+    H --> A[Application-facing bundle]
+```
+
+Only Candidate Profile statements may appear as resume claims. Retrieval candidates are
+not semantic coverage verification. Internal receipts and the optional external bundle
+have separate delivery states; external publication uses a private staging directory and
+must target a location outside the Git repository. This plane does not change Casebook,
+BuildLog, or publishing state and does not submit an application.
+
 This is a custom code-controlled loop, not an integration with an external agent
 framework or the OpenAI Agents SDK. Deterministic code owns maximum rounds, maximum
 queries, hit and context budgets, source filters, and citation-membership checks.

@@ -56,6 +56,17 @@ class JobRequirement(ContractModel):
 
 
 class EvidenceLocator(ContractModel):
+    document_id: str
+    source_kind: str
+    external_id: str
+    source_locator: str
+    title: str | None = None
+    role: str
+    timestamp: str | None = None
+    chunk_sha256: str
+    document_sha256: str
+    searchable_metadata_sha256: str | None = None
+    channels: list[str] = Field(min_length=1)
     repository: str | None = None
     branch: str | None = None
     commit: str | None = None
@@ -71,15 +82,22 @@ class EvidenceMatch(ContractModel):
     requirement_id: str
     evidence_id: str
     excerpt: str
-    strength: Literal["strong", "partial"]
-    locator: EvidenceLocator = Field(default_factory=EvidenceLocator)
+    match_quality: Literal["lexical_candidate_strong", "lexical_candidate_partial"]
+    locator: EvidenceLocator
 
 
 class ResumeBullet(ContractModel):
     text: str
     requirement_ids: list[str] = Field(default_factory=list)
-    evidence_ids: list[str] = Field(min_length=1)
-    support: Literal["candidate_profile", "local_evidence"]
+    profile_entry_ids: list[str] = Field(min_length=1)
+    support: Literal["candidate_profile"] = "candidate_profile"
+
+    @field_validator("profile_entry_ids")
+    @classmethod
+    def profile_entry_ids_are_explicit(cls, values: list[str]) -> list[str]:
+        if any(not value.startswith("PROFILE-") for value in values):
+            raise ValueError("resume bullets must reference Candidate Profile entries")
+        return values
 
 
 class ResumeDraft(ContractModel):
@@ -124,3 +142,16 @@ class ResumeRun(ContractModel):
     )
     route: dict[str, str | int | bool] = Field(default_factory=dict)
     artifact_paths: list[str] = Field(default_factory=list)
+
+
+class ResumeDeliveryReceipt(ContractModel):
+    run_id: str
+    state: Literal[
+        "INTERNAL_READY",
+        "APPLICATION_LIBRARY_PENDING",
+        "APPLICATION_LIBRARY_SAVED",
+        "APPLICATION_LIBRARY_FAILED",
+    ]
+    application_library_path: str | None = None
+    error_type: str | None = None
+    retry_safe: bool = False

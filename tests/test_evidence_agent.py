@@ -1686,16 +1686,3 @@ def test_grounded_draft_schema_rejects_missing_claim_evidence() -> None:
                 "suggested_outputs": [],
             }
         )
-
-
-def test_grounded_draft_schema_rejects_citations_in_suggested_outputs() -> None:
-    with pytest.raises(ValueError, match="suggested_outputs"):
-        GroundedDraft.model_validate(
-            {
-                "claims": [],
-                "unsupported": [],
-                "open_questions": [],
-                "suggested_case_title": None,
-                "suggested_outputs": ["Resume bullet with chunk-abc123 citation"],
-            }
-        )

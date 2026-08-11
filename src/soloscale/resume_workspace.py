@@ -10,6 +10,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import stat
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol
@@ -27,6 +30,7 @@ from soloscale.resume_models import (
     JobResearchSource,
     LearningTask,
     ResumeBullet,
+    ResumeDeliveryReceipt,
     ResumeDraft,
     ResumeMode,
     ResumeRun,
@@ -90,9 +94,19 @@ def parse_requirements(job_description: str) -> list[JobRequirement]:
 
 
 def _locator(hit: RetrievalHit) -> EvidenceLocator:
-    # Existing Conversation RAG hits have no code locator; retain that absence explicitly.
-    del hit
-    return EvidenceLocator()
+    return EvidenceLocator(
+        document_id=hit.document_id,
+        source_kind=hit.source_kind.value,
+        external_id=hit.external_id,
+        source_locator=hit.locator,
+        title=hit.title,
+        role=hit.role.value,
+        timestamp=hit.timestamp.isoformat() if hit.timestamp else None,
+        chunk_sha256=hit.chunk_sha256,
+        document_sha256=hit.document_sha256,
+        searchable_metadata_sha256=hit.searchable_metadata_sha256,
+        channels=hit.channels,
+    )
 
 
 def build_matches(
@@ -113,7 +127,11 @@ def build_matches(
                     requirement_id=requirement.id,
                     evidence_id=hit.chunk_id,
                     excerpt=hit.excerpt,
-                    strength="strong" if overlap > 1 else "partial",
+                    match_quality=(
+                        "lexical_candidate_strong"
+                        if overlap > 1
+                        else "lexical_candidate_partial"
+                    ),
                     locator=_locator(hit),
                 )
             )
@@ -132,7 +150,7 @@ def build_resume(profile: CandidateProfile, requirements: list[JobRequirement]) 
         bullets.append(
             ResumeBullet(
                 text=text,
-                evidence_ids=[f"PROFILE-{index:02d}"],
+                profile_entry_ids=[f"PROFILE-{index:02d}"],
                 requirement_ids=requirement_ids,
                 support="candidate_profile",
             )
@@ -159,7 +177,7 @@ def _gaps(
             SkillGap(
                 requirement_id=requirement.id,
                 skill=skill,
-                reason="No verified local evidence match.",
+                reason="No local lexical retrieval candidate matched this requirement.",
             )
         )
         tasks.append(
@@ -218,7 +236,9 @@ def build_graph(
             )
         edges.append(
             EvidenceGraphEdge(
-                source=match.requirement_id, target=evidence_id, relation="demonstrated_by"
+                source=match.requirement_id,
+                target=evidence_id,
+                relation="lexically_matched_by",
             )
         )
     for gap, task in zip(gaps, tasks, strict=True):
@@ -245,11 +265,79 @@ def build_graph(
     return nodes, edges
 
 
+class ResumeWorkspaceStorageError(OSError):
+    """Raised when a private Resume Workspace path cannot be handled safely."""
+
+
+def _ensure_private_directory(path: Path, *, parents: bool = False) -> None:
+    if path.is_symlink():
+        raise ResumeWorkspaceStorageError("private workspace path cannot be a symlink")
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        path.mkdir(mode=_DIR_MODE, parents=parents)
+        metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ResumeWorkspaceStorageError("private workspace path must be a directory")
+    os.chmod(path, _DIR_MODE)
+
+
+def _atomic_private_write(path: Path, text: str) -> None:
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        raise ResumeWorkspaceStorageError("unsafe private artifact directory")
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(existing.st_mode):
+            raise ResumeWorkspaceStorageError("private artifact must be a regular file")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    replaced = False
+    try:
+        os.fchmod(descriptor, _FILE_MODE)
+        data = text.encode("utf-8")
+        offset = 0
+        while offset < len(data):
+            written = os.write(descriptor, data[offset:])
+            if written <= 0:
+                raise ResumeWorkspaceStorageError("short private artifact write")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary_path, path)
+        replaced = True
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        if replaced:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary_metadata = temporary_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISREG(temporary_metadata.st_mode):
+                temporary_path.unlink()
+
+
 def _write_json(path: Path, value: object) -> None:
-    path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"
+    _atomic_private_write(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2, default=str) + "\n",
     )
-    os.chmod(path, _FILE_MODE)
 
 
 def _resume_markdown(draft: ResumeDraft) -> str:
@@ -263,7 +351,7 @@ def _resume_markdown(draft: ResumeDraft) -> str:
         for bullet in draft.bullets:
             lines.append(f"- {bullet.text}")
             lines.append(
-                f"  <!-- evidence_ids: {', '.join(bullet.evidence_ids)}; "
+                f"  <!-- profile_entry_ids: {', '.join(bullet.profile_entry_ids)}; "
                 f"requirement_ids: {', '.join(bullet.requirement_ids)} -->"
             )
     if draft.education:
@@ -307,16 +395,19 @@ def _application_bundle(
             _safe_filename_component(resolved_job_id, "No-Job-ID"),
         ]
     )
-    library_root.mkdir(parents=True, mode=_DIR_MODE, exist_ok=True)
+    _ensure_private_directory(library_root, parents=True)
     applications_root = library_root / "applications"
-    applications_root.mkdir(parents=True, mode=_DIR_MODE, exist_ok=True)
+    _ensure_private_directory(applications_root)
     application_dir = applications_root / directory_name
-    try:
-        application_dir.mkdir(mode=_DIR_MODE)
-    except FileExistsError:
+    if application_dir.exists() or application_dir.is_symlink():
         application_dir = applications_root / f"{directory_name}__{run_id}"
-        application_dir.mkdir(mode=_DIR_MODE)
-    os.chmod(application_dir, _DIR_MODE)
+    if application_dir.exists() or application_dir.is_symlink():
+        raise ResumeWorkspaceStorageError("application bundle destination already exists")
+    staging_dir = applications_root / f".{run_id}.staging"
+    if staging_dir.exists() or staging_dir.is_symlink():
+        raise ResumeWorkspaceStorageError("application bundle staging path already exists")
+    staging_dir.mkdir(mode=_DIR_MODE)
+    os.chmod(staging_dir, _DIR_MODE)
 
     candidate = _safe_filename_component(candidate_profile.full_name, "Candidate")
     company = _safe_filename_component(company_name, "Company")
@@ -330,27 +421,49 @@ def _application_bundle(
     if company_url:
         jd_lines.append(f"- Source: <{company_url}>")
     jd_lines += [f"- SoloScale run: `{run_id}`", "", "## Job Description", "", job_description, ""]
-    jd_path = application_dir / "JD.md"
-    jd_path.write_text("\n".join(jd_lines), encoding="utf-8")
-    os.chmod(jd_path, _FILE_MODE)
-    resume_path = application_dir / resume_filename
-    resume_path.write_text(resume_markdown, encoding="utf-8")
-    os.chmod(resume_path, _FILE_MODE)
-    metadata = {
-        "schema_version": "1.0",
-        "company": company_name,
-        "role": resolved_title,
-        "job_id": resolved_job_id,
-        "source_url": company_url,
-        "captured_at": date,
-        "jd_filename": "JD.md",
-        "resume_filename": resume_filename,
-        "soloscale_run_id": run_id,
-        "status": "DRAFT_REQUIRES_HUMAN_REVIEW",
-    }
-    metadata_path = application_dir / "application.json"
-    _write_json(metadata_path, metadata)
+    try:
+        _atomic_private_write(staging_dir / "JD.md", "\n".join(jd_lines))
+        _atomic_private_write(staging_dir / resume_filename, resume_markdown)
+        metadata = {
+            "schema_version": "1.0",
+            "company": company_name,
+            "role": resolved_title,
+            "job_id": resolved_job_id,
+            "source_url": company_url,
+            "captured_at": date,
+            "jd_filename": "JD.md",
+            "resume_filename": resume_filename,
+            "soloscale_run_id": run_id,
+            "status": "DRAFT_REQUIRES_HUMAN_REVIEW",
+        }
+        _write_json(staging_dir / "application.json", metadata)
+        os.rename(staging_dir, application_dir)
+        directory_fd = os.open(applications_root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        if staging_dir.exists() and not staging_dir.is_symlink():
+            shutil.rmtree(staging_dir)
+        raise
     return application_dir
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _is_inside_git_worktree(path: Path) -> bool:
+    resolved = path.expanduser().resolve(strict=False)
+    return any(
+        (candidate / ".git").exists() or (candidate / ".git").is_symlink()
+        for candidate in (resolved, *resolved.parents)
+    )
 
 
 def run_resume_workspace(
@@ -364,6 +477,7 @@ def run_resume_workspace(
     job_title: str | None = None,
     job_id: str | None = None,
     application_library_root: Path | None = None,
+    repository_root: Path | None = None,
     mode: ResumeMode = ResumeMode.LOCAL_ONLY,
     research_provider: JobResearchProvider | None = None,
 ) -> ResumeRun:
@@ -371,6 +485,12 @@ def run_resume_workspace(
         raise ValueError("job_description must not be empty")
     if mode is ResumeMode.HYBRID and research_provider is None:
         raise ValueError("hybrid mode requires an explicit JobResearchProvider")
+    if application_library_root is not None:
+        if (
+            repository_root is not None
+            and _is_within(application_library_root, repository_root)
+        ) or _is_inside_git_worktree(application_library_root):
+            raise ValueError("application_library_root must be outside every Git repository")
     if mode is ResumeMode.LOCAL_ONLY:
         research: list[JobResearchSource] = []
     else:
@@ -378,12 +498,17 @@ def run_resume_workspace(
         research = research_provider.research(
             job_description=job_description, company_name=company_name, company_url=company_url
         )
+    hits_by_id = {hit.chunk_id: hit for hit in evidence_hits}
+    if len(hits_by_id) != len(evidence_hits):
+        raise ValueError("evidence_hits must have unique chunk identities")
     run_id = f"resume-{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{uuid4().hex[:10]}"
+    _ensure_private_directory(data_root, parents=True)
     runs_root = data_root / "resume-runs"
-    runs_root.mkdir(parents=True, mode=_DIR_MODE, exist_ok=True)
-    os.chmod(runs_root, _DIR_MODE)
+    _ensure_private_directory(runs_root)
     run_dir = runs_root / run_id
-    run_dir.mkdir(parents=True, mode=_DIR_MODE)
+    if run_dir.exists() or run_dir.is_symlink():
+        raise ResumeWorkspaceStorageError("resume run directory already exists")
+    run_dir.mkdir(mode=_DIR_MODE)
     os.chmod(run_dir, _DIR_MODE)
     requirements = parse_requirements(job_description)
     matches = build_matches(requirements, evidence_hits)
@@ -392,21 +517,44 @@ def run_resume_workspace(
     nodes, edges = build_graph(
         company_name or "Job Description", requirements, matches, gaps, tasks
     )
-    hit_ids = {hit.chunk_id for hit in evidence_hits}
-    strong = {match.requirement_id for match in matches if match.strength == "strong"}
-    partial = {match.requirement_id for match in matches if match.strength == "partial"} - strong
+    candidate_strong = {
+        match.requirement_id
+        for match in matches
+        if match.match_quality == "lexical_candidate_strong"
+    }
+    candidate_partial = {
+        match.requirement_id
+        for match in matches
+        if match.match_quality == "lexical_candidate_partial"
+    } - candidate_strong
     critical = {item.id for item in requirements if item.priority == "critical"}
     coverage = {
         "total": len(requirements),
-        "strong": len(strong),
-        "partial": len(partial),
-        "unsupported": len(requirements) - len(strong | partial),
-        "critical_covered": len(critical & (strong | partial)),
+        "lexical_candidate_strong": len(candidate_strong),
+        "lexical_candidate_partial": len(candidate_partial),
+        "no_lexical_candidate": len(requirements)
+        - len(candidate_strong | candidate_partial),
+        "critical_with_candidate": len(critical & (candidate_strong | candidate_partial)),
         "critical_total": len(critical),
     }
+    lineage_replayable = all(
+        match.evidence_id in hits_by_id
+        and match.excerpt == hits_by_id[match.evidence_id].excerpt
+        and match.locator == _locator(hits_by_id[match.evidence_id])
+        for match in matches
+    )
     verification = {
-        "all_evidence_ids_exist": all(match.evidence_id in hit_ids for match in matches),
-        "personal_bullets_supported": all(bool(bullet.evidence_ids) for bullet in draft.bullets),
+        "candidate_lineage_replayable": lineage_replayable,
+        "resume_claim_source": "operator_supplied_candidate_profile_only",
+        "resume_claims_reference_profile_entries": all(
+            bullet.support == "candidate_profile"
+            and all(
+                profile_entry_id.startswith("PROFILE-")
+                for profile_entry_id in bullet.profile_entry_ids
+            )
+            for bullet in draft.bullets
+        ),
+        "semantic_requirement_coverage_verified": False,
         "coverage": coverage,
     }
     artifacts: list[tuple[str, object]] = [
@@ -446,15 +594,32 @@ def run_resume_workspace(
         _write_json(run_dir / name, value)
     resume_markdown = _resume_markdown(draft)
     resume_path = run_dir / "04_resume.md"
-    resume_path.write_text(resume_markdown, encoding="utf-8")
-    os.chmod(resume_path, _FILE_MODE)
+    _atomic_private_write(resume_path, resume_markdown)
+    artifact_paths = [name for name, _ in artifacts] + [
+        "04_resume.md",
+        "delivery.json",
+        "run.json",
+    ]
     route: dict[str, str | int | bool] = {
         "network_allowed": mode is ResumeMode.HYBRID,
         "max_research_sources": 0 if mode is ResumeMode.LOCAL_ONLY else len(research),
         "evidence_source": "direct local KnowledgeStore search",
         "application_library_saved": False,
     }
+    delivery_path = run_dir / "delivery.json"
+    _write_json(
+        delivery_path,
+        ResumeDeliveryReceipt(run_id=run_id, state="INTERNAL_READY").model_dump(mode="json"),
+    )
     if application_library_root is not None:
+        _write_json(
+            delivery_path,
+            ResumeDeliveryReceipt(
+                run_id=run_id,
+                state="APPLICATION_LIBRARY_PENDING",
+                application_library_path=str(application_library_root),
+            ).model_dump(mode="json"),
+        )
         try:
             application_dir = _application_bundle(
                 library_root=application_library_root,
@@ -467,22 +632,35 @@ def run_resume_workspace(
                 job_title=job_title,
                 job_id=job_id,
             )
-        except OSError:
-            failed_run = ResumeRun(
-                run_id=run_id,
-                mode=mode,
-                route=route,
-                artifact_paths=[name for name, _ in artifacts] + ["04_resume.md", "run.json"],
+        except OSError as exc:
+            _write_json(
+                delivery_path,
+                ResumeDeliveryReceipt(
+                    run_id=run_id,
+                    state="APPLICATION_LIBRARY_FAILED",
+                    application_library_path=str(application_library_root),
+                    error_type=type(exc).__name__,
+                    retry_safe=False,
+                ).model_dump(mode="json"),
             )
-            _write_json(run_dir / "run.json", failed_run.model_dump(mode="json"))
-            raise
+            raise ResumeWorkspaceStorageError(
+                "application library save failed; inspect delivery.json"
+            ) from None
         route["application_library_saved"] = True
         route["application_library_path"] = str(application_dir)
+        _write_json(
+            delivery_path,
+            ResumeDeliveryReceipt(
+                run_id=run_id,
+                state="APPLICATION_LIBRARY_SAVED",
+                application_library_path=str(application_dir),
+            ).model_dump(mode="json"),
+        )
     run = ResumeRun(
         run_id=run_id,
         mode=mode,
         route=route,
-        artifact_paths=[name for name, _ in artifacts] + ["04_resume.md", "run.json"],
+        artifact_paths=artifact_paths,
     )
     _write_json(run_dir / "run.json", run.model_dump(mode="json"))
     return run
