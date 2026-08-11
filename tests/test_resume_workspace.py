@@ -384,6 +384,54 @@ def test_post_rename_fsync_failure_records_published_uncertain_bundle(
     assert not (run_dir / "run.json").exists()
 
 
+def test_publication_race_never_replaces_new_empty_destination(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from soloscale import resume_workspace
+
+    original_publish = resume_workspace._atomic_rename_directory_no_replace
+    raced_destination: Path | None = None
+    raced_inode: int | None = None
+
+    def create_destination_immediately_before_publish(source: Path, destination: Path) -> None:
+        nonlocal raced_destination, raced_inode
+        destination.mkdir(mode=0o700)
+        raced_destination = destination
+        raced_inode = destination.stat().st_ino
+        original_publish(source, destination)
+
+    monkeypatch.setattr(
+        resume_workspace,
+        "_atomic_rename_directory_no_replace",
+        create_destination_immediately_before_publish,
+    )
+    data_root = tmp_path / ".soloscale"
+    library_root = tmp_path / "Resume Applications"
+
+    with pytest.raises(ResumeWorkspaceStorageError, match="inspect delivery.json"):
+        run_resume_workspace(
+            data_root=data_root,
+            job_description="Required: Python",
+            candidate_profile=CandidateProfile(full_name="Candidate"),
+            evidence_hits=[],
+            application_library_root=library_root,
+        )
+
+    assert raced_destination is not None
+    assert raced_inode is not None
+    assert raced_destination.is_dir()
+    assert raced_destination.stat().st_ino == raced_inode
+    assert list(raced_destination.iterdir()) == []
+    assert not any(
+        path.name.endswith(".staging")
+        for path in (library_root / "applications").iterdir()
+    )
+    run_dir = next((data_root / "resume-runs").iterdir())
+    delivery = json.loads((run_dir / "delivery.json").read_text(encoding="utf-8"))
+    assert delivery["state"] == "APPLICATION_LIBRARY_FAILED"
+    assert delivery["error_type"] == "FileExistsError"
+
+
 def test_final_internal_failure_leaves_saved_delivery_receipt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

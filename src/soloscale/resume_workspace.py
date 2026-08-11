@@ -7,11 +7,14 @@ provider boundary; callers must explicitly supply a provider and its research pa
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import json
 import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -337,6 +340,47 @@ def _atomic_private_write(path: Path, text: str) -> None:
                 temporary_path.unlink()
 
 
+def _atomic_rename_directory_no_replace(source: Path, destination: Path) -> None:
+    """Publish a directory atomically without ever replacing an existing destination."""
+    library = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source.absolute())
+    destination_bytes = os.fsencode(destination.absolute())
+    function: object | None
+    arguments: tuple[object, ...]
+    if sys.platform == "darwin":
+        function = getattr(library, "renameatx_np", None)
+        arguments = (-2, source_bytes, -2, destination_bytes, 0x00000004)
+    elif sys.platform.startswith("linux"):
+        function = getattr(library, "renameat2", None)
+        arguments = (-100, source_bytes, -100, destination_bytes, 0x00000001)
+    else:
+        function = None
+        arguments = ()
+    if function is None:
+        raise ResumeWorkspaceStorageError(
+            "atomic no-replace directory publication is unavailable on this platform"
+        )
+    rename_function = function
+    rename_function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename_function.restype = ctypes.c_int
+    if rename_function(*arguments) == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            "application bundle destination already exists",
+            destination,
+        )
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def _write_json(path: Path, value: object) -> None:
     _atomic_private_write(
         path,
@@ -442,7 +486,7 @@ def _application_bundle(
             "status": "DRAFT_REQUIRES_HUMAN_REVIEW",
         }
         _write_json(staging_dir / "application.json", metadata)
-        os.rename(staging_dir, application_dir)
+        _atomic_rename_directory_no_replace(staging_dir, application_dir)
         published = True
         directory_fd = os.open(applications_root, os.O_RDONLY)
         try:

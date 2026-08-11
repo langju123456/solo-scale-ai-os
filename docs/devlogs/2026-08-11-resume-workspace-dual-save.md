@@ -24,8 +24,9 @@ The external bundle contains only:
 The library must be outside the Git repository in the UI workflow. Repeated runs never
 overwrite an existing application directory. The first run uses the
 human-readable date/company/role/job-ID name; a later collision receives the unique
-SoloScale run ID suffix. Files are built in a private staging directory and published by
-rename. Managed roots reject symlinks throughout their lexical ancestry and wrong types,
+SoloScale run ID suffix. Files are built in a private staging directory and published with
+a platform-native atomic no-replace rename; unsupported platforms fail closed. Managed
+roots reject symlinks throughout their lexical ancestry and wrong types,
 existing roots are tightened to private POSIX modes, and `delivery.json` records pending,
 saved, published-but-durability-uncertain, or failed state with an exact published path.
 
