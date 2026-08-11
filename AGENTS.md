@@ -23,6 +23,15 @@ Before changing code, read:
 - Add or update tests for behavior changes.
 - Keep generated run artifacts under `.soloscale/`, which is ignored by default.
 
+## Local MVP Product Mode
+
+For bounded local, private, single-operator slices, implement only safeguards needed to
+prevent private-data leakage, destructive loss, unsupported career/public claims,
+irreversible external actions, and unbounded model/tool usage. Record other production
+concerns as `DEFERRED_PRODUCTION_HARDENING`; do not add authentication, multi-tenancy,
+queues, distributed locks, rate limiting, cloud deployment, OAuth, or broad framework
+migrations unless an approved acceptance criterion requires them.
+
 ## Commands
 
 ```bash

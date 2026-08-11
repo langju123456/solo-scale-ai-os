@@ -82,6 +82,34 @@ have separate delivery states; external publication uses a private staging direc
 must target a location outside the Git repository. This plane does not change Casebook,
 BuildLog, or publishing state and does not submit an application.
 
+### Learning traceability projection
+
+The golden Learning Traceability case is a read-only projection over tracked reasoning,
+decisions, existing implementation, and test definitions:
+
+```mermaid
+flowchart LR
+    S[Tracked source / reasoning] --> I[Distilled insight]
+    I --> D[Engineering decision]
+    D --> C[Implemented capability]
+    C --> A[Real code anchor]
+    C --> V[Committed test definition]
+    C --> T[Technical concept]
+    T --> M[Human mastery receipt]
+    C --> J[Target-JD relevance]
+    M --> G{Claim gate}
+    J --> G
+```
+
+The projection records `ENGINEERING_VERIFIED` from real repository and committed test
+anchors without treating the learning run as a fresh test execution receipt. Mastery starts
+at `L0 Seen`, contribution fields remain unknown without receipts, and no claim reaches
+`APPROVED_CLAIM`. Detailed learning material is generated only for the selected case and
+cached by evidence hash. The runtime reads no ignored conversation body and makes no model,
+network, publishing, or application call. User-authored Explain and Trace responses are stored as
+private `RAW_STATEMENT` candidates under the selected run. They require review and do not
+modify the mastery snapshot or create a `MASTERY_RECEIPT`.
+
 This is a custom code-controlled loop, not an integration with an external agent
 framework or the OpenAI Agents SDK. Deterministic code owns maximum rounds, maximum
 queries, hit and context budgets, source filters, and citation-membership checks.

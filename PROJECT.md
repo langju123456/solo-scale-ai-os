@@ -151,6 +151,20 @@ an explicit delivery-state receipt. This slice does not update Casebook or Build
 to a job, publish, deploy, or call a network service in local-only mode. ADR-0005 freezes
 this boundary before the candidate slice is promoted into a released roadmap version.
 
+## 5.4 Local candidate slice: Learning Traceability golden case
+
+The first Learning Traceability slice compiles exactly one existing capability—Conversation
+RAG chunking and bounded retrieval—into a shared evidence graph. Tracked source
+distillations and ADRs remain raw reasoning evidence; decisions, implemented capabilities,
+real code/test anchors, mastery receipts, and approved claims remain distinct truth stages.
+Engineering evidence can be verified while operator contribution and mastery remain
+unknown. The local UI exposes the graph, bounded source excerpts, Explain/Trace starts,
+target-JD relevance, and the resume-claim gate without advancing mastery or publishing.
+
+Private runs and content-hash caches stay under ignored `.soloscale/` storage. This local,
+single-operator MVP adds no authentication, multi-user runtime, cloud service, external
+publishing, or automatic web/model call. ADR-0006 freezes this candidate boundary.
+
 ## 6. v0.2 success criteria
 
 - Repeated sync preserves stable source/document/chunk identities and does not duplicate a

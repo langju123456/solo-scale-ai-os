@@ -18,6 +18,12 @@ from pathlib import Path
 
 from soloscale.knowledge_models import RetrievalHit
 from soloscale.knowledge_store import KnowledgeStore, KnowledgeStoreError
+from soloscale.learning_traceability import (
+    DEFAULT_TARGET_REQUIREMENT,
+    LearningTraceabilityError,
+    run_learning_traceability,
+    save_learning_response,
+)
 from soloscale.resume_docx import (
     ResumeTemplateError,
     extract_candidate_profile,
@@ -57,7 +63,7 @@ class FormSubmission:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return Path(__file__).resolve().parents[2]
 
 
 def _resolve_soloscale_command() -> tuple[list[str], dict[str, str]]:
@@ -556,6 +562,97 @@ def _run_user_resume(
         "",
         elapsed_ms,
     )
+
+
+def _run_learning_workspace(
+    form: dict[str, str],
+    data_root: Path,
+    repo_root: Path,
+) -> UIActionResult:
+    start = time.perf_counter()
+    requirement = form.get("target_requirement", "").strip()
+    try:
+        run = run_learning_traceability(
+            data_root=data_root,
+            repository_root=repo_root,
+            target_requirement=requirement,
+        )
+    except (LearningTraceabilityError, OSError, ValueError) as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        return UIActionResult(
+            "learning-traceability",
+            "local deterministic traceability build",
+            1,
+            "",
+            str(exc),
+            elapsed_ms,
+        )
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    return UIActionResult(
+        "learning-traceability",
+        "local deterministic traceability build",
+        0,
+        f"Learning workspace: {run.private_run_path}",
+        "",
+        elapsed_ms,
+    )
+
+
+def _save_learning_response(
+    form: dict[str, str],
+    data_root: Path,
+) -> UIActionResult:
+    start = time.perf_counter()
+    try:
+        receipt, receipt_path = save_learning_response(
+            data_root=data_root,
+            run_id=form.get("run_id", ""),
+            stage=form.get("stage", ""),
+            response=form.get("response", ""),
+        )
+    except ValueError as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        return UIActionResult(
+            "learning-response",
+            "private local response save",
+            2,
+            "",
+            str(exc),
+            elapsed_ms,
+        )
+    except (LearningTraceabilityError, OSError) as exc:
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        return UIActionResult(
+            "learning-response",
+            "private local response save",
+            1,
+            "",
+            str(exc),
+            elapsed_ms,
+        )
+    elapsed_ms = int((time.perf_counter() - start) * 1000)
+    return UIActionResult(
+        "learning-response",
+        "private local response save",
+        0,
+        (
+            f"Learning response saved: {receipt_path}\n"
+            f"Status: {receipt.status}\n"
+            "Mastery advanced: False"
+        ),
+        "",
+        elapsed_ms,
+    )
+
+
+def _learning_response_location(stage: str) -> str:
+    stage_slug = {
+        "Explain": "explain",
+        "Trace": "trace",
+    }.get(stage)
+    if stage_slug is None:
+        raise ValueError("learning response stage is invalid")
+    return f"/learning?response_saved={stage_slug}#exercise-{stage_slug}"
 
 
 def _escape(value: str) -> str:
@@ -1151,6 +1248,462 @@ def _user_page(
 </html>"""
 
 
+def _latest_learning_run(data_root: Path) -> Path | None:
+    runs_root = data_root / "learning-runs"
+    if not runs_root.is_dir() or runs_root.is_symlink():
+        return None
+    candidates = sorted(
+        (
+            path
+            for path in runs_root.iterdir()
+            if path.name.startswith("learning-")
+            and path.is_dir()
+            and not path.is_symlink()
+            and (path / "run.json").is_file()
+        ),
+        key=lambda path: path.name,
+    )
+    return candidates[-1] if candidates else None
+
+
+def _learning_graph(run_dir: Path) -> str:
+    graph = _load_json_file(run_dir / "04_evidence_graph.json")
+    if graph is None:
+        return '<p class="error">Graph artifact is unavailable.</p>'
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return '<p class="error">Graph artifact has an invalid shape.</p>'
+    node_json = json.dumps(nodes, ensure_ascii=True).replace("</", "<\\/")
+    edge_json = json.dumps(edges, ensure_ascii=True).replace("</", "<\\/")
+    run_id = json.dumps(run_dir.name)
+    return f"""<section class="panel graph-panel">
+  <h2>Interactive evidence graph</h2>
+  <p class="muted">Click a node for its evidence neighborhood. Double-click to focus it.</p>
+  <div class="graph-scroll"><svg id="learning-graph" role="img"></svg></div>
+  <div class="detail-grid">
+    <pre id="learning-node-detail">Select a Concept, Code, Test, or Decision node.</pre>
+    <p><a id="learning-source-link" class="button-link hidden" target="_blank"
+      rel="noopener">Open grounded local source</a></p>
+  </div>
+  <script>
+  (function(){{
+    const nodes={node_json};
+    const edges={edge_json};
+    const runId={run_id};
+    const svg=document.getElementById('learning-graph');
+    const detail=document.getElementById('learning-node-detail');
+    const sourceLink=document.getElementById('learning-source-link');
+    const columns=5;
+    const width=1060;
+    const rowHeight=128;
+    const height=Math.max(450,rowHeight*Math.ceil(nodes.length/columns)+70);
+    svg.setAttribute('viewBox',`0 0 ${{width}} ${{height}}`);
+    svg.setAttribute('height',height);
+    const byId=Object.fromEntries(nodes.map((node,index)=>[
+      node.id,
+      {{...node,x:105+(index%columns)*210,y:65+Math.floor(index/columns)*rowHeight}},
+    ]));
+    let focused=null;
+    function related(nodeId){{
+      const ids=new Set();
+      edges.forEach(edge=>{{
+        if(edge.source===nodeId)ids.add(edge.target);
+        if(edge.target===nodeId)ids.add(edge.source);
+      }});
+      return [...ids].map(id=>byId[id]).filter(Boolean).map(node=>({{
+        id:node.id,kind:node.kind,label:node.label,
+      }}));
+    }}
+    function traceability(nodeId){{
+      const visited=new Set([nodeId]);
+      const pending=[nodeId];
+      while(pending.length){{
+        const current=pending.shift();
+        edges.forEach(edge=>{{
+          let candidate=null;
+          if(edge.source===current)candidate=edge.target;
+          if(edge.target===current)candidate=edge.source;
+          if(candidate&&!visited.has(candidate)){{visited.add(candidate);pending.push(candidate);}}
+        }});
+      }}
+      visited.delete(nodeId);
+      return [...visited].map(id=>byId[id]).filter(Boolean).map(node=>({{
+        id:node.id,kind:node.kind,label:node.label,
+      }}));
+    }}
+    function inspect(node){{
+      detail.textContent=JSON.stringify({{
+        id:node.id,
+        kind:node.kind,
+        label:node.label,
+        truth_stage:node.truth_stage,
+        detail:node.detail,
+        related:related(node.id),
+        traceability:traceability(node.id),
+      }},null,2);
+      if(node.kind==='CODE'||node.kind==='TEST'){{
+        sourceLink.href='/learning/source?run_id='+encodeURIComponent(runId)
+          +'&anchor_id='+encodeURIComponent(node.id);
+        sourceLink.classList.remove('hidden');
+      }}else{{
+        sourceLink.classList.add('hidden');
+      }}
+    }}
+    function draw(){{
+      svg.innerHTML='';
+      edges.forEach(edge=>{{
+        const source=byId[edge.source];
+        const target=byId[edge.target];
+        if(!source||!target)return;
+        if(focused&&source.id!==focused&&target.id!==focused)return;
+        const line=document.createElementNS('http://www.w3.org/2000/svg','line');
+        line.setAttribute('x1',source.x);
+        line.setAttribute('y1',source.y);
+        line.setAttribute('x2',target.x);
+        line.setAttribute('y2',target.y);
+        line.setAttribute('stroke','#64748b');
+        line.setAttribute('stroke-width','1.5');
+        svg.append(line);
+      }});
+      Object.values(byId).forEach(node=>{{
+        if(focused&&node.id!==focused&&!related(focused).some(item=>item.id===node.id))return;
+        const group=document.createElementNS('http://www.w3.org/2000/svg','g');
+        const box=document.createElementNS('http://www.w3.org/2000/svg','rect');
+        const kind=document.createElementNS('http://www.w3.org/2000/svg','text');
+        const label=document.createElementNS('http://www.w3.org/2000/svg','text');
+        box.setAttribute('x',node.x-84);
+        box.setAttribute('y',node.y-34);
+        box.setAttribute('width','168');
+        box.setAttribute('height','68');
+        box.setAttribute('rx','12');
+        box.setAttribute('fill',node.kind==='CONCEPT'?'#0f766e':'#1e3a8a');
+        box.setAttribute('stroke',node.id===focused?'#fbbf24':'#60a5fa');
+        kind.setAttribute('x',node.x);
+        kind.setAttribute('y',node.y-8);
+        kind.setAttribute('text-anchor','middle');
+        kind.setAttribute('fill','#bfdbfe');
+        kind.setAttribute('font-size','10');
+        kind.textContent=node.kind;
+        label.setAttribute('x',node.x);
+        label.setAttribute('y',node.y+12);
+        label.setAttribute('text-anchor','middle');
+        label.setAttribute('fill','white');
+        label.setAttribute('font-size','10');
+        label.textContent=(node.label||'').slice(0,25);
+        group.append(box,kind,label);
+        group.style.cursor='pointer';
+        group.onclick=()=>inspect(node);
+        group.ondblclick=()=>{{focused=focused===node.id?null:node.id;draw();inspect(node);}};
+        svg.append(group);
+      }});
+    }}
+    draw();
+  }})();
+  </script>
+</section>"""
+
+
+def _learning_source_excerpt(
+    data_root: Path,
+    repo_root: Path,
+    run_id: str,
+    anchor_id: str,
+) -> tuple[str, str]:
+    if re.fullmatch(r"learning-[A-Za-z0-9T-]+", run_id) is None:
+        raise ValueError("invalid learning run id")
+    if re.fullmatch(r"[A-Z0-9-]+", anchor_id) is None:
+        raise ValueError("invalid learning anchor id")
+    runs_root = data_root / "learning-runs"
+    run_dir = runs_root / run_id
+    if run_dir.is_symlink() or not run_dir.is_dir():
+        raise ValueError("learning run is unavailable")
+    anchors_path = run_dir / "03_code_anchors.json"
+    if anchors_path.is_symlink():
+        raise ValueError("learning anchors are unavailable")
+    anchors = _load_json_file(anchors_path)
+    if anchors is None:
+        raise ValueError("learning anchors are unavailable")
+    candidates: list[object] = []
+    for key in ("code_anchors", "verification_anchors"):
+        value = anchors.get(key, [])
+        if isinstance(value, list):
+            candidates.extend(value)
+    selected = next(
+        (
+            item
+            for item in candidates
+            if isinstance(item, dict) and item.get("id") == anchor_id
+        ),
+        None,
+    )
+    if not isinstance(selected, dict):
+        raise ValueError("learning anchor is unavailable")
+    relative_file = selected.get("file")
+    line_start = selected.get("line_start")
+    line_end = selected.get("line_end")
+    if not isinstance(relative_file, str) or not isinstance(line_start, int):
+        raise ValueError("learning anchor is invalid")
+    if not isinstance(line_end, int) or line_start < 1 or line_end < line_start:
+        raise ValueError("learning anchor is invalid")
+    if line_end - line_start > 200:
+        raise ValueError("learning anchor exceeds the local excerpt limit")
+    resolved_root = repo_root.resolve()
+    resolved_file = (resolved_root / relative_file).resolve()
+    try:
+        resolved_file.relative_to(resolved_root)
+    except ValueError:
+        raise ValueError("learning anchor escapes the repository") from None
+    if not resolved_file.is_file() or resolved_file.is_symlink():
+        raise ValueError("learning source file is unavailable")
+    lines = resolved_file.read_text(encoding="utf-8").splitlines()
+    excerpt_start = max(1, line_start - 3)
+    excerpt_end = min(len(lines), line_end + 3)
+    numbered = "\n".join(
+        f"{line_number:>5}  {lines[line_number - 1]}"
+        for line_number in range(excerpt_start, excerpt_end + 1)
+    )
+    title = f"{relative_file}:{line_start}-{line_end}"
+    return title, numbered
+
+
+def _learning_list(value: object) -> str:
+    if not isinstance(value, list):
+        return "<li>Not available.</li>"
+    return "".join(f"<li>{_escape(str(item))}</li>" for item in value)
+
+
+def _learning_page(
+    data_root: Path,
+    repo_root: Path,
+    form: dict[str, str],
+    result: UIActionResult | None = None,
+) -> str:
+    run_dir = _latest_learning_run(data_root)
+    response_saved_stage = form.get("response_saved_stage", "")
+    target_requirement = _escape(
+        form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT)
+    )
+    result_html = ""
+    if result is not None:
+        class_name = "success" if result.return_code == 0 else "error"
+        body = result.stdout or result.stderr
+        result_html = (
+            f'<div class="notice {class_name}"><strong>{_escape(body)}</strong>'
+            f" · {result.elapsed_ms}ms</div>"
+        )
+        if result.return_code == 0:
+            prefix = "Learning workspace: "
+            path_text = next(
+                (
+                    line[len(prefix) :]
+                    for line in result.stdout.splitlines()
+                    if line.startswith(prefix)
+                ),
+                "",
+            )
+            if path_text:
+                run_dir = Path(path_text)
+    dashboard = ""
+    if run_dir is not None:
+        case = _load_json_file(run_dir / "01_case.json") or {}
+        mastery = _load_json_file(run_dir / "06_mastery.json") or {}
+        learning_plan = _load_json_file(run_dir / "07_learning_plan.json") or {}
+        claim = _load_json_file(run_dir / "09_claim_eligibility.json") or {}
+        run = _load_json_file(run_dir / "run.json") or {}
+        architecture = learning_plan.get("architecture_walkthrough_5_minutes", [])
+        deep_dive = learning_plan.get("technical_deep_dive_15_minutes", {})
+        decisions = learning_plan.get("decisions_and_trade_offs", [])
+        unknowns = learning_plan.get("known_failures_and_unknowns", [])
+        exercises = learning_plan.get("exercises", {})
+        explain = exercises.get("Explain", {}) if isinstance(exercises, dict) else {}
+        trace = exercises.get("Trace", {}) if isinstance(exercises, dict) else {}
+        engineering_state = _escape(str(case.get("engineering_state", "UNKNOWN")))
+        mastery_level = _escape(str(mastery.get("level", "UNKNOWN")))
+        mastery_ready = _escape(str(mastery.get("interview_ready", False)))
+        next_action = _escape(str(mastery.get("next_action", "UNKNOWN")))
+        engineering_truth = _escape(
+            str(claim.get("engineering_truth_stage", "UNKNOWN"))
+        )
+        interview_ready = _escape(str(claim.get("interview_ready", False)))
+        resume_eligible = _escape(str(claim.get("resume_eligible", False)))
+        explain_saved = (
+            '<p class="saved-response" role="status">Explain response saved privately. '
+            "Review is still required; mastery was not advanced.</p>"
+            if response_saved_stage == "explain"
+            else ""
+        )
+        trace_saved = (
+            '<p class="saved-response" role="status">Trace response saved privately. '
+            "Review is still required; mastery was not advanced.</p>"
+            if response_saved_stage == "trace"
+            else ""
+        )
+        dashboard = f"""
+<section class="status-grid">
+  <article class="status-card verified">
+    <span>Engineering</span><strong>{engineering_state}</strong>
+    <small>Real code + committed test definitions</small>
+  </article>
+  <article class="status-card warning">
+    <span>Human mastery</span><strong>{mastery_level}</strong>
+    <small>Interview ready: {mastery_ready}</small>
+  </article>
+  <article class="status-card action">
+    <span>Exact next action</span><strong>{next_action}</strong>
+    <small>No automatic promotion</small>
+  </article>
+</section>
+<section class="panel hero-copy">
+  <p class="eyebrow">30-second explanation</p>
+  <h2>Conversation RAG · Chunking + Retrieval</h2>
+  <p>{_escape(str(learning_plan.get("plain_language_30_seconds", "Not available.")))}</p>
+  <div class="button-row">
+    <a class="button-link" href="#exercise-explain">Start Explain</a>
+    <a class="button-link secondary" href="#exercise-trace">Start Trace</a>
+  </div>
+</section>
+{_learning_graph(run_dir)}
+<section class="panel">
+  <h2>Target JD relevance</h2>
+  <p>{_escape(str(claim.get("target_requirement", "Not available.")))}</p>
+  <div class="truth-grid">
+    <div><span>Engineering truth</span><strong>{engineering_truth}</strong></div>
+    <div><span>Interview ready</span><strong>{interview_ready}</strong></div>
+    <div><span>Resume eligible</span><strong>{resume_eligible}</strong></div>
+  </div>
+  <p class="warning-text">{_escape(str(claim.get("rationale", "Not available.")))}</p>
+</section>
+<details class="panel" open>
+  <summary>Architecture · 5 minutes</summary>
+  <ol>{_learning_list(architecture)}</ol>
+</details>
+<details class="panel">
+  <summary>Code, evidence, and 15-minute deep dive</summary>
+  <pre>{_escape(json.dumps(deep_dive, ensure_ascii=False, indent=2))}</pre>
+  <h3>Decisions and trade-offs</h3><ul>{_learning_list(decisions)}</ul>
+  <h3>Known failures and unknowns</h3><ul>{_learning_list(unknowns)}</ul>
+</details>
+<section id="exercise-explain" class="panel exercise">
+  <p class="eyebrow">L1 · Explain exercise</p>
+  <h2>Start without an answer key</h2>
+  <p>{_escape(str(explain.get("prompt", "Not available.")))}</p>
+  <p class="muted">Completion requires a user-authored receipt;
+    opening this card does not pass L1.</p>
+  <form class="response-form" method="post"
+    action="/learning/respond#exercise-explain">
+    <input type="hidden" name="run_id" value="{_escape(run_dir.name)}" />
+    <input type="hidden" name="stage" value="Explain" />
+    <input type="hidden" name="target_requirement" value="{target_requirement}" />
+    <label for="learning-explain-response">Your Explain response</label>
+    <textarea id="learning-explain-response" name="response" rows="8" maxlength="20000"
+      required
+      placeholder="Explain it. Include one trade-off and one truth boundary."></textarea>
+    <button type="submit">Save private Explain response</button>
+  </form>
+  {explain_saved}
+  <p class="muted">Saved locally as pending review. Submission never advances mastery.</p>
+</section>
+<section id="exercise-trace" class="panel exercise">
+  <p class="eyebrow">L2 · Trace exercise</p>
+  <h2>Follow the real symbols</h2>
+  <p>{_escape(str(trace.get("prompt", "Not available.")))}</p>
+  <p class="muted">Use the graph's Code and Test nodes to open bounded local excerpts.</p>
+  <form class="response-form" method="post"
+    action="/learning/respond#exercise-trace">
+    <input type="hidden" name="run_id" value="{_escape(run_dir.name)}" />
+    <input type="hidden" name="stage" value="Trace" />
+    <input type="hidden" name="target_requirement" value="{target_requirement}" />
+    <label for="learning-trace-response">Your Trace response</label>
+    <textarea id="learning-trace-response" name="response" rows="8" maxlength="20000"
+      required
+      placeholder="Trace the recorded symbols and tests. Name any remaining unknowns."></textarea>
+    <button type="submit">Save private Trace response</button>
+  </form>
+  {trace_saved}
+  <p class="muted">Saved locally as pending review. Submission never advances mastery.</p>
+</section>
+<section class="panel footnote">
+  <strong>Private run</strong> <code>{_escape(str(run_dir))}</code><br />
+  <span>Branch {_escape(str(run.get("branch", "")))} ·
+    commit {_escape(str(run.get("commit", "")))}</span>
+</section>
+"""
+    else:
+        dashboard = """
+<section class="panel empty-state">
+  <h2>No Learning Traceability run yet</h2>
+  <p>Build the one bounded Conversation RAG golden case below.</p>
+</section>
+"""
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SoloScale Learning Control Tower</title>
+  <style>
+    :root {{ color-scheme: dark; --panel:#111827; --line:#334155; --muted:#94a3b8; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin:0; font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      background:#07111f; color:#e5edf7; }}
+    header {{ padding:28px max(24px,calc((100vw - 1180px)/2)); border-bottom:1px solid var(--line);
+      background:linear-gradient(135deg,#0f172a,#112a46); }}
+    header a {{ color:#93c5fd; }}
+    main {{ max-width:1180px; margin:0 auto; padding:24px; display:grid; gap:18px; }}
+    .panel {{ background:var(--panel); border:1px solid var(--line); border-radius:16px;
+      padding:20px; }}
+    .build-form {{ display:grid; grid-template-columns:1fr auto; gap:12px; align-items:end; }}
+    label {{ display:grid; gap:7px; color:var(--muted); }}
+    input,textarea {{ width:100%; border:1px solid #475569; border-radius:10px; padding:12px;
+      background:#081321; color:white; }}
+    textarea {{ resize:vertical; min-height:150px; line-height:1.55; }}
+    button,.button-link {{ display:inline-block; border:0; border-radius:10px; padding:11px 15px;
+      background:#2563eb; color:white; font-weight:700; text-decoration:none; cursor:pointer; }}
+    .button-link.secondary {{ background:#0f766e; }}
+    .button-row {{ display:flex; gap:10px; flex-wrap:wrap; }}
+    .notice {{ border:1px solid; border-radius:12px; padding:12px; }}
+    .success {{ border-color:#10b981; color:#a7f3d0; }}
+    .error {{ border-color:#ef4444; color:#fecaca; }}
+    .saved-response {{ border-left:3px solid #10b981; padding:9px 12px;
+      background:#052e2b; color:#a7f3d0; border-radius:8px; }}
+    .status-grid,.truth-grid {{ display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }}
+    .status-card,.truth-grid div {{ border:1px solid var(--line); border-radius:14px; padding:16px;
+      background:#0b1525; display:grid; gap:7px; }}
+    .status-card span,.truth-grid span,.eyebrow {{ color:var(--muted); text-transform:uppercase;
+      letter-spacing:.09em; font-size:.75rem; }}
+    .status-card strong {{ font-size:1.15rem; }} .verified strong {{ color:#6ee7b7; }}
+    .warning strong,.warning-text {{ color:#fcd34d; }} .action strong {{ color:#93c5fd; }}
+    .hero-copy p:not(.eyebrow) {{ max-width:820px; font-size:1.08rem; line-height:1.7; }}
+    .graph-scroll {{ overflow:auto; background:#081321; border-radius:12px; }}
+    #learning-graph {{ width:1060px; display:block; }}
+    pre {{ white-space:pre-wrap; overflow:auto; padding:14px; background:#081321;
+      border-radius:10px; color:#c7d2fe; }}
+    details summary {{ cursor:pointer; font-size:1.1rem; font-weight:700; }}
+    li {{ margin:.55rem 0; line-height:1.55; }} .muted,.footnote span {{ color:var(--muted); }}
+    .hidden {{ display:none; }} code {{ color:#bae6fd; word-break:break-all; }}
+    @media(max-width:760px) {{
+      .status-grid,.truth-grid,.build-form {{ grid-template-columns:1fr; }}
+    }}
+  </style>
+</head>
+<body>
+  <header><a href="/">← SoloScale local UI</a><h1>Learning Control Tower</h1>
+    <p>One real capability. Evidence first. Mastery stays human-earned.</p></header>
+  <main>
+    <form class="panel build-form" method="post" action="/learning/run">
+      <label>Current target-JD requirement
+        <input name="target_requirement" value="{target_requirement}" required />
+      </label>
+      <button type="submit">Build / refresh golden case</button>
+    </form>
+    {result_html}
+    {dashboard}
+  </main>
+</body>
+</html>"""
+
+
 def _control_tower_section(data_root: Path) -> str:
     exists, _ = _read_control_tower(data_root)
     if not exists:
@@ -1240,6 +1793,7 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
   <p class="small">
     这是个人使用最小界面：用于触发本地流程并读取结果。
     Resume Workspace 会保存候选简历，但不会自动申请、更新 Casebook 或发布内容。
+    <a href="/learning">Open Learning Control Tower</a>.
   </p>
   <div class="container">
     <section class="card">
@@ -1490,11 +2044,47 @@ def _serve_resume_download(
     handler.wfile.write(content)
 
 
+def _serve_learning_source(
+    handler: BaseHTTPRequestHandler,
+    data_root: Path,
+    repo_root: Path,
+) -> None:
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(handler.path).query)
+    run_id = query.get("run_id", [""])[0]
+    anchor_id = query.get("anchor_id", [""])[0]
+    try:
+        title, excerpt = _learning_source_excerpt(
+            data_root,
+            repo_root,
+            run_id,
+            anchor_id,
+        )
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        handler.send_error(404, str(exc))
+        return
+    document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>{_escape(title)}</title><style>
+body{{margin:0;padding:24px;background:#07111f;color:#e5edf7;font-family:ui-monospace,monospace}}
+a{{color:#93c5fd}} pre{{white-space:pre;overflow:auto;background:#111827;border:1px solid #334155;
+border-radius:12px;padding:18px;line-height:1.55}}</style></head><body>
+<p><a href="/learning">← Learning Control Tower</a></p><h1>{_escape(title)}</h1>
+<p>Read-only bounded excerpt from a recorded anchor.</p>
+<pre>{_escape(excerpt)}</pre></body></html>"""
+    body = document.encode("utf-8")
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     ui_data_root: Path = Path(".soloscale")
     repo_root: Path = _repo_root()
     latest_form: dict[str, str] = {}
     latest_user_form: dict[str, str] = {}
+    latest_learning_form: dict[str, str] = {}
 
     def _send_advanced_page(self, result: UIActionResult | None) -> None:
         data_root = self.ui_data_root.resolve()
@@ -1517,6 +2107,22 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_learning_page(
+        self, result: UIActionResult | None, response_saved_stage: str | None = None
+    ) -> None:
+        data_root = self.ui_data_root.resolve()
+        display_form = dict(self.latest_learning_form)
+        if response_saved_stage is not None:
+            display_form["response_saved_stage"] = response_saved_stage
+        page = _learning_page(data_root, self.repo_root, display_form, result)
+        body = page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:  # noqa: N802
         path = urllib.parse.urlsplit(self.path).path
         if path in {"/", ""}:
@@ -1524,6 +2130,16 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             return
         if path == "/advanced":
             self._send_advanced_page(None)
+            return
+        if path == "/learning":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            saved_stage = query.get("response_saved", [""])[0]
+            self._send_learning_page(
+                None, saved_stage if saved_stage in {"explain", "trace"} else None
+            )
+            return
+        if path == "/learning/source":
+            _serve_learning_source(self, self.ui_data_root.resolve(), self.repo_root)
             return
         if path == "/control-tower":
             _serve_control_tower(self, self.ui_data_root.resolve())
@@ -1536,6 +2152,36 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/learning/run":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            body = self.rfile.read(length)
+            self.latest_learning_form = _parse_form(body)
+            self._send_learning_page(
+                _run_learning_workspace(
+                    self.latest_learning_form, self.ui_data_root.resolve(), self.repo_root
+                )
+            )
+            return
+        if path == "/learning/respond":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            response_form = _parse_form(self.rfile.read(length))
+            self.latest_learning_form = {
+                "target_requirement": response_form.get(
+                    "target_requirement",
+                    self.latest_learning_form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT),
+                )
+            }
+            learning_result = _save_learning_response(response_form, self.ui_data_root.resolve())
+            if learning_result.return_code == 0:
+                self.send_response(303)
+                self.send_header(
+                    "Location", _learning_response_location(response_form.get("stage", ""))
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self._send_learning_page(learning_result)
+            return
         if path not in {"/run", "/generate"}:
             self.send_error(404, "Not found")
             return

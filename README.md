@@ -132,6 +132,14 @@ python -m soloscale.local_ui --host 127.0.0.1 --port 8765 --data-root .soloscale
 
 打开终端打印的地址（默认 `http://127.0.0.1:8765`）。
 
+### Learning Traceability golden case
+
+Open `http://127.0.0.1:8765/learning` to build and inspect the bounded Learning
+Traceability workflow. It produces a clickable evidence graph and private, append-only
+Explain/Trace response receipts; submitting a response never advances mastery automatically.
+The local workflow makes no model or network call and keeps learning status separate from
+resume eligibility.
+
 The default `/` route is the end-user resume flow: upload an existing `.docx` resume,
 paste a Job Description, optionally add company/job metadata, then generate, preview, and
 download a targeted DOCX. Developer-oriented Knowledge, Evidence Agent, model, and source
@@ -375,6 +383,7 @@ Keeping them separate makes each portfolio artifact clearer while creating a com
 - [Conversation distillation policy](docs/conversations/README.md)
 - [Casebook local evidence and learning workflow](docs/casebook.md)
 - [Private Conversation RAG and Evidence Agent](docs/conversation-rag.md)
+- [Learning Traceability golden-case decision](docs/decisions/ADR-0006-learning-traceability-golden-case.md)
 - [Evidence-to-multichannel content template](docs/content/TEMPLATE.md)
 - [Editable Figma architecture board](https://www.figma.com/board/psWfF0mEOdHqUvyOWrJWeF)
 
