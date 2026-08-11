@@ -132,21 +132,26 @@ python -m soloscale.local_ui --host 127.0.0.1 --port 8765 --data-root .soloscale
 
 打开终端打印的地址（默认 `http://127.0.0.1:8765`）。
 
-### Resume Intelligence Workspace v0.1
+### Resume Intelligence Workspace candidate slice
 
 The local UI now includes a bounded Resume Workspace: JD + operator-supplied Candidate
-Profile + direct local KnowledgeStore evidence candidates produce a one-page draft,
-explicit gaps, and a clickable Skill–Evidence graph. Each run is private under
-`.soloscale/resume-runs/<run-id>/` with nine inspectable artifacts. `Local-only` performs
+Profile + direct local KnowledgeStore lexical candidates produce a one-page draft,
+explicit gaps, and a clickable Skill–Evidence graph. Resume facts come only from the
+operator-supplied Candidate Profile; retrieval candidates never become resume claims.
+Each run is private under `.soloscale/resume-runs/<run-id>/` with ten inspectable artifacts,
+including a delivery-state receipt. `Local-only` performs
 no network call. `Hybrid` is intentionally only a provider interface in v0.1; it does not
 send local evidence or Candidate Profile data to any service.
 
 The local UI also writes an application-facing bundle to the configurable Resume Library
 Root, which defaults to `~/Documents/Resume Applications`. Each non-overwriting application
 directory keeps `JD.md`, the generated Markdown resume, and `application.json` together.
+The library root must remain outside the Git repository. Bundle publication is staged and
+atomic; `delivery.json` distinguishes internal-ready, pending, saved, and failed states.
 The complete internal evidence/graph/verification artifacts remain in `.soloscale`; the
 external library receives only the application-facing bundle. DOCX template export remains
-a separate manual step in v0.1.
+a separate manual step. The older Evidence-Agent-to-resume renderer is disabled because
+retrieval claims are evidence-discovery candidates, not operator-confirmed career facts.
 
 Create and route a task:
 

@@ -96,23 +96,6 @@ def _split_path_list(raw: str) -> list[str]:
     return [item.strip() for item in raw.replace("\n", ",").split(",") if item.strip()]
 
 
-def _normalize_for_resume(value: str, *, limit: int = 260) -> str:
-    text = (value or "").strip()
-    if len(text) <= limit:
-        return text
-    return f"{text[: limit - 1].rstrip()}…"
-
-
-def _extract_private_result_path(raw_stdout: str) -> Path | None:
-    prefix = "Private result: "
-    for line in raw_stdout.splitlines():
-        if line.startswith(prefix):
-            candidate = line[len(prefix) :].strip()
-            if candidate:
-                return Path(candidate).expanduser()
-    return None
-
-
 def _load_json_file(path: Path) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -123,182 +106,20 @@ def _load_json_file(path: Path) -> dict[str, object] | None:
     return payload
 
 
-def _build_resume_sections(payload: dict[str, object], *, job_title_hint: str | None) -> str:
-    claims = payload.get("claims", [])
-    refs = payload.get("refs", [])
-    unsupported = payload.get("unsupported", [])
-    open_questions = payload.get("open_questions", [])
-    if not isinstance(claims, list):
-        claims = []
-    if not isinstance(refs, list):
-        refs = []
-    if not isinstance(unsupported, list):
-        unsupported = []
-    if not isinstance(open_questions, list):
-        open_questions = []
-
-    refs_by_id = {}
-    for item in refs:
-        if isinstance(item, dict):
-            chunk_id = item.get("chunk_id")
-            if isinstance(chunk_id, str) and chunk_id:
-                refs_by_id[chunk_id] = item
-
-    title = (job_title_hint or "JD 简历草稿").strip() or "JD 简历草稿"
-    lines: list[str] = []
-    lines.append(f"# {title}")
-    lines.append("## 项目经历（可追溯）")
-
-    if claims:
-        for index, item in enumerate(claims, start=1):
-            text = str(item.get("text", "") if isinstance(item, dict) else "")
-            evidence_ids = [
-                str(evidence_id)
-                for evidence_id in (
-                    item.get("evidence_chunk_ids", []) if isinstance(item, dict) else []
-                )
-                if isinstance(evidence_id, str) and evidence_id.strip()
-            ]
-            lines.append(f"- 项目经历 {index}：{_normalize_for_resume(text)}")
-            if evidence_ids:
-                lines.append("  - 证据锚点：")
-                for evidence_id in evidence_ids:
-                    ref = refs_by_id.get(evidence_id, {})
-                    source_kind = str(ref.get("source_kind", "unknown"))
-                    title_text = _normalize_for_resume(str(ref.get("title", "") or ""), limit=80)
-                    tag = f"{source_kind}" + (f"｜{title_text}" if title_text else "")
-                    lines.append(f"    - {evidence_id}（{tag}）")
-                lines.append("  - 可追溯说明：")
-                for evidence_id in evidence_ids:
-                    ref = refs_by_id.get(evidence_id, {})
-                    excerpt = _normalize_for_resume(str(ref.get("excerpt", "") or ""), limit=220)
-                    external_id = str(ref.get("external_id", "") or "")
-                    prefix = " / ".join(
-                        part
-                        for part in [
-                            str(ref.get("title", "") or ""),
-                            external_id,
-                        ]
-                        if part
-                    )
-                    if prefix:
-                        lines.append(f"    - {evidence_id}（{prefix}）：{excerpt}")
-                    else:
-                        lines.append(f"    - {evidence_id}：{excerpt}")
-            else:
-                lines.append("  - 证据锚点：未命中（请重试）")
-    else:
-        lines.append("- 尚未生成候选经历，请增加 JD 关键词并重试。")
-
-    if unsupported:
-        lines.append("")
-        lines.append("## 未被证据覆盖 / 需人工补证")
-        for item in unsupported:
-            lines.append(f"- {_normalize_for_resume(str(item))}")
-
-    if open_questions:
-        lines.append("")
-        lines.append("## 待补充问题")
-        for item in open_questions:
-            lines.append(f"- {_normalize_for_resume(str(item))}")
-
-    lines.append("")
-    lines.append("## 说明")
-    lines.append(
-        "- 所有“项目经历”条目均来自当前本地证据并保留 chunk_id。\n"
-        "- 本次输出为本地草稿，建议人工改写为与你经历一致的表达。"
-    )
-    return "\n".join(lines).strip() + "\n"
-
-
-def _build_jd_resume_command(form: dict[str, str], data_root: Path) -> tuple[list[str], str | None]:
-    jd = form.get("job_description", "").strip()
-    if not jd:
-        return [], None
-
-    model = form.get("resume_model", "qwen3:8b").strip() or "qwen3:8b"
-    ollama_url = (
-        form.get("resume_ollama_url", "http://127.0.0.1:11434").strip() or "http://127.0.0.1:11434"
-    )
-    source_kind = form.get("resume_source_kind", "").strip()
-    raw_rounds = form.get("resume_max_rounds", "2").strip()
-    safe_rounds = max(1, min(3, int(raw_rounds) if raw_rounds.isdigit() else 2))
-
-    instruction = (
-        "请根据以下 JD，为个人 AI Engineer 简历输出结构化简历草稿：\n"
-        "1) 项目经历（1-6条）；\n"
-        "2) 每条都要关联 evidence chunk_id；\n"
-        "3) 每条给出一句可追溯说明。\n"
-        "4) 不允许发明未检索到的内容；缺证据请直说。"
-        "\n\nJD：\n"
-        f"{jd}"
-    )
-
-    command = [
-        "evidence-agent",
-        instruction,
-        "--data-root",
-        str(data_root),
-        "--model",
-        model,
-        "--ollama-url",
-        ollama_url,
-        "--max-rounds",
-        str(safe_rounds),
-    ]
-    if source_kind:
-        command += ["--source-kind", source_kind]
-    return command, jd
-
-
 def _run_jd_resume_draft(
     form: dict[str, str], data_root: Path, repo_root: Path
 ) -> UIActionResult | None:
-    command, prompt_hint = _build_jd_resume_command(form, data_root)
-    if not command:
-        return UIActionResult(
-            name="jd-resume-draft",
-            command="jd-resume-draft",
-            return_code=2,
-            stdout="",
-            stderr="JD 不能为空。",
-            elapsed_ms=0,
-        )
-
-    base = _run_command(command, repo_root)
-    if base.return_code != 0:
-        return base
-
-    result_path = _extract_private_result_path(base.stdout)
-    if result_path is None or not result_path.is_file():
-        return UIActionResult(
-            name="jd-resume-draft",
-            command=base.command,
-            return_code=1,
-            stdout=base.stdout,
-            stderr="未找到 evidence-agent 产出的 04_result.json，无法生成结构化简历。",
-            elapsed_ms=base.elapsed_ms,
-        )
-
-    payload = _load_json_file(result_path)
-    if payload is None:
-        return UIActionResult(
-            name="jd-resume-draft",
-            command=base.command,
-            return_code=1,
-            stdout=base.stdout,
-            stderr="无法解析 evidence-agent 的 JSON 结果。",
-            elapsed_ms=base.elapsed_ms,
-        )
-
-    structured = _build_resume_sections(payload, job_title_hint=prompt_hint)
+    del form, data_root, repo_root
     return UIActionResult(
         name="jd-resume-draft",
-        command=base.command,
-        return_code=0,
-        stdout=structured,
-        stderr="",
-        elapsed_ms=base.elapsed_ms,
+        command="jd-resume-draft",
+        return_code=2,
+        stdout="",
+        stderr=(
+            "该旧入口已停用：Evidence Agent 结果只能用于证据发现，不能直接生成简历事实。"
+            "请使用 Resume Intelligence Workspace，并显式提供 Candidate Profile。"
+        ),
+        elapsed_ms=0,
     )
 
 
@@ -317,7 +138,6 @@ def _candidate_profile_from_form(form: dict[str, str]) -> CandidateProfile:
 
 
 def _run_resume_workspace(form: dict[str, str], data_root: Path, repo_root: Path) -> UIActionResult:
-    del repo_root
     job_description = form.get("job_description", "").strip()
     if not job_description:
         return UIActionResult("resume-workspace", "resume-workspace", 2, "", "JD 不能为空。", 0)
@@ -346,7 +166,7 @@ def _run_resume_workspace(form: dict[str, str], data_root: Path, repo_root: Path
         library_root = (
             Path(library_value or Path.home() / "Documents" / "Resume Applications")
             .expanduser()
-            .resolve()
+            .absolute()
         )
         store = KnowledgeStore(data_root)
         requirements = form.get("job_description", "").splitlines()
@@ -365,6 +185,7 @@ def _run_resume_workspace(form: dict[str, str], data_root: Path, repo_root: Path
             job_title=form.get("job_title", "").strip() or None,
             job_id=form.get("job_id", "").strip() or None,
             application_library_root=library_root,
+            repository_root=repo_root,
             mode=mode,
         )
     except (KnowledgeStoreError, OSError, ValueError) as exc:
@@ -532,10 +353,11 @@ def _resume_workspace_result(raw_stdout: str) -> str:
         or "- None"
     )
     summary = (
-        f"Requirements: {coverage.get('total', 0)} · strong: {coverage.get('strong', 0)} · "
-        f"partial: {coverage.get('partial', 0)} · unsupported: {coverage.get('unsupported', 0)} · "
-        "critical covered: "
-        f"{coverage.get('critical_covered', 0)}/{coverage.get('critical_total', 0)}"
+        f"Requirements: {coverage.get('total', 0)} · strong lexical candidates: "
+        f"{coverage.get('lexical_candidate_strong', 0)} · partial lexical candidates: "
+        f"{coverage.get('lexical_candidate_partial', 0)} · no lexical candidate: "
+        f"{coverage.get('no_lexical_candidate', 0)} · critical with candidate: "
+        f"{coverage.get('critical_with_candidate', 0)}/{coverage.get('critical_total', 0)}"
     )
     return f"""<section class=\"graph-card\"><h3>One-page resume preview</h3>
 <pre class=\"success\">{_escape(resume)}</pre><h3>Coverage</h3><p>{_escape(summary)}</p>
@@ -650,10 +472,6 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
     ollama_url = _escape(form.get("ollama_url", "http://127.0.0.1:11434"))
     agent_source_kind = form.get("agent_source_kind", "")
     resume_job_description = _escape(form.get("job_description", ""))
-    resume_model = _escape(form.get("resume_model", "qwen3:8b"))
-    resume_ollama_url = _escape(form.get("resume_ollama_url", "http://127.0.0.1:11434"))
-    resume_source_kind = form.get("resume_source_kind", "")
-    resume_max_rounds = _escape(form.get("resume_max_rounds", "2"))
     candidate_name = _escape(form.get("candidate_name", ""))
     candidate_headline = _escape(form.get("candidate_headline", ""))
     candidate_summary = _escape(form.get("candidate_summary", ""))
@@ -828,42 +646,11 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
     </section>
 
     <section class="card full">
-      <h2>6）JD 简历草稿（结构化，可追溯）</h2>
-      <form method="post" action="/run">
-        <input type="hidden" name="action" value="jd-resume-draft" />
-        <label>
-          Job Description
-          <textarea name="job_description" rows="8">{resume_job_description}</textarea>
-        </label>
-        <label>
-          Model
-          <input name="resume_model" value="{resume_model}" />
-        </label>
-        <label>
-          Ollama URL
-          <input name="resume_ollama_url" value="{resume_ollama_url}" />
-        </label>
-        <label>
-          每次检索轮次（1-3）
-          <input name="resume_max_rounds" value="{resume_max_rounds}" />
-        </label>
-        <label>
-          Source kind（可选）
-          <select name="resume_source_kind">
-            <option value="" {"selected" if resume_source_kind == "" else ""}></option>
-            <option value="codex_session"
-              {"selected" if resume_source_kind == "codex_session" else ""}
-            >codex_session</option>
-            <option value="buildlog_run"
-              {"selected" if resume_source_kind == "buildlog_run" else ""}
-            >buildlog_run</option>
-            <option value="chatgpt_conversation"
-              {"selected" if resume_source_kind == "chatgpt_conversation" else ""}
-            >chatgpt_conversation</option>
-          </select>
-        </label>
-        <button type="submit">生成 JD 简历草稿</button>
-      </form>
+      <h2>6）Evidence discovery（旧 JD 简历入口已停用）</h2>
+      <p class="muted">
+        Evidence Agent 的 claims 只能作为待人工核验的证据发现结果，不能直接变成简历事实。
+        请使用下方 Resume Intelligence Workspace，并显式提供 Candidate Profile。
+      </p>
     </section>
 
     <section class="card full">

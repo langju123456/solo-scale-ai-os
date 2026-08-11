@@ -9,7 +9,8 @@ controlling JD together.
 
 ## Decision
 
-Preserve the nine internal run artifacts unchanged and add one optional, explicitly scoped
+Preserve the internal evidence artifacts and add one delivery-state receipt plus an optional,
+explicitly scoped
 application-library sink. The local UI enables it by default at
 `~/Documents/Resume Applications`; direct Python callers must opt in with
 `application_library_root`.
@@ -20,15 +21,20 @@ The external bundle contains only:
 - the generated Markdown resume; and
 - `application.json` with job identity, source, run ID, and review status.
 
-Repeated runs never overwrite an existing application directory. The first run uses the
+The library must be outside the Git repository in the UI workflow. Repeated runs never
+overwrite an existing application directory. The first run uses the
 human-readable date/company/role/job-ID name; a later collision receives the unique
-SoloScale run ID suffix. Internal and external directories remain private on POSIX systems.
+SoloScale run ID suffix. Files are built in a private staging directory and published by
+rename. Managed roots reject symlinks and wrong types, existing roots are tightened to
+private POSIX modes, and `delivery.json` records pending, saved, or failed state.
 
 ## Boundary
 
 This change does not generate DOCX, call a network service, apply to a job, publish data,
 or copy Conversation RAG evidence bodies into the application library. The DOCX template
-workflow remains separately human-reviewed.
+workflow remains separately human-reviewed. Resume facts come only from the operator's
+Candidate Profile. Retrieval matches are lineage-backed lexical candidates, not semantic
+coverage verification. The older Evidence-Agent-to-resume renderer is disabled.
 
 ## Verification
 

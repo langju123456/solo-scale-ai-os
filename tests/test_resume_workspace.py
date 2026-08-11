@@ -6,7 +6,7 @@ import pytest
 
 from soloscale.knowledge_models import ContentRole, RetrievalHit, SourceKind
 from soloscale.resume_models import CandidateProfile, JobResearchSource, ResumeMode, ResumeRun
-from soloscale.resume_workspace import run_resume_workspace
+from soloscale.resume_workspace import ResumeWorkspaceStorageError, run_resume_workspace
 
 AI_ENGINEER_JD = """AI Engineer
 - Required: Python and RAG systems
@@ -37,7 +37,7 @@ def _hits() -> list[RetrievalHit]:
     return [_hit("chunk-rag", "Python RAG evidence"), _hit("chunk-ci", "Docker CI/CD verification")]
 
 
-def test_local_workspace_writes_nine_private_artifacts_and_valid_graph(tmp_path: Path) -> None:
+def test_local_workspace_writes_private_artifacts_and_replayable_lineage(tmp_path: Path) -> None:
     run = run_resume_workspace(
         data_root=tmp_path / ".soloscale",
         job_description=AI_ENGINEER_JD,
@@ -59,6 +59,7 @@ def test_local_workspace_writes_nine_private_artifacts_and_valid_graph(tmp_path:
         "05_gaps.json",
         "06_graph.json",
         "07_verification.json",
+        "delivery.json",
         "run.json",
     }
     assert {path.name for path in run_dir.iterdir()} == expected
@@ -70,9 +71,19 @@ def test_local_workspace_writes_nine_private_artifacts_and_valid_graph(tmp_path:
     assert not ({"PROJECT", "CODE", "VERIFICATION"} & {node["kind"] for node in graph["nodes"]})
     assert all({"source", "target", "relation"} <= set(edge) for edge in graph["edges"])
     verification = json.loads((run_dir / "07_verification.json").read_text(encoding="utf-8"))
-    assert verification["all_evidence_ids_exist"] is True
-    assert verification["personal_bullets_supported"] is True
+    assert verification["candidate_lineage_replayable"] is True
+    assert verification["resume_claims_reference_profile_entries"] is True
+    assert verification["semantic_requirement_coverage_verified"] is False
     assert verification["coverage"]["total"] == 4
+    matches = json.loads((run_dir / "03_evidence_matches.json").read_text(encoding="utf-8"))
+    locator = matches[0]["locator"]
+    assert locator["document_id"] == "doc-1"
+    assert locator["source_kind"] == "codex_session"
+    assert locator["external_id"] == "thread-1"
+    assert locator["source_locator"] == "private"
+    assert locator["chunk_sha256"] == "a" * 64
+    assert locator["document_sha256"] == "b" * 64
+    assert matches[0]["match_quality"].startswith("lexical_candidate_")
 
 
 def test_profile_and_evidence_truth_boundary_and_repeat_runs(tmp_path: Path) -> None:
@@ -97,7 +108,7 @@ def test_profile_and_evidence_truth_boundary_and_repeat_runs(tmp_path: Path) -> 
     )
     assert "Only operator supplied this experience." in first_resume
     assert "Python RAG evidence" not in first_resume
-    assert "evidence_ids: PROFILE-01" in first_resume
+    assert "profile_entry_ids: PROFILE-01" in first_resume
     assert not (root / "resume-runs" / first.run_id / "04_resume.md").samefile(
         root / "resume-runs" / second.run_id / "04_resume.md"
     )
@@ -207,7 +218,117 @@ def test_critical_generic_requirement_remains_gap_and_profile_ids_are_determinis
     )
     run_dir = tmp_path / ".soloscale" / "resume-runs" / run.run_id
     verification = json.loads((run_dir / "07_verification.json").read_text(encoding="utf-8"))
-    assert verification["coverage"]["unsupported"] == 1
+    assert verification["coverage"]["no_lexical_candidate"] == 1
     resume = (run_dir / "04_resume.md").read_text(encoding="utf-8")
     assert "Led a local club." in resume
-    assert "evidence_ids: PROFILE-01" in resume
+    assert "profile_entry_ids: PROFILE-01" in resume
+
+
+def test_rejects_managed_symlink_and_tightens_existing_private_roots(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    data_root = tmp_path / ".soloscale"
+    data_root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ResumeWorkspaceStorageError, match="symlink"):
+        run_resume_workspace(
+            data_root=data_root,
+            job_description="Required: Python",
+            candidate_profile=CandidateProfile(),
+            evidence_hits=[],
+        )
+    assert list(outside.iterdir()) == []
+
+    data_root.unlink()
+    data_root.mkdir(mode=0o755)
+    library_root = tmp_path / "Resume Applications"
+    library_root.mkdir(mode=0o755)
+    run_resume_workspace(
+        data_root=data_root,
+        job_description="Required: Python",
+        candidate_profile=CandidateProfile(),
+        evidence_hits=[],
+        application_library_root=library_root,
+    )
+    assert stat.S_IMODE(data_root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(library_root.stat().st_mode) == 0o700
+
+
+def test_external_failure_keeps_recovery_receipt_and_no_partial_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from soloscale import resume_workspace
+
+    original = resume_workspace._atomic_private_write
+
+    def fail_resume_file(path: Path, text: str) -> None:
+        if path.parent.name.endswith(".staging") and path.name.startswith("Resume_"):
+            raise OSError("private detail must not escape")
+        original(path, text)
+
+    monkeypatch.setattr(resume_workspace, "_atomic_private_write", fail_resume_file)
+    data_root = tmp_path / ".soloscale"
+    library_root = tmp_path / "Resume Applications"
+    with pytest.raises(ResumeWorkspaceStorageError, match="inspect delivery.json"):
+        run_resume_workspace(
+            data_root=data_root,
+            job_description="Required: Python",
+            candidate_profile=CandidateProfile(full_name="Candidate"),
+            evidence_hits=[],
+            application_library_root=library_root,
+        )
+
+    run_dir = next((data_root / "resume-runs").iterdir())
+    delivery = json.loads((run_dir / "delivery.json").read_text(encoding="utf-8"))
+    assert delivery["state"] == "APPLICATION_LIBRARY_FAILED"
+    assert delivery["error_type"] == "OSError"
+    assert delivery["retry_safe"] is False
+    assert not (run_dir / "run.json").exists()
+    assert list((library_root / "applications").iterdir()) == []
+
+
+def test_final_internal_failure_leaves_saved_delivery_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from soloscale import resume_workspace
+
+    original = resume_workspace._write_json
+
+    def fail_run_json(path: Path, value: object) -> None:
+        if path.name == "run.json":
+            raise OSError("simulated final receipt failure")
+        original(path, value)
+
+    monkeypatch.setattr(resume_workspace, "_write_json", fail_run_json)
+    data_root = tmp_path / ".soloscale"
+    library_root = tmp_path / "Resume Applications"
+    with pytest.raises(OSError, match="simulated final receipt failure"):
+        run_resume_workspace(
+            data_root=data_root,
+            job_description="Required: Python",
+            candidate_profile=CandidateProfile(full_name="Candidate"),
+            evidence_hits=[],
+            application_library_root=library_root,
+        )
+
+    run_dir = next((data_root / "resume-runs").iterdir())
+    delivery = json.loads((run_dir / "delivery.json").read_text(encoding="utf-8"))
+    assert delivery["state"] == "APPLICATION_LIBRARY_SAVED"
+    assert Path(delivery["application_library_path"]).is_dir()
+    assert not (run_dir / "run.json").exists()
+
+
+def test_rejects_application_library_inside_repository_before_writing(tmp_path: Path) -> None:
+    repository_root = tmp_path / "repo"
+    repository_root.mkdir()
+    data_root = repository_root / ".soloscale"
+    with pytest.raises(ValueError, match="outside every Git repository"):
+        run_resume_workspace(
+            data_root=data_root,
+            job_description="Required: Python",
+            candidate_profile=CandidateProfile(),
+            evidence_hits=[],
+            application_library_root=repository_root / "resume-data",
+            repository_root=repository_root,
+        )
+    assert not data_root.exists()

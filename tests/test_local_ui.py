@@ -6,8 +6,6 @@ import pytest
 from soloscale.knowledge_models import ContentRole, RetrievalHit, SourceKind
 from soloscale.local_ui import (
     UIActionResult,
-    _build_jd_resume_command,
-    _build_resume_sections,
     _page,
     _result_card,
     _resume_graph,
@@ -42,63 +40,6 @@ def test_run_action_knowledge_status_builds_expected_command(
     assert result is not None
     assert result.return_code == 0
     assert calls == [["knowledge-status", "--data-root", ".soloscale"]]
-
-
-def test_build_resume_sections_with_claims_and_refs() -> None:
-    payload = {
-        "claims": [
-            {
-                "text": "实现了基于 evidence 的结构化输出链路。",
-                "evidence_chunk_ids": ["c1", "c2"],
-            },
-            {
-                "text": "补齐了工程恢复流程。",
-                "evidence_chunk_ids": ["c2"],
-            },
-        ],
-        "refs": [
-            {
-                "chunk_id": "c1",
-                "title": "Run 2026 evidence",
-                "source_kind": "chatgpt_conversation",
-                "external_id": "ext-1",
-                "excerpt": "run evidence excerpt",
-            },
-            {
-                "chunk_id": "c2",
-                "title": "BuildLog log",
-                "source_kind": "buildlog_run",
-                "external_id": "ext-2",
-                "excerpt": "another evidence snippet",
-            },
-        ],
-        "unsupported": ["缺失真实证据字段说明"],
-        "open_questions": ["需要确认产品规模化指标"],
-    }
-    output = _build_resume_sections(payload, job_title_hint="AI Engineer JD")
-
-    assert "# AI Engineer JD" in output
-    assert "项目经历 1" in output
-    assert "证据锚点" in output
-    assert "c1（chatgpt_conversation｜Run 2026 evidence）" in output
-    assert "未被证据覆盖 / 需人工补证" in output
-    assert "待补充问题" in output
-
-
-def test_build_jd_resume_command_requires_jd() -> None:
-    command, prompt = _build_jd_resume_command({"job_description": ""}, Path(".soloscale"))
-    assert command == []
-    assert prompt is None
-
-
-def test_build_jd_resume_command_uses_expected_defaults() -> None:
-    command, prompt = _build_jd_resume_command(
-        {"job_description": "AI 工程师", "resume_max_rounds": "2"},
-        Path(".soloscale"),
-    )
-    assert prompt == "AI 工程师"
-    assert command[0] == "evidence-agent"
-    assert "--max-rounds" in command
 
 
 def test_resume_graph_renders_clickable_native_svg(tmp_path: Path) -> None:
@@ -185,7 +126,7 @@ def test_resume_workspace_is_local_only_and_renders_preview(
             "resume_library_root": str(tmp_path / "Resume Applications"),
         },
         tmp_path / ".soloscale",
-        tmp_path,
+        tmp_path / "repo",
     )
     assert result is not None and result.return_code == 0
     page = _result_card(result)
@@ -199,3 +140,48 @@ def test_resume_workspace_is_local_only_and_renders_preview(
     assert len(application_dirs) == 1
     assert (application_dirs[0] / "JD.md").is_file()
     assert (application_dirs[0] / "application.json").is_file()
+
+
+def test_old_jd_resume_action_is_disabled_and_not_rendered(tmp_path: Path) -> None:
+    result = _run_action(
+        {"action": "jd-resume-draft", "job_description": "Required: Python"},
+        tmp_path / ".soloscale",
+        tmp_path,
+    )
+    assert result is not None
+    assert result.return_code == 2
+    assert "Evidence Agent" in result.stderr
+    page = _page(None, tmp_path / ".soloscale", {})
+    assert 'name="action" value="jd-resume-draft"' not in page
+    assert "Evidence discovery（旧 JD 简历入口已停用）" in page
+
+
+def test_resume_workspace_rejects_symlinked_application_library(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class FakeStore:
+        def __init__(self, root: Path) -> None:
+            del root
+
+        def search(self, query: str, limit: int) -> list[RetrievalHit]:
+            del query, limit
+            return []
+
+    monkeypatch.setattr("soloscale.local_ui.KnowledgeStore", FakeStore)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    library = tmp_path / "Resume Applications"
+    library.symlink_to(outside, target_is_directory=True)
+    result = _run_action(
+        {
+            "action": "resume-workspace",
+            "job_description": "Required: Python",
+            "resume_library_root": str(library),
+        },
+        tmp_path / ".soloscale",
+        tmp_path / "repo",
+    )
+    assert result is not None
+    assert result.return_code == 1
+    assert result.stderr == "application library save failed; inspect delivery.json"
+    assert list(outside.iterdir()) == []
