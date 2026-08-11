@@ -1,4 +1,5 @@
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -254,6 +255,48 @@ def test_rejects_managed_symlink_and_tightens_existing_private_roots(tmp_path: P
     assert stat.S_IMODE(library_root.stat().st_mode) == 0o700
 
 
+def test_rejects_symlink_in_managed_root_ancestry(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ResumeWorkspaceStorageError, match="ancestry"):
+        run_resume_workspace(
+            data_root=linked_parent / ".soloscale",
+            job_description="Required: Python",
+            candidate_profile=CandidateProfile(),
+            evidence_hits=[],
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_post_replace_fsync_failure_preserves_final_resume_artifact(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from soloscale import resume_workspace
+
+    target = tmp_path / "receipt.json"
+    target.write_text("old", encoding="utf-8")
+    original_fsync = os.fsync
+    calls = 0
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated directory durability failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="durability"):
+        resume_workspace._atomic_private_write(target, "new")
+
+    assert target.read_text(encoding="utf-8") == "new"
+
+
 def test_external_failure_keeps_recovery_receipt_and_no_partial_bundle(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -285,6 +328,60 @@ def test_external_failure_keeps_recovery_receipt_and_no_partial_bundle(
     assert delivery["retry_safe"] is False
     assert not (run_dir / "run.json").exists()
     assert list((library_root / "applications").iterdir()) == []
+
+
+def test_post_rename_fsync_failure_records_published_uncertain_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    library_root = tmp_path / "Resume Applications"
+    applications_root = library_root / "applications"
+    original_open = os.open
+    original_fsync = os.fsync
+    applications_root_descriptors: set[int] = set()
+
+    def track_applications_root(
+        path: Path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if dir_fd is None:
+            descriptor = original_open(path, flags, mode)
+        else:
+            descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if Path(os.fsdecode(path)) == applications_root:
+            applications_root_descriptors.add(descriptor)
+        return descriptor
+
+    def fail_applications_root_fsync(descriptor: int) -> None:
+        if descriptor in applications_root_descriptors:
+            applications_root_descriptors.remove(descriptor)
+            raise OSError("simulated published bundle durability failure")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "open", track_applications_root)
+    monkeypatch.setattr(os, "fsync", fail_applications_root_fsync)
+
+    with pytest.raises(ResumeWorkspaceStorageError, match="published with uncertain durability"):
+        run_resume_workspace(
+            data_root=data_root,
+            job_description="Required: Python",
+            candidate_profile=CandidateProfile(full_name="Candidate"),
+            evidence_hits=[],
+            application_library_root=library_root,
+        )
+
+    run_dir = next((data_root / "resume-runs").iterdir())
+    delivery = json.loads((run_dir / "delivery.json").read_text(encoding="utf-8"))
+    published_path = Path(delivery["application_library_path"])
+    assert delivery["state"] == "APPLICATION_LIBRARY_PUBLISHED_DURABILITY_UNCERTAIN"
+    assert delivery["error_type"] == "OSError"
+    assert delivery["retry_safe"] is False
+    assert published_path.is_dir()
+    assert published_path.parent == applications_root
+    assert not (run_dir / "run.json").exists()
 
 
 def test_final_internal_failure_leaves_saved_delivery_receipt(

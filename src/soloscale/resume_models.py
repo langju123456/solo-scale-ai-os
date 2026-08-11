@@ -150,6 +150,7 @@ class ResumeDeliveryReceipt(ContractModel):
         "INTERNAL_READY",
         "APPLICATION_LIBRARY_PENDING",
         "APPLICATION_LIBRARY_SAVED",
+        "APPLICATION_LIBRARY_PUBLISHED_DURABILITY_UNCERTAIN",
         "APPLICATION_LIBRARY_FAILED",
     ]
     application_library_path: str | None = None

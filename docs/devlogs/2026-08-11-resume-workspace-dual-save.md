@@ -25,8 +25,9 @@ The library must be outside the Git repository in the UI workflow. Repeated runs
 overwrite an existing application directory. The first run uses the
 human-readable date/company/role/job-ID name; a later collision receives the unique
 SoloScale run ID suffix. Files are built in a private staging directory and published by
-rename. Managed roots reject symlinks and wrong types, existing roots are tightened to
-private POSIX modes, and `delivery.json` records pending, saved, or failed state.
+rename. Managed roots reject symlinks throughout their lexical ancestry and wrong types,
+existing roots are tightened to private POSIX modes, and `delivery.json` records pending,
+saved, published-but-durability-uncertain, or failed state with an exact published path.
 
 ## Boundary
 

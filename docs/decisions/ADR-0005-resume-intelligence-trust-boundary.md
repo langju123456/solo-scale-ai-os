@@ -22,9 +22,11 @@ private SoloScale run.
 5. An optional application bundle is built in a private staging directory and published by
    rename without overwriting an existing application directory.
 6. `delivery.json` records `INTERNAL_READY`, `APPLICATION_LIBRARY_PENDING`,
-   `APPLICATION_LIBRARY_SAVED`, or `APPLICATION_LIBRARY_FAILED`. It remains the recovery
-   receipt if final `run.json` cannot be written.
-7. UI-triggered application libraries must be outside the Git repository.
+   `APPLICATION_LIBRARY_SAVED`, `APPLICATION_LIBRARY_PUBLISHED_DURABILITY_UNCERTAIN`, or
+   `APPLICATION_LIBRARY_FAILED`. The uncertain state includes the exact published path. The
+   receipt remains available if final `run.json` cannot be written.
+7. Managed roots reject symlinks throughout their lexical ancestry. UI-triggered
+   application libraries must also be outside the Git repository.
 8. No output automatically updates Casebook, BuildLog, a job application, deployment, or a
    publishing surface.
 

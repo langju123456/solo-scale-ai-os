@@ -269,9 +269,22 @@ class ResumeWorkspaceStorageError(OSError):
     """Raised when a private Resume Workspace path cannot be handled safely."""
 
 
+class ApplicationBundleDurabilityError(ResumeWorkspaceStorageError):
+    """Raised after bundle publication when directory durability is uncertain."""
+
+    def __init__(self, application_dir: Path) -> None:
+        super().__init__("application bundle was published but directory durability is uncertain")
+        self.application_dir = application_dir
+
+
+def _reject_symlink_ancestry(path: Path) -> None:
+    absolute = path.expanduser().absolute()
+    if any(candidate.is_symlink() for candidate in (absolute, *absolute.parents)):
+        raise ResumeWorkspaceStorageError("private workspace ancestry cannot contain a symlink")
+
+
 def _ensure_private_directory(path: Path, *, parents: bool = False) -> None:
-    if path.is_symlink():
-        raise ResumeWorkspaceStorageError("private workspace path cannot be a symlink")
+    _reject_symlink_ancestry(path)
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -294,7 +307,6 @@ def _atomic_private_write(path: Path, text: str) -> None:
             raise ResumeWorkspaceStorageError("private artifact must be a regular file")
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}-", dir=path.parent)
     temporary_path = Path(temporary_name)
-    replaced = False
     try:
         os.fchmod(descriptor, _FILE_MODE)
         data = text.encode("utf-8")
@@ -308,19 +320,11 @@ def _atomic_private_write(path: Path, text: str) -> None:
         os.close(descriptor)
         descriptor = -1
         os.replace(temporary_path, path)
-        replaced = True
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-    except BaseException:
-        if replaced:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -421,6 +425,7 @@ def _application_bundle(
     if company_url:
         jd_lines.append(f"- Source: <{company_url}>")
     jd_lines += [f"- SoloScale run: `{run_id}`", "", "## Job Description", "", job_description, ""]
+    published = False
     try:
         _atomic_private_write(staging_dir / "JD.md", "\n".join(jd_lines))
         _atomic_private_write(staging_dir / resume_filename, resume_markdown)
@@ -438,15 +443,19 @@ def _application_bundle(
         }
         _write_json(staging_dir / "application.json", metadata)
         os.rename(staging_dir, application_dir)
+        published = True
         directory_fd = os.open(applications_root, os.O_RDONLY)
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
-    except BaseException:
-        if staging_dir.exists() and not staging_dir.is_symlink():
-            shutil.rmtree(staging_dir)
+    except BaseException as exc:
+        if published and isinstance(exc, OSError):
+            raise ApplicationBundleDurabilityError(application_dir) from exc
         raise
+    finally:
+        if not published and staging_dir.exists() and not staging_dir.is_symlink():
+            shutil.rmtree(staging_dir)
     return application_dir
 
 
@@ -632,6 +641,20 @@ def run_resume_workspace(
                 job_title=job_title,
                 job_id=job_id,
             )
+        except ApplicationBundleDurabilityError as exc:
+            _write_json(
+                delivery_path,
+                ResumeDeliveryReceipt(
+                    run_id=run_id,
+                    state="APPLICATION_LIBRARY_PUBLISHED_DURABILITY_UNCERTAIN",
+                    application_library_path=str(exc.application_dir),
+                    error_type=type(exc.__cause__).__name__ if exc.__cause__ else type(exc).__name__,
+                    retry_safe=False,
+                ).model_dump(mode="json"),
+            )
+            raise ResumeWorkspaceStorageError(
+                "application library published with uncertain durability; inspect delivery.json"
+            ) from None
         except OSError as exc:
             _write_json(
                 delivery_path,

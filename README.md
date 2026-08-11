@@ -147,7 +147,9 @@ The local UI also writes an application-facing bundle to the configurable Resume
 Root, which defaults to `~/Documents/Resume Applications`. Each non-overwriting application
 directory keeps `JD.md`, the generated Markdown resume, and `application.json` together.
 The library root must remain outside the Git repository. Bundle publication is staged and
-atomic; `delivery.json` distinguishes internal-ready, pending, saved, and failed states.
+atomic; `delivery.json` distinguishes internal-ready, pending, saved,
+published-but-durability-uncertain, and failed states. Managed roots reject symlinks in
+their lexical ancestry rather than silently following them.
 The complete internal evidence/graph/verification artifacts remain in `.soloscale`; the
 external library receives only the application-facing bundle. DOCX template export remains
 a separate manual step. The older Evidence-Agent-to-resume renderer is disabled because
