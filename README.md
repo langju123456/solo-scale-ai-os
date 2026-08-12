@@ -149,7 +149,9 @@ Open `http://127.0.0.1:8765/content` for Content Studio. Supply concise verified
 observed claims with receipts, plus any explicitly labeled hypotheses and planned work.
 One deterministic local run produces previewable LinkedIn, X Thread, and short-video
 script/storyboard candidates under `.soloscale/content-runs/`. The page supports copy and
-bounded downloads, but it does not call a model, connect a social account, or publish.
+bounded downloads. The optional Creator Video Factory renders the saved storyboard into a
+local MP4 using Remotion and the installed browser; it does not call a model, connect a
+social account, upload, or publish.
 
 ### Resume Intelligence Workspace v0.1
 

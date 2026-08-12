@@ -11,6 +11,7 @@ from soloscale.content_workspace import (
     parse_claim_ledger,
     run_content_workspace,
 )
+from soloscale.video_factory import creator_video_ready, render_creator_video
 
 
 def _brief() -> ContentBrief:
@@ -149,3 +150,39 @@ def test_content_download_rejects_unknown_names_and_symlinks(tmp_path: Path) -> 
     original.symlink_to(outside)
     with pytest.raises(ContentWorkspaceError, match="unsafe"):
         content_download(data_root, run.run_id, "linkedin.md")
+
+
+def test_creator_video_render_uses_only_saved_storyboard_and_is_non_overwriting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    run = run_content_workspace(data_root=data_root, brief=_brief())
+    repository_root = tmp_path / "repo"
+    renderer = repository_root / "video_factory" / "render.mjs"
+    renderer.parent.mkdir(parents=True)
+    renderer.write_text("// test renderer", encoding="utf-8")
+
+    def fake_run(command: list[str], **_: object) -> object:
+        output = Path(command[-1])
+        output.write_bytes(b"mp4")
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr("soloscale.video_factory.subprocess.run", fake_run)
+    output = render_creator_video(
+        data_root=data_root, run_id=run.run_id, repository_root=repository_root
+    )
+
+    assert output.name == "10_creator_video.mp4"
+    assert creator_video_ready(data_root, run.run_id) is True
+    input_payload = json.loads((output.parent / "09_creator_video_input.json").read_text())
+    assert input_payload["scenes"][0]["claim_ids"] == ["CLAIM-01"]
+    assert (output.parent / "11_creator_video_render.json").is_file()
+    with pytest.raises(ValueError, match="already has"):
+        render_creator_video(
+            data_root=data_root,
+            run_id=run.run_id,
+            repository_root=repository_root,
+        )
+    artifact_name, artifact = content_download(data_root, run.run_id, "creator-video.mp4")
+    assert artifact_name == output.name
+    assert artifact == b"mp4"

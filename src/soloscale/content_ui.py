@@ -15,6 +15,7 @@ from soloscale.content_workspace import (
     parse_claim_ledger,
     run_content_workspace,
 )
+from soloscale.video_factory import creator_video_ready
 
 
 @dataclass(frozen=True)
@@ -132,7 +133,7 @@ def _form_from_run(run: ContentRun) -> dict[str, str]:
     }
 
 
-def _result_html(run: ContentRun) -> str:
+def _result_html(run: ContentRun, *, video_ready: bool) -> str:
     run_id = _escape(run.run_id)
     linkedin = _escape(run.drafts.linkedin)
     x_posts = "".join(
@@ -154,6 +155,18 @@ def _result_html(run: ContentRun) -> str:
         ("视频脚本", "video-script.md"),
         ("Storyboard", "storyboard.json"),
         ("Publish Pack", "publish-pack.json"),
+    )
+    video_download = f"/content/downloads/{run_id}/creator-video.mp4"
+    video_action = (
+        f'''<video class="creator-video" controls preload="metadata">
+          <source src="{video_download}" type="video/mp4" />
+        </video>
+        <a class="text-link" href="{video_download}" download>下载 MP4</a>'''
+        if video_ready
+        else f'''<form method="post" action="/content/render/{run_id}" class="render-form">
+          <button class="primary" type="submit">生成 MP4 视频</button>
+          <small>本机 Remotion 渲染；只使用本次 storyboard，不会发布。</small>
+        </form>'''
     )
     download_links = "".join(
         f'<a href="/content/downloads/{run_id}/{name}" download>{label}</a>'
@@ -186,6 +199,7 @@ def _result_html(run: ContentRun) -> str:
             download>下载脚本</a>
         </div>
         <div class="storyboard">{scenes}</div>
+        <div class="creator-video-result">{video_action}</div>
       </div>
       <p class="review-note">SoloScale 没有连接或操作你的社交账号，也没有自动发布。</p>
     </section>"""
@@ -216,10 +230,14 @@ def content_page(
     error_html = (
         f'<div class="error" role="alert">{_escape(error)}</div>' if error else ""
     )
-    result_html = _result_html(run) if run is not None else """<section class="empty">
+    result_html = (
+        _result_html(run, video_ready=creator_video_ready(data_root, run.run_id))
+        if run is not None
+        else """<section class="empty">
       <span class="kicker">Preview</span><h2>今天要发的内容，会直接在这里预览</h2>
       <p>你只提供可确认的事实和边界；SoloScale 负责排成 LinkedIn、X 和短视频版本。</p>
     </section>"""
+    )
     language = values.get("language", "English")
     return f"""<!doctype html>
 <html lang="zh-CN">

@@ -49,6 +49,7 @@ from soloscale.resume_workspace import (
 from soloscale.resume_workspace import (
     run_resume_workspace as execute_resume_workspace,
 )
+from soloscale.video_factory import CreatorVideoError, render_creator_video
 
 COMMAND_TIMEOUT_SECONDS = 120
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
@@ -2484,7 +2485,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             content_type = (
                 "application/json"
                 if filename.endswith(".json")
-                else "text/markdown; charset=utf-8"
+                else "video/mp4" if filename.endswith(".mp4") else "text/markdown; charset=utf-8"
             )
             self.send_response(200)
             self.send_header("Content-Type", content_type)
@@ -2538,6 +2539,24 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 + urllib.parse.urlencode({"run_id": content_result.run_id})
                 + "#results",
             )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        content_render_match = re.fullmatch(r"/content/render/(content-[^/]+)", path)
+        if content_render_match is not None:
+            run_id = content_render_match.group(1)
+            try:
+                render_creator_video(
+                    data_root=self.ui_data_root.absolute(),
+                    run_id=run_id,
+                    repository_root=self.repo_root,
+                )
+            except (ContentWorkspaceError, CreatorVideoError, OSError, subprocess.TimeoutExpired):
+                self.send_error(422, "Creator Video render failed")
+                return
+            self.send_response(303)
+            location = "/content?" + urllib.parse.urlencode({"run_id": run_id}) + "#results"
+            self.send_header("Location", location)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return

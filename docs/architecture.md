@@ -129,6 +129,7 @@ flowchart LR
     L --> P[Private content run]
     X --> P
     S --> P
+    P --> R[Optional local Remotion MP4]
     P --> H{Human fact-check and publish approval}
     H --> B[BuildLog or approved publishing surface]
 ```
@@ -138,6 +139,11 @@ classification. Draft blocks preserve claim IDs, while private absolute paths an
 credential shapes fail before persistence. The deterministic local slice performs no
 model, network, account, or publish action. Receipt membership does not prove semantic
 support or public suitability, so the human gate remains mandatory.
+
+The optional Creator Video Factory reads only saved storyboard scene fields and writes a
+non-overwriting local MP4 plus a render receipt beside the private Content run. It uses
+Remotion with one local browser-rendering process; it does not synthesize narration, fetch
+assets, upload video, or change external publishing state.
 
 Retrieved text is untrusted. Code limits its possible effects to bounded local search and
 verifies that each declared claim cites an in-context chunk from the same run. Prompt

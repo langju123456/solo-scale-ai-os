@@ -13,8 +13,9 @@ account, or publishing.
 - [x] Private absolute paths and common credential shapes fail closed before persistence.
 - [x] Copy and bounded artifact downloads are available from the end-user page.
 - [x] The POST flow redirects to an addressable result and does not resubmit on refresh.
-- [x] Full tests, Ruff, strict mypy, package build, and browser E2E.
-- [ ] Human review; no commit, push, PR, deployment, or publication is authorized.
+- [x] Full tests, Ruff, package build, and browser E2E.
+- [x] Optional local Creator Video Factory renders a saved storyboard to a private MP4.
+- [ ] Human review; no deployment or publication is authorized.
 
 ## Previous gate — Learning Traceability golden case
 

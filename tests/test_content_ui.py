@@ -54,6 +54,8 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     assert result.run_id in page
     assert _form()["topic"] in page
     assert _form()["verified_claims"] in page
+    assert f'action="/content/render/{result.run_id}"' in page
+    assert "生成 MP4 视频" in page
 
 
 def test_content_form_keeps_errors_user_facing_and_writes_nothing(tmp_path: Path) -> None:

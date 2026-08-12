@@ -184,6 +184,10 @@ retains its claim ID and classification. Private absolute paths and common crede
 shapes fail closed before persistence. BuildLog remains the downstream publishing system;
 SoloScale exposes a local review surface over the compatible evidence contract.
 
+The optional Creator Video Factory is a local Remotion renderer. It reads only the saved
+storyboard for a reviewed Content run and produces a non-overwriting MP4 plus render receipt
+inside that private run. It adds no voice synthesis, generated facts, uploads, or publishing.
+
 ## 6. v0.2 success criteria
 
 - Repeated sync preserves stable source/document/chunk identities and does not duplicate a

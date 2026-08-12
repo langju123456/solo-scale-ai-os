@@ -38,6 +38,8 @@ _DOWNLOADS = {
     "x-thread.md": "03_x_thread.md",
     "video-script.md": "04_video_script.md",
     "storyboard.json": "05_storyboard.json",
+    "creator-video.mp4": "10_creator_video.mp4",
+    "creator-video-render.json": "11_creator_video_render.json",
     "publish-pack.json": "06_publish_pack.json",
     "provenance.json": "07_provenance.json",
 }
