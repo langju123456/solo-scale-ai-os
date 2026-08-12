@@ -1,0 +1,68 @@
+{
+  "id": "buildlog-infrastructure-001",
+  "title": "Publishing BuildLog when CLI and GitHub Desktop used different authentication",
+  "goal": "Publish the approved BuildLog baseline commits to the intended existing GitHub repository without changing the remote, committing local artifacts, or creating another repository.",
+  "context": "The BuildLog commits were complete locally on master, and GitHub Desktop already had an authenticated user session. The command-line GitHub client did not share that authenticated state.",
+  "problem": "A command-line push to the HTTPS origin failed because Git could not read a GitHub username from the current environment. GitHub CLI also reported that no GitHub host was authenticated, even though GitHub Desktop was signed in.",
+  "actions": [
+    "Reviewed git status, the configured branch, and the intended repository URL before attempting to publish.",
+    "Kept the existing origin URL unchanged.",
+    "Ran the complete tests and diff checks before each commit.",
+    "Staged only source, documentation, prompts, configuration, examples, and tests.",
+    "Left .venv, buildlog.db, caches, generated runs, and local artifacts outside the commits.",
+    "Attempted the HTTPS push from the command line and captured the authentication failure.",
+    "Checked GitHub CLI authentication and confirmed that it was not logged in.",
+    "Used the already authenticated GitHub Desktop session for the manual push.",
+    "Verified the remote master hash with git ls-remote after the Desktop push."
+  ],
+  "decisions": [
+    {
+      "decision": "Use the authenticated GitHub Desktop session instead of changing repository configuration.",
+      "reason": "The repository and commits were correct; the blocker was the command-line authentication context.",
+      "alternatives_considered": [
+        "Replace the origin URL.",
+        "Create another GitHub repository.",
+        "Store a personal access token in the project."
+      ]
+    },
+    {
+      "decision": "Verify the remote commit after the manual push.",
+      "reason": "A clean local status alone does not prove that the expected commit reached GitHub.",
+      "alternatives_considered": [
+        "Assume the Desktop success indicator was sufficient."
+      ]
+    }
+  ],
+  "trade_offs": [
+    "The final publish step required a manual action in GitHub Desktop.",
+    "GitHub CLI remained unauthenticated after the repository was published.",
+    "Desktop and command-line authentication can behave differently even in the same local repository."
+  ],
+  "result": "Both BuildLog baseline commits reached the existing origin on master. The final remote hash matched d00d8ebb3f9c0bba3e34e65a122087bdf52c5b53, and the local branch reported no divergence from origin/master.",
+  "lessons": [
+    "Repository state and authentication state are separate failure domains.",
+    "A GUI client login does not imply that Git or GitHub CLI can reuse the same credentials.",
+    "A manual publishing step can be acceptable when it is explicit, minimal, and followed by a remote hash check.",
+    "Generated model artifacts should stay out of a source commit even when they are central to the experiment."
+  ],
+  "evidence": [
+    "The configured origin is https://github.com/langju123456/BuildLog.git.",
+    "The command-line push failed with: could not read Username for 'https://github.com': Device not configured.",
+    "GitHub CLI reported that it was not logged into any GitHub hosts.",
+    "The architecture baseline commit is ff99f826bb29924e1f1b02cbd420e27038fa2181.",
+    "The output-quality baseline commit is d00d8ebb3f9c0bba3e34e65a122087bdf52c5b53.",
+    "A remote refs/heads/master lookup returned d00d8ebb3f9c0bba3e34e65a122087bdf52c5b53.",
+    "The final local status was master...origin/master with no tracked changes."
+  ],
+  "audience": "Software engineers working across local Git tools and authenticated desktop clients",
+  "metadata": {
+    "project": "BuildLog",
+    "language": "Python",
+    "tools": [
+      "Git",
+      "GitHub",
+      "GitHub Desktop",
+      "GitHub CLI"
+    ]
+  }
+}

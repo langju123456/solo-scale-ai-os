@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BuildLog Operations</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand-block">
+      <strong>BuildLog</strong>
+      <span>Internal AI Operations</span>
+    </div>
+    <nav class="tabs" aria-label="Application views">
+      <button class="tab active" data-view="overview" type="button">Overview</button>
+      <button class="tab" data-view="new-run" type="button">New workflow</button>
+    </nav>
+    <div class="connection-controls">
+      <label for="api-key">API key</label>
+      <input id="api-key" type="password" autocomplete="off" placeholder="Optional locally">
+      <button id="connect" class="secondary" type="button">Connect</button>
+      <span id="connection-status" class="connection-state">Checking</span>
+    </div>
+  </header>
+
+  <main>
+    <section id="overview-view" class="view active" aria-labelledby="overview-heading">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Portfolio health</p>
+          <h1 id="overview-heading">Workflow operations</h1>
+        </div>
+        <button id="refresh" class="secondary" type="button">Refresh</button>
+      </div>
+
+      <div id="metric-grid" class="metric-grid" aria-live="polite"></div>
+
+      <section class="data-section" aria-labelledby="runs-heading">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Generation</p>
+            <h2 id="runs-heading">Recent runs</h2>
+          </div>
+          <select id="run-status" aria-label="Filter runs by status">
+            <option value="">All statuses</option>
+            <option value="completed">Completed</option>
+            <option value="running">Running</option>
+            <option value="failed">Failed</option>
+          </select>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Run</th>
+                <th>Iteration</th>
+                <th>Status</th>
+                <th>Quality</th>
+                <th>Latency</th>
+                <th>Artifacts</th>
+                <th>Started</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="runs-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="data-section" aria-labelledby="jobs-heading">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Durable queue</p>
+            <h2 id="jobs-heading">Workflow jobs</h2>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Job</th>
+                <th>Status</th>
+                <th>Attempts</th>
+                <th>Run</th>
+                <th>Updated</th>
+                <th>Outcome</th>
+              </tr>
+            </thead>
+            <tbody id="jobs-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <section id="new-run-view" class="view" aria-labelledby="new-run-heading">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Evidence intake</p>
+          <h1 id="new-run-heading">Submit engineering iteration</h1>
+        </div>
+      </div>
+      <form id="iteration-form" class="workflow-form">
+        <div class="form-grid">
+          <label>Title<input name="title" required maxlength="180"></label>
+          <label>Audience<input name="audience" required value="engineering and GTM leaders"></label>
+          <label class="wide">Goal<textarea name="goal" required rows="2"></textarea></label>
+          <label class="wide">Context<textarea name="context" required rows="3"></textarea></label>
+          <label class="wide">Problem<textarea name="problem" required rows="3"></textarea></label>
+          <label class="wide">Actions<textarea name="actions" required rows="4"></textarea></label>
+          <label>Decision<input name="decision" required></label>
+          <label>Decision reason<input name="decision_reason" required></label>
+          <label class="wide">Alternatives considered<textarea name="alternatives" required rows="2"></textarea></label>
+          <label class="wide">Trade-offs<textarea name="trade_offs" required rows="3"></textarea></label>
+          <label class="wide">Result<textarea name="result" required rows="3"></textarea></label>
+          <label class="wide">Lessons<textarea name="lessons" required rows="3"></textarea></label>
+          <label class="wide">Evidence<textarea name="evidence" required rows="3"></textarea></label>
+        </div>
+        <div class="form-actions">
+          <span id="submit-status" role="status"></span>
+          <button class="primary" type="submit">Queue workflow</button>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <dialog id="run-dialog">
+    <div class="dialog-heading">
+      <h2>Run details</h2>
+      <button id="close-dialog" class="secondary" type="button">Close</button>
+    </div>
+    <pre id="run-detail"></pre>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

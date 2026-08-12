@@ -1,0 +1,21 @@
+{
+  "id": "local-agent-001",
+  "title": "Running my first local AI agent",
+  "goal": "Run the Hugging Face Agents Course example locally with Ollama and Qwen3.",
+  "context": "The original example used a hosted model.",
+  "problem": "The model backend and installed Gradio version were incompatible with the original tutorial defaults.",
+  "actions": ["Replaced the hosted model wrapper with LiteLLMModel."],
+  "decisions": [
+    {
+      "decision": "Use LiteLLM as the model adapter.",
+      "reason": "It kept model backend changes separate from the agent workflow.",
+      "alternatives_considered": ["Call Ollama directly."]
+    }
+  ],
+  "trade_offs": ["The local model may be slower than a hosted endpoint."],
+  "result": "The Gradio interface successfully completed the local agent pipeline.",
+  "lessons": ["Adapter layers reduce coupling between applications and model providers."],
+  "evidence": ["The final execution path was Gradio -> smolagents -> LiteLLM -> Ollama -> Qwen3."],
+  "audience": "AI engineers",
+  "metadata": {"project": "Local AI Agent"}
+}

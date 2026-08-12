@@ -1,0 +1,79 @@
+{
+  "id": "buildlog-architecture-001",
+  "title": "Evolving BuildLog from file-only traces to hybrid persistence",
+  "goal": "Preserve queryable relationships among BuildLog runs without sacrificing readable local artifacts or expanding v0.1 into a backend platform.",
+  "context": "BuildLog v0.1 already had a working local pipeline that validated one development iteration, planned a story, wrote a LinkedIn draft, evaluated it, optionally revised it once, and stored each step as JSON or Markdown under runs/.",
+  "problem": "Filesystem traces were easy to inspect, but they did not provide a structured way to relate projects, iterations, runs, artifacts, evaluations, and prompt versions. Keeping the implementation file-only would make later trace comparison and evaluation history difficult, while adding a full backend stack would over-engineer v0.1.",
+  "actions": [
+    "Revised PROJECT.md and TASK.md before changing the implementation.",
+    "Added SQLite metadata persistence through SQLAlchemy 2.0.",
+    "Created tables for projects, iterations, runs, artifacts, evaluations, and prompt versions.",
+    "Defined persistence-facing domain records without SQLAlchemy imports.",
+    "Defined a minimal RunRepository protocol used by the pipeline.",
+    "Implemented a synchronous SQLAlchemyRunRepository for SQLite.",
+    "Kept original input, normalized input, plans, drafts, evaluations, final Markdown, and run metadata as readable filesystem artifacts.",
+    "Stored artifact paths, prompt paths, SHA-256 hashes, evaluation scores, statuses, and relationships in SQLite.",
+    "Added tests for database creation, run persistence, evaluation persistence, artifact relationships, and pipeline integration.",
+    "Ran the real local sample with Ollama and Qwen3:8b."
+  ],
+  "decisions": [
+    {
+      "decision": "Use hybrid persistence instead of replacing filesystem traces with database content.",
+      "reason": "SQLite is useful for metadata, relationships, and queries, while JSON and Markdown files remain easier for humans to inspect and debug.",
+      "alternatives_considered": [
+        "Keep all persistence file-only.",
+        "Store generated artifact content only in SQLite."
+      ]
+    },
+    {
+      "decision": "Separate domain records from SQLAlchemy table models.",
+      "reason": "The pipeline should express BuildLog concepts without importing ORM-specific classes or session behavior.",
+      "alternatives_considered": [
+        "Pass SQLAlchemy models directly through pipeline business logic."
+      ]
+    },
+    {
+      "decision": "Use one minimal repository protocol and one synchronous SQLite implementation.",
+      "reason": "The current pipeline needs explicit persistence boundaries, but it does not need factories, asynchronous database access, migrations, or additional service layers.",
+      "alternatives_considered": [
+        "Add a multi-backend repository factory.",
+        "Use asynchronous SQLAlchemy and a migration framework."
+      ]
+    }
+  ],
+  "trade_offs": [
+    "The hybrid model must keep filesystem writes and SQLite metadata consistent.",
+    "SQLAlchemy adds a dependency and table mappings to a previously file-only project.",
+    "Creating tables on startup is sufficient for v0.1 but does not provide a long-term migration strategy.",
+    "The repository interface stays intentionally narrow and does not yet support dashboards, analytics, or human feedback workflows."
+  ],
+  "result": "BuildLog retained its fixed local pipeline and readable run directories while adding queryable metadata lineage in six SQLite tables. Business logic remained independent of ORM models. Fifteen tests passed, and a real Ollama Qwen3:8b run completed successfully with artifact and prompt hashes matching their files.",
+  "lessons": [
+    "A database is justified when it preserves product relationships, not when it only makes a project look more engineered.",
+    "Hybrid persistence can serve both machine queries and human debugging when each storage mechanism has one explicit responsibility.",
+    "A repository boundary is most useful when it protects domain logic from persistence details without introducing speculative abstractions.",
+    "Architecture constraints are easier to preserve when the product decision is documented before implementation."
+  ],
+  "evidence": [
+    "The SQLite schema contains projects, iterations, runs, artifacts, evaluations, and prompt_versions tables.",
+    "Run rows reference the exact planner, writer, evaluator, and reviser prompt version records.",
+    "Stored SHA-256 values matched the corresponding prompt and artifact files.",
+    "The test suite completed with 15 passing tests.",
+    "The real local sample produced a completed run using ollama_chat/qwen3:8b.",
+    "The completed sample received scores of 10 for technical accuracy, 9 for specificity, 9 for readability, 9 for reader value, and 8 for evidence coverage."
+  ],
+  "audience": "Software engineers and AI engineers designing small, traceable LLM pipelines",
+  "metadata": {
+    "project": "BuildLog",
+    "language": "Python",
+    "tools": [
+      "Pydantic",
+      "LiteLLM",
+      "Ollama",
+      "Qwen3",
+      "SQLite",
+      "SQLAlchemy 2.0",
+      "Pytest"
+    ]
+  }
+}

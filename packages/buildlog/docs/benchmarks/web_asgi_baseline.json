@@ -1,0 +1,23 @@
+{
+  "concurrency": 20,
+  "error_rate_percent": 0.0,
+  "exception_counts": {},
+  "latency_ms": {
+    "max": 42.18,
+    "min": 14.91,
+    "p50": 27.85,
+    "p95": 34.56,
+    "p99": 37.38
+  },
+  "measured_at": "2026-08-02T09:17:56.828841+00:00",
+  "requests": 500,
+  "requests_per_second": 701.29,
+  "scope": "in-process ASGI read benchmark; excludes network and container overhead",
+  "status_counts": {
+    "200": 500
+  },
+  "successful_requests": 500,
+  "target": "http://buildlog.test/api/v1/dashboard",
+  "wall_seconds": 0.713,
+  "warmup_requests": 20
+}
