@@ -17,6 +17,11 @@ from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from soloscale.buildlog_handoff import (
+    BuildLogHandoffError,
+    stage_for_buildlog,
+    sync_buildlog_receipt,
+)
 from soloscale.content_ui import ContentFormResult, content_page, run_content_form
 from soloscale.content_workspace import ContentWorkspaceError, content_download
 from soloscale.knowledge_models import RetrievalHit
@@ -2557,6 +2562,39 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_response(303)
             location = "/content?" + urllib.parse.urlencode({"run_id": run_id}) + "#results"
             self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        buildlog_match = re.fullmatch(
+            r"/content/buildlog/(content-[^/]+)/(linkedin|x)(/receipt)?", path
+        )
+        if buildlog_match is not None:
+            run_id, channel, receipt_path = buildlog_match.groups()
+            try:
+                if receipt_path:
+                    receipt = sync_buildlog_receipt(
+                        data_root=self.ui_data_root.absolute(),
+                        run_id=run_id,
+                        channel=channel,
+                    )
+                    query = {"run_id": run_id, "buildlog": "published" if receipt else "pending"}
+                else:
+                    stage_for_buildlog(
+                        data_root=self.ui_data_root.absolute(),
+                        run_id=run_id,
+                        channel=channel,
+                    )
+                    query = {"run_id": run_id, "buildlog": "staged"}
+            except (
+                BuildLogHandoffError,
+                ContentWorkspaceError,
+                OSError,
+                subprocess.TimeoutExpired,
+            ):
+                self.send_error(422, "BuildLog handoff failed")
+                return
+            self.send_response(303)
+            self.send_header("Location", "/content?" + urllib.parse.urlencode(query) + "#results")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return

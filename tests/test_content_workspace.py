@@ -3,6 +3,11 @@ from pathlib import Path
 
 import pytest
 
+from soloscale.buildlog_handoff import (
+    buildlog_handoff_status,
+    stage_for_buildlog,
+    sync_buildlog_receipt,
+)
 from soloscale.content_models import ClaimStatus, ContentBrief, ContentClaim
 from soloscale.content_workspace import (
     ContentWorkspaceError,
@@ -186,3 +191,32 @@ def test_creator_video_render_uses_only_saved_storyboard_and_is_non_overwriting(
     artifact_name, artifact = content_download(data_root, run.run_id, "creator-video.mp4")
     assert artifact_name == output.name
     assert artifact == b"mp4"
+
+
+def test_buildlog_handoff_stages_exact_artifact_and_persists_returned_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    run = run_content_workspace(data_root=data_root, brief=_brief())
+    responses = [
+        {"buildlog_run_id": "soloscale-linkedin-123"},
+        {
+            "receipt_id": "receipt-123",
+            "platform": "linkedin",
+            "external_post_id": "urn:li:share:123",
+            "published_at": "2026-08-12T00:00:00+00:00",
+            "buildlog_run_id": "soloscale-linkedin-123",
+        },
+    ]
+    monkeypatch.setattr(
+        "soloscale.buildlog_handoff._run_buildlog",
+        lambda *args: responses.pop(0),
+    )
+
+    handoff = stage_for_buildlog(data_root=data_root, run_id=run.run_id, channel="linkedin")
+    receipt = sync_buildlog_receipt(data_root=data_root, run_id=run.run_id, channel="linkedin")
+
+    assert handoff["buildlog_run_id"] == "soloscale-linkedin-123"
+    assert receipt is not None
+    assert receipt["external_post_id"] == "urn:li:share:123"
+    assert buildlog_handoff_status(data_root, run.run_id, "linkedin") == (handoff, receipt)

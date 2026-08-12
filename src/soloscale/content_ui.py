@@ -8,6 +8,7 @@ from typing import Literal
 
 from pydantic import ValidationError
 
+from soloscale.buildlog_handoff import buildlog_handoff_status
 from soloscale.content_models import ContentBrief, ContentRun
 from soloscale.content_workspace import (
     ContentWorkspaceError,
@@ -133,7 +134,7 @@ def _form_from_run(run: ContentRun) -> dict[str, str]:
     }
 
 
-def _result_html(run: ContentRun, *, video_ready: bool) -> str:
+def _result_html(run: ContentRun, *, data_root: Path, video_ready: bool) -> str:
     run_id = _escape(run.run_id)
     linkedin = _escape(run.drafts.linkedin)
     x_posts = "".join(
@@ -167,6 +168,10 @@ def _result_html(run: ContentRun, *, video_ready: bool) -> str:
           <button class="primary" type="submit">生成 MP4 视频</button>
           <small>本机 Remotion 渲染；只使用本次 storyboard，不会发布。</small>
         </form>'''
+    )
+    buildlog = "".join(
+        _buildlog_channel_html(data_root, run.run_id, channel)
+        for channel in ("linkedin", "x")
     )
     download_links = "".join(
         f'<a href="/content/downloads/{run_id}/{name}" download>{label}</a>'
@@ -202,7 +207,38 @@ def _result_html(run: ContentRun, *, video_ready: bool) -> str:
         <div class="creator-video-result">{video_action}</div>
       </div>
       <p class="review-note">SoloScale 没有连接或操作你的社交账号，也没有自动发布。</p>
+      <section class="buildlog-handoff">
+        <span class="kicker">BuildLog publishing</span>
+        <h3>发布前，交给已有的 BuildLog 审核与确认流程</h3>
+        <p>BuildLog 会显示精确文本、检查重复内容，并在你确认后才调用平台。</p>
+        {buildlog}
+      </section>
     </section>"""
+
+
+def _buildlog_channel_html(data_root: Path, run_id: str, channel: str) -> str:
+    label = "LinkedIn" if channel == "linkedin" else "X"
+    try:
+        handoff, receipt = buildlog_handoff_status(data_root, run_id, channel)
+    except ValueError:
+        handoff, receipt = None, None
+    if handoff is None:
+        return (
+            f'<form method="post" action="/content/buildlog/{run_id}/{channel}">'
+            f'<button class="secondary" type="submit">交给 BuildLog 发布 {label}</button></form>'
+        )
+    run = _escape(handoff["buildlog_run_id"])
+    if receipt is not None:
+        return (
+            f'<p><strong>{label} 已发布</strong> · Post ID: {_escape(receipt["external_post_id"])} '
+            f'· BuildLog receipt: {_escape(receipt["receipt_id"])}</p>'
+        )
+    heading = f"<strong>{label} 已转交 BuildLog</strong> · Run: {run}"
+    return f'''<div class="handoff-state"><p>{heading}</p>
+      <p>在 BuildLog 中预览并输入 PUBLISH 后，再回这里同步回执。</p>
+      <form method="post" action="/content/buildlog/{run_id}/{channel}/receipt">
+        <button class="secondary" type="submit">同步 {label} 发布回执</button>
+      </form></div>'''
 
 
 def content_page(
@@ -231,7 +267,11 @@ def content_page(
         f'<div class="error" role="alert">{_escape(error)}</div>' if error else ""
     )
     result_html = (
-        _result_html(run, video_ready=creator_video_ready(data_root, run.run_id))
+        _result_html(
+            run,
+            data_root=data_root,
+            video_ready=creator_video_ready(data_root, run.run_id),
+        )
         if run is not None
         else """<section class="empty">
       <span class="kicker">Preview</span><h2>今天要发的内容，会直接在这里预览</h2>
