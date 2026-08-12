@@ -13,3 +13,4 @@ build/
 .soloscale/
 private/
 .DS_Store
+video_factory/node_modules/
