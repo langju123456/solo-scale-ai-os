@@ -130,6 +130,18 @@ python -m soloscale.local_ui
 python -m soloscale.local_ui --host 127.0.0.1 --port 8765 --data-root .soloscale
 ```
 
+For the unified local product, install both editable packages into one environment and
+start every product route with one command:
+
+```bash
+uv venv .venv
+uv pip install -e '.[dev]' -e packages/buildlog
+./scripts/run_local_product.sh
+```
+
+The default persistent private root is `~/Documents/SoloScaleData` and the stable URL is
+`http://127.0.0.1:8765`.
+
 打开终端打印的地址（默认 `http://127.0.0.1:8765`）。
 
 ### Learning Traceability golden case

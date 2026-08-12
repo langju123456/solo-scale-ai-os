@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import os
@@ -21,8 +22,8 @@ from typing import cast
 from soloscale.buildlog_handoff import (
     BuildLogHandoffError,
     Channel,
-    stage_for_buildlog,
-    sync_buildlog_receipt,
+    preview_for_buildlog,
+    publish_via_buildlog,
 )
 from soloscale.content_ui import ContentFormResult, content_page, run_content_form
 from soloscale.content_workspace import ContentWorkspaceError, content_download
@@ -57,6 +58,15 @@ from soloscale.resume_workspace import (
     run_resume_workspace as execute_resume_workspace,
 )
 from soloscale.video_factory import CreatorVideoError, render_creator_video
+from soloscale.video_generation import (
+    GoogleVeoClient,
+    VideoGenerationError,
+    VideoGenerationRequest,
+    create_job,
+    load_job,
+    provider_status,
+    save_job,
+)
 
 COMMAND_TIMEOUT_SECONDS = 120
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
@@ -85,6 +95,84 @@ class UploadedFile:
 class FormSubmission:
     fields: dict[str, str]
     files: dict[str, UploadedFile]
+
+
+def _video_page(data_root: Path, job_id: str | None = None, error: str | None = None) -> str:
+    job = load_job(data_root, job_id) if job_id else None
+    configuration = provider_status()
+    detail = ""
+    if job:
+        outgoing = html.escape(json.dumps(job.request.external_payload(), indent=2), quote=True)
+        detail = f"""<section>
+<h2>External submission preview</h2>
+<p>Only this distilled brief and selected excerpts will leave this machine.
+Raw chat and Codex histories are excluded.</p>
+<pre>{outgoing}</pre>
+<p>Status: <strong>{job.status}</strong> · estimated cost:
+${job.estimated_cost_usd:.2f}</p>"""
+        if job.status == "AWAITING_APPROVAL" and configuration == "READY":
+            detail += f"""<form method="post" action="/video/submit/{job.job_id}">
+<label>Type PUBLISH to authorize this one Vertex AI generation
+<input name="confirmation" required></label>
+<button class="primary">Submit to Google Vertex AI</button></form>"""
+        elif job.status == "AWAITING_APPROVAL":
+            detail += (
+                "<p><strong>PROVIDER_NOT_CONFIGURED</strong> · "
+                "This private draft is saved and can be submitted later.</p>"
+            )
+        elif job.status in {"SUBMITTED", "RUNNING"}:
+            detail += f"""<form method="post" action="/video/poll/{job.job_id}">
+<button class="secondary">Refresh progress</button></form>"""
+        elif job.status == "SUCCEEDED" and job.output_path:
+            local_video = f"/video/downloads/{job.job_id}/output.mp4"
+            detail += f'''<video controls src="{local_video}"></video>
+<p><a href="{local_video}" download>Download generated video</a></p>'''
+        detail += "</section>"
+    message = f'<p class="error">{html.escape(error)}</p>' if error else ""
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Creator Video</title></head><body><main><nav>
+<a href="/">Resume</a> · <a href="/learning">Learning</a> ·
+<a href="/content">Content Studio</a> · <a href="/video">Creator Video</a> ·
+<a href="/publishing">Publishing</a>
+</nav><h1>Creator Video</h1>
+<p>Google Vertex AI Veo · cloud generation. Provider:
+<strong>{configuration}</strong>. Local Remotion remains experimental.</p>
+{message}<form method="post" action="/video/prepare">
+<label>Topic<input name="topic" required></label>
+<label>Script or design document<textarea name="script" required></textarea></label>
+<label>Selected evidence IDs (one per line, optional)
+<textarea name="evidence_ids"></textarea></label>
+<label>Selected evidence excerpts (one per line, optional)
+<textarea name="evidence_excerpts"></textarea></label>
+<label>SoloScale content run ID (optional)<input name="content_run_id"></label>
+<label>Platform<input name="platform" value="Short video"></label>
+<label>Language<input name="language" value="English"></label>
+<label>Style<input name="style" value="Cinematic product demo"></label>
+<button class="primary">Save brief and preview external submission</button>
+</form>{detail}</main></body></html>"""
+
+
+def _publishing_page() -> str:
+    return """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SoloScale · Publishing</title><style>
+body{margin:0;background:#07111f;color:#e5edf7;font-family:Inter,-apple-system,
+BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:820px;margin:auto;padding:36px 24px}
+a{color:#93c5fd}.panel{margin-top:48px;padding:28px;border:1px solid #334155;
+border-radius:18px;background:#111827}p{color:#b8c4d6;line-height:1.65}.button{display:inline-block;
+margin-top:12px;padding:12px 16px;border-radius:10px;background:#2563eb;color:white;
+font-weight:750;text-decoration:none}code{color:#bae6fd}</style></head><body><main>
+<nav><a href="/">Resume</a> · <a href="/learning">Learning</a> ·
+<a href="/content">Content Studio</a> · <a href="/video">Creator Video</a> ·
+<a href="/publishing">Publishing</a></nav><section class="panel">
+<h1>BuildLog Publishing Engine</h1>
+<p>Publishing is available inside Content Studio. Select a saved LinkedIn or X
+artifact, inspect the exact BuildLog preview, then type <code>PUBLISH</code>.
+BuildLog remains responsible for OAuth, identity checks, duplicate protection,
+platform adapters, and publication receipts.</p>
+<p>Opening this page does not load credentials, contact a platform, or publish anything.</p>
+<a class="button" href="/content">Open Content Studio</a>
+</section></main></body></html>"""
 
 
 def _repo_root() -> Path:
@@ -168,6 +256,8 @@ def _extract_private_result_path(raw_stdout: str) -> Path | None:
             if candidate:
                 return Path(candidate).expanduser()
     return None
+
+
 def _load_json_file(path: Path) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -416,6 +506,25 @@ def _run_user_resume(
         return UIActionResult(
             "tailored-resume", "local resume generation", 2, "", "请粘贴完整的 Job Description。", 0
         )
+    if form.get("approve_candidate_claims") != "yes":
+        return UIActionResult(
+            "tailored-resume",
+            "local resume generation",
+            2,
+            "",
+            "请确认只使用你上传简历中的真实经历和技能。",
+            0,
+        )
+    tailoring_instructions = form.get("tailoring_instructions", "").strip()
+    if len(tailoring_instructions) > 1200:
+        return UIActionResult(
+            "tailored-resume",
+            "local resume generation",
+            2,
+            "",
+            "针对性说明不能超过 1200 个字符。",
+            0,
+        )
     upload = files.get("resume_template")
     if upload is None or not upload.content:
         return UIActionResult(
@@ -435,17 +544,32 @@ def _run_user_resume(
     try:
         _reject_symlink_ancestry(data_root)
         profile = extract_candidate_profile(upload.content)
-        tailored = tailor_resume_docx(upload.content, job_description)
+        relevance_text = "\n".join(
+            part for part in (job_description, tailoring_instructions) if part
+        )
+        tailored = tailor_resume_docx(upload.content, relevance_text)
+        profile_claims = profile.experience_bullets + profile.project_bullets
+        approved_claims = [
+            {
+                "id": f"PROFILE-{index:02d}",
+                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            }
+            for index, text in enumerate(profile_claims, start=1)
+        ]
         output_name = _user_resume_filename(
             profile,
             form.get("company_name", "").strip() or None,
             form.get("job_title", "").strip() or None,
             job_description,
         )
-        library_root = Path(
-            form.get("resume_library_root", "").strip()
-            or Path.home() / "Documents" / "Resume Applications"
-        ).expanduser().absolute()
+        library_root = (
+            Path(
+                form.get("resume_library_root", "").strip()
+                or Path.home() / "Documents" / "Resume Applications"
+            )
+            .expanduser()
+            .absolute()
+        )
         evidence_hits = _search_job_evidence(job_description, data_root)
         run = execute_resume_workspace(
             data_root=data_root,
@@ -467,6 +591,12 @@ def _run_user_resume(
                 "source_paragraph_count": tailored.source_paragraph_count,
                 "project_blocks_reordered": tailored.project_blocks_reordered,
                 "skill_bullets_reordered": tailored.skill_bullets_reordered,
+                "operator_approved_profile_claims_sha256": hashlib.sha256(
+                    json.dumps(approved_claims, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+                "tailoring_instructions_sha256": hashlib.sha256(
+                    tailoring_instructions.encode("utf-8")
+                ).hexdigest(),
             },
             mode=ResumeMode.LOCAL_ONLY,
         )
@@ -486,7 +616,7 @@ def _run_user_resume(
             raise OSError("Published resume DOCX failed byte-integrity verification")
         preview_pdf = run_dir / "10_resume_preview.pdf"
         preview_created = _create_resume_pdf_preview(internal_docx, preview_pdf)
-        user_metadata = {
+        user_metadata: dict[str, object] = {
             "schema_version": "1.0",
             "template_filename": upload_name,
             "template_content_type": upload.content_type,
@@ -503,8 +633,25 @@ def _run_user_resume(
             "preview_url": f"/previews/{run.run_id}/resume.pdf" if preview_created else "",
             "preview_generated": preview_created,
             "network_used": False,
+            "tailoring_instructions": tailoring_instructions,
+            "operator_approved_profile_claims": approved_claims,
         }
         _write_private_json(run_dir / "09_user_ui.json", user_metadata)
+        application_receipt = {
+            "schema_version": "1.0",
+            "status": "PRIVATE_APPLICATION_DRAFT_SAVED",
+            "run_id": run.run_id,
+            "operator_approved_profile_claims": approved_claims,
+            "tailoring_instructions": tailoring_instructions,
+            "tailoring_instructions_sha256": hashlib.sha256(
+                tailoring_instructions.encode("utf-8")
+            ).hexdigest(),
+            "resume_sha256": tailored.output_sha256,
+            "application_directory": str(application_dir),
+            "final_human_review_required": True,
+            "job_application_submitted": False,
+        }
+        _write_private_json(run_dir / "application_receipt.json", application_receipt)
 
         run_path = run_dir / "run.json"
         run_payload = _load_json_file(run_path) or {}
@@ -520,7 +667,7 @@ def _run_user_resume(
         if not isinstance(artifact_paths, list):
             artifact_paths = []
             run_payload["artifact_paths"] = artifact_paths
-        output_artifacts = ["09_user_ui.json"]
+        output_artifacts = ["09_user_ui.json", "application_receipt.json"]
         if preview_created:
             output_artifacts.append("10_resume_preview.pdf")
         for name in output_artifacts:
@@ -633,6 +780,8 @@ def _learning_response_location(stage: str) -> str:
     if stage_slug is None:
         raise ValueError("learning response stage is invalid")
     return f"/learning?response_saved={stage_slug}#exercise-{stage_slug}"
+
+
 def _escape(value: str) -> str:
     return html.escape(value or "", quote=True)
 
@@ -654,11 +803,7 @@ def _parse_submission(raw: bytes, content_type: str) -> FormSubmission:
     if "\r" in content_type or "\n" in content_type:
         raise ValueError("Invalid multipart content type")
     message = BytesParser(policy=policy.default).parsebytes(
-        (
-            f"Content-Type: {content_type}\r\n"
-            "MIME-Version: 1.0\r\n\r\n"
-        ).encode("ascii")
-        + raw
+        (f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n").encode("ascii") + raw
     )
     if not message.is_multipart():
         raise ValueError("无法解析上传表单。")
@@ -690,6 +835,8 @@ def _parse_submission(raw: bytes, content_type: str) -> FormSubmission:
             raise ValueError("表单文字不是有效的 UTF-8。") from exc
         fields.setdefault(field_name, value)
     return FormSubmission(fields=fields, files=files)
+
+
 def _build_control_tower_path(data_root: Path) -> Path:
     return (data_root / "control-tower" / "index.html").resolve()
 
@@ -1013,9 +1160,7 @@ def _user_result_card(result: UIActionResult | None) -> str:
     else:
         preview_action = ""
         fallback_preview = resume or "DOCX 已生成；文字预览不可用。"
-        preview_content = (
-            f'<pre class="resume-preview">{_escape(fallback_preview)}</pre>'
-        )
+        preview_content = f'<pre class="resume-preview">{_escape(fallback_preview)}</pre>'
         preview_note = "本机未找到 DOCX 渲染器，当前显示内容预览；最终版式保留上传模板。"
     defense = _interview_defense_panel(data_root=run_dir.parents[1], run_id=run_dir.name)
     return f"""<section class="result-card success-state" aria-live="polite">
@@ -1049,6 +1194,8 @@ def _user_result_card(result: UIActionResult | None) -> str:
     <summary>查看自动保存位置</summary>
     <p><strong>SoloScale 私有运行：</strong><code>{_escape(internal_path)}</code></p>
     <p><strong>Resume Applications：</strong><code>{_escape(external_path)}</code></p>
+    <p><strong>Application Receipt：</strong>
+      <code>{_escape(str(run_dir / "application_receipt.json"))}</code></p>
   </details>
   {defense}
 </section>"""
@@ -1126,10 +1273,7 @@ def _interview_defense_panel(*, data_root: Path, run_id: str, repo_root: Path | 
                 )
             except (LearningTraceabilityError, OSError, ValueError):
                 display_status = "NEEDS_MAPPING"
-                action = (
-                    "映射已失效；请修复原始 Learning run，"
-                    "或重新生成这次简历后再关联。"
-                )
+                action = "映射已失效；请修复原始 Learning run，或重新生成这次简历后再关联。"
             else:
                 href = (
                     "/learning?"
@@ -1154,7 +1298,7 @@ def _interview_defense_panel(*, data_root: Path, run_id: str, repo_root: Path | 
         else:
             action = '<a href="/learning">先建立 Learning 黄金案例。</a>'
         rows.append(
-            f'<li><code>{_escape(record.bullet_id)}</code> · '
+            f"<li><code>{_escape(record.bullet_id)}</code> · "
             f"{_escape(display_status)}<br />"
             f"{_escape(record.bullet_text)}<br />{action}</li>"
         )
@@ -1173,18 +1317,17 @@ def _interview_defense_panel(*, data_root: Path, run_id: str, repo_root: Path | 
             )
     return (
         '<section class="interview-defense"><h3>Interview Defense</h3>'
-        f'<p>{_escape(availability)}</p><ul>{"".join(rows)}</ul></section>'
+        f"<p>{_escape(availability)}</p><ul>{''.join(rows)}</ul></section>"
     )
 
 
-def _user_page(
-    action_result: UIActionResult | None, data_root: Path, form: dict[str, str]
-) -> str:
+def _user_page(action_result: UIActionResult | None, data_root: Path, form: dict[str, str]) -> str:
     job_description = _escape(form.get("job_description", ""))
     company_name = _escape(form.get("company_name", ""))
     company_url = _escape(form.get("company_url", ""))
     job_title = _escape(form.get("job_title", ""))
     job_id = _escape(form.get("job_id", ""))
+    tailoring_instructions = _escape(form.get("tailoring_instructions", ""))
     workspace_class = (
         "workspace has-result"
         if action_result is not None and action_result.return_code == 0
@@ -1331,6 +1474,8 @@ def _user_page(
         <a class="advanced-link current" href="/">Resume</a>
         <a class="advanced-link" href="/learning">Learning</a>
         <a class="advanced-link" href="/content">Content</a>
+        <a class="advanced-link" href="/video">Video</a>
+        <a class="advanced-link" href="/publishing">Publishing</a>
         <a class="advanced-link" href="/advanced">Advanced</a>
       </div>
     </nav>
@@ -1361,6 +1506,13 @@ def _user_page(
               placeholder="Paste the full job description here…"
             >{job_description}</textarea>
           </label>
+          <label>针对性说明（可选）
+            <span class="hint">例如：突出 RAG、后端工程和产品交付。
+              说明只影响已有内容的排序，不会新增经历。</span>
+            <textarea name="tailoring_instructions" maxlength="1200"
+              placeholder="Prioritize relevant existing projects and skills…"
+            >{tailoring_instructions}</textarea>
+          </label>
           <div class="metadata">
             <label>公司（可选）<input name="company_name" value="{company_name}" /></label>
             <label>岗位（可选）<input name="job_title" value="{job_title}" /></label>
@@ -1371,11 +1523,14 @@ def _user_page(
           </div>
           <input
             type="hidden" name="resume_library_root"
-            value="{_escape(str(Path.home() / 'Documents' / 'Resume Applications'))}"
+            value="{_escape(str(Path.home() / "Documents" / "Resume Applications"))}"
           />
           <div class="save-note">
             自动保存两份：SoloScale 私有运行目录 + Documents/Resume Applications。
           </div>
+          <label><input type="checkbox" name="approve_candidate_claims" value="yes" required />
+            我确认上传简历中的经历、项目和技能是真实的，并批准仅使用这些 claims 生成草稿。
+          </label>
           <div id="progress" role="status" aria-live="polite">正在读取模板并核对 JD…</div>
           <button id="generate-button" class="primary-button" type="submit">生成针对性简历</button>
         </form>
@@ -1579,11 +1734,7 @@ def _learning_source_excerpt(
         if isinstance(value, list):
             candidates.extend(value)
     selected = next(
-        (
-            item
-            for item in candidates
-            if isinstance(item, dict) and item.get("id") == anchor_id
-        ),
+        (item for item in candidates if isinstance(item, dict) and item.get("id") == anchor_id),
         None,
     )
     if not isinstance(selected, dict):
@@ -1675,15 +1826,10 @@ def _anchor_pack_text(bullet: str, pack: dict[str, object]) -> str:
         f"Selected bullet: {bullet}",
         f"Case: {pack['case_id']}",
         f"Keywords: {', '.join(keywords)}",
-        (
-            "Project: "
-            f"{project['repository']} · {project['branch']} · {project['commit']}"
-        ),
+        (f"Project: {project['repository']} · {project['branch']} · {project['commit']}"),
         "Reasoning:",
     ]
-    lines += [
-        f"- {item['path']} · {item['sha256']}" for item in reasoning
-    ]
+    lines += [f"- {item['path']} · {item['sha256']}" for item in reasoning]
     lines.append("Code:")
     lines += [
         f"- {item['file']}:{item['symbol']}:{item['line_start']}-"
@@ -1722,9 +1868,7 @@ def _anchor_pack_html(pack: dict[str, object]) -> str:
             rendered.append(f"<li><code>{_escape(locator)}</code></li>")
         return "".join(rendered)
 
-    project_text = (
-        f"{project['repository']} · {project['branch']} · {project['commit']}"
-    )
+    project_text = f"{project['repository']} · {project['branch']} · {project['commit']}"
     return f"""
 <p><strong>Project</strong><br /><code>{_escape(project_text)}</code></p>
 <p><strong>Keywords</strong><br />{_escape(", ".join(keywords))}</p>
@@ -1744,9 +1888,7 @@ def _learning_page(
     if requested_run_id:
         run_dir = (
             data_root / "learning-runs" / requested_run_id
-            if re.fullmatch(
-                r"learning-\d{8}T\d{6}Z-[0-9a-f]{10}", requested_run_id
-            )
+            if re.fullmatch(r"learning-\d{8}T\d{6}Z-[0-9a-f]{10}", requested_run_id)
             else None
         )
     else:
@@ -1754,9 +1896,7 @@ def _learning_page(
     if run_dir is not None and (run_dir.is_symlink() or not run_dir.is_dir()):
         run_dir = None
     response_saved_stage = form.get("response_saved_stage", "")
-    target_requirement = _escape(
-        form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT)
-    )
+    target_requirement = _escape(form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT))
     result_html = ""
     if result is not None:
         class_name = "success" if result.return_code == 0 else "error"
@@ -1795,9 +1935,7 @@ def _learning_page(
         mastery_level = _escape(str(mastery.get("level", "UNKNOWN")))
         mastery_ready = _escape(str(mastery.get("interview_ready", False)))
         next_action = _escape(str(mastery.get("next_action", "UNKNOWN")))
-        engineering_truth = _escape(
-            str(claim.get("engineering_truth_stage", "UNKNOWN"))
-        )
+        engineering_truth = _escape(str(claim.get("engineering_truth_stage", "UNKNOWN")))
         interview_ready = _escape(str(claim.get("interview_ready", False)))
         resume_eligible = _escape(str(claim.get("resume_eligible", False)))
         explain_saved = (
@@ -1825,9 +1963,9 @@ def _learning_page(
                     repo_root=repo_root,
                     learning_run_id=run_dir.name,
                 )
-                pack_json = json.dumps(
-                    _anchor_pack_text(linked.bullet_text, pack)
-                ).replace("</", "<\\/")
+                pack_json = json.dumps(_anchor_pack_text(linked.bullet_text, pack)).replace(
+                    "</", "<\\/"
+                )
                 backlink = f"""<section id="interview-defense" class="panel">
   <h2>Interview Defense anchors</h2>
   <p><strong>{_escape(linked.bullet_id)}</strong> · {_escape(linked.bullet_text)}</p>
@@ -2010,6 +2148,8 @@ def _learning_page(
 </head>
 <body>
   <header><a href="/">Resume</a> · <a href="/content">Content Studio</a> ·
+    <a href="/video">Creator Video</a> ·
+    <a href="/publishing">Publishing</a> ·
     <a href="/advanced">Advanced</a><h1>Learning Control Tower</h1>
     <p>One real capability. Evidence first. Mastery stays human-earned.</p></header>
   <main>
@@ -2024,6 +2164,8 @@ def _learning_page(
   </main>
 </body>
 </html>"""
+
+
 def _control_tower_section(data_root: Path) -> str:
     exists, _ = _read_control_tower(data_root)
     if not exists:
@@ -2111,6 +2253,8 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
     Resume Workspace 会保存候选简历，但不会自动申请、更新 Casebook 或发布内容。
     <a href="/learning">Open Learning Control Tower</a> ·
     <a href="/content">Open Content Studio</a>.
+    <a href="/video">Open Creator Video</a>.
+    <a href="/publishing">Open Publishing</a>.
   </p>
   <div class="container">
     <section class="card">
@@ -2313,9 +2457,7 @@ def _resume_run_artifact(data_root: Path, run_id: str, filename: str) -> Path | 
     return target
 
 
-def _serve_resume_download(
-    handler: BaseHTTPRequestHandler, data_root: Path, run_id: str
-) -> None:
+def _serve_resume_download(handler: BaseHTTPRequestHandler, data_root: Path, run_id: str) -> None:
     target = _resume_run_artifact(data_root, run_id, "08_resume.docx")
     if target is None:
         handler.send_error(404, "Resume not found")
@@ -2337,9 +2479,7 @@ def _serve_resume_download(
     handler.wfile.write(content)
 
 
-def _serve_resume_preview(
-    handler: BaseHTTPRequestHandler, data_root: Path, run_id: str
-) -> None:
+def _serve_resume_preview(handler: BaseHTTPRequestHandler, data_root: Path, run_id: str) -> None:
     target = _resume_run_artifact(data_root, run_id, "10_resume_preview.pdf")
     if target is None:
         handler.send_error(404, "Resume preview not found")
@@ -2388,6 +2528,8 @@ border-radius:12px;padding:18px;line-height:1.55}}</style></head><body>
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
 class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     ui_data_root: Path = Path(".soloscale")
     repo_root: Path = _repo_root()
@@ -2395,6 +2537,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     latest_user_form: dict[str, str] = {}
     latest_learning_form: dict[str, str] = {}
     latest_content_form: dict[str, str] = {}
+
+    def _video_data_root(self) -> Path:
+        return self.ui_data_root.absolute() / "video"
 
     def _send_advanced_page(self, result: UIActionResult | None) -> None:
         data_root = self.ui_data_root.absolute()
@@ -2453,6 +2598,18 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_video_page(self, job_id: str | None = None, error: str | None = None) -> None:
+        try:
+            page = _video_page(self._video_data_root(), job_id, error)
+        except VideoGenerationError:
+            page = _video_page(self._video_data_root(), None, "Video job is unavailable")
+        body = page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:  # noqa: N802
         path = urllib.parse.urlsplit(self.path).path
         if path in {"/", ""}:
@@ -2463,9 +2620,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             return
         if path == "/learning":
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-            self.latest_learning_form = {
-                key: values[0] for key, values in query.items() if values
-            }
+            self.latest_learning_form = {key: values[0] for key, values in query.items() if values}
             saved_stage = query.get("response_saved", [""])[0]
             self._send_learning_page(
                 None, saved_stage if saved_stage in {"explain", "trace"} else None
@@ -2476,9 +2631,41 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             run_id = query.get("run_id", [""])[0]
             self._send_content_page(run_id=run_id or None)
             return
-        content_download_match = re.fullmatch(
-            r"/content/downloads/([^/]+)/([^/]+)", path
+        if path == "/video":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            self._send_video_page(query.get("job_id", [None])[0])
+            return
+        if path == "/publishing":
+            body = _publishing_page().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        video_download_match = re.fullmatch(
+            r"/video/downloads/(video-[a-f0-9]{12})/output\.mp4", path
         )
+        if video_download_match is not None:
+            try:
+                job = load_job(self._video_data_root(), video_download_match.group(1))
+                output = Path(job.output_path or "")
+                if not output.is_file() or output.is_symlink():
+                    raise VideoGenerationError("video output is unavailable")
+                content = output.read_bytes()
+            except (OSError, VideoGenerationError):
+                self.send_error(404, "Video output not found")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Disposition", 'attachment; filename="output.mp4"')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(content)
+            return
+        content_download_match = re.fullmatch(r"/content/downloads/([^/]+)/([^/]+)", path)
         if content_download_match is not None:
             try:
                 filename, content = content_download(
@@ -2492,7 +2679,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             content_type = (
                 "application/json"
                 if filename.endswith(".json")
-                else "video/mp4" if filename.endswith(".mp4") else "text/markdown; charset=utf-8"
+                else "video/mp4"
+                if filename.endswith(".mp4")
+                else "text/markdown; charset=utf-8"
             )
             self.send_response(200)
             self.send_header("Content-Type", content_type)
@@ -2523,6 +2712,61 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/video/prepare":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            form = _parse_form(self.rfile.read(length))
+            try:
+                request = VideoGenerationRequest(
+                    topic=form.get("topic", ""),
+                    script=form.get("script", ""),
+                    platform=form.get("platform", "Short video"),
+                    language=form.get("language", "English"),
+                    style=form.get("style", "Cinematic product demo"),
+                    content_run_id=form.get("content_run_id", "").strip() or None,
+                    evidence_ids=[
+                        x.strip() for x in form.get("evidence_ids", "").splitlines() if x.strip()
+                    ],
+                    evidence_excerpts=[
+                        x.strip()
+                        for x in form.get("evidence_excerpts", "").splitlines()
+                        if x.strip()
+                    ],
+                )
+                job = create_job(self._video_data_root(), request)
+            except (VideoGenerationError, ValueError, OSError) as exc:
+                self._send_video_page(error=str(exc))
+                return
+            self.send_response(303)
+            self.send_header("Location", f"/video?job_id={job.job_id}")
+            self.end_headers()
+            return
+        submit_match = re.fullmatch(r"/video/submit/(video-[a-f0-9]{12})", path)
+        poll_match = re.fullmatch(r"/video/poll/(video-[a-f0-9]{12})", path)
+        if submit_match or poll_match:
+            matched_video_action = submit_match or poll_match
+            assert matched_video_action is not None
+            job_id = matched_video_action.group(1)
+            form = _parse_form(self.rfile.read(int(self.headers.get("Content-Length", "0") or 0)))
+            try:
+                job = load_job(self._video_data_root(), job_id)
+                if submit_match:
+                    if form.get("confirmation") != "PUBLISH":
+                        raise VideoGenerationError("Type PUBLISH to authorize the external request")
+                    if job.estimated_cost_usd > 1.0:
+                        raise VideoGenerationError(
+                            "Estimated cost exceeds the authorized $1.00 limit"
+                        )
+                    job = GoogleVeoClient().submit(job)
+                else:
+                    job = GoogleVeoClient().poll(job, data_root=self._video_data_root())
+                save_job(self._video_data_root(), job)
+            except (VideoGenerationError, OSError, ValueError) as exc:
+                self._send_video_page(job_id, str(exc))
+                return
+            self.send_response(303)
+            self.send_header("Location", f"/video?job_id={job_id}")
+            self.end_headers()
+            return
         if path == "/content/generate":
             try:
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -2568,29 +2812,32 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         buildlog_match = re.fullmatch(
-            r"/content/buildlog/(content-[^/]+)/(linkedin|x)(/receipt)?", path
+            r"/content/buildlog/(content-[^/]+)/(linkedin|x)(/publish)?", path
         )
         if buildlog_match is not None:
-            run_id, channel, receipt_path = buildlog_match.groups()
+            run_id, channel, publish_path = buildlog_match.groups()
             if channel not in {"linkedin", "x"}:
                 self.send_error(404)
                 return
             channel = cast(Channel, channel)
             try:
-                if receipt_path:
-                    receipt = sync_buildlog_receipt(
+                if publish_path:
+                    length = int(self.headers.get("Content-Length", "0") or 0)
+                    publish_form = _parse_form(self.rfile.read(length))
+                    publish_via_buildlog(
                         data_root=self.ui_data_root.absolute(),
                         run_id=run_id,
                         channel=channel,
+                        confirmation=publish_form.get("confirmation", ""),
                     )
-                    query = {"run_id": run_id, "buildlog": "published" if receipt else "pending"}
+                    query = {"run_id": run_id, "buildlog": "published"}
                 else:
-                    stage_for_buildlog(
+                    preview_for_buildlog(
                         data_root=self.ui_data_root.absolute(),
                         run_id=run_id,
                         channel=channel,
                     )
-                    query = {"run_id": run_id, "buildlog": "staged"}
+                    query = {"run_id": run_id, "buildlog": "previewed"}
             except (
                 BuildLogHandoffError,
                 ContentWorkspaceError,
@@ -2697,9 +2944,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             return
         self.latest_form = _parse_form(body)
         data_root = (
-            Path(self.latest_form.get("data_root", str(self.ui_data_root)))
-            .expanduser()
-            .absolute()
+            Path(self.latest_form.get("data_root", str(self.ui_data_root))).expanduser().absolute()
         )
         advanced_result = _run_action(self.latest_form, data_root, self.repo_root)
         self._send_advanced_page(advanced_result)
@@ -2711,8 +2956,8 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument(
         "--data-root",
-        default=".soloscale",
-        help="SoloScale private data root (default: .soloscale)",
+        default=str(Path.home() / "Documents" / "SoloScaleData"),
+        help="SoloScale private data root (default: ~/Documents/SoloScaleData)",
     )
     args = parser.parse_args()
 

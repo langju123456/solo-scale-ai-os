@@ -1,48 +1,58 @@
-"""Minimal handoff from a reviewed SoloScale content artifact to BuildLog."""
+"""In-process handoff from reviewed SoloScale content to BuildLog publishing."""
 
 from __future__ import annotations
 
 import json
 import os
-import subprocess
-import sys
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from soloscale.content_workspace import content_run_directory
 from soloscale.resume_workspace import ResumeWorkspaceStorageError, _atomic_private_write
 
 Channel = Literal["linkedin", "x"]
-_SOURCE_NAMES: dict[Channel, str] = {"linkedin": "02_linkedin.md", "x": "03_x_thread.md"}
+_SOURCE_NAMES: dict[Channel, str] = {"linkedin": "02_linkedin.md", "x": "03_x_post.md"}
 
 
 class BuildLogHandoffError(ValueError):
-    """Raised when BuildLog cannot accept or report a SoloScale content handoff."""
+    """Raised when BuildLog cannot safely preview or publish an artifact."""
+
+
+def _gateway(data_root: Path, channel: Channel):  # type: ignore[no-untyped-def]
+    try:
+        from buildlog.publishing_gateway import PublishingGateway
+    except ImportError as exc:
+        raise BuildLogHandoffError("BuildLog internal package is unavailable") from exc
+    config_value = os.environ.get("BUILDLOG_CONFIG_ROOT", "").strip()
+    config_root = (
+        Path(config_value).expanduser().absolute()
+        if config_value
+        else Path(__file__).resolve().parents[2] / "packages" / "buildlog"
+    )
+    return PublishingGateway(
+        data_root=data_root / "publishing",
+        config_root=config_root,
+        channel=channel,
+    )
 
 
 def stage_for_buildlog(*, data_root: Path, run_id: str, channel: Channel) -> dict[str, str]:
-    """Stage an exact Content Studio artifact without publishing it."""
+    """Stage one exact artifact inside BuildLog without authenticating or publishing."""
 
     run_dir = content_run_directory(data_root, run_id)
     record_path = run_dir / f"12_buildlog_{channel}.json"
     if record_path.exists() or record_path.is_symlink():
-        return _load_record(record_path)
+        return _load_string_record(record_path)
     source = run_dir / _SOURCE_NAMES[channel]
     if source.is_symlink() or not source.is_file():
         raise BuildLogHandoffError("Content artifact is unavailable")
-    payload = _run_buildlog(
-        "external",
-        "stage",
-        "--source",
-        str(source),
-        "--source-run-id",
-        run_id,
-        "--channel",
-        channel,
-    )
-    buildlog_run_id = payload.get("buildlog_run_id")
-    if not isinstance(buildlog_run_id, str) or not buildlog_run_id:
-        raise BuildLogHandoffError("BuildLog did not return a staging receipt")
+    try:
+        buildlog_run_id = _gateway(data_root, channel).stage(
+            source_path=source,
+            source_run_id=run_id,
+        )
+    except Exception as exc:
+        raise BuildLogHandoffError("BuildLog could not stage this artifact") from exc
     record = {
         "status": "STAGED_FOR_BUILDLOG_APPROVAL",
         "channel": channel,
@@ -50,92 +60,122 @@ def stage_for_buildlog(*, data_root: Path, run_id: str, channel: Channel) -> dic
         "source_artifact": _SOURCE_NAMES[channel],
         "buildlog_run_id": buildlog_run_id,
     }
-    try:
-        _atomic_private_write(record_path, json.dumps(record, indent=2) + "\n")
-    except (OSError, ResumeWorkspaceStorageError) as exc:
-        raise BuildLogHandoffError("BuildLog handoff was staged but could not be recorded") from exc
+    _write_record(record_path, record)
     return record
 
 
-def sync_buildlog_receipt(
-    *, data_root: Path, run_id: str, channel: Channel
-) -> dict[str, str] | None:
-    """Persist BuildLog's returned platform post ID only after it reports success."""
+def preview_for_buildlog(*, data_root: Path, run_id: str, channel: Channel) -> dict[str, object]:
+    """Resolve identity and exact content without making a publication request."""
 
     run_dir = content_run_directory(data_root, run_id)
-    handoff = _load_record(run_dir / f"12_buildlog_{channel}.json")
-    receipt_path = run_dir / f"13_buildlog_{channel}_receipt.json"
-    if receipt_path.exists() or receipt_path.is_symlink():
-        return _load_record(receipt_path)
-    payload = _run_buildlog("external", "receipt", handoff["buildlog_run_id"])
-    if payload.get("receipt") is None and "receipt_id" not in payload:
-        return None
-    required = ("receipt_id", "platform", "external_post_id", "published_at", "buildlog_run_id")
-    if any(not isinstance(payload.get(key), str) or not payload[key] for key in required):
-        raise BuildLogHandoffError("BuildLog publication receipt is incomplete")
-    receipt = {key: str(payload[key]) for key in required}
+    preview_path = run_dir / f"12_buildlog_{channel}_preview.json"
+    if preview_path.is_file() and not preview_path.is_symlink():
+        return _load_record(preview_path)
+    handoff = stage_for_buildlog(data_root=data_root, run_id=run_id, channel=channel)
     try:
-        _atomic_private_write(receipt_path, json.dumps(receipt, indent=2) + "\n")
-    except (OSError, ResumeWorkspaceStorageError) as exc:
-        raise BuildLogHandoffError("BuildLog receipt could not be recorded") from exc
-    return receipt
+        preview = _gateway(data_root, channel).preview(handoff["buildlog_run_id"])
+    except Exception as exc:
+        raise BuildLogHandoffError(
+            f"BuildLog {channel} publishing is not configured or authorized"
+        ) from exc
+    record: dict[str, object] = {
+        "status": "READY_FOR_EXPLICIT_PUBLISH_APPROVAL",
+        "channel": channel,
+        "source_run_id": run_id,
+        "buildlog_run_id": handoff["buildlog_run_id"],
+        "platform": preview.platform.value,
+        "account_reference": preview.account_reference,
+        "account_display_name": preview.account_display_name,
+        "content": preview.content,
+        "content_hash": preview.content_hash,
+        "content_length": preview.content_length,
+        "duplicate_found": preview.duplicate_found,
+        "indeterminate_found": preview.indeterminate_found,
+        "network_publication_performed": False,
+    }
+    _replace_record(preview_path, record)
+    return record
+
+
+def publish_via_buildlog(
+    *,
+    data_root: Path,
+    run_id: str,
+    channel: Channel,
+    confirmation: str,
+) -> dict[str, str]:
+    """Publish through BuildLog only after approval bound to a stored exact preview."""
+
+    if confirmation != "PUBLISH":
+        raise BuildLogHandoffError("Type PUBLISH to authorize this exact publication")
+    run_dir = content_run_directory(data_root, run_id)
+    preview = _load_record(run_dir / f"12_buildlog_{channel}_preview.json")
+    required = ("buildlog_run_id", "content_hash", "account_reference")
+    if any(not isinstance(preview.get(key), str) or not preview[key] for key in required):
+        raise BuildLogHandoffError("BuildLog preview is incomplete; preview again")
+    try:
+        receipt = _gateway(data_root, channel).publish(
+            cast(str, preview["buildlog_run_id"]),
+            confirmation=confirmation,
+            approved_content_hash=cast(str, preview["content_hash"]),
+            approved_account_reference=cast(str, preview["account_reference"]),
+        )
+    except Exception as exc:
+        raise BuildLogHandoffError("BuildLog publication failed; inspect its receipt") from exc
+    if receipt.external_post_id is None or receipt.published_at is None:
+        raise BuildLogHandoffError("BuildLog did not return a successful receipt")
+    record = {
+        "receipt_id": receipt.receipt_id,
+        "platform": receipt.platform.value,
+        "status": receipt.status.value,
+        "external_post_id": receipt.external_post_id,
+        "published_at": receipt.published_at.isoformat(),
+        "buildlog_run_id": receipt.run_id,
+        "source_run_id": run_id,
+    }
+    _write_record(run_dir / f"13_buildlog_{channel}_receipt.json", record)
+    return record
 
 
 def buildlog_handoff_status(
     data_root: Path, run_id: str, channel: Channel
-) -> tuple[dict[str, str] | None, dict[str, str] | None]:
+) -> tuple[dict[str, str] | None, dict[str, object] | None, dict[str, str] | None]:
     run_dir = content_run_directory(data_root, run_id)
     handoff_path = run_dir / f"12_buildlog_{channel}.json"
+    preview_path = run_dir / f"12_buildlog_{channel}_preview.json"
     receipt_path = run_dir / f"13_buildlog_{channel}_receipt.json"
-    handoff = (
-        _load_record(handoff_path)
-        if handoff_path.is_file() and not handoff_path.is_symlink()
-        else None
-    )
-    receipt = (
-        _load_record(receipt_path)
-        if receipt_path.is_file() and not receipt_path.is_symlink()
-        else None
-    )
-    return handoff, receipt
+    handoff = _load_string_record(handoff_path) if handoff_path.is_file() else None
+    preview = _load_record(preview_path) if preview_path.is_file() else None
+    receipt = _load_string_record(receipt_path) if receipt_path.is_file() else None
+    return handoff, preview, receipt
 
 
-def _run_buildlog(*arguments: str) -> dict[str, object]:
-    root_value = os.environ.get("SOLOSCALE_BUILDLOG_ROOT", "").strip()
-    if not root_value:
-        raise BuildLogHandoffError("Set SOLOSCALE_BUILDLOG_ROOT before using BuildLog publishing")
-    root = Path(root_value).expanduser()
-    if not (root / "src" / "buildlog" / "main.py").is_file():
-        raise BuildLogHandoffError("SOLOSCALE_BUILDLOG_ROOT does not contain BuildLog")
-    python = root / ".venv" / "bin" / "python"
-    executable = str(python) if python.is_file() else sys.executable
-    environment = os.environ.copy()
-    environment.pop("PYTHONPATH", None)
-    completed = subprocess.run(
-        [executable, "-m", "buildlog.main", *arguments],
-        cwd=root,
-        env=environment,
-        capture_output=True,
-        check=False,
-        text=True,
-        timeout=30,
-    )
-    if completed.returncode != 0:
-        raise BuildLogHandoffError("BuildLog could not stage this artifact")
+def _write_record(path: Path, record: dict[str, str]) -> None:
     try:
-        parsed = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise BuildLogHandoffError("BuildLog returned an invalid handoff response") from exc
-    if not isinstance(parsed, dict):
-        raise BuildLogHandoffError("BuildLog returned an invalid handoff response")
-    return parsed
+        _atomic_private_write(path, json.dumps(record, indent=2) + "\n")
+    except (OSError, ResumeWorkspaceStorageError) as exc:
+        raise BuildLogHandoffError("BuildLog result could not be recorded") from exc
 
 
-def _load_record(path: Path) -> dict[str, str]:
+def _replace_record(path: Path, record: dict[str, object]) -> None:
+    try:
+        _atomic_private_write(path, json.dumps(record, indent=2) + "\n")
+    except (OSError, ResumeWorkspaceStorageError) as exc:
+        raise BuildLogHandoffError("BuildLog preview could not be recorded") from exc
+
+
+def _load_record(path: Path) -> dict[str, object]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise BuildLogHandoffError("BuildLog handoff record is invalid") from exc
-    if not isinstance(loaded, dict) or not all(isinstance(value, str) for value in loaded.values()):
+    if not isinstance(loaded, dict):
         raise BuildLogHandoffError("BuildLog handoff record is invalid")
-    return loaded
+    return cast(dict[str, object], loaded)
+
+
+def _load_string_record(path: Path) -> dict[str, str]:
+    loaded = _load_record(path)
+    if not all(isinstance(value, str) for value in loaded.values()):
+        raise BuildLogHandoffError("BuildLog handoff record is invalid")
+    return cast(dict[str, str], loaded)

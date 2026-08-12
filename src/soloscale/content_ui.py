@@ -57,9 +57,7 @@ def _brief_from_form(form: dict[str, str]) -> ContentBrief:
         *_ungrounded_lines(form.get("hypotheses", ""), "HYPOTHESIS"),
         *_ungrounded_lines(form.get("planned", ""), "PLANNED"),
     ]
-    language: Literal["English", "中文"] = (
-        "中文" if form.get("language") == "中文" else "English"
-    )
+    language: Literal["English", "中文"] = "中文" if form.get("language") == "中文" else "English"
     return ContentBrief(
         topic=form.get("topic", "").strip(),
         audience=form.get("audience", "").strip(),
@@ -142,7 +140,7 @@ def _result_html(run: ContentRun, *, data_root: Path, video_ready: bool) -> str:
         for index, post in enumerate(run.drafts.x_thread, start=1)
     )
     scenes = "".join(
-        "<article class=\"scene\">"
+        '<article class="scene">'
         f"<span>{scene.start_second:02d}–{scene.end_second:02d}s</span>"
         f"<strong>{_escape(scene.purpose)}</strong>"
         f"<p>{_escape(scene.voiceover)}</p>"
@@ -164,15 +162,14 @@ def _result_html(run: ContentRun, *, data_root: Path, video_ready: bool) -> str:
         </video>
         <a class="text-link" href="{video_download}" download>下载 MP4</a>'''
         if video_ready
-        else f'''<form method="post" action="/content/render/{run_id}" class="render-form">
+        else f"""<form method="post" action="/content/render/{run_id}" class="render-form">
           <button class="primary" type="submit">生成 MP4 视频</button>
           <small>本机 Remotion 渲染；只使用本次 storyboard，不会发布。</small>
-        </form>'''
+        </form>"""
     )
     channels: tuple[Literal["linkedin"], Literal["x"]] = ("linkedin", "x")
     buildlog = "".join(
-        _buildlog_channel_html(data_root, run.run_id, channel)
-        for channel in channels
+        _buildlog_channel_html(data_root, run.run_id, channel) for channel in channels
     )
     download_links = "".join(
         f'<a href="/content/downloads/{run_id}/{name}" download>{label}</a>'
@@ -205,7 +202,12 @@ def _result_html(run: ContentRun, *, data_root: Path, video_ready: bool) -> str:
             download>下载脚本</a>
         </div>
         <div class="storyboard">{scenes}</div>
-        <div class="creator-video-result">{video_action}</div>
+        <div class="creator-video-result">
+          <p><a href="/video">Generate a cloud video with Google Vertex AI</a></p>
+          <details><summary>Experimental local Remotion renderer</summary>
+            {video_action}
+          </details>
+        </div>
       </div>
       <p class="review-note">SoloScale 没有连接或操作你的社交账号，也没有自动发布。</p>
       <section class="buildlog-handoff">
@@ -220,26 +222,35 @@ def _result_html(run: ContentRun, *, data_root: Path, video_ready: bool) -> str:
 def _buildlog_channel_html(data_root: Path, run_id: str, channel: Literal["linkedin", "x"]) -> str:
     label = "LinkedIn" if channel == "linkedin" else "X"
     try:
-        handoff, receipt = buildlog_handoff_status(data_root, run_id, channel)
+        handoff, preview, receipt = buildlog_handoff_status(data_root, run_id, channel)
     except ValueError:
-        handoff, receipt = None, None
-    if handoff is None:
+        handoff, preview, receipt = None, None, None
+    if handoff is None or preview is None:
         return (
             f'<form method="post" action="/content/buildlog/{run_id}/{channel}">'
-            f'<button class="secondary" type="submit">交给 BuildLog 发布 {label}</button></form>'
+            f'<button class="secondary" type="submit">在 BuildLog 中预览 {label}</button></form>'
         )
-    run = _escape(handoff["buildlog_run_id"])
     if receipt is not None:
         return (
-            f'<p><strong>{label} 已发布</strong> · Post ID: {_escape(receipt["external_post_id"])} '
-            f'· BuildLog receipt: {_escape(receipt["receipt_id"])}</p>'
+            f"<p><strong>{label} · {_escape(receipt['status'])}</strong> · "
+            f"Post ID: {_escape(receipt['external_post_id'])} · "
+            f"Receipt: {_escape(receipt['receipt_id'])} · "
+            f"Published: {_escape(receipt['published_at'])} · "
+            f"Source: {_escape(receipt['source_run_id'])}</p>"
         )
-    heading = f"<strong>{label} 已转交 BuildLog</strong> · Run: {run}"
-    return f'''<div class="handoff-state"><p>{heading}</p>
-      <p>在 BuildLog 中预览并输入 PUBLISH 后，再回这里同步回执。</p>
-      <form method="post" action="/content/buildlog/{run_id}/{channel}/receipt">
-        <button class="secondary" type="submit">同步 {label} 发布回执</button>
-      </form></div>'''
+    exact_content = _escape(str(preview.get("content", "")))
+    account = _escape(str(preview.get("account_display_name", "")))
+    duplicate = "yes" if preview.get("duplicate_found") else "no"
+    indeterminate = "yes" if preview.get("indeterminate_found") else "no"
+    return f"""<div class="handoff-state"><p><strong>{label} exact BuildLog preview</strong>
+      · Account: {account} · Duplicate: {duplicate} · Unresolved attempt: {indeterminate}</p>
+      <pre>{exact_content}</pre>
+      <form method="post" action="/content/buildlog/{run_id}/{channel}/publish">
+        <label>Type PUBLISH to publish this exact text
+          <input name="confirmation" autocomplete="off" required />
+        </label>
+        <button class="secondary" type="submit">Publish {label}</button>
+      </form></div>"""
 
 
 def content_page(
@@ -264,9 +275,7 @@ def content_page(
     )
     if not recent_html:
         recent_html = "<span>生成后会显示在这里。</span>"
-    error_html = (
-        f'<div class="error" role="alert">{_escape(error)}</div>' if error else ""
-    )
+    error_html = f'<div class="error" role="alert">{_escape(error)}</div>' if error else ""
     result_html = (
         _result_html(
             run,
@@ -420,7 +429,9 @@ pre {{
   <div class="brand">SoloScale</div>
   <div class="nav-links">
     <a href="/">Resume</a><a href="/learning">Learning</a>
-    <a class="active" href="/content">Content</a><a href="/advanced">Advanced</a>
+    <a class="active" href="/content">Content</a><a href="/video">Video</a>
+    <a href="/publishing">Publishing</a>
+    <a href="/advanced">Advanced</a>
   </div>
 </nav>
 <header class="hero">
@@ -437,48 +448,48 @@ pre {{
 <form id="content-form" method="post" action="/content/generate">
 <label>主题
   <input name="topic" maxlength="180" required
-    value="{_escape(values.get('topic', ''))}"
+    value="{_escape(values.get("topic", ""))}"
     placeholder="例如：Why green tests were not enough to publish" />
 </label>
 <div class="two">
   <label>受众
     <input name="audience" maxlength="500" required
-      value="{_escape(values.get('audience', 'AI engineers and solo builders'))}" />
+      value="{_escape(values.get("audience", "AI engineers and solo builders"))}" />
   </label>
   <label>输出语言
     <select name="language">
-      <option {'selected' if language == 'English' else ''}>English</option>
-      <option {'selected' if language == '中文' else ''}>中文</option>
+      <option {"selected" if language == "English" else ""}>English</option>
+      <option {"selected" if language == "中文" else ""}>中文</option>
     </select>
   </label>
 </div>
 <label>来源 / 项目链接
   <input name="source_label" maxlength="500" required
-    value="{_escape(values.get('source_label', ''))}"
+    value="{_escape(values.get("source_label", ""))}"
     placeholder="GitHub PR、公开文档或证据包标识" />
 </label>
 <label>已验证事实
   <span class="hint">每行：事实 | 证据链接 | 这条证据不能证明什么（可选）</span>
   <textarea class="large" name="verified_claims" required
     placeholder="Python CI checks passed. | https://github.com/... | Local run only."
-  >{_escape(values.get('verified_claims', ''))}</textarea>
+  >{_escape(values.get("verified_claims", ""))}</textarea>
 </label>
 <label>个人观察（可选）
   <span class="hint">每行：观察 | 对应记录或链接 | 边界（可选）</span>
   <textarea name="observed_claims"
-  >{_escape(values.get('observed_claims', ''))}</textarea>
+  >{_escape(values.get("observed_claims", ""))}</textarea>
 </label>
 <label>待验证假设（可选）
   <span class="hint">每行一条，不会被写成已验证结论。</span>
-  <textarea name="hypotheses">{_escape(values.get('hypotheses', ''))}</textarea>
+  <textarea name="hypotheses">{_escape(values.get("hypotheses", ""))}</textarea>
 </label>
 <label>下一步（可选）
   <span class="hint">每行一条，会使用未来时态和 PLANNED 标签。</span>
-  <textarea name="planned">{_escape(values.get('planned', ''))}</textarea>
+  <textarea name="planned">{_escape(values.get("planned", ""))}</textarea>
 </label>
 <label>CTA
   <input name="call_to_action" maxlength="220" required
-    value="{_escape(values.get('call_to_action', 'Follow the next measured iteration.'))}" />
+    value="{_escape(values.get("call_to_action", "Follow the next measured iteration."))}" />
 </label>
 <div class="boundary">生成器不会调用模型或网络，不会连接社交账号，也不会自动发布。</div>
 <button id="generate-content" class="primary" type="submit">生成三渠道内容</button>

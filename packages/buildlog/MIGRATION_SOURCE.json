@@ -1,0 +1,7 @@
+{
+  "source_repository": "https://github.com/langju123456/BuildLog.git",
+  "source_commit": "07ff28a",
+  "method": "git subtree add --prefix=packages/buildlog buildlog-source/master",
+  "imported_at": "2026-08-12",
+  "ownership": "BuildLog remains the publishing bounded context."
+}

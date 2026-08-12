@@ -36,6 +36,7 @@ _SECRET = re.compile(
 _DOWNLOADS = {
     "linkedin.md": "02_linkedin.md",
     "x-thread.md": "03_x_thread.md",
+    "x-post.md": "03_x_post.md",
     "video-script.md": "04_video_script.md",
     "storyboard.json": "05_storyboard.json",
     "creator-video.mp4": "10_creator_video.mp4",
@@ -65,9 +66,7 @@ def parse_claim_ledger(raw: str) -> list[ContentClaim]:
         try:
             status = ClaimStatus(parts[0].upper())
         except ValueError:
-            raise ContentWorkspaceError(
-                f"Claim line {line_number} has an unknown status"
-            ) from None
+            raise ContentWorkspaceError(f"Claim line {line_number} has an unknown status") from None
         receipt = parts[2] if len(parts) >= 3 and parts[2] else None
         limits = parts[3] if len(parts) >= 4 and parts[3] else None
         try:
@@ -136,11 +135,7 @@ def _claim_line(claim: ContentClaim, language: str) -> str:
 def _render_linkedin(brief: ContentBrief) -> str:
     first_claim = brief.claims[0]
     grouped = {
-        status: [
-            claim
-            for claim in brief.claims[1:]
-            if claim.status is status
-        ]
+        status: [claim for claim in brief.claims[1:] if claim.status is status]
         for status in ClaimStatus
     }
     first_label = _status_heading(first_claim.status, brief.language)
@@ -178,9 +173,7 @@ def _render_linkedin(brief: ContentBrief) -> str:
         )
     limits = [claim for claim in brief.claims if claim.limits]
     if limits:
-        sections.extend(
-            [limit_title, *[f"- [{claim.id}] {claim.limits}" for claim in limits], ""]
-        )
+        sections.extend([limit_title, *[f"- [{claim.id}] {claim.limits}" for claim in limits], ""])
     receipts = [claim for claim in brief.claims if claim.receipt]
     if receipts:
         sections.extend(
@@ -321,6 +314,7 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
         "01_claim_ledger.json",
         "02_linkedin.md",
         "03_x_thread.md",
+        "03_x_post.md",
         "04_video_script.md",
         "05_storyboard.json",
         "06_publish_pack.json",
@@ -379,6 +373,7 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
         "01_claim_ledger.json": _canonical_json({"claims": brief_payload["claims"]}),
         "02_linkedin.md": drafts.linkedin,
         "03_x_thread.md": "\n\n".join(drafts.x_thread) + "\n",
+        "03_x_post.md": drafts.x_thread[0].strip() + "\n",
         "04_video_script.md": drafts.video_script,
         "05_storyboard.json": _canonical_json({"scenes": drafts_payload["storyboard"]}),
         "06_publish_pack.json": _canonical_json(publish_pack),

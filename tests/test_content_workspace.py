@@ -1,12 +1,14 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from soloscale.buildlog_handoff import (
     buildlog_handoff_status,
+    preview_for_buildlog,
+    publish_via_buildlog,
     stage_for_buildlog,
-    sync_buildlog_receipt,
 )
 from soloscale.content_models import ClaimStatus, ContentBrief, ContentClaim
 from soloscale.content_workspace import (
@@ -198,25 +200,51 @@ def test_buildlog_handoff_stages_exact_artifact_and_persists_returned_receipt(
 ) -> None:
     data_root = tmp_path / ".soloscale"
     run = run_content_workspace(data_root=data_root, brief=_brief())
-    responses = [
-        {"buildlog_run_id": "soloscale-linkedin-123"},
-        {
-            "receipt_id": "receipt-123",
-            "platform": "linkedin",
-            "external_post_id": "urn:li:share:123",
-            "published_at": "2026-08-12T00:00:00+00:00",
-            "buildlog_run_id": "soloscale-linkedin-123",
-        },
-    ]
-    monkeypatch.setattr(
-        "soloscale.buildlog_handoff._run_buildlog",
-        lambda *args: responses.pop(0),
-    )
+
+    class FakeGateway:
+        def stage(self, **kwargs: object) -> str:
+            assert Path(str(kwargs["source_path"])).read_text() == run.drafts.linkedin
+            return "soloscale-linkedin-123"
+
+        def preview(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "soloscale-linkedin-123"
+            return SimpleNamespace(
+                platform=SimpleNamespace(value="linkedin"),
+                account_reference="linkedin:member:123",
+                account_display_name="Test Member",
+                content=run.drafts.linkedin,
+                content_hash="a" * 64,
+                content_length=len(run.drafts.linkedin),
+                duplicate_found=False,
+                indeterminate_found=False,
+            )
+
+        def publish(self, run_id: str, **kwargs: object) -> SimpleNamespace:
+            assert kwargs["confirmation"] == "PUBLISH"
+            return SimpleNamespace(
+                receipt_id="receipt-123",
+                platform=SimpleNamespace(value="linkedin"),
+                status=SimpleNamespace(value="succeeded"),
+                external_post_id="urn:li:share:123",
+                published_at=SimpleNamespace(isoformat=lambda: "2026-08-12T00:00:00+00:00"),
+                run_id=run_id,
+            )
+
+    monkeypatch.setattr("soloscale.buildlog_handoff._gateway", lambda *args: FakeGateway())
 
     handoff = stage_for_buildlog(data_root=data_root, run_id=run.run_id, channel="linkedin")
-    receipt = sync_buildlog_receipt(data_root=data_root, run_id=run.run_id, channel="linkedin")
+    preview = preview_for_buildlog(data_root=data_root, run_id=run.run_id, channel="linkedin")
+    receipt = publish_via_buildlog(
+        data_root=data_root,
+        run_id=run.run_id,
+        channel="linkedin",
+        confirmation="PUBLISH",
+    )
 
     assert handoff["buildlog_run_id"] == "soloscale-linkedin-123"
-    assert receipt is not None
     assert receipt["external_post_id"] == "urn:li:share:123"
-    assert buildlog_handoff_status(data_root, run.run_id, "linkedin") == (handoff, receipt)
+    assert buildlog_handoff_status(data_root, run.run_id, "linkedin") == (
+        handoff,
+        preview,
+        receipt,
+    )

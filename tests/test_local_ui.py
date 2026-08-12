@@ -57,10 +57,7 @@ def _expected_repository_ref() -> str:
 
 def _uploaded_resume_docx() -> bytes:
     def paragraph(text: str, *, bullet: bool = False) -> str:
-        numbering = (
-            '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/>'
-            "</w:numPr></w:pPr>"
-        )
+        numbering = '<w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>'
         return f"<w:p>{numbering if bullet else ''}<w:r><w:t>{text}</w:t></w:r></w:p>"
 
     values = [
@@ -104,10 +101,13 @@ def test_user_page_is_resume_first_and_keeps_developer_tools_under_advanced(
     assert 'action="/generate"' in page
     assert 'name="resume_template"' in page
     assert 'name="job_description"' in page
+    assert 'name="tailoring_instructions"' in page
+    assert 'name="approve_candidate_claims"' in page
     assert "生成针对性简历" in page
     assert 'href="/advanced"' in page
     assert 'href="/content"' in page
     assert 'href="/learning"' in page
+    assert 'href="/publishing"' in page
     assert "knowledge-sync" not in page
     assert 'name="model"' not in page
     assert 'name="source_kind"' not in page
@@ -187,9 +187,7 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
     assert "do not prove authorship" in page
     assert len(list((data_root / "learning-runs").iterdir())) == run_count
 
-    anchors_path = (
-        data_root / "learning-runs" / selected.run_id / "03_code_anchors.json"
-    )
+    anchors_path = data_root / "learning-runs" / selected.run_id / "03_code_anchors.json"
     anchors = json.loads(anchors_path.read_text(encoding="utf-8"))
     anchors["code_anchors"][0]["file_sha256"] = "0" * 64
     anchors_path.write_text(json.dumps(anchors), encoding="utf-8")
@@ -214,13 +212,17 @@ def test_parse_submission_reads_text_and_docx_upload() -> None:
     boundary = "SoloScaleBoundary"
     template = _uploaded_resume_docx()
     body = (
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="job_description"\r\n\r\n'
-        "Required: Python RAG\r\n"
-        f"--{boundary}\r\n"
-        'Content-Disposition: form-data; name="resume_template"; filename="resume.docx"\r\n'
-        f"Content-Type: application/octet-stream\r\n\r\n"
-    ).encode() + template + f"\r\n--{boundary}--\r\n".encode()
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="job_description"\r\n\r\n'
+            "Required: Python RAG\r\n"
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="resume_template"; filename="resume.docx"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n"
+        ).encode()
+        + template
+        + f"\r\n--{boundary}--\r\n".encode()
+    )
 
     submission = _parse_submission(body, f"multipart/form-data; boundary={boundary}")
 
@@ -263,8 +265,8 @@ def test_job_evidence_search_processes_every_normal_jd_term(
 
     monkeypatch.setattr("soloscale.local_ui.KnowledgeStore", FakeStore)
     terms = [f"requirement{index}" for index in range(40)]
-    job_description = " ".join(terms) + "\n" + "\n".join(
-        f"line{index} python" for index in range(30)
+    job_description = (
+        " ".join(terms) + "\n" + "\n".join(f"line{index} python" for index in range(30))
     )
 
     hits = _search_job_evidence(job_description, tmp_path)
@@ -347,6 +349,7 @@ def test_user_resume_rejects_symlinked_data_root_before_search(
     result = _run_user_resume(
         {
             "job_description": "Required: Python",
+            "approve_candidate_claims": "yes",
             "resume_library_root": str(tmp_path / "Resume Applications"),
         },
         {
@@ -411,6 +414,8 @@ def test_user_resume_flow_generates_matching_private_and_application_docx(
             "company_name": "Example AI",
             "job_title": "GenAI Engineer",
             "job_id": "1234567",
+            "tailoring_instructions": "Prioritize RAG and Python delivery.",
+            "approve_candidate_claims": "yes",
             "resume_library_root": str(library_root),
         },
         {
@@ -438,10 +443,17 @@ def test_user_resume_flow_generates_matching_private_and_application_docx(
     assert metadata["download_url"].endswith("/resume.docx")
     assert metadata["preview_url"].endswith("/resume.pdf")
     assert (run_dir / "10_resume_preview.pdf").is_file()
+    application_receipt = json.loads((run_dir / "application_receipt.json").read_text())
+    assert application_receipt["status"] == "PRIVATE_APPLICATION_DRAFT_SAVED"
+    assert application_receipt["operator_approved_profile_claims"]
+    assert application_receipt["job_application_submitted"] is False
     run_payload = json.loads((run_dir / "run.json").read_text())
-    assert {"08_resume.docx", "09_user_ui.json", "10_resume_preview.pdf"} <= set(
-        run_payload["artifact_paths"]
-    )
+    assert {
+        "08_resume.docx",
+        "09_user_ui.json",
+        "10_resume_preview.pdf",
+        "application_receipt.json",
+    } <= set(run_payload["artifact_paths"])
     application_metadata = json.loads((external_docx.parent / "application.json").read_text())
     assert application_metadata["resume_docx_filename"] == external_docx.name
     rendered = _user_page(result, tmp_path / ".soloscale", {})
@@ -451,6 +463,8 @@ def test_user_resume_flow_generates_matching_private_and_application_docx(
     assert 'class="resume-pdf-preview"' in rendered
     assert "在新窗口打开" in rendered
     assert "没有网络调用" in rendered
+
+
 def test_run_action_knowledge_status_builds_expected_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -513,6 +527,8 @@ def test_resume_workspace_rejects_unknown_mode_without_crashing(tmp_path: Path) 
     assert result is not None
     assert result.return_code == 2
     assert "Resume mode 无效" in result.stderr
+
+
 def test_resume_workspace_is_local_only_and_renders_preview(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
