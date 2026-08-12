@@ -151,6 +151,43 @@ an explicit delivery-state receipt. This slice does not update Casebook or Build
 to a job, publish, deploy, or call a network service in local-only mode. ADR-0005 freezes
 this boundary before the candidate slice is promoted into a released roadmap version.
 
+## 5.4 Local candidate slice: Learning Traceability golden case
+
+The first Learning Traceability slice compiles exactly one existing capability—Conversation
+RAG chunking and bounded retrieval—into a shared evidence graph. Tracked source
+distillations and ADRs remain raw reasoning evidence; decisions, implemented capabilities,
+real code/test anchors, mastery receipts, and approved claims remain distinct truth stages.
+Engineering evidence can be verified while operator contribution and mastery remain
+unknown. The local UI exposes the graph, bounded source excerpts, Explain/Trace starts,
+target-JD relevance, and the resume-claim gate without advancing mastery or publishing.
+
+Private runs and content-hash caches stay under ignored `.soloscale/` storage. This local,
+single-operator MVP adds no authentication, multi-user runtime, cloud service, external
+publishing, or automatic web/model call. ADR-0006 freezes this candidate boundary.
+
+## 5.5 Local candidate slice: Content Studio MVP
+
+Content Studio is a human-triggered, deterministic projection over an operator-supplied
+claim ledger:
+
+```text
+VERIFIED / OBSERVED / HYPOTHESIS / PLANNED claims + receipts + limits
+→ LinkedIn draft + X thread + short-video script/storyboard
+→ private non-overwriting content run
+→ preview, copy, and download
+→ human fact-check and per-channel publish approval
+```
+
+The local generator does not call a model or network service, connect a social account,
+or publish. Verified and observed claims require a receipt; every emitted factual block
+retains its claim ID and classification. Private absolute paths and common credential
+shapes fail closed before persistence. BuildLog remains the downstream publishing system;
+SoloScale exposes a local review surface over the compatible evidence contract.
+
+The optional Creator Video Factory is a local Remotion renderer. It reads only the saved
+storyboard for a reviewed Content run and produces a non-overwriting MP4 plus render receipt
+inside that private run. It adds no voice synthesis, generated facts, uploads, or publishing.
+
 ## 6. v0.2 success criteria
 
 - Repeated sync preserves stable source/document/chunk identities and does not duplicate a

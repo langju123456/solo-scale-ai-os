@@ -18,7 +18,8 @@ application-library sink. The local UI enables it by default at
 The external bundle contains only:
 
 - `JD.md`;
-- the generated Markdown resume; and
+- the generated Markdown resume;
+- the generated DOCX when the end-user template flow is used; and
 - `application.json` with job identity, source, run ID, and review status.
 
 The library must be outside the Git repository in the UI workflow. Repeated runs never
@@ -32,9 +33,10 @@ saved, published-but-durability-uncertain, or failed state with an exact publish
 
 ## Boundary
 
-This change does not generate DOCX, call a network service, apply to a job, publish data,
-or copy Conversation RAG evidence bodies into the application library. The DOCX template
-workflow remains separately human-reviewed. Resume facts come only from the operator's
+This change does not semantically rewrite resume claims, call a network service, apply to a
+job, publish data, or copy Conversation RAG evidence bodies into the application library.
+The DOCX template workflow only reorders intact uploaded content and remains human-reviewed.
+Resume facts come only from the operator's
 Candidate Profile. Retrieval matches are lineage-backed lexical candidates, not semantic
 coverage verification. The older Evidence-Agent-to-resume renderer is disabled.
 

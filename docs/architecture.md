@@ -79,14 +79,71 @@ flowchart LR
 Only Candidate Profile statements may appear as resume claims. Retrieval candidates are
 not semantic coverage verification. Internal receipts and the optional external bundle
 have separate delivery states, including an exact-path durability-uncertain receipt after
-publication; external publication uses a private staging directory and must target a
-location outside the Git repository. Managed storage rejects symlinks throughout the
-lexical root ancestry. This plane does not change Casebook,
+publication; external publication uses a private staging directory, a platform-native
+atomic no-replace operation, and must target a location outside the Git repository.
+Managed storage rejects symlinks throughout the lexical root ancestry. This plane does not change Casebook,
 BuildLog, or publishing state and does not submit an application.
 
+### Learning traceability projection
+
+The golden Learning Traceability case is a read-only projection over tracked reasoning,
+decisions, existing implementation, and test definitions:
+
+```mermaid
+flowchart LR
+    S[Tracked source / reasoning] --> I[Distilled insight]
+    I --> D[Engineering decision]
+    D --> C[Implemented capability]
+    C --> A[Real code anchor]
+    C --> V[Committed test definition]
+    C --> T[Technical concept]
+    T --> M[Human mastery receipt]
+    C --> J[Target-JD relevance]
+    M --> G{Claim gate}
+    J --> G
+```
+
+The projection records `ENGINEERING_VERIFIED` from real repository and committed test
+anchors without treating the learning run as a fresh test execution receipt. Mastery starts
+at `L0 Seen`, contribution fields remain unknown without receipts, and no claim reaches
+`APPROVED_CLAIM`. Detailed learning material is generated only for the selected case and
+cached by evidence hash. The runtime reads no ignored conversation body and makes no model,
+network, publishing, or application call. User-authored Explain and Trace responses are stored as
+private `RAW_STATEMENT` candidates under the selected run. They require review and do not
+modify the mastery snapshot or create a `MASTERY_RECEIPT`.
 This is a custom code-controlled loop, not an integration with an external agent
 framework or the OpenAI Agents SDK. Deterministic code owns maximum rounds, maximum
 queries, hit and context budgets, source filters, and citation-membership checks.
+
+### Content Studio projection
+
+Content Studio exposes a local review surface without taking ownership of external
+publishing:
+
+```mermaid
+flowchart LR
+    C[Operator claim ledger] --> V[Receipt and output-safety validation]
+    V --> L[LinkedIn candidate]
+    V --> X[X Thread candidate]
+    V --> S[Short-video script and storyboard]
+    L --> P[Private content run]
+    X --> P
+    S --> P
+    P --> R[Optional local Remotion MP4]
+    P --> H{Human fact-check and publish approval}
+    H --> B[BuildLog or approved publishing surface]
+```
+
+Verified and observed claims require receipts; hypotheses and planned work retain their
+classification. Draft blocks preserve claim IDs, while private absolute paths and common
+credential shapes fail before persistence. The deterministic local slice performs no
+model, network, account, or publish action. Receipt membership does not prove semantic
+support or public suitability, so the human gate remains mandatory.
+
+The optional Creator Video Factory reads only saved storyboard scene fields and writes a
+non-overwriting local MP4 plus a render receipt beside the private Content run. It uses
+Remotion with one local browser-rendering process; it does not synthesize narration, fetch
+assets, upload video, or change external publishing state.
 
 Retrieved text is untrusted. Code limits its possible effects to bounded local search and
 verifies that each declared claim cites an in-context chunk from the same run. Prompt

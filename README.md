@@ -132,29 +132,55 @@ python -m soloscale.local_ui --host 127.0.0.1 --port 8765 --data-root .soloscale
 
 打开终端打印的地址（默认 `http://127.0.0.1:8765`）。
 
-### Resume Intelligence Workspace candidate slice
+### Learning Traceability golden case
+
+Open `http://127.0.0.1:8765/learning` to build and inspect the bounded Learning
+Traceability workflow. It produces a clickable evidence graph and private, append-only
+Explain/Trace response receipts; submitting a response never advances mastery automatically.
+The local workflow makes no model or network call and keeps learning status separate from
+resume eligibility.
+
+The default `/` route is the end-user resume flow: upload an existing `.docx` resume,
+paste a Job Description, optionally add company/job metadata, then generate, preview, and
+download a targeted DOCX. Developer-oriented Knowledge, Evidence Agent, model, and source
+controls remain available at `/advanced`.
+
+Open `http://127.0.0.1:8765/content` for Content Studio. Supply concise verified or
+observed claims with receipts, plus any explicitly labeled hypotheses and planned work.
+One deterministic local run produces previewable LinkedIn, X Thread, and short-video
+script/storyboard candidates under `.soloscale/content-runs/`. The page supports copy and
+bounded downloads. The optional Creator Video Factory renders the saved storyboard into a
+local MP4 using Remotion and the installed browser; it does not call a model, connect a
+social account, upload, or publish.
+
+### Resume Intelligence Workspace v0.1
 
 The local UI now includes a bounded Resume Workspace: JD + operator-supplied Candidate
 Profile + direct local KnowledgeStore lexical candidates produce a one-page draft,
 explicit gaps, and a clickable Skill–Evidence graph. Resume facts come only from the
+operator-supplied Candidate Profile; retrieval candidates never become resume claims. Each
 operator-supplied Candidate Profile; retrieval candidates never become resume claims.
-Each run is private under `.soloscale/resume-runs/<run-id>/` with ten inspectable artifacts,
+Each baseline run is private under `.soloscale/resume-runs/<run-id>/` with inspectable artifacts,
 including a delivery-state receipt. `Local-only` performs
 no network call. `Hybrid` is intentionally only a provider interface in v0.1; it does not
 send local evidence or Candidate Profile data to any service.
 
-The local UI also writes an application-facing bundle to the configurable Resume Library
-Root, which defaults to `~/Documents/Resume Applications`. Each non-overwriting application
-directory keeps `JD.md`, the generated Markdown resume, and `application.json` together.
-The library root must remain outside the Git repository. Bundle publication is staged and
-uses a platform-native atomic no-replace rename; unsupported platforms fail closed.
+The end-user flow reads candidate facts directly from the uploaded template and only
+reorders intact project blocks and skill bullets by transparent JD keyword relevance; it
+does not rewrite candidate claims. It adds the generated `08_resume.docx` and a local UI
+receipt to the private run. A byte-identical DOCX is staged inside the non-overwriting,
+atomically published application bundle under `~/Documents/Resume Applications`, next to
+`JD.md`, the Markdown draft, and `application.json`. The library root must be outside the
+Git repository. The original DOCX package parts remain unchanged except for
+`word/document.xml`, which retains the template's styles and layout while reordering existing
+content. The older Evidence-Agent-to-resume renderer is disabled because retrieval claims
+are evidence-discovery candidates, not operator-confirmed career facts.
 `delivery.json` distinguishes internal-ready, pending, saved,
 published-but-durability-uncertain, and failed states. Managed roots reject symlinks in
 their lexical ancestry rather than silently following them.
 The complete internal evidence/graph/verification artifacts remain in `.soloscale`; the
-external library receives only the application-facing bundle. DOCX template export remains
-a separate manual step. The older Evidence-Agent-to-resume renderer is disabled because
-retrieval claims are evidence-discovery candidates, not operator-confirmed career facts.
+external library receives only the application-facing bundle. Publication uses a
+platform-native atomic no-replace rename; unsupported platforms fail closed.
 
 Create and route a task:
 
@@ -372,6 +398,7 @@ Keeping them separate makes each portfolio artifact clearer while creating a com
 - [Conversation distillation policy](docs/conversations/README.md)
 - [Casebook local evidence and learning workflow](docs/casebook.md)
 - [Private Conversation RAG and Evidence Agent](docs/conversation-rag.md)
+- [Learning Traceability golden-case decision](docs/decisions/ADR-0006-learning-traceability-golden-case.md)
 - [Evidence-to-multichannel content template](docs/content/TEMPLATE.md)
 - [Editable Figma architecture board](https://www.figma.com/board/psWfF0mEOdHqUvyOWrJWeF)
 

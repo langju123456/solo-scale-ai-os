@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from soloscale.models import ContractModel, utc_now
 
@@ -15,6 +15,35 @@ class ResumeMode(StrEnum):
     HYBRID = "hybrid"
 
 
+class InterviewDefenseStatus(StrEnum):
+    NEEDS_MAPPING = "NEEDS_MAPPING"
+    MAPPED = "MAPPED"
+
+
+class InterviewDefenseMapping(ContractModel):
+    case_id: str
+    learning_run_id: str
+    mapping_basis: Literal["OPERATOR_CONFIRMED"] = "OPERATOR_CONFIRMED"
+    repository: str
+    branch: str
+    commit: str
+    anchor_pack: dict[str, object]
+
+
+class InterviewDefenseRecord(ContractModel):
+    bullet_id: str
+    bullet_text: str
+    bullet_sha256: str
+    status: InterviewDefenseStatus = InterviewDefenseStatus.NEEDS_MAPPING
+    mapping: InterviewDefenseMapping | None = None
+
+    @model_validator(mode="after")
+    def validate_mapping(self) -> InterviewDefenseRecord:
+        if (self.status == InterviewDefenseStatus.MAPPED) is not (
+            self.mapping is not None
+        ):
+            raise ValueError("interview defense mapping status must match its mapping")
+        return self
 class GraphNodeKind(StrEnum):
     JOB = "JOB"
     REQUIREMENT = "REQUIREMENT"

@@ -1450,8 +1450,6 @@ def test_post_replace_fsync_failure_preserves_final_evidence_artifact(
         evidence_agent._atomic_private_write(target, "new")
 
     assert target.read_text(encoding="utf-8") == "new"
-
-
 def test_prompt_injection_in_evidence_cannot_change_system_or_invoke_tools(
     tmp_path: Path,
 ) -> None:
@@ -1710,5 +1708,16 @@ def test_grounded_draft_schema_rejects_missing_claim_evidence() -> None:
                 "open_questions": [],
                 "suggested_case_title": None,
                 "suggested_outputs": [],
+            }
+        )
+def test_grounded_draft_schema_rejects_citations_in_suggested_outputs() -> None:
+    with pytest.raises(ValueError, match="suggested_outputs"):
+        GroundedDraft.model_validate(
+            {
+                "claims": [],
+                "unsupported": [],
+                "open_questions": [],
+                "suggested_case_title": None,
+                "suggested_outputs": ["Resume bullet with chunk-abc123 citation"],
             }
         )

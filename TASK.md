@@ -1,4 +1,42 @@
-# Current Sprint — Resume Workspace boundary hardening
+# Current Sprint — Content Studio MVP
+
+The bounded branch goal is one end-user content vertical slice. It must turn an explicit
+claim ledger into reviewable multichannel drafts without calling a model, connecting an
+account, or publishing.
+
+## Content Studio gate
+
+- [x] `/content` is reachable from Resume, Learning, and Advanced product navigation.
+- [x] Verified and observed claims require receipts; hypotheses and plans remain labeled.
+- [x] LinkedIn, X Thread, and short-video script/storyboard previews share claim anchors.
+- [x] Runs save privately, atomically, and without overwriting prior runs.
+- [x] Private absolute paths and common credential shapes fail closed before persistence.
+- [x] Copy and bounded artifact downloads are available from the end-user page.
+- [x] The POST flow redirects to an addressable result and does not resubmit on refresh.
+- [x] Full tests, Ruff, package build, and browser E2E.
+- [x] Optional local Creator Video Factory renders a saved storyboard to a private MP4.
+- [ ] Human review; no deployment or publication is authorized.
+
+## Previous gate — Learning Traceability golden case
+
+The bounded branch goal is one inspectable Conversation RAG chunking/retrieval chain. It
+must preserve existing Resume, Casebook, and Conversation RAG boundaries.
+
+## Learning Traceability gate
+
+- [x] Shared typed contracts preserve seven distinct truth stages.
+- [x] One real capability resolves to current branch, commit, files, symbols, and tests.
+- [x] Contribution ownership stays unknown where repository evidence cannot prove it.
+- [x] Engineering state and L0 human mastery render separately.
+- [x] Explain and Trace exercises start without auto-completing mastery.
+- [x] Explain and Trace responses save privately as pending review without mastery promotion.
+- [x] Target-JD relevance and resume-claim eligibility are separate gates.
+- [x] Twelve non-overwriting private artifacts and an evidence-hash cache are produced.
+- [x] The existing local UI exposes the clickable graph and bounded grounded source views.
+- [x] Final deterministic checks and local browser E2E.
+- [ ] Human review; no commit or push is authorized for this branch.
+
+## Previous gate — Resume Workspace boundary hardening
 
 Conversation RAG v0.2 is merged and remains the knowledge-plane foundation. The current
 local follow-up gate is the separately human-triggered Resume Workspace candidate slice.
