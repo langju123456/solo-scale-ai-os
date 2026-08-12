@@ -75,6 +75,8 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
     assert run.network_used is False
     assert run.model_used is False
     assert run.publication_performed is False
+    assert run.editorial_provenance[0].provider.kind.value == "template"
+    assert run.editorial_provenance[0].exact_model == "deterministic-content-template-v1"
     assert set(run.artifact_paths) == {path.name for path in run_dir.iterdir()}
     assert run_dir.stat().st_mode & 0o777 == 0o700
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in run_dir.iterdir())
@@ -91,6 +93,7 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
         "claim_count": 3,
         "credential_shape_scan_passed": True,
         "every_claim_has_anchor": True,
+        "editorial_provenance_recorded": True,
         "model_used": False,
         "network_used": False,
         "private_path_scan_passed": True,
@@ -104,6 +107,18 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
     artifact_name, content = content_download(data_root, run.run_id, "linkedin.md")
     assert artifact_name == "02_linkedin.md"
     assert content.decode("utf-8") == linkedin
+    artifact_name, provenance = content_download(
+        data_root, run.run_id, "editorial-provenance.json"
+    )
+    assert artifact_name == "12_editorial_provenance.json"
+    assert b'"fresh_context": true' in provenance
+    run_path = data_root / "content-runs" / run.run_id / "run.json"
+    payload = json.loads(run_path.read_text(encoding="utf-8"))
+    payload.pop("editorial_provenance")
+    run_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = load_content_run(data_root, run.run_id)
+    assert loaded.editorial_provenance == []
 
 
 def test_content_workspace_repeat_runs_never_overwrite(tmp_path: Path) -> None:

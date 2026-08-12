@@ -18,6 +18,8 @@ from soloscale.content_models import (
     ContentRun,
     StoryboardScene,
 )
+from soloscale.editorial_models import EditorialRole, ProviderIdentity, ProviderKind
+from soloscale.editorial_pipeline import make_provenance
 from soloscale.resume_workspace import (
     ResumeWorkspaceStorageError,
     _atomic_private_write,
@@ -43,6 +45,7 @@ _DOWNLOADS = {
     "creator-video-render.json": "11_creator_video_render.json",
     "publish-pack.json": "06_publish_pack.json",
     "provenance.json": "07_provenance.json",
+    "editorial-provenance.json": "12_editorial_provenance.json",
 }
 
 
@@ -320,10 +323,33 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
         "06_publish_pack.json",
         "07_provenance.json",
         "08_verification.json",
+        "12_editorial_provenance.json",
         "run.json",
     ]
     brief_payload = brief.model_dump(mode="json")
     drafts_payload = drafts.model_dump(mode="json")
+    output_artifacts = {
+        "02_linkedin.md": drafts.linkedin,
+        "03_x_thread.md": "\n\n".join(drafts.x_thread) + "\n",
+        "03_x_post.md": drafts.x_thread[0].strip() + "\n",
+        "04_video_script.md": drafts.video_script,
+        "05_storyboard.json": _canonical_json({"scenes": drafts_payload["storyboard"]}),
+    }
+    editorial_provenance = make_provenance(
+        role=EditorialRole.WRITER,
+        provider=ProviderIdentity(
+            kind=ProviderKind.TEMPLATE,
+            provider="soloscale",
+            model="deterministic-content-template-v1",
+        ),
+        reasoning="deterministic",
+        prompt_version="content-template-v1",
+        input_artifacts={"00_input.json": _canonical_json(brief_payload)},
+        output_artifacts=output_artifacts,
+        network_used=False,
+        token_usage=None,
+        cost_usd=0,
+    )
     publish_pack = {
         "status": "DRAFT_REQUIRES_HUMAN_APPROVAL",
         "topic": brief.topic,
@@ -340,6 +366,7 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
             "Citation membership and operator classification are recorded; semantic support "
             "and public suitability still require human review."
         ),
+        "editorial_pipeline": [editorial_provenance.model_dump(mode="json")],
     }
     verification = {
         "status": "PASS",
@@ -354,6 +381,7 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
         "credential_shape_scan_passed": True,
         "network_used": False,
         "model_used": False,
+        "editorial_provenance_recorded": True,
         "publication_performed": False,
     }
     run = ContentRun(
@@ -362,6 +390,7 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
         brief=brief,
         drafts=drafts,
         artifact_paths=artifact_paths,
+        editorial_provenance=[editorial_provenance],
         limitations=[
             "Drafts are deterministic editorial candidates, not semantic fact-check results.",
             "Receipts may still need public-safe URLs before posting.",
@@ -379,6 +408,13 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
         "06_publish_pack.json": _canonical_json(publish_pack),
         "07_provenance.json": _canonical_json(provenance),
         "08_verification.json": _canonical_json(verification),
+        "12_editorial_provenance.json": _canonical_json(
+            {
+                "workflow": ["writer", "fresh_reviewer", "reviser", "human_gate"],
+                "completed": [editorial_provenance.model_dump(mode="json")],
+                "next_gate": "Fresh independent review before controlled revision",
+            }
+        ),
         "run.json": _canonical_json(run.model_dump(mode="json")),
     }
     try:

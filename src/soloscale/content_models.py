@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from soloscale.editorial_models import EditorialProvenance
+
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -71,6 +73,7 @@ class ContentRun(_StrictModel):
     brief: ContentBrief
     drafts: ContentDrafts
     artifact_paths: list[str]
+    editorial_provenance: list[EditorialProvenance] = Field(default_factory=list)
     network_used: Literal[False] = False
     model_used: Literal[False] = False
     publication_performed: Literal[False] = False

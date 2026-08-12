@@ -50,6 +50,9 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     assert f"/content/downloads/{result.run_id}/linkedin.md" in page
     assert f"/content/downloads/{result.run_id}/video-script.md" in page
     assert "已私有保存" in page
+    assert "Editorial provenance" in page
+    assert "deterministic-content-template-v1" in page
+    assert "Writer → Fresh Reviewer → Reviser" in page
     assert "没有连接或操作你的社交账号" in page
     assert result.run_id in page
     assert _form()["topic"] in page

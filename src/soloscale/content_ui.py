@@ -175,6 +175,16 @@ def _result_html(run: ContentRun, *, data_root: Path, video_ready: bool) -> str:
         f'<a href="/content/downloads/{run_id}/{name}" download>{label}</a>'
         for label, name in downloads
     )
+    editorial_trace = "".join(
+        "<li>"
+        f"<strong>{_escape(item.role.value.title())}</strong> · "
+        f"{_escape(item.provider.kind.value)} · {_escape(item.exact_model)} · "
+        f"{_escape(item.status.value)}"
+        "</li>"
+        for item in run.editorial_provenance
+    )
+    if not editorial_trace:
+        editorial_trace = "<li>Historical run · model provenance UNKNOWN</li>"
     return f"""<section id="results" class="result-panel">
       <div class="result-head">
         <div><span class="kicker">已生成</span><h2>一份素材，三个渠道</h2>
@@ -210,6 +220,12 @@ def _result_html(run: ContentRun, *, data_root: Path, video_ready: bool) -> str:
         </div>
       </div>
       <p class="review-note">SoloScale 没有连接或操作你的社交账号，也没有自动发布。</p>
+      <details class="editorial-trace"><summary>Editorial provenance</summary>
+        <ol>{editorial_trace}</ol>
+        <p>Workflow: Writer → Fresh Reviewer → Reviser → Human publication gate.</p>
+        <a class="text-link" href="/content/downloads/{run_id}/editorial-provenance.json"
+          download>下载溯源记录</a>
+      </details>
       <section class="buildlog-handoff">
         <span class="kicker">BuildLog publishing</span>
         <h3>发布前，交给已有的 BuildLog 审核与确认流程</h3>
@@ -404,6 +420,11 @@ pre {{
   margin:18px 0 0; padding:12px; background:#fff8e8; color:#72510c;
   border-radius:12px; font-size:12px;
 }}
+.editorial-trace {{
+  margin-top:12px; padding:12px; border:1px solid var(--line); border-radius:12px;
+  color:var(--muted); font-size:12px;
+}}
+.editorial-trace summary {{ color:var(--ink); font-weight:800; cursor:pointer; }}
 .recent {{
   margin-top:18px; display:flex; gap:9px; flex-wrap:wrap; color:var(--muted);
   font-size:12px;
@@ -491,7 +512,9 @@ pre {{
   <input name="call_to_action" maxlength="220" required
     value="{_escape(values.get("call_to_action", "Follow the next measured iteration."))}" />
 </label>
-<div class="boundary">生成器不会调用模型或网络，不会连接社交账号，也不会自动发布。</div>
+<div class="boundary">当前安全 fallback 使用确定性模板，不调用模型或网络；每次生成都会记录
+  Writer/provider/model/prompt/hash。Fresh Reviewer 与 Reviser 会在独立 editorial 流程中留下记录。
+  不会连接社交账号，也不会自动发布。</div>
 <button id="generate-content" class="primary" type="submit">生成三渠道内容</button>
 </form>
 <div class="recent"><strong>最近内容：</strong>{recent_html}</div>
