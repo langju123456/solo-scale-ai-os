@@ -169,9 +169,10 @@ def _result_html(run: ContentRun, *, data_root: Path, video_ready: bool) -> str:
           <small>本机 Remotion 渲染；只使用本次 storyboard，不会发布。</small>
         </form>'''
     )
+    channels: tuple[Literal["linkedin"], Literal["x"]] = ("linkedin", "x")
     buildlog = "".join(
         _buildlog_channel_html(data_root, run.run_id, channel)
-        for channel in ("linkedin", "x")
+        for channel in channels
     )
     download_links = "".join(
         f'<a href="/content/downloads/{run_id}/{name}" download>{label}</a>'
@@ -216,7 +217,7 @@ def _result_html(run: ContentRun, *, data_root: Path, video_ready: bool) -> str:
     </section>"""
 
 
-def _buildlog_channel_html(data_root: Path, run_id: str, channel: str) -> str:
+def _buildlog_channel_html(data_root: Path, run_id: str, channel: Literal["linkedin", "x"]) -> str:
     label = "LinkedIn" if channel == "linkedin" else "X"
     try:
         handoff, receipt = buildlog_handoff_status(data_root, run_id, channel)

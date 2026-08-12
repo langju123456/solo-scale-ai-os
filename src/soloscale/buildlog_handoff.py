@@ -73,7 +73,7 @@ def sync_buildlog_receipt(
     required = ("receipt_id", "platform", "external_post_id", "published_at", "buildlog_run_id")
     if any(not isinstance(payload.get(key), str) or not payload[key] for key in required):
         raise BuildLogHandoffError("BuildLog publication receipt is incomplete")
-    receipt = {key: payload[key] for key in required}
+    receipt = {key: str(payload[key]) for key in required}
     try:
         _atomic_private_write(receipt_path, json.dumps(receipt, indent=2) + "\n")
     except (OSError, ResumeWorkspaceStorageError) as exc:

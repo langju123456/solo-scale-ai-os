@@ -16,9 +16,11 @@ from email import policy
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import cast
 
 from soloscale.buildlog_handoff import (
     BuildLogHandoffError,
+    Channel,
     stage_for_buildlog,
     sync_buildlog_receipt,
 )
@@ -2570,6 +2572,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         )
         if buildlog_match is not None:
             run_id, channel, receipt_path = buildlog_match.groups()
+            if channel not in {"linkedin", "x"}:
+                self.send_error(404)
+                return
+            channel = cast(Channel, channel)
             try:
                 if receipt_path:
                     receipt = sync_buildlog_receipt(
