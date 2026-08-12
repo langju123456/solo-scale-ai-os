@@ -106,6 +106,8 @@ def test_user_page_is_resume_first_and_keeps_developer_tools_under_advanced(
     assert 'name="job_description"' in page
     assert "生成针对性简历" in page
     assert 'href="/advanced"' in page
+    assert 'href="/content"' in page
+    assert 'href="/learning"' in page
     assert "knowledge-sync" not in page
     assert 'name="model"' not in page
     assert 'name="source_kind"' not in page

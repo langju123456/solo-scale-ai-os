@@ -145,6 +145,12 @@ paste a Job Description, optionally add company/job metadata, then generate, pre
 download a targeted DOCX. Developer-oriented Knowledge, Evidence Agent, model, and source
 controls remain available at `/advanced`.
 
+Open `http://127.0.0.1:8765/content` for Content Studio. Supply concise verified or
+observed claims with receipts, plus any explicitly labeled hypotheses and planned work.
+One deterministic local run produces previewable LinkedIn, X Thread, and short-video
+script/storyboard candidates under `.soloscale/content-runs/`. The page supports copy and
+bounded downloads, but it does not call a model, connect a social account, or publish.
+
 ### Resume Intelligence Workspace v0.1
 
 The local UI now includes a bounded Resume Workspace: JD + operator-supplied Candidate

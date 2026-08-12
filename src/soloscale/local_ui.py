@@ -17,6 +17,8 @@ from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from soloscale.content_ui import ContentFormResult, content_page, run_content_form
+from soloscale.content_workspace import ContentWorkspaceError, content_download
 from soloscale.knowledge_models import RetrievalHit
 from soloscale.knowledge_store import (
     InvalidKnowledgeQueryError,
@@ -1207,7 +1209,9 @@ def _user_page(
       color:white; background:linear-gradient(135deg,#3157d5,#6c4ad8);
       box-shadow:0 8px 22px #3157d533;
     }}
+    .nav-links {{ display:flex; gap:16px; align-items:center; }}
     .advanced-link {{ color:var(--muted); text-decoration:none; font-size:14px; }}
+    .advanced-link.current {{ color:var(--accent); font-weight:800; }}
     .hero {{ max-width:780px; margin:0 auto 34px; text-align:center; }}
     .eyebrow,.result-kicker {{
       color:var(--accent); font-size:12px; font-weight:800; letter-spacing:.14em;
@@ -1315,7 +1319,12 @@ def _user_page(
   <main class="shell">
     <nav>
       <div class="brand"><span class="brand-mark">S</span><span>SoloScale</span></div>
-      <a class="advanced-link" href="/advanced">开发者工具 →</a>
+      <div class="nav-links">
+        <a class="advanced-link current" href="/">Resume</a>
+        <a class="advanced-link" href="/learning">Learning</a>
+        <a class="advanced-link" href="/content">Content</a>
+        <a class="advanced-link" href="/advanced">Advanced</a>
+      </div>
     </nav>
     <header class="hero">
       <span class="eyebrow">Resume Workspace</span>
@@ -1992,7 +2001,8 @@ def _learning_page(
   </style>
 </head>
 <body>
-  <header><a href="/">← SoloScale local UI</a><h1>Learning Control Tower</h1>
+  <header><a href="/">Resume</a> · <a href="/content">Content Studio</a> ·
+    <a href="/advanced">Advanced</a><h1>Learning Control Tower</h1>
     <p>One real capability. Evidence first. Mastery stays human-earned.</p></header>
   <main>
     <form class="panel build-form" method="post" action="/learning/run">
@@ -2091,7 +2101,8 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
   <p class="small">
     这是个人使用最小界面：用于触发本地流程并读取结果。
     Resume Workspace 会保存候选简历，但不会自动申请、更新 Casebook 或发布内容。
-    <a href="/learning">Open Learning Control Tower</a>.
+    <a href="/learning">Open Learning Control Tower</a> ·
+    <a href="/content">Open Content Studio</a>.
   </p>
   <div class="container">
     <section class="card">
@@ -2375,6 +2386,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     latest_form: dict[str, str] = {}
     latest_user_form: dict[str, str] = {}
     latest_learning_form: dict[str, str] = {}
+    latest_content_form: dict[str, str] = {}
 
     def _send_advanced_page(self, result: UIActionResult | None) -> None:
         data_root = self.ui_data_root.absolute()
@@ -2413,6 +2425,26 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_content_page(
+        self,
+        *,
+        run_id: str | None = None,
+        result: ContentFormResult | None = None,
+    ) -> None:
+        page = content_page(
+            data_root=self.ui_data_root.absolute(),
+            form=self.latest_content_form,
+            run_id=run_id,
+            error=result.error if result is not None else None,
+        )
+        body = page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:  # noqa: N802
         path = urllib.parse.urlsplit(self.path).path
         if path in {"/", ""}:
@@ -2430,6 +2462,40 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self._send_learning_page(
                 None, saved_stage if saved_stage in {"explain", "trace"} else None
             )
+            return
+        if path == "/content":
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            run_id = query.get("run_id", [""])[0]
+            self._send_content_page(run_id=run_id or None)
+            return
+        content_download_match = re.fullmatch(
+            r"/content/downloads/([^/]+)/([^/]+)", path
+        )
+        if content_download_match is not None:
+            try:
+                filename, content = content_download(
+                    self.ui_data_root.absolute(),
+                    content_download_match.group(1),
+                    content_download_match.group(2),
+                )
+            except ContentWorkspaceError:
+                self.send_error(404, "Content artifact not found")
+                return
+            content_type = (
+                "application/json"
+                if filename.endswith(".json")
+                else "text/markdown; charset=utf-8"
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header(
+                "Content-Disposition",
+                f'attachment; filename="{content_download_match.group(2)}"',
+            )
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(content)
             return
         if path == "/learning/source":
             _serve_learning_source(self, self.ui_data_root.absolute(), self.repo_root)
@@ -2449,6 +2515,32 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/content/generate":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if length < 0 or length > MAX_UPLOAD_BYTES:
+                self.send_error(413, "Content brief is too large")
+                return
+            self.latest_content_form = _parse_form(self.rfile.read(length))
+            content_result = run_content_form(
+                self.latest_content_form, self.ui_data_root.absolute()
+            )
+            if content_result.run_id is None:
+                self._send_content_page(result=content_result)
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                "/content?"
+                + urllib.parse.urlencode({"run_id": content_result.run_id})
+                + "#results",
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path == "/learning/run":
             length = int(self.headers.get("Content-Length", "0") or 0)
             body = self.rfile.read(length)

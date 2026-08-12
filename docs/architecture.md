@@ -115,6 +115,30 @@ This is a custom code-controlled loop, not an integration with an external agent
 framework or the OpenAI Agents SDK. Deterministic code owns maximum rounds, maximum
 queries, hit and context budgets, source filters, and citation-membership checks.
 
+### Content Studio projection
+
+Content Studio exposes a local review surface without taking ownership of external
+publishing:
+
+```mermaid
+flowchart LR
+    C[Operator claim ledger] --> V[Receipt and output-safety validation]
+    V --> L[LinkedIn candidate]
+    V --> X[X Thread candidate]
+    V --> S[Short-video script and storyboard]
+    L --> P[Private content run]
+    X --> P
+    S --> P
+    P --> H{Human fact-check and publish approval}
+    H --> B[BuildLog or approved publishing surface]
+```
+
+Verified and observed claims require receipts; hypotheses and planned work retain their
+classification. Draft blocks preserve claim IDs, while private absolute paths and common
+credential shapes fail before persistence. The deterministic local slice performs no
+model, network, account, or publish action. Receipt membership does not prove semantic
+support or public suitability, so the human gate remains mandatory.
+
 Retrieved text is untrusted. Code limits its possible effects to bounded local search and
 verifies that each declared claim cites an in-context chunk from the same run. Prompt
 injection, irrelevant citations, and omitted gaps remain possible, so human review is
