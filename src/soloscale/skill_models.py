@@ -157,7 +157,9 @@ class SelectedSkill(SkillContractModel):
 class PhaseModelRoute(SkillContractModel):
     phase: Literal["discovery", "decision", "implementation", "verification", "review"]
     recommended: str = Field(min_length=1, max_length=120)
+    actual_provider_used: str | None = Field(default=None, max_length=120)
     actual_model_used: str | None = Field(default=None, max_length=120)
+    actual_reasoning_effort: str | None = Field(default=None, max_length=80)
     actual_agent_used: str | None = Field(default=None, max_length=120)
 
 

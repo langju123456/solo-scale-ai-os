@@ -226,9 +226,10 @@ flowchart LR
 ```
 
 The registry is discovery and routing truth; existing domain stores remain execution
-truth. Receipts retain exact Skill versions, recommendations, observed model identities
-when known, hashes, checks, gates, retries, and distinct workflow/artifact/approval/
-publication/outcome states. Unknown model identity remains unknown. Public, paid,
+truth. Receipts retain exact Skill versions, recommendations, observed provider/model/
+reasoning/agent identities when known, hashes, checks, gates, retries, and distinct
+workflow/artifact/approval/publication/outcome states. Unknown execution identity remains
+unknown rather than being inferred. Public, paid,
 credential, destructive, migration, history, and deployment boundaries remain human-gated.
 
 ### Retrieval evaluation boundary

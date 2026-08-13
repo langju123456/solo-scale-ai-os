@@ -84,7 +84,9 @@ def test_editorial_scenario_selects_evidence_review_and_visual_route() -> None:
     ]
     assert route.unmet_preconditions == []
     assert not route.task.publication_intent
+    assert all(phase.actual_provider_used is None for phase in route.model_route)
     assert all(phase.actual_model_used is None for phase in route.model_route)
+    assert all(phase.actual_reasoning_effort is None for phase in route.model_route)
 
     dependency_route = route_skill_request("Create a LinkedIn draft and fresh-review it.")
     assert dependency_route.dependency_order == [
