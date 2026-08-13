@@ -46,10 +46,19 @@ from soloscale.models import (
     TaskEnvelope,
 )
 from soloscale.router import route_task
+from soloscale.skill_os import (
+    SkillOSError,
+    default_registry_path,
+    load_skill_registry,
+    persist_route_receipt,
+    render_skill_route,
+    route_skill_request,
+)
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
 _DEFAULT_CODEX_HOME = Path.home() / ".codex"
+_DEFAULT_SKILL_REGISTRY = default_registry_path()
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -323,6 +332,57 @@ def task_create(
     console.print(f"[green]Created[/green] {path}")
     decision = route_task(task)
     console.print(Panel(decision.model_dump_json(indent=2), title="Route decision"))
+
+
+@app.command("skill-list")
+def skill_list(
+    registry_path: Annotated[
+        Path,
+        typer.Option("--registry", help="Tracked repo-scoped Skill registry"),
+    ] = _DEFAULT_SKILL_REGISTRY,
+) -> None:
+    """List registered Skill versions and trust status without reading private runs."""
+
+    try:
+        registry = load_skill_registry(registry_path)
+    except SkillOSError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--registry") from exc
+    table = Table(title="SoloScale Skill Registry")
+    table.add_column("Skill")
+    table.add_column("Version")
+    table.add_column("Status")
+    table.add_column("Risk")
+    for skill in registry.skills:
+        table.add_row(skill.name, skill.current_version, skill.status.value, skill.risk_class.value)
+    console.print(table)
+
+
+@app.command("skill-route")
+def skill_route(
+    request_text: Annotated[str, typer.Argument(help="High-level operator request")],
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private ignored SoloScale data root"),
+    ] = Path(".soloscale"),
+    registry_path: Annotated[
+        Path,
+        typer.Option("--registry", help="Tracked repo-scoped Skill registry"),
+    ] = _DEFAULT_SKILL_REGISTRY,
+) -> None:
+    """Normalize one high-level request, compose Skills, and save a private route receipt."""
+
+    _validate_private_data_root(data_root)
+    try:
+        registry = load_skill_registry(registry_path)
+        route = route_skill_request(request_text, registry=registry)
+        receipt, receipt_path = persist_route_receipt(route, data_root=data_root)
+    except SkillOSError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(render_skill_route(route))
+    console.print(
+        f"[green]Private receipt[/green] {receipt.receipt_id} — {receipt.final_status.value}"
+    )
+    console.print(receipt_path)
 
 
 @app.command("task-route")

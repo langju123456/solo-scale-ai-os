@@ -1,4 +1,22 @@
-# Current Sprint — Unified Evidence Core
+# Current Sprint — SoloScale Skill OS
+
+- [x] Tracked registry and nine bounded Skill definitions with version, status, risk, gates,
+      phase routes, dependencies, validation, and receipts.
+- [x] Short free-form Task intake contract plus strict Task Envelope and Run Receipt models.
+- [x] Deterministic routing for Editorial, Career, Publishing, Evidence, and Skill
+      distillation intents without a new agent framework.
+- [x] Private non-overwriting `0700`/`0600` route receipts under the ignored data root.
+- [x] Repository instructions prefer registered Skills and preserve exact versions and
+      human gates.
+- [x] Frozen Editorial, Career, and Publishing scenarios plus registry, privacy, and CLI
+      tests.
+- [x] Independent review completed; no push or merge is authorized.
+
+No initial Skill is `ACTIVE`. Promotion requires a second representative success or
+explicit human canonical approval. Routing does not execute a model, paid API, platform
+publication, deployment, application submission, credential change, or destructive action.
+
+## Previous sprint — Unified Evidence Core
 
 - [x] Metadata-only Source, Evidence, Bundle, Case, Asset, Outcome, and Sync contracts.
 - [x] Compatibility adapters for Conversation Knowledge, BuildLog, local Git, and existing

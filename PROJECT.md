@@ -188,6 +188,27 @@ The optional Creator Video Factory is a local Remotion renderer. It reads only t
 storyboard for a reviewed Content run and produces a non-overwriting MP4 plus render receipt
 inside that private run. It adds no voice synthesis, generated facts, uploads, or publishing.
 
+## 5.6 Reusable execution layer: Skill OS
+
+Skill OS preserves successful workflow contracts as versioned repo-scoped Skills rather
+than autonomous personas:
+
+```text
+high-level request
+→ normalized Skill Task Envelope
+→ registry-backed dependency route
+→ phase-specific model recommendation
+→ existing domain capabilities
+→ deterministic checks + private Run Receipt
+→ optional human-reviewed Skill change proposal
+```
+
+The registry records trust status, version, risk, human gates, and validation history.
+Runtime input and receipts remain private. Skills do not silently share domain state,
+promote Evidence into truth, publish, submit, deploy, spend, or change credentials. A
+successful Run can propose a candidate or version update, but it cannot mutate an
+`ACTIVE` Skill or claim external outcome without the corresponding receipt and human gate.
+
 ## 6. v0.2 success criteria
 
 - Repeated sync preserves stable source/document/chunk identities and does not duplicate a

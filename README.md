@@ -184,6 +184,25 @@ not call a model, network service, or publisher. New Content, Resume, Learning, 
 and publication-result artifacts register metadata-only hashes and lineage automatically;
 each product retains its own domain state and remains independently callable.
 
+### Reusable Skill OS
+
+Repo-scoped Skills under `.agents/skills/` turn high-level requests into a versioned Task
+Envelope, ordered Skill route, phase-specific model recommendation, human gates, and a
+private Run Receipt. They compose the existing Evidence, Content, Career, Learning, and
+BuildLog boundaries; they do not duplicate those implementations or gain new authority.
+
+```bash
+soloscale skill-list
+soloscale skill-route \
+  "Use the latest Evidence about Learning Debt. Create LinkedIn, X Thread, and one diagram. Fresh-review and revise it. Stop before publication." \
+  --data-root "$HOME/Documents/SoloScaleData"
+```
+
+The route command performs no model, network, publication, deployment, or paid API call.
+It stores the normalized envelope and exact Skill versions privately under
+`<data-root>/skills/`; a real public, paid, destructive, credential, or irreversible action
+still stops at its explicit human gate.
+
 ### Resume Intelligence Workspace v0.1
 
 The local UI now includes a bounded Resume Workspace: JD + operator-supplied Candidate
@@ -366,6 +385,7 @@ evaluated and remain human-gated or future opt-in evaluations.
 ├── TASK.md                           current sprint
 ├── ROADMAP.md                        milestone plan
 ├── AGENTS.md                         instructions for coding agents
+├── .agents/                          tracked Skill registry, contracts, and task templates
 ├── src/soloscale/
 │   ├── models.py                     contracts
 │   ├── router.py                     deterministic route policy
@@ -382,6 +402,8 @@ evaluated and remain human-gated or future opt-in evaluations.
 │   ├── conversation_intake.py        defensive source adapters and redaction
 │   ├── knowledge_store.py             private SQLite/FTS evidence index
 │   ├── evidence_agent.py              custom code-controlled Evidence Agent
+│   ├── skill_models.py                Skill, Task Route, and Run Receipt contracts
+│   ├── skill_os.py                    deterministic Skill discovery and routing
 │   └── cli.py                        local CLI
 ├── tests/                            deterministic tests
 ├── examples/                         dogfooding inputs

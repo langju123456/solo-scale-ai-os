@@ -12,6 +12,15 @@ Before changing code, read:
 
 ## Operating rules
 
+- Before inventing a workflow, read `.agents/skills/registry.yaml` and prefer a matching
+  `ACTIVE` Skill. A `CANDIDATE` or `DRAFT` Skill may be used only with its status visible.
+- Compose registered Skills in dependency order instead of copying large workflow prompts.
+- Record every selected Skill and exact version in the private Skill Run Receipt.
+- After a completed, operator-approved Run, evaluate whether to make no Skill change,
+  create a candidate, propose a version update, or deprecate a Skill. Never silently
+  rewrite an old version or auto-promote an experimental Run.
+- Preserve explicit human approval before publication, paid use, credential or permission
+  changes, destructive operations, database migrations, history rewriting, or deployment.
 - Make the smallest change that satisfies the approved task.
 - Do not redesign the product during implementation.
 - Do not read or commit `.env`, credentials, private keys, tokens, or ignored private notes.
