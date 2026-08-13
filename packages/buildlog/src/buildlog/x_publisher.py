@@ -56,7 +56,7 @@ class XTextPublisher:
                 "The X adapter received a non-X publication request."
             )
         validate_x_content(request.content)
-        token = require_valid_x_token(self.token_store)
+        token = require_valid_x_token(self.token_store, self.settings)
         require_x_scopes(token, {"tweet.write"})
         try:
             response = self.http.create_post(

@@ -1,10 +1,11 @@
+# ruff: noqa: E501
 from __future__ import annotations
 
 import html
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import ValidationError
 
@@ -16,6 +17,7 @@ from soloscale.content_workspace import (
     parse_claim_ledger,
     run_content_workspace,
 )
+from soloscale.editorial_publishing_handoff import editorial_publishing_status
 from soloscale.video_factory import creator_video_ready
 
 
@@ -267,6 +269,65 @@ def _buildlog_channel_html(data_root: Path, run_id: str, channel: Literal["linke
         </label>
         <button class="secondary" type="submit">Publish {label}</button>
       </form></div>"""
+
+
+def editorial_publishing_page(*, data_root: Path, error: str | None = None) -> str:
+    """Render the separate, sealed-editorial-package publishing flow."""
+
+    channels: tuple[Literal["linkedin", "x"], Literal["linkedin", "x"]] = ("linkedin", "x")
+    cards = "".join(_editorial_channel_html(data_root, channel) for channel in channels)
+    error_html = f'<p class="error" role="alert">{_escape(error)}</p>' if error else ""
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>SoloScale · Publishing</title>
+<style>body{{margin:0;background:#07111f;color:#e5edf7;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}}main{{max-width:940px;margin:auto;padding:36px 24px}}a{{color:#93c5fd}}.panel,.channel{{margin-top:24px;padding:24px;border:1px solid #334155;border-radius:18px;background:#111827}}p,small{{color:#b8c4d6;line-height:1.65}}label{{display:grid;gap:7px;margin:14px 0}}input{{padding:10px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#fff}}button{{padding:10px 14px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-weight:750}}pre{{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;border-radius:10px;background:#020617;color:#e5edf7}}.error{{color:#fecaca}}.meta{{font-size:.9rem}}code{{color:#bae6fd}}</style></head><body><main>
+<nav><a href="/">Resume</a> · <a href="/content">Content Studio</a> · <a href="/publishing">Publishing</a></nav>
+<section class="panel"><h1>Sealed editorial day → BuildLog</h1>
+<p>Select an external finalized <code>day-01</code> directory. SoloScale verifies its day receipt, sealed batch receipts, every recorded hash, and one regular PNG before asking BuildLog for a plan preview. This does not read tokens or publish.</p>
+{error_html}<form method="post" action="/publishing/editorial/preview"><label>Finalized editorial day directory<input name="day_directory" autocomplete="off" required></label>
+<label>Channel<select name="channel"><option value="linkedin">LinkedIn</option><option value="x">X</option></select></label><button type="submit">Verify and preview plan</button></form></section>{cards}
+</main></body></html>"""
+
+
+def _editorial_channel_html(data_root: Path, channel: Literal["linkedin", "x"]) -> str:
+    label = "LinkedIn" if channel == "linkedin" else "X"
+    try:
+        preview, receipt = editorial_publishing_status(data_root, channel)
+    except ValueError:
+        preview, receipt = None, None
+    if preview is None:
+        return f'<section class="channel"><h2>{label}</h2><p>No verified plan preview yet.</p></section>'
+    if receipt is not None and receipt.get("plan_id") != preview.get("plan_id"):
+        receipt = None
+    parts = preview.get("parts", [])
+    exact_parts = "".join(
+        f"<article><h3>Part {index}</h3><pre>{_escape(str(part))}</pre></article>"
+        for index, part in enumerate(parts if isinstance(parts, list) else [], start=1)
+    )
+    image = cast(dict[str, object], preview.get("image")) if isinstance(preview.get("image"), dict) else {}
+    duplicate = _escape(str(preview.get("duplicate", "unknown")))
+    indeterminate = _escape(str(preview.get("indeterminate", "unknown")))
+    image_path = _escape(str(preview.get("source_image_path", "BuildLog-staged image")))
+    image_hash = _escape(str(image.get("sha256", "")))
+    image_size = _escape(f"{image.get('width', '?')}×{image.get('height', '?')}")
+    alt = _escape(str(image.get("alt_text", "")))
+    account = _escape(str(preview.get("account_display_name", "")))
+    plan_hash = _escape(str(preview.get("plan_hash", "")))
+    blocked = preview.get("duplicate") is True or preview.get("indeterminate") is True
+    receipt_html = (
+        f"<p><strong>BuildLog result:</strong> {_escape(str(receipt.get('status', 'unknown')))} · "
+        f"plan {_escape(str(receipt.get('plan_id', '')))}</p>"
+        if receipt is not None
+        else (
+            "<p class=\"error\">Publication is blocked by a duplicate or unresolved prior attempt.</p>"
+            if blocked
+            else f'''<form method="post" action="/publishing/editorial/{channel}/publish">
+<label>Type PUBLISH to approve this exact {label} plan<input name="confirmation" autocomplete="off" required></label>
+<button type="submit">PUBLISH {label}</button></form>'''
+        )
+    )
+    return f"""<section class="channel"><h2>{label} plan preview</h2>
+<p class="meta">Account: {_escape(str(preview.get("account_reference", "")))} · Display name: {account}<br>Aggregate plan hash: <code>{plan_hash}</code><br>Duplicate: {duplicate} · Indeterminate: {indeterminate}</p>
+{exact_parts}<h3>Image</h3><img src="/publishing/editorial/{channel}/image" alt="{alt}" style="display:block;max-width:100%;height:auto;border-radius:12px;border:1px solid #334155"><p class="meta">Path: {image_path}<br>SHA-256: <code>{image_hash}</code> · Dimensions: {image_size}<br>Alt text: {alt}</p>{receipt_html}</section>"""
 
 
 def content_page(

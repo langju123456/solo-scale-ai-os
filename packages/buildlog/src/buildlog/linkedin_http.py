@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 import httpx
 
@@ -107,11 +108,52 @@ class LinkedInHttpClient:
             },
         )
 
+    def initialize_image(
+        self,
+        url: str,
+        *,
+        access_token: str,
+        api_version: str,
+        owner_urn: str,
+    ) -> LinkedInHttpResult:
+        """Initialize one LinkedIn image upload."""
+        return self._request(
+            "POST",
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Linkedin-Version": api_version,
+                "X-Restli-Protocol-Version": RESTLI_PROTOCOL_VERSION,
+                "User-Agent": USER_AGENT,
+            },
+            json={"initializeUploadRequest": {"owner": owner_urn}},
+        )
+
+    def upload_image(
+        self,
+        url: str,
+        *,
+        access_token: str,
+        content: bytes,
+    ) -> LinkedInHttpResult:
+        """Upload bytes only to a validated LinkedIn signed URL."""
+        return self._request(
+            "PUT",
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "image/png",
+                "User-Agent": USER_AGENT,
+            },
+            content=content,
+        )
+
     def _request(
         self,
         method: str,
         url: str,
-        **kwargs: object,
+        **kwargs: Any,
     ) -> LinkedInHttpResult:
         try:
             response = self._client.request(

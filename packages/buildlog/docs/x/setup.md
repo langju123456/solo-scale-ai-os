@@ -19,7 +19,7 @@ In the X Developer Console:
 4. Enable these scopes:
 
    ```text
-   tweet.read tweet.write users.read
+   tweet.read tweet.write users.read offline.access media.write
    ```
 
 5. Ensure the developer account has API credits and a spending limit you
@@ -57,8 +57,10 @@ Run:
 ```
 
 The token is stored under `~/.buildlog/credentials/x.json` with private file
-permissions. This first baseline does not refresh expired tokens; run login
-again when the access token expires.
+permissions. `offline.access` provides a refresh token and BuildLog rotates it
+before an identity, preview, upload, or post request when the access token is
+near expiry. Existing tokens created without these scopes require one new
+authorization; routine publication does not require another login afterward.
 
 ## Safe Publication Flow
 

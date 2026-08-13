@@ -104,7 +104,11 @@ class XOAuthService:
             ) from exc
         finally:
             client.close()
+        if isinstance(payload, dict) and "scope" not in payload:
+            payload = dict(payload)
+            payload["scope"] = list(self.settings.scopes)
         token = parse_x_token(payload, now=completed_at)
+        _require_refresh_capable_token(token, self.settings, now=completed_at)
         self.token_store.save(token)
         return token
 
@@ -165,3 +169,83 @@ def parse_x_token(payload: Any, *, now: datetime) -> XToken:
         )
     except (OverflowError, ValidationError) as exc:
         raise XOAuthError("X token response contained invalid values.") from exc
+
+
+def refresh_x_token(
+    settings: XSettings,
+    token_store: FileXTokenStore,
+    current: XToken,
+    *,
+    now: datetime | None = None,
+) -> XToken:
+    """Rotate a near-expired X token before any downstream API request."""
+    refreshed_at = now or datetime.now(UTC)
+    if current.refresh_token is None or "offline.access" not in current.scopes:
+        raise XOAuthError(
+            "X authorization cannot be refreshed. Authorize the existing App "
+            "once with offline access."
+        )
+    previous_refresh_token = current.refresh_token.get_secret_value()
+    client = OAuth2Client(
+        client_id=settings.client_id,
+        token_endpoint_auth_method="none",
+        scope=" ".join(settings.scopes),
+        redirect_uri=settings.redirect_uri,
+        code_challenge_method="S256",
+        timeout=settings.request_timeout_seconds,
+    )
+    try:
+        payload = client.fetch_token(
+            settings.token_url,
+            grant_type="refresh_token",
+            refresh_token=previous_refresh_token,
+        )
+    except (OAuthError, httpx.HTTPError, ValueError) as exc:
+        raise XOAuthError(
+            "X token refresh failed before any identity, upload, or post "
+            "request. Authorize the existing App again."
+        ) from exc
+    finally:
+        client.close()
+    if isinstance(payload, dict) and "scope" not in payload:
+        payload = dict(payload)
+        payload["scope"] = sorted(current.scopes)
+    refreshed = parse_x_token(payload, now=refreshed_at)
+    _require_refresh_capable_token(
+        refreshed,
+        settings,
+        previous_refresh_token=previous_refresh_token,
+        now=refreshed_at,
+    )
+    token_store.save(refreshed)
+    return refreshed
+
+
+def _require_refresh_capable_token(
+    token: XToken,
+    settings: XSettings,
+    *,
+    previous_refresh_token: str | None = None,
+    now: datetime | None = None,
+) -> None:
+    missing = set(settings.scopes) - token.scopes
+    if missing:
+        raise XOAuthError(
+            "X authorization omitted required scope(s): "
+            + ", ".join(sorted(missing))
+        )
+    if token.refresh_token is None:
+        raise XOAuthError(
+            "X authorization did not return a refresh token. Authorize the "
+            "existing App again."
+        )
+    if (
+        previous_refresh_token is not None
+        and token.refresh_token.get_secret_value() == previous_refresh_token
+    ):
+        raise XOAuthError(
+            "X did not rotate the refresh credential; no local credential was "
+            "replaced. Authorize the existing App again."
+        )
+    if token.is_expired(now=now or datetime.now(UTC)):
+        raise XOAuthError("X returned a token that is already near expiry.")

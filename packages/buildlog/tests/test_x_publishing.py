@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -10,8 +12,6 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import pytest
 from authlib.integrations.httpx_client import OAuth2Client
-from pydantic import SecretStr
-
 from buildlog.linkedin_callback import OAuthCallback
 from buildlog.linkedin_errors import IndeterminatePublicationError
 from buildlog.main import main
@@ -27,7 +27,7 @@ from buildlog.publishing_models import (
 )
 from buildlog.publishing_service import PublishingService
 from buildlog.x_config import XSettings, load_x_settings
-from buildlog.x_errors import XPublicationValidationError
+from buildlog.x_errors import XOAuthError, XPublicationValidationError
 from buildlog.x_http import XHttpClient
 from buildlog.x_identity import XIdentity, XIdentityService
 from buildlog.x_oauth import XOAuthService, parse_x_token
@@ -42,6 +42,7 @@ from buildlog.x_token_store import (
     FileXTokenStore,
     XToken,
 )
+from pydantic import SecretStr
 
 
 class MemoryTokenStore:
@@ -136,7 +137,13 @@ def test_x_settings_use_only_official_endpoints() -> None:
     assert settings.token_url == "https://api.x.com/2/oauth2/token"
     assert settings.posts_url == "https://api.x.com/2/tweets"
     assert settings.redirect_uri == "http://127.0.0.1:8766/auth/x/callback"
-    assert settings.scopes == ("tweet.read", "tweet.write", "users.read")
+    assert settings.scopes == (
+        "tweet.read",
+        "tweet.write",
+        "users.read",
+        "offline.access",
+        "media.write",
+    )
 
 
 def test_x_oauth_start_uses_pkce_and_required_parameters(tmp_path: Path) -> None:
@@ -157,15 +164,28 @@ def test_x_oauth_start_uses_pkce_and_required_parameters(tmp_path: Path) -> None
     assert query["response_type"] == ["code"]
     assert query["client_id"] == ["client-id"]
     assert query["redirect_uri"] == [settings.redirect_uri]
-    assert query["scope"] == ["tweet.read tweet.write users.read"]
+    assert query["scope"] == [
+        "tweet.read tweet.write users.read offline.access media.write"
+    ]
     assert query["code_challenge_method"] == ["S256"]
     assert query["code_challenge"][0]
     assert query["state"][0]
     assert "code_verifier" not in query
 
 
-def test_x_token_parsing_and_private_round_trip(tmp_path: Path) -> None:
+def test_x_token_parsing_and_private_round_trip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     now = datetime(2026, 7, 29, tzinfo=UTC)
+    real_fsync = os.fsync
+    fsync_targets: list[bool] = []
+
+    def tracked_fsync(descriptor: int) -> None:
+        fsync_targets.append(stat.S_ISDIR(os.fstat(descriptor).st_mode))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr("buildlog.x_token_store.os.fsync", tracked_fsync)
     token = parse_x_token(
         {
             "access_token": "access-value",
@@ -186,6 +206,7 @@ def test_x_token_parsing_and_private_round_trip(tmp_path: Path) -> None:
     assert restored.scopes == {"tweet.read", "tweet.write", "users.read"}
     assert (store.path.stat().st_mode & 0o077) == 0
     assert "access-value" not in repr(restored)
+    assert fsync_targets == [False, True]
 
 
 def test_x_oauth_exchange_uses_public_client_and_saved_verifier(
@@ -207,9 +228,9 @@ def test_x_oauth_exchange_uses_public_client_and_saved_verifier(
             200,
             json={
                 "access_token": "access-value",
+                "refresh_token": "refresh-value",
                 "token_type": "bearer",
                 "expires_in": 7200,
-                "scope": "tweet.read tweet.write users.read",
             },
         )
 
@@ -240,7 +261,205 @@ def test_x_oauth_exchange_uses_public_client_and_saved_verifier(
 
     assert len(requests) == 1
     assert token.access_token.get_secret_value() == "access-value"
+    assert token.refresh_token is not None
+    assert token.scopes == set(settings.scopes)
     assert token_store.load() is not None
+
+
+def test_x_identity_rotates_near_expiry_token_before_users_me(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 8, 13, tzinfo=UTC)
+    settings = XSettings(client_id="client-id")
+    store = FileXTokenStore(tmp_path / "x.json")
+    store.save(
+        XToken(
+            access_token=SecretStr("old-access"),
+            refresh_token=SecretStr("old-refresh"),
+            expires_at=now + timedelta(seconds=30),
+            obtained_at=now - timedelta(hours=2),
+            scopes=set(settings.scopes),
+        )
+    )
+    refresh_requests: list[httpx.Request] = []
+
+    def refresh_handler(request: httpx.Request) -> httpx.Response:
+        refresh_requests.append(request)
+        form = parse_qs(request.content.decode("utf-8"))
+        assert form == {
+            "client_id": ["client-id"],
+            "grant_type": ["refresh_token"],
+            "refresh_token": ["old-refresh"],
+            "scope": [" ".join(settings.scopes)],
+        }
+        assert "authorization" not in request.headers
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "token_type": "bearer",
+                "expires_in": 7200,
+                "scope": " ".join(settings.scopes),
+            },
+        )
+
+    def client_factory(**kwargs) -> OAuth2Client:
+        assert kwargs["client_id"] == settings.client_id
+        kwargs["transport"] = httpx.MockTransport(refresh_handler)
+        return OAuth2Client(**kwargs)
+
+    monkeypatch.setattr("buildlog.x_oauth.OAuth2Client", client_factory)
+    identity_calls = 0
+
+    def identity_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal identity_calls
+        identity_calls += 1
+        assert request.headers["authorization"] == "Bearer new-access"
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "id": "123456",
+                    "name": "Lang Ju",
+                    "username": "langju",
+                }
+            },
+        )
+
+    http = _http(identity_handler)
+    try:
+        identity = XIdentityService(settings, http, store).resolve(now=now)
+    finally:
+        http.close()
+
+    stored = store.load()
+    assert identity.username == "langju"
+    assert len(refresh_requests) == 1
+    assert identity_calls == 1
+    assert stored is not None and stored.refresh_token is not None
+    assert stored.access_token.get_secret_value() == "new-access"
+    assert stored.refresh_token.get_secret_value() == "new-refresh"
+    raw = store.path.read_text(encoding="utf-8")
+    assert "old-access" not in raw
+    assert "old-refresh" not in raw
+    assert (store.path.stat().st_mode & 0o077) == 0
+
+
+@pytest.mark.parametrize("failure", ["same-refresh", "reduced-scope", "timeout"])
+def test_x_refresh_failure_preserves_token_and_skips_identity(
+    failure: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 8, 13, tzinfo=UTC)
+    settings = XSettings(client_id="client-id")
+    store = FileXTokenStore(tmp_path / "x.json")
+    store.save(
+        XToken(
+            access_token=SecretStr("old-access"),
+            refresh_token=SecretStr("old-refresh"),
+            expires_at=now,
+            obtained_at=now - timedelta(hours=2),
+            scopes=set(settings.scopes),
+        )
+    )
+    before = store.path.read_bytes()
+
+    def refresh_handler(request: httpx.Request) -> httpx.Response:
+        if failure == "timeout":
+            raise httpx.ReadTimeout("timed out", request=request)
+        scopes = (
+            settings.scopes[:-1]
+            if failure == "reduced-scope"
+            else settings.scopes
+        )
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "new-access",
+                "refresh_token": (
+                    "old-refresh" if failure == "same-refresh" else "new-refresh"
+                ),
+                "token_type": "bearer",
+                "expires_in": 7200,
+                "scope": " ".join(scopes),
+            },
+        )
+
+    def client_factory(**kwargs) -> OAuth2Client:
+        kwargs["transport"] = httpx.MockTransport(refresh_handler)
+        return OAuth2Client(**kwargs)
+
+    monkeypatch.setattr("buildlog.x_oauth.OAuth2Client", client_factory)
+    identity_calls = 0
+
+    def identity_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal identity_calls
+        identity_calls += 1
+        return httpx.Response(500)
+
+    http = _http(identity_handler)
+    try:
+        with pytest.raises(XOAuthError) as raised:
+            XIdentityService(settings, http, store).resolve(now=now)
+    finally:
+        http.close()
+
+    assert store.path.read_bytes() == before
+    assert identity_calls == 0
+    assert "old-access" not in str(raised.value)
+    assert "old-refresh" not in str(raised.value)
+
+
+def test_x_login_rejects_token_without_refresh_capability(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = XSettings(client_id="client-id")
+    token_store = FileXTokenStore(tmp_path / "token.json")
+    original = _token()
+    token_store.save(original)
+    before = token_store.path.read_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "replacement-access",
+                "token_type": "bearer",
+                "expires_in": 7200,
+                "scope": "tweet.read tweet.write users.read",
+            },
+        )
+
+    def client_factory() -> OAuth2Client:
+        return OAuth2Client(
+            client_id=settings.client_id,
+            token_endpoint_auth_method="none",
+            scope=" ".join(settings.scopes),
+            redirect_uri=settings.redirect_uri,
+            code_challenge_method="S256",
+            transport=httpx.MockTransport(handler),
+        )
+
+    service = XOAuthService(
+        settings,
+        token_store,
+        FileXAuthorizationStore(tmp_path / "state.json"),
+    )
+    monkeypatch.setattr(service, "_client", client_factory)
+    start = service.start_authorization(now=datetime(2026, 8, 13, tzinfo=UTC))
+    state = parse_qs(urlparse(start.authorization_url).query)["state"][0]
+
+    with pytest.raises(XOAuthError, match="required scope"):
+        service.complete_authorization(
+            OAuthCallback(state=state, code="fresh-code"),
+            now=datetime(2026, 8, 13, 0, 1, tzinfo=UTC),
+        )
+
+    assert token_store.path.read_bytes() == before
 
 
 def test_x_identity_uses_verified_users_me_response() -> None:

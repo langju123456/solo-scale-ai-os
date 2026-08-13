@@ -25,8 +25,20 @@ from soloscale.buildlog_handoff import (
     preview_for_buildlog,
     publish_via_buildlog,
 )
-from soloscale.content_ui import ContentFormResult, content_page, run_content_form
+from soloscale.content_ui import (
+    ContentFormResult,
+    content_page,
+    editorial_publishing_page,
+    run_content_form,
+)
 from soloscale.content_workspace import ContentWorkspaceError, content_download
+from soloscale.editorial_publishing_handoff import (
+    EditorialChannel,
+    EditorialPublishingError,
+    editorial_image_preview,
+    preview_editorial_day,
+    publish_editorial_preview,
+)
 from soloscale.knowledge_models import RetrievalHit
 from soloscale.knowledge_store import (
     InvalidKnowledgeQueryError,
@@ -150,29 +162,6 @@ ${job.estimated_cost_usd:.2f}</p>"""
 <label>Style<input name="style" value="Cinematic product demo"></label>
 <button class="primary">Save brief and preview external submission</button>
 </form>{detail}</main></body></html>"""
-
-
-def _publishing_page() -> str:
-    return """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SoloScale · Publishing</title><style>
-body{margin:0;background:#07111f;color:#e5edf7;font-family:Inter,-apple-system,
-BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:820px;margin:auto;padding:36px 24px}
-a{color:#93c5fd}.panel{margin-top:48px;padding:28px;border:1px solid #334155;
-border-radius:18px;background:#111827}p{color:#b8c4d6;line-height:1.65}.button{display:inline-block;
-margin-top:12px;padding:12px 16px;border-radius:10px;background:#2563eb;color:white;
-font-weight:750;text-decoration:none}code{color:#bae6fd}</style></head><body><main>
-<nav><a href="/">Resume</a> · <a href="/learning">Learning</a> ·
-<a href="/content">Content Studio</a> · <a href="/video">Creator Video</a> ·
-<a href="/publishing">Publishing</a></nav><section class="panel">
-<h1>BuildLog Publishing Engine</h1>
-<p>Publishing is available inside Content Studio. Select a saved LinkedIn or X
-artifact, inspect the exact BuildLog preview, then type <code>PUBLISH</code>.
-BuildLog remains responsible for OAuth, identity checks, duplicate protection,
-platform adapters, and publication receipts.</p>
-<p>Opening this page does not load credentials, contact a platform, or publish anything.</p>
-<a class="button" href="/content">Open Content Studio</a>
-</section></main></body></html>"""
 
 
 def _repo_root() -> Path:
@@ -2636,13 +2625,33 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self._send_video_page(query.get("job_id", [None])[0])
             return
         if path == "/publishing":
-            body = _publishing_page().encode("utf-8")
+            body = editorial_publishing_page(data_root=self.ui_data_root.absolute()).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(body)
+            return
+        editorial_image_match = re.fullmatch(
+            r"/publishing/editorial/(linkedin|x)/image", path
+        )
+        if editorial_image_match is not None:
+            try:
+                content = editorial_image_preview(
+                    self.ui_data_root.absolute(),
+                    cast(EditorialChannel, editorial_image_match.group(1)),
+                )
+            except (EditorialPublishingError, OSError):
+                self.send_error(404, "Editorial image preview not found")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(content)
             return
         video_download_match = re.fullmatch(
             r"/video/downloads/(video-[a-f0-9]{12})/output\.mp4", path
@@ -2808,6 +2817,44 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_response(303)
             location = "/content?" + urllib.parse.urlencode({"run_id": run_id}) + "#results"
             self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/publishing/editorial/preview":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            form = _parse_form(self.rfile.read(length))
+            channel = form.get("channel", "")
+            try:
+                if channel not in {"linkedin", "x"}:
+                    raise EditorialPublishingError("select LinkedIn or X")
+                preview_editorial_day(
+                    data_root=self.ui_data_root.absolute(),
+                    day_directory=Path(form.get("day_directory", "")),
+                    channel=cast(EditorialChannel, channel),
+                )
+            except (EditorialPublishingError, OSError):
+                self.send_error(422, "Editorial package preview failed")
+                return
+            self.send_response(303)
+            self.send_header("Location", "/publishing")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        editorial_publish_match = re.fullmatch(r"/publishing/editorial/(linkedin|x)/publish", path)
+        if editorial_publish_match is not None:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            form = _parse_form(self.rfile.read(length))
+            try:
+                publish_editorial_preview(
+                    data_root=self.ui_data_root.absolute(),
+                    channel=cast(EditorialChannel, editorial_publish_match.group(1)),
+                    confirmation=form.get("confirmation", ""),
+                )
+            except (EditorialPublishingError, OSError):
+                self.send_error(422, "Editorial publication failed")
+                return
+            self.send_response(303)
+            self.send_header("Location", "/publishing")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return

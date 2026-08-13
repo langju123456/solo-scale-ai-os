@@ -17,6 +17,7 @@ from buildlog.x_errors import (
     XMissingTokenError,
 )
 from buildlog.x_http import XHttpClient
+from buildlog.x_oauth import refresh_x_token
 from buildlog.x_token_store import FileXTokenStore, XToken
 
 
@@ -55,7 +56,11 @@ class XIdentityService:
 
     def resolve(self, *, now: datetime | None = None) -> XIdentity:
         """Return the verified identity from X's authenticated-user endpoint."""
-        token = require_valid_x_token(self.token_store, now=now)
+        token = require_valid_x_token(
+            self.token_store,
+            self.settings,
+            now=now,
+        )
         require_x_scopes(token, {"users.read"})
         response = self.http.get_me(
             self.settings.me_url,
@@ -100,18 +105,23 @@ class XIdentityService:
 
 def require_valid_x_token(
     token_store: FileXTokenStore,
+    settings: XSettings,
     *,
     now: datetime | None = None,
 ) -> XToken:
-    """Return a present, non-expired X token."""
+    """Return a present X token, rotating it once when it is near expiry."""
     token = token_store.load()
     if token is None:
         raise XMissingTokenError("No X token exists. Run `buildlog x login`.")
-    if token.is_expired(now=now or datetime.now(UTC)):
+    current = now or datetime.now(UTC)
+    if not token.is_expired(now=current):
+        return token
+    if token.refresh_token is None or "offline.access" not in token.scopes:
         raise XExpiredTokenError(
-            "The X token has expired. Run `buildlog x login` again."
+            "The X token has expired and cannot be refreshed. Authorize the "
+            "existing App once with offline access."
         )
-    return token
+    return refresh_x_token(settings, token_store, token, now=current)
 
 
 def require_x_scopes(token: XToken, required: set[str]) -> None:

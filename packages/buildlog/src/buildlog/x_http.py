@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 import httpx
 
@@ -61,11 +62,31 @@ class XHttpClient:
             json=payload,
         )
 
+    def upload_media(
+        self,
+        url: str,
+        *,
+        access_token: str,
+        payload: Mapping[str, Any],
+    ) -> XHttpResult:
+        """Upload one image through X's v2 media endpoint."""
+        return self._request("POST", url, headers=_headers(access_token), json=payload)
+
+    def set_media_metadata(
+        self,
+        url: str,
+        *,
+        access_token: str,
+        payload: Mapping[str, Any],
+    ) -> XHttpResult:
+        """Set X media metadata after a successful upload."""
+        return self._request("POST", url, headers=_headers(access_token), json=payload)
+
     def _request(
         self,
         method: str,
         url: str,
-        **kwargs: object,
+        **kwargs: Any,
     ) -> XHttpResult:
         try:
             response = self._client.request(

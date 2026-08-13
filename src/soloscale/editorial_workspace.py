@@ -34,6 +34,13 @@ _SECRET = re.compile(
 )
 
 
+def validate_public_editorial_text(value: str) -> None:
+    """Reject provider-bound text containing local paths or credential shapes."""
+
+    if _PRIVATE.search(value) or _SECRET.search(value):
+        raise ValueError("editorial text contains a private path or credential-like value")
+
+
 class EvidenceAnchor(ContractModel):
     evidence_id: str = Field(min_length=1, max_length=180)
     source_label: str = Field(min_length=1, max_length=240)
@@ -49,8 +56,8 @@ class EditorialArtifacts(ContractModel):
     @model_validator(mode="after")
     def public_artifacts_must_be_safe_and_platform_fit(self) -> EditorialArtifacts:
         public_values = [self.canonical_story, self.linkedin, self.x_post, *self.x_thread]
-        if any(_PRIVATE.search(value) or _SECRET.search(value) for value in public_values):
-            raise ValueError("editorial artifacts contain a private path or credential-like value")
+        for value in public_values:
+            validate_public_editorial_text(value)
         validate_x_artifacts(self.x_thread, self.x_post)
         return self
 

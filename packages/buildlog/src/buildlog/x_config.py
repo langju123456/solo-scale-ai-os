@@ -17,7 +17,13 @@ DEFAULT_AUTHORIZATION_URL = "https://x.com/i/oauth2/authorize"
 DEFAULT_TOKEN_URL = "https://api.x.com/2/oauth2/token"
 DEFAULT_API_BASE_URL = "https://api.x.com"
 DEFAULT_API_VERSION = "2"
-DEFAULT_SCOPES = ("tweet.read", "tweet.write", "users.read")
+DEFAULT_SCOPES = (
+    "tweet.read",
+    "tweet.write",
+    "users.read",
+    "offline.access",
+    "media.write",
+)
 
 
 @dataclass(frozen=True)

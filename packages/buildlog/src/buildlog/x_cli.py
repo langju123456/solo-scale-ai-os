@@ -5,9 +5,9 @@ from __future__ import annotations
 import argparse
 import sys
 import webbrowser
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable
 
 from buildlog.config import load_settings
 from buildlog.exceptions import BuildLogError
@@ -156,10 +156,11 @@ def _login(
     oauth = XOAuthService(settings, token_store, authorization_store)
     try:
         start = oauth.start_authorization()
-        if no_browser:
-            on_listening = lambda: _show_url(start.authorization_url)
-        else:
-            on_listening = lambda: _open_url(
+        def on_listening() -> None:
+            if no_browser:
+                _show_url(start.authorization_url)
+                return
+            _open_url(
                 start.authorization_url,
                 browser_opener,
             )
@@ -197,6 +198,10 @@ def _status(root: Path) -> int:
     if token is not None:
         print(f"  Token expired: {_yes_no(token.is_expired(now=datetime.now(UTC)))}")
         print(f"  Token expires at: {_terminal_text(token.expires_at.isoformat())}")
+        refresh_ready = (
+            token.refresh_token is not None and "offline.access" in token.scopes
+        )
+        print(f"  Automatic refresh ready: {_yes_no(refresh_ready)}")
         print("  Granted scopes: " + ", ".join(sorted(token.scopes)))
     return 0
 
@@ -206,7 +211,7 @@ def _whoami(settings: XSettings) -> int:
     http = XHttpClient(timeout_seconds=settings.request_timeout_seconds)
     try:
         identity = XIdentityService(settings, http, store).resolve()
-        token = require_valid_x_token(store)
+        token = require_valid_x_token(store, settings)
     finally:
         http.close()
     print("Authenticated X user:")

@@ -238,6 +238,12 @@ def _write_private_json(path: Path, payload: dict[str, object]) -> None:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
+            if os.name == "posix":
+                directory_descriptor = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_descriptor)
+                finally:
+                    os.close(directory_descriptor)
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise

@@ -82,7 +82,6 @@ This phase does not establish:
 
 - exactly-once delivery by X;
 - autonomous or scheduled publishing;
-- refresh-token support;
 - media, threads, replies, direct messages, or analytics;
 - X support in the Publishing Package;
 - channel-specific X content generation;
@@ -110,3 +109,10 @@ platform adapter until real use shows that transport is blocking value.
 The next product validation should focus on whether the same reviewed
 engineering evidence can produce distinct LinkedIn and X artifacts that the
 user is willing to publish with low editing effort.
+
+## 2026-08-13 bounded extension
+
+The unified-product branch adds refresh-token rotation plus the scopes needed
+for image-bearing X threads. This extension preserves the original exact
+preview, explicit `PUBLISH`, no-retry, duplicate, indeterminate-result, and
+receipt boundaries. It does not authorize unattended publication.
