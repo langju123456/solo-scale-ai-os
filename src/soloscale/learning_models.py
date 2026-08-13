@@ -260,6 +260,7 @@ class KnowledgeGraphEdge(ContractModel):
 class LearningTraceabilityRun(ContractModel):
     run_id: StableId
     case_id: StableId
+    evidence_bundle_id: str | None = None
     repository: NonBlankStr
     branch: NonBlankStr
     commit: NonBlankStr

@@ -18,6 +18,7 @@ from soloscale.content_workspace import (
     parse_claim_ledger,
     run_content_workspace,
 )
+from soloscale.evidence_hub import EvidenceHub
 from soloscale.video_factory import creator_video_ready, render_creator_video
 
 
@@ -80,6 +81,7 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
     assert set(run.artifact_paths) == {path.name for path in run_dir.iterdir()}
     assert run_dir.stat().st_mode & 0o777 == 0o700
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in run_dir.iterdir())
+    assert EvidenceHub(data_root).status().asset_count == len(run.artifact_paths)
 
     linkedin = (run_dir / "02_linkedin.md").read_text(encoding="utf-8")
     x_thread = (run_dir / "03_x_thread.md").read_text(encoding="utf-8")
@@ -94,6 +96,9 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
         "credential_shape_scan_passed": True,
         "every_claim_has_anchor": True,
         "editorial_provenance_recorded": True,
+        "evidence_bundle_used": False,
+        "evidence_gap_count": 0,
+        "evidence_item_count": 0,
         "model_used": False,
         "network_used": False,
         "private_path_scan_passed": True,
@@ -124,9 +129,33 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
 def test_content_workspace_repeat_runs_never_overwrite(tmp_path: Path) -> None:
     data_root = tmp_path / ".soloscale"
     first = run_content_workspace(data_root=data_root, brief=_brief())
-    second = run_content_workspace(data_root=data_root, brief=_brief())
+    hub = EvidenceHub(data_root)
+    item = hub.search_metadata("content run input metadata")[0]
+    bundle = hub.register_bundle(
+        hub.build_bundle(
+            [item.evidence_id],
+            intent="Draft a bounded product update",
+            coverage=["One private run input is hash-captured"],
+            gaps=["No external user outcome has been observed"],
+        )
+    )
+    second = run_content_workspace(
+        data_root=data_root,
+        brief=_brief().model_copy(update={"evidence_bundle_id": bundle.bundle_id}),
+        evidence_hub=hub,
+    )
     assert first.run_id != second.run_id
     assert len(list((data_root / "content-runs").iterdir())) == 2
+    assert second.brief.evidence_item_ids == [item.evidence_id]
+    assert second.brief.evidence_gaps == ["No external user outcome has been observed"]
+    context = json.loads(
+        (
+            data_root / "content-runs" / second.run_id / "14_evidence_context.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert context["bundle_id"] == bundle.bundle_id
+    assert context["items"][0]["public_safe_summary"] == item.public_safe_summary
+    assert context["gaps"] == bundle.gaps
 
 
 @pytest.mark.parametrize(
@@ -263,3 +292,11 @@ def test_buildlog_handoff_stages_exact_artifact_and_persists_returned_receipt(
         preview,
         receipt,
     )
+    hub = EvidenceHub(data_root)
+    outcome = hub.recent_outcomes()[0]
+    assert outcome.asset_id is not None
+    published_asset = hub.get_asset(outcome.asset_id)
+    assert published_asset is not None
+    assert published_asset.private_locator is not None
+    assert published_asset.private_locator.endswith("/02_linkedin.md")
+    assert published_asset.content_sha256 == outcome.final_sha256

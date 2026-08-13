@@ -39,6 +39,8 @@ from soloscale.editorial_publishing_handoff import (
     preview_editorial_day,
     publish_editorial_preview,
 )
+from soloscale.evidence_hub import EvidenceHubError
+from soloscale.evidence_ui import evidence_page, refresh_evidence_catalog
 from soloscale.knowledge_models import RetrievalHit
 from soloscale.knowledge_store import (
     InvalidKnowledgeQueryError,
@@ -144,7 +146,8 @@ ${job.estimated_cost_usd:.2f}</p>"""
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Creator Video</title></head><body><main><nav>
 <a href="/">Resume</a> · <a href="/learning">Learning</a> ·
-<a href="/content">Content Studio</a> · <a href="/video">Creator Video</a> ·
+<a href="/content">Content Studio</a> · <a href="/evidence">Evidence Center</a> ·
+<a href="/video">Creator Video</a> ·
 <a href="/publishing">Publishing</a>
 </nav><h1>Creator Video</h1>
 <p>Google Vertex AI Veo · cloud generation. Provider:
@@ -2241,7 +2244,7 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
     这是个人使用最小界面：用于触发本地流程并读取结果。
     Resume Workspace 会保存候选简历，但不会自动申请、更新 Casebook 或发布内容。
     <a href="/learning">Open Learning Control Tower</a> ·
-    <a href="/content">Open Content Studio</a>.
+    <a href="/content">Open Content Studio</a> · <a href="/evidence">Open Evidence Center</a>.
     <a href="/video">Open Creator Video</a>.
     <a href="/publishing">Open Publishing</a>.
   </p>
@@ -2313,9 +2316,9 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
               {"selected" if source_kind == "codex_session" else ""}>codex_session</option>
             <option value="buildlog_run"
               {"selected" if source_kind == "buildlog_run" else ""}>buildlog_run</option>
-            <option value="chatgpt_conversation"
-              {"selected" if source_kind == "chatgpt_conversation" else ""}
-            >chatgpt_conversation</option>
+            <option value="chatgpt_export"
+              {"selected" if source_kind == "chatgpt_export" else ""}
+            >chatgpt_export</option>
           </select>
         </label>
         <button type="submit">Run knowledge-search</button>
@@ -2348,9 +2351,9 @@ def _page(action_result: UIActionResult | None, data_root: Path, form: dict[str,
             <option value="buildlog_run"
               {"selected" if agent_source_kind == "buildlog_run" else ""}
             >buildlog_run</option>
-            <option value="chatgpt_conversation"
-              {"selected" if agent_source_kind == "chatgpt_conversation" else ""}
-            >chatgpt_conversation</option>
+            <option value="chatgpt_export"
+              {"selected" if agent_source_kind == "chatgpt_export" else ""}
+            >chatgpt_export</option>
           </select>
         </label>
         <button type="submit">Run evidence-agent</button>
@@ -2587,6 +2590,15 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_evidence_page(self) -> None:
+        body = evidence_page(self.ui_data_root.absolute()).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_video_page(self, job_id: str | None = None, error: str | None = None) -> None:
         try:
             page = _video_page(self._video_data_root(), job_id, error)
@@ -2619,6 +2631,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             run_id = query.get("run_id", [""])[0]
             self._send_content_page(run_id=run_id or None)
+            return
+        if path == "/evidence":
+            self._send_evidence_page()
             return
         if path == "/video":
             query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -2721,6 +2736,24 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/evidence/refresh":
+            try:
+                receipt = refresh_evidence_catalog(
+                    self.ui_data_root.absolute(), repository_root=self.repo_root
+                )
+            except (EvidenceHubError, OSError, ValueError):
+                location = "/evidence?refresh=failed"
+            else:
+                location = (
+                    "/evidence?refresh=complete"
+                    if receipt.status.value == "succeeded"
+                    else "/evidence?refresh=failed"
+                )
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path == "/video/prepare":
             length = int(self.headers.get("Content-Length", "0") or 0)
             form = _parse_form(self.rfile.read(length))

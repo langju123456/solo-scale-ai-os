@@ -1,4 +1,21 @@
-# Current Sprint — Content Studio MVP
+# Current Sprint — Unified Evidence Core
+
+- [x] Metadata-only Source, Evidence, Bundle, Case, Asset, Outcome, and Sync contracts.
+- [x] Compatibility adapters for Conversation Knowledge, BuildLog, local Git, and existing
+      application runs without copying raw transcript bodies.
+- [x] Explicit `soloscale evidence-refresh` and private `/evidence` operator surface.
+- [x] Optional EvidenceBundle inputs preserve Content, Resume, Learning, and BuildLog domain
+      contracts.
+- [x] Internal artifacts and successful outcomes register after their source operation.
+- [x] Evidence registration failures retain a private retry warning without retrying an
+      external action or corrupting domain state.
+- [x] Final private no-publication dogfood, full suite, and package build.
+- [x] Local commit after final diff review.
+
+Deferred: watchers, schedulers, GitHub webhooks, vector storage, cloud sync, bulk migration,
+database unification, and automatic truth promotion.
+
+## Previous sprint — Content Studio MVP
 
 The bounded branch goal is one end-user content vertical slice. It must turn an explicit
 claim ledger into reviewable multichannel drafts without calling a model, connecting an

@@ -165,6 +165,25 @@ bounded downloads. The optional Creator Video Factory renders the saved storyboa
 local MP4 using Remotion and the installed browser; it does not call a model, connect a
 social account, upload, or publish.
 
+### Unified Evidence Core
+
+Open `http://127.0.0.1:8765/evidence` for the private operator-facing Evidence Center.
+It shows metadata counts, truth classes, refresh receipts, application assets, and
+outcomes without rendering source bodies, locators, credentials, or absolute paths.
+External and historical sources are refreshed explicitly—there is no watcher or daemon:
+
+```bash
+soloscale evidence-refresh \
+  --data-root "$HOME/Documents/SoloScaleData" \
+  --repository-root "$(pwd)"
+```
+
+The command reuses Conversation Knowledge metadata, local Git metadata, the private
+BuildLog publishing namespace, and existing SoloScale application-run metadata. It does
+not call a model, network service, or publisher. New Content, Resume, Learning, editorial,
+and publication-result artifacts register metadata-only hashes and lineage automatically;
+each product retains its own domain state and remains independently callable.
+
 ### Resume Intelligence Workspace v0.1
 
 The local UI now includes a bounded Resume Workspace: JD + operator-supplied Candidate

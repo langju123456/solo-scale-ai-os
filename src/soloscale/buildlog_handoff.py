@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Literal, cast
 
-from soloscale.content_workspace import content_run_directory
+from soloscale.content_workspace import content_run_directory, load_content_run
+from soloscale.evidence_capture import capture_assets, capture_outcome
+from soloscale.evidence_hub import EvidenceHub
 from soloscale.resume_workspace import ResumeWorkspaceStorageError, _atomic_private_write
 
 Channel = Literal["linkedin", "x"]
@@ -103,6 +106,7 @@ def publish_via_buildlog(
     run_id: str,
     channel: Channel,
     confirmation: str,
+    evidence_hub: EvidenceHub | None = None,
 ) -> dict[str, str]:
     """Publish through BuildLog only after approval bound to a stored exact preview."""
 
@@ -134,6 +138,43 @@ def publish_via_buildlog(
         "source_run_id": run_id,
     }
     _write_record(run_dir / f"13_buildlog_{channel}_receipt.json", record)
+    source = run_dir / _SOURCE_NAMES[channel]
+    content_run = load_content_run(data_root, run_id)
+    try:
+        final_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    except OSError:
+        # The capture helper will retain a private retry warning for the invalid digest.
+        final_sha256 = ""
+    captured_assets = capture_assets(
+        data_root=data_root,
+        run_dir=run_dir,
+        owner="content",
+        run_id=run_id,
+        artifact_names=[_SOURCE_NAMES[channel]],
+        evidence_bundle_id=content_run.brief.evidence_bundle_id,
+        evidence_item_ids=content_run.brief.evidence_item_ids,
+        evidence_hub=evidence_hub,
+    )
+    capture_outcome(
+        data_root=data_root,
+        run_dir=run_dir,
+        owner="buildlog",
+        run_id=run_id,
+        outcome_type="publication",
+        platform=receipt.platform.value,
+        status=receipt.status.value,
+        final_sha256=final_sha256,
+        external_id=receipt.external_post_id,
+        metadata={
+            "channel": channel,
+            "buildlog_run_id": receipt.run_id,
+            "receipt_id": receipt.receipt_id,
+            "published_at": receipt.published_at.isoformat(),
+        },
+        evidence_item_ids=content_run.brief.evidence_item_ids,
+        asset_id=captured_assets.get(_SOURCE_NAMES[channel]),
+        evidence_hub=evidence_hub,
+    )
     return record
 
 

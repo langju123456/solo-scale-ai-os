@@ -33,6 +33,8 @@ from soloscale.evidence_agent import (
     EvidenceAgentError,
     OllamaReasoner,
 )
+from soloscale.evidence_hub import EvidenceHub, EvidenceHubError
+from soloscale.evidence_ui import refresh_evidence_catalog
 from soloscale.handoff import packet_from_task, render_packet_markdown
 from soloscale.knowledge_models import ParsedSource, SourceFailure, SourceKind, SyncReport
 from soloscale.knowledge_store import KnowledgeStore, KnowledgeStoreError
@@ -720,6 +722,53 @@ def knowledge_status(
         status.last_synced_at.isoformat() if status.last_synced_at else "NEVER",
     )
     console.print(table)
+
+
+@app.command("evidence-refresh")
+def evidence_refresh(
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private ignored SoloScale data root"),
+    ] = Path(".soloscale"),
+    repository_root: Annotated[
+        Path | None,
+        typer.Option("--repository-root", help="Repository used for Git snapshot metadata"),
+    ] = None,
+    buildlog_root: Annotated[
+        list[Path] | None,
+        typer.Option("--buildlog-root", help="BuildLog root; repeat as needed"),
+    ] = None,
+) -> None:
+    """Explicitly refresh metadata-only local evidence without models or publishing."""
+
+    _validate_private_data_root(data_root)
+    try:
+        receipt = refresh_evidence_catalog(
+            data_root,
+            repository_root=repository_root or Path.cwd(),
+            buildlog_roots=buildlog_root or (),
+        )
+        status = EvidenceHub(data_root).status()
+    except (EvidenceHubError, OSError, ValueError) as exc:
+        raise typer.BadParameter("evidence refresh could not be completed") from exc
+    table = Table(title="Evidence catalog refresh")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Status", receipt.status.value)
+    table.add_row("Sources", str(status.source_count))
+    table.add_row("Evidence", str(status.evidence_count))
+    table.add_row("Assets", str(status.asset_count))
+    table.add_row("Outcomes", str(status.outcome_count))
+    table.add_row("Created", str(receipt.created_count))
+    table.add_row("Updated", str(receipt.updated_count))
+    table.add_row("Unchanged", str(receipt.unchanged_count))
+    table.add_row("Errors", str(receipt.error_count))
+    console.print(table)
+    if receipt.status.value == "failed":
+        console.print(
+            "[red]Evidence refresh failed. Review local source availability and retry.[/red]"
+        )
+        raise typer.Exit(code=1)
 
 
 @app.command("knowledge-reset")

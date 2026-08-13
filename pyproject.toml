@@ -48,3 +48,4 @@ select = ["B", "E", "F", "I", "ISC", "UP"]
 python_version = "3.11"
 strict = true
 packages = ["soloscale"]
+mypy_path = ["packages/buildlog/src"]

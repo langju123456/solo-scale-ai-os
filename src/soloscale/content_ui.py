@@ -512,6 +512,7 @@ pre {{
   <div class="nav-links">
     <a href="/">Resume</a><a href="/learning">Learning</a>
     <a class="active" href="/content">Content</a><a href="/video">Video</a>
+    <a href="/evidence">Evidence</a>
     <a href="/publishing">Publishing</a>
     <a href="/advanced">Advanced</a>
   </div>

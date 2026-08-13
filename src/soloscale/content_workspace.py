@@ -20,6 +20,8 @@ from soloscale.content_models import (
 )
 from soloscale.editorial_models import EditorialRole, ProviderIdentity, ProviderKind
 from soloscale.editorial_pipeline import make_provenance
+from soloscale.evidence_capture import capture_assets
+from soloscale.evidence_hub import EvidenceHub
 from soloscale.resume_workspace import (
     ResumeWorkspaceStorageError,
     _atomic_private_write,
@@ -46,6 +48,7 @@ _DOWNLOADS = {
     "publish-pack.json": "06_publish_pack.json",
     "provenance.json": "07_provenance.json",
     "editorial-provenance.json": "12_editorial_provenance.json",
+    "evidence-context.json": "14_evidence_context.json",
 }
 
 
@@ -303,9 +306,56 @@ def _new_run_dir(data_root: Path) -> tuple[str, Path]:
     raise ContentWorkspaceError("Could not allocate a non-overwriting content run")
 
 
-def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun:
+def run_content_workspace(
+    *, data_root: Path, brief: ContentBrief, evidence_hub: EvidenceHub | None = None
+) -> ContentRun:
     """Build a deterministic, private content candidate without publishing it."""
 
+    evidence_context: dict[str, object] = {
+        "status": "NOT_REQUESTED",
+        "bundle_id": None,
+        "bundle_sha256": None,
+        "coverage": [],
+        "gaps": [],
+        "items": [],
+    }
+    if brief.evidence_bundle_id is not None:
+        selected_hub = evidence_hub or EvidenceHub(data_root)
+        bundle, items = selected_hub.resolve_bundle(brief.evidence_bundle_id)
+        if brief.evidence_item_ids and not set(brief.evidence_item_ids).issubset(
+            bundle.evidence_ids
+        ):
+            raise ValueError("content evidence items must belong to the selected bundle")
+        selected_ids = brief.evidence_item_ids or bundle.evidence_ids
+        selected_by_id = {item.evidence_id: item for item in items}
+        selected_items = [selected_by_id[evidence_id] for evidence_id in selected_ids]
+        merged_gaps = list(dict.fromkeys([*bundle.gaps, *brief.evidence_gaps]))
+        for index, item in enumerate(selected_items):
+            _reject_private_output(
+                item.public_safe_summary, field=f"evidence item {index + 1} summary"
+            )
+        for index, gap in enumerate(merged_gaps):
+            _reject_private_output(gap, field=f"evidence gap {index + 1}")
+        brief = brief.model_copy(
+            update={"evidence_item_ids": selected_ids, "evidence_gaps": merged_gaps}
+        )
+        evidence_context = {
+            "status": "BUNDLE_RESOLVED_FOR_EDITORIAL_REVIEW",
+            "bundle_id": bundle.bundle_id,
+            "bundle_sha256": bundle.bundle_sha256,
+            "coverage": bundle.coverage,
+            "gaps": merged_gaps,
+            "items": [
+                {
+                    "evidence_id": item.evidence_id,
+                    "public_safe_summary": item.public_safe_summary,
+                    "truth_class": item.truth_class.value,
+                    "verification_status": item.verification_status,
+                }
+                for item in selected_items
+            ],
+        }
+        evidence_hub = selected_hub
     drafts = build_content_drafts(brief)
     try:
         run_id, run_dir = _new_run_dir(data_root.absolute())
@@ -324,6 +374,7 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
         "07_provenance.json",
         "08_verification.json",
         "12_editorial_provenance.json",
+        "14_evidence_context.json",
         "run.json",
     ]
     brief_payload = brief.model_dump(mode="json")
@@ -344,7 +395,10 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
         ),
         reasoning="deterministic",
         prompt_version="content-template-v1",
-        input_artifacts={"00_input.json": _canonical_json(brief_payload)},
+        input_artifacts={
+            "00_input.json": _canonical_json(brief_payload),
+            "14_evidence_context.json": _canonical_json(evidence_context),
+        },
         output_artifacts=output_artifacts,
         network_used=False,
         token_usage=None,
@@ -356,12 +410,14 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
         "channels": ["LinkedIn", "X", "Short video"],
         "drafts": drafts_payload,
         "publication_performed": False,
+        "evidence_context": evidence_context,
         "next_gate": "Human fact-check and explicit per-channel publish approval",
     }
     provenance = {
         "source_label": brief.source_label,
         "claim_ledger_sha256": _sha256(brief_payload["claims"]),
         "claims": brief_payload["claims"],
+        "evidence_context": evidence_context,
         "boundary": (
             "Citation membership and operator classification are recorded; semantic support "
             "and public suitability still require human review."
@@ -382,6 +438,9 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
         "network_used": False,
         "model_used": False,
         "editorial_provenance_recorded": True,
+        "evidence_bundle_used": brief.evidence_bundle_id is not None,
+        "evidence_item_count": len(brief.evidence_item_ids),
+        "evidence_gap_count": len(brief.evidence_gaps),
         "publication_performed": False,
     }
     run = ContentRun(
@@ -395,6 +454,7 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
             "Drafts are deterministic editorial candidates, not semantic fact-check results.",
             "Receipts may still need public-safe URLs before posting.",
             "No account connection or publishing action was performed.",
+            "Evidence gaps remain explicit and are not converted into factual claims.",
         ],
     )
     artifacts = {
@@ -415,6 +475,7 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
                 "next_gate": "Fresh independent review before controlled revision",
             }
         ),
+        "14_evidence_context.json": _canonical_json(evidence_context),
         "run.json": _canonical_json(run.model_dump(mode="json")),
     }
     try:
@@ -422,6 +483,16 @@ def run_content_workspace(*, data_root: Path, brief: ContentBrief) -> ContentRun
             _atomic_private_write(run_dir / name, artifacts[name])
     except (OSError, ResumeWorkspaceStorageError) as exc:
         raise ContentWorkspaceError("Private content artifacts could not be saved") from exc
+    capture_assets(
+        data_root=data_root,
+        run_dir=run_dir,
+        owner="content",
+        run_id=run_id,
+        artifact_names=artifact_paths,
+        evidence_bundle_id=brief.evidence_bundle_id,
+        evidence_item_ids=brief.evidence_item_ids,
+        evidence_hub=evidence_hub,
+    )
     return run
 
 

@@ -14,6 +14,9 @@ from uuid import uuid4
 
 from soloscale.knowledge_models import (
     ContentRole,
+    KnowledgeCatalogChunk,
+    KnowledgeCatalogDocument,
+    KnowledgeCatalogSnapshot,
     KnowledgeStatus,
     ParsedSource,
     RetrievalHit,
@@ -225,6 +228,85 @@ class KnowledgeStore:
             source_counts=source_counts,
             last_synced_at=last_synced_at,
         )
+
+    def catalog_metadata(self) -> KnowledgeCatalogSnapshot:
+        """Return a consistent metadata-only projection for downstream catalogs.
+
+        This query intentionally does not select chunk bodies or retrieval excerpts.
+        Native IDs and locators are private provenance metadata for local catalogs.
+        """
+
+        try:
+            with self._connect() as connection:
+                with _read_snapshot(connection):
+                    document_rows = connection.execute(
+                        """
+                        SELECT document_id, source_kind, external_id, locator, parent_external_id,
+                               title, content_sha256, byte_size, observed_at, metadata_json
+                        FROM documents
+                        ORDER BY document_id
+                        """
+                    ).fetchall()
+                    chunk_rows = connection.execute(
+                        """
+                        SELECT chunk_id, document_id, ordinal, role, timestamp,
+                               text_sha256, metadata_json
+                        FROM chunks
+                        ORDER BY document_id, ordinal, chunk_id
+                        """
+                    ).fetchall()
+        except (UnsafeKnowledgePathError, CorruptKnowledgeStoreError):
+            raise
+        except sqlite3.Error:
+            raise KnowledgeStoreError("knowledge catalog metadata read failed") from None
+
+        try:
+            return KnowledgeCatalogSnapshot(
+                documents=[
+                    KnowledgeCatalogDocument(
+                        document_id=str(row["document_id"]),
+                        native_id=str(row["external_id"]),
+                        source_kind=SourceKind(str(row["source_kind"])),
+                        project=(
+                            str(row["parent_external_id"])
+                            if row["parent_external_id"] is not None
+                            else None
+                        ),
+                        locator=str(row["locator"]),
+                        title=str(row["title"]) if row["title"] is not None else None,
+                        content_sha256=str(row["content_sha256"]),
+                        byte_size=int(row["byte_size"]),
+                        observed_at=_parse_catalog_datetime(row["observed_at"]),
+                        metadata_sha256=hashlib.sha256(
+                            str(row["metadata_json"]).encode("utf-8")
+                        ).hexdigest(),
+                        metadata={
+                            str(key): str(value)
+                            for key, value in json.loads(str(row["metadata_json"])).items()
+                            if isinstance(key, str) and isinstance(value, str)
+                        },
+                    )
+                    for row in document_rows
+                ],
+                chunks=[
+                    KnowledgeCatalogChunk(
+                        chunk_id=str(row["chunk_id"]),
+                        document_id=str(row["document_id"]),
+                        ordinal=int(row["ordinal"]),
+                        role=ContentRole(str(row["role"])),
+                        timestamp=_parse_catalog_datetime(row["timestamp"]),
+                        text_sha256=str(row["text_sha256"]),
+                        metadata_sha256=hashlib.sha256(
+                            str(row["metadata_json"]).encode("utf-8")
+                        ).hexdigest(),
+                    )
+                    for row in chunk_rows
+                ],
+            )
+        except (TypeError, ValueError):
+            raise CorruptKnowledgeStoreError(
+                "knowledge store contains invalid catalog metadata"
+            ) from None
 
     def reset_index(self) -> None:
         """Delete only the derived SQLite index; preserve private agent-run receipts."""
@@ -1133,6 +1215,13 @@ def _datetime_text(value: datetime | None) -> str | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC).isoformat()
     return value.astimezone(UTC).isoformat()
+
+
+def _parse_catalog_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(str(value))
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 
 def _utc_now_text() -> str:

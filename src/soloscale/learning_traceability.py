@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from soloscale.evidence_capture import capture_assets, capture_outcome
+from soloscale.evidence_hub import EvidenceHub
 from soloscale.learning_models import (
     ClaimEligibility,
     CodeAnchor,
@@ -175,6 +177,7 @@ def _resolve_symbol(
     repository_root: Path,
     relative_file: str,
     qualified_symbol: str,
+    commit: str,
 ) -> _ResolvedSymbol:
     tracked = _git(
         repository_root,
@@ -185,10 +188,12 @@ def _resolve_symbol(
     )
     if not tracked:
         raise LearningTraceabilityError(f"code anchor is not tracked: {relative_file}")
-    path = repository_root / relative_file
+    content = _git_bytes(repository_root, "show", f"{commit}:{relative_file}")
+    if content is None:
+        raise LearningTraceabilityError(f"code anchor is unavailable: {relative_file}")
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative_file)
-    except (OSError, SyntaxError, UnicodeDecodeError) as exc:
+        tree = ast.parse(content.decode("utf-8"), filename=relative_file)
+    except (SyntaxError, UnicodeDecodeError) as exc:
         raise LearningTraceabilityError(
             f"code anchor could not be parsed: {relative_file}"
         ) from exc
@@ -224,7 +229,7 @@ def _resolve_symbol(
         symbol=qualified_symbol,
         line_start=resolved.lineno,
         line_end=resolved.end_lineno or resolved.lineno,
-        file_sha256=_sha256_file(path),
+        file_sha256=_sha256_bytes(content),
     )
 
 
@@ -425,6 +430,7 @@ def _source_record(
     source_kind: str,
     title: str,
     relative_file: str,
+    commit: str,
 ) -> SourceRecord:
     tracked = _git(
         repository_root,
@@ -433,15 +439,15 @@ def _source_record(
         relative_file,
         required=False,
     )
-    path = repository_root / relative_file
-    if not tracked or not path.is_file():
+    content = _git_bytes(repository_root, "show", f"{commit}:{relative_file}")
+    if not tracked or content is None:
         raise LearningTraceabilityError(f"source record is missing: {relative_file}")
     return SourceRecord(
         id=record_id,
         source_kind=source_kind,
         title=title,
         source_path=relative_file,
-        content_sha256=_sha256_file(path),
+        content_sha256=_sha256_bytes(content),
     )
 
 
@@ -528,7 +534,7 @@ def _build_anchors(
     code_anchors = [
         _code_anchor(
             identity,
-            _resolve_symbol(repository_root, relative_file, symbol),
+            _resolve_symbol(repository_root, relative_file, symbol, identity.commit),
             anchor_id=anchor_id,
             capability_ids=capability_ids,
         )
@@ -571,7 +577,7 @@ def _build_anchors(
     verification_anchors = [
         _verification_anchor(
             identity,
-            _resolve_symbol(repository_root, relative_file, symbol),
+            _resolve_symbol(repository_root, relative_file, symbol, identity.commit),
             anchor_id=anchor_id,
             command=command,
             capability_ids=capability_ids,
@@ -997,6 +1003,7 @@ def save_learning_response(
     run_id: str,
     stage: MasteryAction | str,
     response: str,
+    evidence_hub: EvidenceHub | None = None,
 ) -> tuple[LearningResponseReceipt, Path]:
     """Save one private response candidate without creating a mastery receipt."""
 
@@ -1068,6 +1075,28 @@ def save_learning_response(
     )
     receipt_path = response_root / filename
     _atomic_private_json(receipt_path, receipt.model_dump(mode="json"))
+    response_sha256 = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    captured_assets = capture_assets(
+        data_root=selected_root,
+        run_dir=run_dir,
+        owner="learning_response",
+        run_id=run_id,
+        artifact_names=[f"practice-responses/{filename}"],
+        evidence_hub=evidence_hub,
+    )
+    capture_outcome(
+        data_root=selected_root,
+        run_dir=run_dir,
+        owner="learning_response",
+        run_id=run_id,
+        outcome_type="learning_response",
+        platform="local",
+        status="submitted_requires_review",
+        final_sha256=response_sha256,
+        metadata={"stage": accepted_stage.value, "receipt_id": receipt.id},
+        asset_id=captured_assets.get(f"practice-responses/{filename}"),
+        evidence_hub=evidence_hub,
+    )
     return receipt, receipt_path
 
 
@@ -1076,8 +1105,17 @@ def run_learning_traceability(
     data_root: Path,
     repository_root: Path,
     target_requirement: str = DEFAULT_TARGET_REQUIREMENT,
+    evidence_hub: EvidenceHub | None = None,
+    evidence_bundle_id: str | None = None,
 ) -> LearningTraceabilityRun:
     """Build the one selected traceability case without reading private conversation bodies."""
+
+    bundle_evidence_ids: list[str] = []
+    if evidence_bundle_id is not None:
+        selected_hub = evidence_hub or EvidenceHub(data_root)
+        bundle, _items = selected_hub.resolve_bundle(evidence_bundle_id)
+        bundle_evidence_ids = bundle.evidence_ids
+        evidence_hub = selected_hub
 
     requirement = " ".join(target_requirement.split())
     if not requirement:
@@ -1092,6 +1130,7 @@ def run_learning_traceability(
             source_kind="tracked_conversation_distillation",
             title="Agent swarm to surface routing distillation",
             relative_file="docs/conversations/2026-08-06-agent-swarm-to-surface-routing.md",
+            commit=identity.commit,
         ),
         _source_record(
             repository_root,
@@ -1099,6 +1138,7 @@ def run_learning_traceability(
             source_kind="architecture_decision",
             title="Private evidence-bound Conversation RAG decision",
             relative_file="docs/decisions/ADR-0004-private-conversation-rag.md",
+            commit=identity.commit,
         ),
         _source_record(
             repository_root,
@@ -1106,6 +1146,7 @@ def run_learning_traceability(
             source_kind="technical_guide",
             title="Private Conversation RAG v0.2 guide",
             relative_file="docs/conversation-rag.md",
+            commit=identity.commit,
         ),
     ]
     reasoning = ReasoningArtifact(
@@ -1363,6 +1404,7 @@ def run_learning_traceability(
     run = LearningTraceabilityRun(
         run_id=run_id,
         case_id=CASE_ID,
+        evidence_bundle_id=evidence_bundle_id,
         repository=identity.name,
         branch=identity.branch,
         commit=identity.commit,
@@ -1460,4 +1502,14 @@ def run_learning_traceability(
         if staging_dir.exists() and not staging_dir.is_symlink():
             shutil.rmtree(staging_dir)
         raise
+    capture_assets(
+        data_root=data_root,
+        run_dir=run_dir,
+        owner="learning",
+        run_id=run_id,
+        artifact_names=list(ARTIFACT_FILES),
+        evidence_bundle_id=evidence_bundle_id,
+        evidence_item_ids=bundle_evidence_ids,
+        evidence_hub=evidence_hub,
+    )
     return run

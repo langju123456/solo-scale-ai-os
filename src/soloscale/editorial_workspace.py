@@ -18,6 +18,8 @@ from soloscale.editorial_models import (
     RevisionResult,
 )
 from soloscale.editorial_pipeline import PrivateWriteError, write_private_once
+from soloscale.evidence_capture import capture_assets
+from soloscale.evidence_hub import EvidenceHub
 from soloscale.models import ContractModel
 from soloscale.visual_planner import VisualPlan, write_visual_package
 
@@ -160,7 +162,14 @@ def write_author_voice_profile(root: Path, profile: AuthorVoiceProfile) -> Path:
 
 
 def write_editorial_package(
-    root: Path, package: EditorialPackage, *, try_png: bool = True
+    root: Path,
+    package: EditorialPackage,
+    *,
+    try_png: bool = True,
+    data_root: Path | None = None,
+    evidence_hub: EvidenceHub | None = None,
+    evidence_bundle_id: str | None = None,
+    evidence_item_ids: list[str] | None = None,
 ) -> dict[str, str]:
     """Persist one complete package exactly once; never publish or call a provider."""
 
@@ -228,7 +237,28 @@ def write_editorial_package(
         "artifacts": hashes,
     }
     hashes["receipt.json"] = write_private_once(root / "receipt.json", _canonical_json(receipt))
+    selected_data_root = data_root or _inferred_data_root(root)
+    if evidence_hub is not None:
+        selected_data_root = evidence_hub.data_root
+    if selected_data_root is not None:
+        capture_assets(
+            data_root=selected_data_root,
+            run_dir=root,
+            owner="editorial",
+            run_id=package.package_id,
+            artifact_names=list(hashes),
+            evidence_bundle_id=evidence_bundle_id,
+            evidence_item_ids=evidence_item_ids,
+            evidence_hub=evidence_hub,
+        )
     return hashes
+
+
+def _inferred_data_root(package_root: Path) -> Path | None:
+    for parent in package_root.absolute().parents:
+        if parent.name == "content":
+            return parent.parent
+    return None
 
 
 def verify_editorial_package(root: Path) -> bool:

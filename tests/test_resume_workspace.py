@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from soloscale.evidence_hub import EvidenceHub
 from soloscale.knowledge_models import ContentRole, RetrievalHit, SourceKind
 from soloscale.learning_traceability import run_learning_traceability
 from soloscale.resume_models import CandidateProfile, JobResearchSource, ResumeMode, ResumeRun
@@ -103,6 +104,9 @@ def test_local_workspace_writes_private_artifacts_and_replayable_lineage(tmp_pat
     assert defense["records"][0]["status"] == "NEEDS_MAPPING"
     assert len(run.artifact_paths) == len(set(run.artifact_paths))
     assert run.artifact_paths.count("interview_defense.json") == 1
+    assert EvidenceHub(tmp_path / ".soloscale").status().asset_count == len(
+        run.artifact_paths
+    )
 
 
 def test_interview_defense_mapping_is_explicit_and_validated(tmp_path: Path) -> None:

@@ -40,6 +40,18 @@ class ContentBrief(_StrictModel):
     call_to_action: str = Field(min_length=1, max_length=220)
     source_label: str = Field(min_length=1, max_length=500)
     claims: list[ContentClaim] = Field(min_length=1, max_length=8)
+    evidence_bundle_id: str | None = None
+    evidence_item_ids: list[str] = Field(default_factory=list, max_length=100)
+    evidence_gaps: list[str] = Field(default_factory=list, max_length=20)
+    evidence_filters: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def evidence_references_are_consistent(self) -> ContentBrief:
+        if len(self.evidence_item_ids) != len(set(self.evidence_item_ids)):
+            raise ValueError("evidence item ids must be unique")
+        if self.evidence_item_ids and self.evidence_bundle_id is None:
+            raise ValueError("evidence item ids require an evidence bundle id")
+        return self
 
 
 class StoryboardScene(_StrictModel):

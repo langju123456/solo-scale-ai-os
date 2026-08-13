@@ -166,6 +166,7 @@ class ResumeRun(ContractModel):
     run_id: str
     created_at: str = Field(default_factory=lambda: utc_now().isoformat())
     mode: ResumeMode
+    evidence_bundle_id: str | None = None
     status: Literal["CANDIDATE_REQUIRES_HUMAN_CONFIRMATION"] = (
         "CANDIDATE_REQUIRES_HUMAN_CONFIRMATION"
     )
