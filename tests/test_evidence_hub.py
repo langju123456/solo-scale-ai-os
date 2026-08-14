@@ -127,6 +127,59 @@ def test_search_bundle_and_lineage_are_metadata_only(tmp_path: Path) -> None:
         ).fetchone() == (1,)
 
 
+def test_bundle_registration_rolls_back_when_lineage_freeze_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / ".soloscale"
+    hub = EvidenceHub(root, knowledge_store=_store(root))
+    hub.refresh()
+    item = hub.search_metadata("knowledge_chunk")[0]
+    candidate = hub.build_bundle([item.evidence_id], intent="atomic failure test")
+
+    def fail_lineage_freeze(
+        _hub: EvidenceHub, _connection: sqlite3.Connection, _bundle: object
+    ) -> None:
+        raise EvidenceHubError("simulated lineage freeze failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(EvidenceHub, "_archive_bundle_lineage", fail_lineage_freeze)
+        with pytest.raises(EvidenceHubError, match="simulated lineage freeze failure"):
+            hub.register_bundle(candidate)
+
+    assert hub.get_bundle(candidate.bundle_id) is None
+    with sqlite3.connect(hub.database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bundle_lineage_items WHERE bundle_id = ?",
+            (candidate.bundle_id,),
+        ).fetchone() == (0,)
+
+    assert hub.register_bundle(candidate) == candidate
+    assert hub.register_bundle(candidate) == candidate
+    assert hub.resolve_bundle(candidate.bundle_id)[0] == candidate
+    with sqlite3.connect(hub.database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bundles WHERE bundle_id = ?", (candidate.bundle_id,)
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM bundle_lineage_items WHERE bundle_id = ?",
+            (candidate.bundle_id,),
+        ).fetchone() == (1,)
+
+    conflict = candidate.model_copy(update={"intent": "conflicting immutable payload"})
+    with pytest.raises(EvidenceHubError, match="conflicting immutable"):
+        hub.register_bundle(conflict)
+
+    with sqlite3.connect(hub.database_path) as connection:
+        connection.execute(
+            "DELETE FROM bundle_lineage_items WHERE bundle_id = ?",
+            (candidate.bundle_id,),
+        )
+    with pytest.raises(EvidenceHubError, match="evidence is unavailable"):
+        hub.resolve_bundle(candidate.bundle_id)
+    with pytest.raises(EvidenceHubError, match="immutable lineage is incomplete"):
+        hub.register_bundle(candidate)
+
+
 def test_case_asset_and_outcome_records_are_deterministic(tmp_path: Path) -> None:
     root = tmp_path / ".soloscale"
     hub = EvidenceHub(root, knowledge_store=_store(root))

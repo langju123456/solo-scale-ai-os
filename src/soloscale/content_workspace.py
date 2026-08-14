@@ -113,6 +113,8 @@ def _validate_public_fields(brief: ContentBrief) -> None:
         values[f"{claim.id}.text"] = claim.text
         values[f"{claim.id}.receipt"] = claim.receipt or ""
         values[f"{claim.id}.limits"] = claim.limits or ""
+    for index, gap in enumerate(brief.evidence_gaps):
+        values[f"evidence gap {index + 1}"] = gap
     for field, value in values.items():
         _reject_private_output(value, field=field)
 
@@ -330,6 +332,8 @@ def run_content_workspace(
         selected_by_id = {item.evidence_id: item for item in items}
         selected_items = [selected_by_id[evidence_id] for evidence_id in selected_ids]
         merged_gaps = list(dict.fromkeys([*bundle.gaps, *brief.evidence_gaps]))
+        for index, coverage in enumerate(bundle.coverage):
+            _reject_private_output(coverage, field=f"evidence coverage {index + 1}")
         for index, item in enumerate(selected_items):
             _reject_private_output(
                 item.public_safe_summary, field=f"evidence item {index + 1} summary"

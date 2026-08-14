@@ -318,16 +318,39 @@ class EvidenceHub:
         )
 
     def register_bundle(self, bundle: EvidenceBundle) -> EvidenceBundle:
-        if not set(bundle.evidence_ids).issubset({item.evidence_id for item in self._all_items()}):
-            raise EvidenceHubError("bundle references unavailable evidence")
-        payload = self._insert_record(
-            "bundles", "bundle_id", bundle.bundle_id, bundle.model_dump_json()
-        )
-        registered = EvidenceBundle.model_validate_json(payload)
+        payload = bundle.model_dump_json()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                self._archive_bundle_lineage(connection, registered)
+                inserted = connection.execute(
+                    "INSERT OR IGNORE INTO bundles (bundle_id, payload_json) VALUES (?, ?)",
+                    (bundle.bundle_id, payload),
+                )
+                if inserted.rowcount == 0:
+                    existing = connection.execute(
+                        "SELECT payload_json FROM bundles WHERE bundle_id = ?",
+                        (bundle.bundle_id,),
+                    ).fetchone()
+                    if existing is None or _stable_json(
+                        str(existing["payload_json"])
+                    ) != _stable_json(payload):
+                        raise EvidenceHubError("conflicting immutable bundles record")
+                    registered = EvidenceBundle.model_validate_json(
+                        str(existing["payload_json"])
+                    )
+                else:
+                    registered = bundle
+                    self._archive_bundle_lineage(connection, registered)
+                frozen_ids = {
+                    str(row["evidence_id"])
+                    for row in connection.execute(
+                        "SELECT evidence_id FROM bundle_lineage_items "
+                        "WHERE bundle_id = ?",
+                        (registered.bundle_id,),
+                    )
+                }
+                if frozen_ids != set(registered.evidence_ids):
+                    raise EvidenceHubError("bundle immutable lineage is incomplete")
                 connection.commit()
             except Exception:
                 connection.rollback()
@@ -842,14 +865,12 @@ class EvidenceHub:
                 f"WHERE bundle_id = ? AND evidence_id IN ({placeholders})",
                 [bundle_id, *ids],
             ).fetchall()
-        if rows:
-            return {
-                str(row["evidence_id"]): EvidenceItem.model_validate_json(
-                    str(row["payload_json"])
-                )
-                for row in rows
-            }
-        return self._evidence_records(ids)
+        return {
+            str(row["evidence_id"]): EvidenceItem.model_validate_json(
+                str(row["payload_json"])
+            )
+            for row in rows
+        }
 
     def _archive_lineage(
         self,
@@ -1135,7 +1156,7 @@ class EvidenceHub:
         if len(rows) != len(bundle.evidence_ids):
             raise EvidenceHubError("bundle references unavailable evidence")
         connection.executemany(
-            "INSERT OR IGNORE INTO bundle_lineage_items "
+            "INSERT INTO bundle_lineage_items "
             "(bundle_id, evidence_id, payload_json) VALUES (?, ?, ?)",
             [
                 (bundle.bundle_id, str(row["evidence_id"]), str(row["payload_json"]))

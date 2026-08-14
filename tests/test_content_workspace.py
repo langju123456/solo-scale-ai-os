@@ -157,6 +157,50 @@ def test_content_workspace_repeat_runs_never_overwrite(tmp_path: Path) -> None:
     assert context["items"][0]["public_safe_summary"] == item.public_safe_summary
     assert context["gaps"] == bundle.gaps
 
+    unsafe_coverage_values = [
+        "/Users/synthetic/private-evidence.txt",
+        "Bearer syntheticcredential12345",
+    ]
+    for unsafe_coverage in unsafe_coverage_values:
+        unsafe_bundle = hub.register_bundle(
+            hub.build_bundle(
+                [item.evidence_id],
+                intent="Reject private coverage before creating an editorial run",
+                coverage=[unsafe_coverage],
+            )
+        )
+        with pytest.raises(ContentWorkspaceError, match="private|credential"):
+            run_content_workspace(
+                data_root=data_root,
+                brief=_brief().model_copy(
+                    update={"evidence_bundle_id": unsafe_bundle.bundle_id}
+                ),
+                evidence_hub=hub,
+            )
+    unsafe_gap = "/private/synthetic/evidence-gap.txt"
+    unsafe_gap_bundle = hub.register_bundle(
+        hub.build_bundle(
+            [item.evidence_id],
+            intent="Reject private gaps before creating an editorial run",
+            gaps=[unsafe_gap],
+        )
+    )
+    with pytest.raises(ContentWorkspaceError, match="private absolute path"):
+        run_content_workspace(
+            data_root=data_root,
+            brief=_brief().model_copy(
+                update={"evidence_bundle_id": unsafe_gap_bundle.bundle_id}
+            ),
+            evidence_hub=hub,
+        )
+    assert len(list((data_root / "content-runs").iterdir())) == 2
+    assert all(
+        unsafe_value.encode("utf-8") not in path.read_bytes()
+        for unsafe_value in [*unsafe_coverage_values, unsafe_gap]
+        for run_dir in (data_root / "content-runs").iterdir()
+        for path in run_dir.iterdir()
+    )
+
 
 @pytest.mark.parametrize(
     "field,value",
@@ -164,10 +208,11 @@ def test_content_workspace_repeat_runs_never_overwrite(tmp_path: Path) -> None:
         ("source_label", "/Users/private/secret.json"),
         ("source_label", "file:///tmp/private.json"),
         ("call_to_action", "Use sk-secretcredential12345"),
+        ("evidence_gaps", ["/Users/private/evidence-gap.txt"]),
     ],
 )
 def test_content_workspace_rejects_private_paths_and_credential_shapes(
-    tmp_path: Path, field: str, value: str
+    tmp_path: Path, field: str, value: str | list[str]
 ) -> None:
     brief = _brief().model_copy(update={field: value})
     with pytest.raises(ContentWorkspaceError, match="private|credential"):
