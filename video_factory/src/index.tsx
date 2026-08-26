@@ -4,6 +4,7 @@ import {CreatorVideo, type CreatorVideoProps} from './video';
 const defaultProps: CreatorVideoProps = {
   topic: 'SoloScale Creator Video',
   sourceLabel: 'Operator-supplied claim ledger',
+  subtitle: 'Evidence-backed local story',
   scenes: [
     {
       id: 'SCENE-01',

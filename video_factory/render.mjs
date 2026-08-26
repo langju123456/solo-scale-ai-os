@@ -1,5 +1,5 @@
 import {bundle} from '@remotion/bundler';
-import {renderMedia, selectComposition} from '@remotion/renderer';
+import {renderMedia, renderStill, selectComposition} from '@remotion/renderer';
 import {readFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import process from 'node:process';
@@ -16,6 +16,8 @@ const valueFor = (flag) => {
 try {
   const input = resolve(valueFor('--input'));
   const output = resolve(valueFor('--output'));
+  const thumbnailIndex = args.indexOf('--thumbnail');
+  const thumbnail = thumbnailIndex === -1 ? null : resolve(valueFor('--thumbnail'));
   const inputProps = JSON.parse(await readFile(input, 'utf8'));
   const serveUrl = await bundle({entryPoint: resolve('src/entry.ts')});
   const browserExecutable = process.env.REMOTION_BROWSER_EXECUTABLE;
@@ -36,6 +38,18 @@ try {
     logLevel: 'error',
     browserExecutable,
   });
+  if (thumbnail) {
+    await renderStill({
+      composition,
+      serveUrl,
+      output: thumbnail,
+      inputProps,
+      frame: 18,
+      imageFormat: 'png',
+      overwrite: false,
+      browserExecutable,
+    });
+  }
   process.stdout.write(`${output}\n`);
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);

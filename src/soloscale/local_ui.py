@@ -144,6 +144,13 @@ from soloscale.video_generation import (
     provider_status,
     save_job,
 )
+from soloscale.video_story import (
+    LocalVideoJobManager,
+    LocalVideoJobSnapshot,
+    VideoStoryError,
+    local_video_artifact,
+    local_video_download_names,
+)
 from soloscale.work_ui import (
     WorkContextError,
     import_chatgpt_export,
@@ -724,11 +731,96 @@ class FormSubmission:
     files: dict[str, UploadedFile]
 
 
+def _local_video_panel(
+    snapshot: LocalVideoJobSnapshot | None,
+    *,
+    available: bool,
+    locale: UILocale,
+) -> str:
+    if snapshot is None:
+        availability = (
+            ""
+            if available
+            else f'<p class="notice warning">{_escape(ui_text(locale, "本地 Remotion 运行环境尚未准备好。", "The local Remotion runtime is not ready."))}</p>'
+        )
+        disabled = "" if available else " disabled"
+        return f'''<section class="card local-story-card">
+  <div class="provider-row"><span>{_escape(ui_text(locale, "本地证据故事 · v0.1", "Local evidence story · v0.1"))}</span><span class="status-badge">LOCAL</span></div>
+  <h2>{_escape(ui_text(locale, "把一次真实工程教训做成成片", "Turn a measured engineering lesson into a finished video"))}</h2>
+  <p>{_escape(ui_text(locale, "首个故事已从本机 Git checkpoint 与两次真实 Resume timing 回执中核验。渲染不会调用模型、不会联网、不会发布。", "The first story is verified from a local Git checkpoint and two real Resume timing receipts. Rendering uses no model, network, or publication."))}</p>
+  <div class="story-preview">
+    <strong>{_escape(ui_text(locale, "一个 AI 简历 App 卡住两分钟之后，我学到的系统设计", "What a two-minute AI resume freeze taught me about system design"))}</strong>
+    <span>9:16 · 1080 × 1920 · 84s · 7 scenes</span>
+  </div>
+  <ol class="story-layers">
+    <li>{_escape(ui_text(locale, "事实：两次 qwen3:8b 真实运行约 122.6s / 128.3s", "Fact: two real qwen3:8b runs took about 122.6s / 128.3s"))}</li>
+    <li>{_escape(ui_text(locale, "决定：分离请求、后台任务、UI 与模型推理", "Decision: separate the request, job, UI, and inference lifecycles"))}</li>
+    <li>{_escape(ui_text(locale, "意外：模型生成占总耗时超过 99%", "Surprise: model generation consumed more than 99% of total time"))}</li>
+  </ol>
+  {availability}
+  <form method="post" action="/video/local/render">
+    <input type="hidden" name="ui_locale" value="{locale}" />
+    <button class="primary"{disabled}>{_escape(ui_text(locale, "生成本地视频", "Render local video"))}</button>
+  </form>
+</section>'''
+
+    progress = {
+        "QUEUED": 8,
+        "PREPARING_STORY": 22,
+        "PREPARING_ASSETS": 38,
+        "RENDERING": 68,
+        "COMPLETE": 100,
+        "FAILED": 100,
+    }[snapshot.phase]
+    labels = {
+        "QUEUED": ui_text(locale, "等待渲染", "Queued"),
+        "PREPARING_STORY": ui_text(locale, "核验并准备故事", "Preparing verified story"),
+        "PREPARING_ASSETS": ui_text(locale, "生成旁白与字幕", "Preparing narration and captions"),
+        "RENDERING": ui_text(locale, "正在渲染成片", "Rendering video"),
+        "COMPLETE": ui_text(locale, "视频已完成", "Video complete"),
+        "FAILED": ui_text(locale, "渲染未完成", "Render failed"),
+    }
+    elapsed = snapshot.total_elapsed_ms / 1000
+    if snapshot.phase == "COMPLETE":
+        base = f"/video/local/downloads/{snapshot.job_id}"
+        result = f'''<video controls preload="metadata" src="{base}/video"></video>
+<div class="video-actions">
+  <a class="primary-button" href="{base}/video" download>{_escape(ui_text(locale, "下载 MP4", "Download MP4"))}</a>
+  <a class="secondary-button" href="{base}/subtitles" download>{_escape(ui_text(locale, "下载字幕", "Download subtitles"))}</a>
+  <a class="secondary-button" href="{base}/thumbnail" target="_blank">{_escape(ui_text(locale, "查看封面", "View thumbnail"))}</a>
+</div>
+<details><summary>{_escape(ui_text(locale, "完整内容包", "Complete output package"))}</summary>
+  <ul class="artifact-list">
+    <li><a href="{base}/story" download>Canonical story</a></li>
+    <li><a href="{base}/narration" download>Narration script</a></li>
+    <li><a href="{base}/manifest" download>Scene manifest</a></li>
+    <li><a href="{base}/receipt" download>Render receipt</a></li>
+  </ul>
+</details>
+<p class="privacy-note">{_escape(ui_text(locale, "本地渲染完成；没有联网，也没有发布。", "Rendered locally with no network call and no publication."))}</p>'''
+    elif snapshot.phase == "FAILED":
+        result = f'<p class="error">{_escape(snapshot.error_message or ui_text(locale, "本地视频渲染安全停止。", "Local video rendering stopped safely."))}</p>'
+    else:
+        result = f'''<p>{_escape(ui_text(locale, "渲染在后台继续。你可以打开 Resume、Learning 或 Content，任务不会被中断。", "Rendering continues in the background. You can use Resume, Learning, or Content without interrupting it."))}</p>
+<script>window.setTimeout(() => window.location.reload(), 1500);</script>'''
+    audio = ui_text(locale, "含中文旁白", "Chinese narration included") if snapshot.audio_included else ui_text(locale, "旁白将在资产准备完成后显示", "Narration status will appear after asset preparation")
+    return f'''<section class="card local-story-card" data-phase="{snapshot.phase}">
+  <div class="provider-row"><span>{_escape(ui_text(locale, "本地证据故事 · v0.1", "Local evidence story · v0.1"))}</span><span class="status-badge">{_escape(labels[snapshot.phase])}</span></div>
+  <h2>{_escape(ui_text(locale, "一个 AI 简历 App 卡住两分钟之后，我学到的系统设计", "What a two-minute AI resume freeze taught me about system design"))}</h2>
+  <progress value="{progress}" max="100"></progress>
+  <p>{_escape(ui_text(locale, "已用时", "Elapsed"))}: {elapsed:.1f}s · {_escape(audio)}</p>
+  {result}
+</section>'''
+
+
 def _video_page(
     data_root: Path,
     job_id: str | None = None,
     error: str | None = None,
     locale: UILocale = DEFAULT_UI_LOCALE,
+    *,
+    local_job: LocalVideoJobSnapshot | None = None,
+    local_video_available: bool = False,
 ) -> str:
     job = load_job(data_root, job_id) if job_id else None
     configuration = provider_status()
@@ -762,7 +854,12 @@ def _video_page(
 <p><a href="{local_video}" download>{_escape(ui_text(locale, '下载生成的视频', 'Download generated video'))}</a></p>'''
         detail += "</section>"
     message = f'<p class="error">{html.escape(error)}</p>' if error else ""
-    body = f"""<div class="video-grid">
+    local_panel = _local_video_panel(
+        local_job,
+        available=local_video_available,
+        locale=locale,
+    )
+    body = f"""{local_panel}<div class="video-grid cloud-video-grid">
 <section class="card">
   <div class="provider-row"><span>Google Vertex AI · Veo</span><span class="status-badge">{_escape(configuration)}</span></div>
   {message}
@@ -798,6 +895,10 @@ def _video_page(
         body=body,
         extra_css="""
 .video-grid{display:grid;grid-template-columns:minmax(340px,.9fr) minmax(0,1.1fr);gap:22px;align-items:start}
+.local-story-card{margin-bottom:22px}.local-story-card video{width:100%;max-height:660px;border-radius:18px;background:#081124;margin-top:18px}
+.story-preview{display:flex;flex-direction:column;gap:8px;background:var(--surface-soft);border:1px solid var(--border);border-radius:16px;padding:16px;margin:18px 0}.story-preview span{color:var(--text-muted);font-size:13px}
+.story-layers{display:grid;gap:8px;color:var(--text-muted);padding-left:22px}.local-story-card progress{width:100%;height:14px;accent-color:var(--accent)}
+.video-actions{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}.artifact-list{display:grid;gap:8px}.cloud-video-grid{margin-top:22px}
 .provider-row{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:18px;color:var(--text-muted);font-size:13px}
 .video-settings{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
 .job-panel video{width:100%;border-radius:16px;background:#101827}
@@ -4774,6 +4875,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     latest_learning_form: dict[str, str] = {}
     latest_content_form: dict[str, str] = {}
     resume_job_manager: ResumeJobManager | None = None
+    video_story_job_manager: LocalVideoJobManager | None = None
 
     def log_message(self, format: str, *args: object) -> None:
         if self.desktop_session_token is not None:
@@ -5193,10 +5295,32 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_video_page(self, job_id: str | None = None, error: str | None = None) -> None:
+    def _send_video_page(
+        self,
+        job_id: str | None = None,
+        error: str | None = None,
+        local_job_id: str | None = None,
+    ) -> None:
+        local_job = None
+        manager = self.video_story_job_manager
+        if manager is not None:
+            local_job = (
+                manager.get(self.ui_data_root.absolute(), local_job_id)
+                if local_job_id is not None
+                else manager.latest(self.ui_data_root.absolute())
+            )
+        local_available = (
+            (self.repo_root / "video_factory" / "render.mjs").is_file()
+            and (self.repo_root / "video_factory" / "node_modules").is_dir()
+        )
         try:
             page = _video_page(
-                self._video_data_root(), job_id, error, self.ui_locale
+                self._video_data_root(),
+                job_id,
+                error,
+                self.ui_locale,
+                local_job=local_job,
+                local_video_available=local_available,
             )
         except VideoGenerationError:
             page = _video_page(
@@ -5208,6 +5332,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     "Video job is unavailable.",
                 ),
                 self.ui_locale,
+                local_job=local_job,
+                local_video_available=local_available,
             )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -5328,7 +5454,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self._send_evidence_page()
             return
         if path == "/video":
-            self._send_video_page(query.get("job_id", [None])[0])
+            self._send_video_page(
+                query.get("job_id", [None])[0],
+                local_job_id=query.get("local_job_id", [None])[0],
+            )
             return
         if path == "/publishing":
             body = editorial_publishing_page(
@@ -5378,6 +5507,37 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "video/mp4")
             self.send_header("Content-Length", str(len(content)))
             self.send_header("Content-Disposition", 'attachment; filename="output.mp4"')
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(content)
+            return
+        local_video_download_match = re.fullmatch(
+            r"/video/local/downloads/(video-story-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10})/([a-z]+)",
+            path,
+        )
+        if local_video_download_match is not None:
+            job_id, artifact = local_video_download_match.groups()
+            try:
+                output = local_video_artifact(self.ui_data_root.absolute(), job_id, artifact)
+                content = output.read_bytes()
+                filename = local_video_download_names()[artifact]
+            except (OSError, KeyError, VideoStoryError):
+                self.send_error(404, "Local video artifact not found")
+                return
+            content_type = {
+                "video": "video/mp4",
+                "subtitles": "application/x-subrip; charset=utf-8",
+                "thumbnail": "image/png",
+                "story": "text/markdown; charset=utf-8",
+                "narration": "text/markdown; charset=utf-8",
+                "manifest": "application/json",
+                "receipt": "application/json",
+            }.get(artifact, "application/octet-stream")
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Cache-Control", "private, no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(content)
@@ -5803,6 +5963,30 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header(
                 "Location", ui_url("/video", self.ui_locale, job_id=job.job_id)
             )
+            self.end_headers()
+            return
+        if path == "/video/local/render":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            manager = self.video_story_job_manager
+            if manager is None:
+                self.send_error(503, "Local video worker is unavailable")
+                return
+            try:
+                job_id = manager.submit(
+                    data_root=self.ui_data_root.absolute(),
+                    repository_root=self.repo_root,
+                )
+            except (OSError, ResumeWorkspaceStorageError, VideoStoryError) as exc:
+                self._send_video_page(error=str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url("/video", self.ui_locale, local_job_id=job_id),
+            )
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
         submit_match = re.fullmatch(r"/video/submit/(video-[a-f0-9]{12})", path)
@@ -6278,6 +6462,8 @@ def main() -> None:
     handler.desktop_bootstrap_consumed = False
     resume_job_manager = ResumeJobManager()
     handler.resume_job_manager = resume_job_manager
+    video_story_job_manager = LocalVideoJobManager()
+    handler.video_story_job_manager = video_story_job_manager
 
     server = HTTPServer((args.host, args.port), handler)
     raw_host, port = server.server_address[:2]
@@ -6319,6 +6505,8 @@ def main() -> None:
         server.server_close()
         resume_job_manager.shutdown()
         handler.resume_job_manager = None
+        video_story_job_manager.shutdown()
+        handler.video_story_job_manager = None
         if readiness_path is not None:
             try:
                 readiness_path.unlink()
