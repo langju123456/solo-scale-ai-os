@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field, ValidationError
 
 from soloscale.evidence_agent import (
+    OllamaCallProfile,
     OllamaReasoner,
     Reasoner,
     ReasonerInvalidResponseError,
@@ -91,6 +92,28 @@ class GatewayDescriptor(ContractModel):
     transport_scope: GatewayTransportScope
     model: str | None = Field(default=None, min_length=1, max_length=240)
     base_url: str | None = Field(default=None, min_length=1, max_length=500)
+
+
+class ModelCallProfile(ContractModel):
+    """Non-content model performance metadata safe for local run receipts."""
+
+    provider: ModelProviderId
+    model: str
+    system_chars: int = Field(ge=0)
+    user_chars: int = Field(ge=0)
+    schema_chars: int = Field(ge=0)
+    max_output_tokens: int = Field(ge=1)
+    thinking_enabled: bool
+    prompt_eval_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    wall_ms: int = Field(ge=0)
+    total_duration_ms: int | None = Field(default=None, ge=0)
+    load_duration_ms: int | None = Field(default=None, ge=0)
+    prompt_eval_duration_ms: int | None = Field(default=None, ge=0)
+    eval_duration_ms: int | None = Field(default=None, ge=0)
+    done_reason: str | None = Field(default=None, max_length=80)
+    response_chars: int = Field(ge=0)
+    thinking_chars: int = Field(ge=0)
 
 
 class ModelGatewayError(RuntimeError):
@@ -490,7 +513,33 @@ class OpenAICompatibleHTTPTransport:
     _schema_name = staticmethod(VercelAIGatewayHTTPTransport._schema_name)
     _extract_content = staticmethod(VercelAIGatewayHTTPTransport._extract_content)
 
+    @staticmethod
+    def _provider_schema(schema: dict[str, object]) -> dict[str, object]:
+        """Project the domain schema onto OpenAI's strict supported subset."""
+
+        def project(value: object) -> object:
+            if isinstance(value, list):
+                return [project(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            projected = {
+                key: project(item)
+                for key, item in value.items()
+                if key != "uniqueItems"
+            }
+            properties = projected.get("properties")
+            if isinstance(properties, dict):
+                projected["required"] = list(properties)
+                projected["additionalProperties"] = False
+            return projected
+
+        projected = project(schema)
+        if not isinstance(projected, dict):
+            raise TypeError("OpenAI provider schema must remain a JSON object")
+        return projected
+
     def _send_once(self, request: OpenAICompatibleGatewayRequest) -> str:
+        provider_schema = self._provider_schema(request.response_json_schema)
         body = json.dumps(
             {
                 "model": request.model,
@@ -505,7 +554,7 @@ class OpenAICompatibleHTTPTransport:
                     "json_schema": {
                         "name": self._schema_name(request.response_json_schema),
                         "strict": True,
-                        "schema": request.response_json_schema,
+                        "schema": provider_schema,
                     },
                 },
             },
@@ -814,6 +863,7 @@ class OllamaModelGateway:
             base_url=endpoint,
         )
         self._reasoner = selected_reasoner
+        self.last_call_profile: ModelCallProfile | None = None
 
     def complete(
         self,
@@ -824,8 +874,16 @@ class OllamaModelGateway:
         reasoning_effort: Literal["none", "low"] = "low",
     ) -> ResponseModelT:
         del reasoning_effort
+        self.last_call_profile = None
         try:
-            return self._reasoner.complete(schema, system=system, user=user)
+            result = self._reasoner.complete(schema, system=system, user=user)
+            profile = getattr(self._reasoner, "last_call_profile", None)
+            if isinstance(profile, OllamaCallProfile):
+                self.last_call_profile = ModelCallProfile(
+                    provider=ModelProviderId.OLLAMA,
+                    **profile.model_dump(mode="python", exclude={"schema_version"}),
+                )
+            return result
         except ReasonerTransportError as exc:
             raise ModelGatewayTransportError("local model request failed") from exc
         except ReasonerInvalidResponseError as exc:

@@ -5,8 +5,9 @@ import urllib.request
 from email.message import Message
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from soloscale.evidence_agent import OllamaCallProfile
 from soloscale.model_gateway import (
     GatewayConfigurationState,
     GatewayErrorCategory,
@@ -25,8 +26,14 @@ class _Reply(BaseModel):
     value: str
 
 
+class _StrictSchemaProbe(BaseModel):
+    labels: list[str] = Field(json_schema_extra={"uniqueItems": True})
+    optional_note: str | None = None
+
+
 class _ScriptedReasoner:
     model = "test-model"
+    last_call_profile: OllamaCallProfile | None = None
 
     def complete(
         self,
@@ -57,10 +64,23 @@ def test_unconfigured_external_providers_fail_closed_without_fallback(
 
 
 def test_optional_ollama_gateway_delegates_only_to_the_supplied_reasoner() -> None:
+    reasoner = _ScriptedReasoner()
+    reasoner.last_call_profile = OllamaCallProfile(
+        model="qwen3:8b",
+        system_chars=6,
+        user_chars=4,
+        schema_chars=100,
+        max_output_tokens=2048,
+        prompt_eval_tokens=10,
+        output_tokens=5,
+        wall_ms=12,
+        response_chars=20,
+        thinking_chars=0,
+    )
     gateway = model_gateway_for(
         ModelProviderId.OLLAMA,
         model="qwen3:8b",
-        reasoner=_ScriptedReasoner(),  # type: ignore[arg-type]
+        reasoner=reasoner,  # type: ignore[arg-type]
     )
     assert gateway.descriptor.provider is ModelProviderId.OLLAMA
     assert gateway.descriptor.configuration_state is GatewayConfigurationState.CONFIGURED
@@ -68,6 +88,9 @@ def test_optional_ollama_gateway_delegates_only_to_the_supplied_reasoner() -> No
     assert gateway.complete(_Reply, system="system", user="user") == _Reply(
         value="grounded"
     )
+    assert gateway.last_call_profile is not None
+    assert gateway.last_call_profile.prompt_eval_tokens == 10
+    assert gateway.last_call_profile.output_tokens == 5
 
     with pytest.raises(ValueError):
         model_gateway_for("unknown-provider")
@@ -149,6 +172,57 @@ def test_openai_compatible_transport_posts_structured_schema_and_redacts_key(
     assert "reasoning" not in body
     assert secret not in gateway.descriptor.model_dump_json()
     assert secret not in json.dumps(body)
+
+
+def test_openai_wire_schema_is_projected_without_weakening_domain_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Response:
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def read(self, maximum: int) -> bytes:
+            del maximum
+            return (
+                b'{"choices":[{"message":{"content":"{\\\"labels\\\":[\\\"one\\\"],'
+                b'\\\"optional_note\\\":null}"}}]}'
+            )
+
+    def fake_urlopen(request: urllib.request.Request, timeout: int) -> Response:
+        del timeout
+        assert isinstance(request.data, bytes)
+        captured["body"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    gateway = model_gateway_for(
+        ModelProviderId.OPENAI_COMPATIBLE,
+        model="gpt-5-mini",
+        openai_api_key="in-memory-test-secret",
+        openai_endpoint="https://api.openai.com/v1/chat/completions",
+    )
+    canonical_schema = _StrictSchemaProbe.model_json_schema()
+
+    result = gateway.complete(
+        _StrictSchemaProbe,
+        system="synthetic-system",
+        user="synthetic-user",
+    )
+
+    assert result == _StrictSchemaProbe(labels=["one"], optional_note=None)
+    assert canonical_schema["properties"]["labels"]["uniqueItems"] is True
+    assert canonical_schema["required"] == ["labels"]
+    body = captured["body"]
+    assert isinstance(body, dict)
+    wire_schema = body["response_format"]["json_schema"]["schema"]
+    assert "uniqueItems" not in wire_schema["properties"]["labels"]
+    assert wire_schema["required"] == ["labels", "optional_note"]
+    assert wire_schema["additionalProperties"] is False
 
 
 def test_openai_compatible_transport_failure_redacts_in_memory_key(

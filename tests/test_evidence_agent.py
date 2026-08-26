@@ -1256,7 +1256,16 @@ def test_ollama_requests_native_json_schema_with_deterministic_options() -> None
         captured["url"] = request.full_url
         captured["timeout"] = timeout
         captured["payload"] = json.loads(request.data.decode("utf-8"))
-        response = {"message": {"content": json.dumps({"queries": ["evidence"]})}}
+        response = {
+            "message": {"content": json.dumps({"queries": ["evidence"]})},
+            "prompt_eval_count": 12,
+            "eval_count": 8,
+            "total_duration": 25_000_000,
+            "load_duration": 3_000_000,
+            "prompt_eval_duration": 7_000_000,
+            "eval_duration": 15_000_000,
+            "done_reason": "stop",
+        }
         return FakeHTTPResponse(json.dumps(response).encode("utf-8"))
 
     reasoner = OllamaReasoner(
@@ -1277,6 +1286,18 @@ def test_ollama_requests_native_json_schema_with_deterministic_options() -> None
     assert payload["think"] is False
     assert payload["options"] == {"temperature": 0, "num_predict": 321}
     assert payload["format"] == QueryPlan.model_json_schema()
+    profile = reasoner.last_call_profile
+    assert profile is not None
+    assert profile.model == "qwen3:8b"
+    assert profile.prompt_eval_tokens == 12
+    assert profile.output_tokens == 8
+    assert profile.total_duration_ms == 25
+    assert profile.load_duration_ms == 3
+    assert profile.prompt_eval_duration_ms == 7
+    assert profile.eval_duration_ms == 15
+    assert profile.done_reason == "stop"
+    assert profile.thinking_enabled is False
+    assert profile.thinking_chars == 0
 
 
 def test_ollama_default_transport_disables_proxies_and_redirects(

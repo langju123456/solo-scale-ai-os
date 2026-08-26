@@ -1,14 +1,24 @@
 import hashlib
 import io
+import json
 import zipfile
 
 import pytest
 
 from soloscale.resume_docx import (
     ResumeTemplateError,
+    ResumeValidationRuleCode,
+    _deterministic_hiring_signals,
+    _select_safe_rewrites,
+    _validate_role_strategy,
     extract_candidate_profile,
     read_template_paragraphs,
     tailor_resume_docx,
+)
+from soloscale.resume_models import (
+    CandidateProfile,
+    GroundedResumeBulletRewrite,
+    RoleStrategy,
 )
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -93,3 +103,170 @@ def test_extract_profile_and_tailor_preserve_every_candidate_claim() -> None:
 def test_rejects_non_docx_upload() -> None:
     with pytest.raises(ResumeTemplateError, match="not a readable DOCX"):
         extract_candidate_profile(b"not-a-zip")
+
+
+def test_hiring_signal_must_be_an_exact_jd_quote() -> None:
+    source = "Built Python service."
+    profile = CandidateProfile(skills=["Python"], project_bullets=[source])
+    strategy = RoleStrategy(
+        role_summary="Python application development",
+        top_hiring_signals=["Python application development"],
+        evidence_priority=["PROFILE-01"],
+        skill_priority=["Python"],
+        bullet_rewrites=[
+            GroundedResumeBulletRewrite(
+                profile_entry_id="PROFILE-01",
+                text=source,
+                source_facts=[source],
+            )
+        ],
+        rewrite_guidance="Preserve the approved fact.",
+    )
+
+    with pytest.raises(ResumeTemplateError) as failure:
+        _validate_role_strategy(
+            strategy,
+            profile=profile,
+            job_description="Required: Python web application development.",
+        )
+
+    diagnostics = failure.value.validation_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.as_dict() == {
+        "validator_status": "rejected",
+        "failure_count": 1,
+        "failures": [
+            {
+                "rule_code": "HIRING_SIGNAL_NOT_SOURCE_GROUNDED",
+                "json_path": "$.top_hiring_signals[0]",
+                "claim_id": None,
+            }
+        ],
+        "candidate_count": 1,
+        "verified_count": 1,
+        "supported_count": 0,
+        "rejected_count": 0,
+        "duplicate_count": 0,
+        "source_span_failure_count": 1,
+    }
+
+
+def test_truth_validation_diagnostics_are_aggregated_and_body_free() -> None:
+    source = "Built Python service for users."
+    profile = CandidateProfile(skills=["Python"], project_bullets=[source])
+    strategy = RoleStrategy(
+        role_summary="Synthetic role",
+        top_hiring_signals=["Python", "python"],
+        evidence_priority=["PROFILE-01", "PROFILE-01"],
+        skill_priority=["Python"],
+        bullet_rewrites=[
+            GroundedResumeBulletRewrite(
+                profile_entry_id="PROFILE-01",
+                text="Improved Python service by 25% with Django.",
+                source_facts=["private unsupported source fragment"],
+            )
+        ],
+        unsupported_requirements=["Kubernetes private requirement"],
+        rewrite_guidance="Synthetic guidance",
+    )
+
+    with pytest.raises(ResumeTemplateError) as failure:
+        _validate_role_strategy(
+            strategy,
+            profile=profile,
+            job_description="Required: Python.",
+        )
+
+    diagnostics = failure.value.validation_diagnostics
+    assert diagnostics is not None
+    payload = diagnostics.as_dict()
+    codes = {
+        item["rule_code"]
+        for item in payload["failures"]
+        if isinstance(item, dict)
+    }
+    assert {
+        ResumeValidationRuleCode.OUTPUT_DUPLICATE.value,
+        ResumeValidationRuleCode.CLAIM_SOURCE_MISMATCH.value,
+        ResumeValidationRuleCode.CLAIM_NO_EVIDENCE.value,
+        ResumeValidationRuleCode.CLAIM_NEW_NUMBER.value,
+        ResumeValidationRuleCode.REWRITE_FACT_MUTATION.value,
+        ResumeValidationRuleCode.GAP_NOT_SOURCE_GROUNDED.value,
+        ResumeValidationRuleCode.HIRING_SIGNAL_DUPLICATE.value,
+    } <= codes
+    assert payload["duplicate_count"] == 2
+    assert payload["source_span_failure_count"] == 2
+    assert payload["rejected_count"] == 1
+    serialized = json.dumps(payload)
+    assert source not in serialized
+    assert "private unsupported source fragment" not in serialized
+    assert "Kubernetes private requirement" not in serialized
+    assert "Improved Python service" not in serialized
+
+
+def test_hiring_signals_are_deterministic_exact_jd_spans() -> None:
+    job_description = """Job Responsibilities:
+• Build Python web applications.
+• Design RAG pipelines.
+Requirements:
+• Use Git for version control.
+• Test application quality.
+"""
+
+    signals = _deterministic_hiring_signals(job_description)
+
+    assert signals == [
+        "Build Python web applications.",
+        "Design RAG pipelines.",
+        "Use Git for version control.",
+        "Test application quality.",
+    ]
+    assert all(signal in job_description for signal in signals)
+
+
+def test_selective_rewrite_keeps_supported_claim_and_restores_rejected_claim() -> None:
+    first_source = "Built Python service for users."
+    second_source = "Delivered RAG system."
+    profile = CandidateProfile(
+        skills=["Python", "RAG"],
+        project_bullets=[first_source, second_source],
+    )
+    strategy = RoleStrategy(
+        role_summary="Python and RAG role",
+        top_hiring_signals=["Required: Python and RAG."],
+        evidence_priority=["PROFILE-01", "PROFILE-02"],
+        skill_priority=["Python", "RAG"],
+        bullet_rewrites=[
+            GroundedResumeBulletRewrite(
+                profile_entry_id="PROFILE-01",
+                text="Built reliable Python service for users.",
+                source_facts=["Python service for users"],
+            ),
+            GroundedResumeBulletRewrite(
+                profile_entry_id="PROFILE-02",
+                text="Built a RAG system.",
+                source_facts=["Delivered RAG system"],
+            ),
+        ],
+        rewrite_guidance="Prefer grounded wording.",
+    )
+
+    selected, _entries, diagnostics = _select_safe_rewrites(
+        strategy,
+        profile=profile,
+        job_description="Required: Python and RAG.",
+    )
+
+    rewrites = {
+        item.profile_entry_id: item.text for item in selected.bullet_rewrites
+    }
+    assert rewrites == {
+        "PROFILE-01": "Built reliable Python service for users.",
+        "PROFILE-02": second_source,
+    }
+    assert diagnostics.validator_status == "selective_pass"
+    assert diagnostics.supported_count == 1
+    assert diagnostics.rejected_count == 1
+    assert {
+        failure.rule_code for failure in diagnostics.failures
+    } == {ResumeValidationRuleCode.CLAIM_NO_EVIDENCE}

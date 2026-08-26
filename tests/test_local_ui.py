@@ -190,9 +190,8 @@ class RecordingResumeGateway:
         reasoning_effort: Literal["none", "low"] = "low",
     ) -> ResponseModelT:
         assert "approved Candidate Profile facts" in system
-        assert "top_hiring_signals item must be a short exact quote" in system
-        signal_schema = schema.model_json_schema()["properties"]["top_hiring_signals"]
-        assert "copied verbatim" in signal_schema["description"]
+        assert "Deterministic hiring signals:" in system
+        assert "top_hiring_signals" not in schema.model_json_schema()["properties"]
         assert reasoning_effort == "none"
         self.requests.append(user)
         exact = {
@@ -226,14 +225,12 @@ class RecordingResumeGateway:
                 "Designed BuildLog architecture for AI-assisted development and evals with "
                 "iterative delivery."
             )
-            signals = ["rapid prototyping", "full-stack GenAI", "architecture"]
             unsupported: list[str] = []
             guidance = "Lead with product prototyping and architecture iteration."
         elif "FPGA compiler" in user:
             priority = list(exact)
             skills = ["Python, RAG, agents, evals", "Customer delivery, requirements, stakeholders"]
             rewrites = dict(exact)
-            signals = ["FPGA compiler design"]
             unsupported = ["Required: FPGA compiler design and semiconductor verification."]
             guidance = "Keep approved facts unchanged and expose the unrelated requirement gap."
         else:
@@ -241,14 +238,13 @@ class RecordingResumeGateway:
             skills = ["Customer delivery, requirements, stakeholders", "Python, RAG, agents, evals"]
             rewrites = dict(exact)
             rewrites["PROFILE-01"] = (
-                "Improved agent reliability for customer-facing stakeholder delivery and "
-                "requirements translation in direct execution."
+                "Improved agent reliability for customer-facing stakeholder delivery "
+                "and requirements translation in direct execution."
             )
             rewrites["PROFILE-02"] = (
-                "Translated customer requirements with Ardent Mills and Kangni stakeholders "
-                "with coordinated delivery."
+                "Translated customer requirements with Ardent Mills and Kangni "
+                "stakeholders with coordinated delivery."
             )
-            signals = ["customer-facing", "requirements translation", "stakeholder"]
             unsupported = []
             guidance = "Lead with customer delivery and requirements translation."
         skill_ids = {
@@ -258,7 +254,6 @@ class RecordingResumeGateway:
         return schema.model_validate(
             {
                 "role_summary": "JD-conditioned strategy for the selected role.",
-                "top_hiring_signals": signals,
                 "evidence_priority": priority,
                 "skill_priority": [skill_ids[item] for item in skills],
                 "bullet_rewrites": {
@@ -1273,16 +1268,197 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
         assert metadata["model_call_performed"] is True
         assert metadata["generation_mode"] == "ai"
         assert metadata["provider"] == "ollama"
+        assert metadata["model_call_profile"]["model_call_count"] == 1
+        assert metadata["model_call_profile"]["output_contract"] == "selective_rewrite_v0.1"
         assert not (run_dir / "11_role_strategy.json").exists()
         provenance = json.loads((run_dir / "12_resume_provenance.json").read_text())
         assert provenance["contains_source_bodies"] is False
         assert provenance["all_exported_claims_supported"] is True
-        assert {claim["status"] for claim in provenance["claims"]} == {"SUPPORTED"}
-        assert all(claim["source_fact_sha256s"] for claim in provenance["claims"])
+        statuses = {claim["status"] for claim in provenance["claims"]}
+        if run_dir == unrelated_run:
+            assert statuses == {"VERIFIED"}
+            assert all(
+                not claim["source_fact_sha256s"] for claim in provenance["claims"]
+            )
+        else:
+            assert statuses == {"SUPPORTED", "VERIFIED"}
+            assert sum(
+                claim["status"] == "SUPPORTED" for claim in provenance["claims"]
+            ) == 2
+            assert all(
+                bool(claim["source_fact_sha256s"])
+                == (claim["status"] == "SUPPORTED")
+                for claim in provenance["claims"]
+            )
         assert all(
             claim["final_text"] in paragraphs_by_run[run_dir]
             for claim in provenance["claims"]
         )
+
+
+def test_resume_ui_rejects_only_unsafe_rewrite_and_keeps_original_bullet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class EmptyStore:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+        def search(self, query: str, limit: int) -> list[RetrievalHit]:
+            del query, limit
+            return []
+
+    class PartiallyUnsafeGateway(RecordingResumeGateway):
+        def complete(
+            self,
+            schema: type[ResponseModelT],
+            *,
+            system: str,
+            user: str,
+            reasoning_effort: Literal["none", "low"] = "low",
+        ) -> ResponseModelT:
+            response = super().complete(
+                schema,
+                system=system,
+                user=user,
+                reasoning_effort=reasoning_effort,
+            )
+            payload = response.model_dump(mode="json")
+            rewrites = payload["bullet_rewrites"]
+            assert isinstance(rewrites, dict)
+            unsafe = dict(rewrites)
+            unsafe["PROFILE-03"] = {
+                "text": "Led an unsupported FPGA compiler program by 40%.",
+                "source_facts": ["SoloScale full-stack GenAI workflows"],
+            }
+            payload["bullet_rewrites"] = unsafe
+            return schema.model_validate(payload)
+
+    monkeypatch.setattr("soloscale.local_ui.KnowledgeStore", EmptyStore)
+    monkeypatch.setattr(
+        "soloscale.local_ui._create_resume_pdf_preview", lambda source, target: False
+    )
+    result = _run_user_resume(
+        {
+            "job_description": (
+                "Forward Deployed Engineer\ncustomer-facing requirements translation "
+                "stakeholder reliable agents"
+            ),
+            "generation_mode": "ollama",
+            "provider_model": "test-model",
+            "approve_resume_processing": "yes",
+        },
+        {
+            "resume_template": UploadedFile(
+                filename="Synthetic.docx",
+                content_type="application/octet-stream",
+                content=_role_resume_docx(),
+            )
+        },
+        tmp_path / "data",
+        tmp_path / "repo",
+        gateway=PartiallyUnsafeGateway(),
+    )
+
+    assert result.return_code == 0, result.stderr
+    run_dir = _workspace_path(result.stdout)
+    assert run_dir is not None
+    metadata = json.loads((run_dir / "09_user_ui.json").read_text())
+    assert metadata["grounded_rewrites"] == 2
+    assert metadata["rejected_rewrites"] == 1
+    paragraphs = {
+        item.text
+        for item in read_template_paragraphs((run_dir / "08_resume.docx").read_bytes())
+    }
+    assert (
+        "Rapidly prototyped SoloScale full-stack GenAI workflows with RAG and agents."
+        in paragraphs
+    )
+    assert all("FPGA compiler" not in item and "40%" not in item for item in paragraphs)
+    candidate_paths = list((tmp_path / "data" / "resume-candidates").glob("*.json"))
+    assert len(candidate_paths) == 1
+    candidate = json.loads(candidate_paths[0].read_text())
+    assert candidate["status"] == "REJECTED"
+    assert candidate["submission_status"] == "NOT_FOR_SUBMISSION"
+    assert candidate["label"] == "REJECTED / NOT FOR SUBMISSION"
+    raw_rewrites = candidate["structured_candidate"]["bullet_rewrites"]
+    assert any("FPGA compiler" in rewrite["text"] for rewrite in raw_rewrites)
+    rendered = _user_page(result, tmp_path / "data", {})
+    assert "1 条未通过事实校验，已保留原文" in rendered
+
+
+def test_resume_ui_persists_globally_rejected_candidate_before_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class GloballyRejectedGateway(RecordingResumeGateway):
+        def complete(
+            self,
+            schema: type[ResponseModelT],
+            *,
+            system: str,
+            user: str,
+            reasoning_effort: Literal["none", "low"] = "low",
+        ) -> ResponseModelT:
+            response = super().complete(
+                schema,
+                system=system,
+                user=user,
+                reasoning_effort=reasoning_effort,
+            )
+            payload = response.model_dump(mode="json")
+            payload["unsupported_requirements"] = [
+                "Private requirement absent from the supplied JD."
+            ]
+            return schema.model_validate(payload)
+
+    candidate_statuses: list[str] = []
+
+    def tracking_write(path: Path, payload: object) -> None:
+        if path.parent.name == "resume-candidates":
+            assert isinstance(payload, dict)
+            candidate_statuses.append(str(payload["status"]))
+        _write_private_json(path, payload)
+
+    monkeypatch.setattr("soloscale.local_ui._write_private_json", tracking_write)
+    data_root = tmp_path / "data"
+    result = _run_user_resume(
+        {
+            "job_description": "Required: Python and RAG.",
+            "generation_mode": "ollama",
+            "provider_model": "test-model",
+            "approve_resume_processing": "yes",
+        },
+        {
+            "resume_template": UploadedFile(
+                filename="Synthetic.docx",
+                content_type="application/octet-stream",
+                content=_role_resume_docx(),
+            )
+        },
+        data_root,
+        tmp_path / "repo",
+        gateway=GloballyRejectedGateway(),
+    )
+
+    assert result.return_code == 1
+    assert candidate_statuses == ["PENDING_VALIDATION", "REJECTED"]
+    candidate_paths = list((data_root / "resume-candidates").glob("*.json"))
+    assert len(candidate_paths) == 1
+    candidate_path = candidate_paths[0]
+    candidate = json.loads(candidate_path.read_text())
+    assert candidate["status"] == "REJECTED"
+    assert candidate["submission_status"] == "NOT_FOR_SUBMISSION"
+    assert candidate["label"] == "REJECTED / NOT FOR SUBMISSION"
+    assert candidate["validation_diagnostics"]["validator_status"] == "rejected"
+    assert {
+        failure["rule_code"]
+        for failure in candidate["validation_diagnostics"]["failures"]
+    } == {"GAP_NOT_SOURCE_GROUNDED"}
+    assert candidate_path.stat().st_mode & 0o777 == 0o600
+    assert result.diagnostics is not None
+    assert result.diagnostics["structured_candidate_path"] == str(candidate_path)
+    assert str(candidate_path) in result.stderr
+    assert not (data_root / "resume-runs").exists()
+    assert not list(data_root.rglob("*.docx"))
 
 
 def test_resume_optional_expert_review_returns_patches_and_reverifies_locally(

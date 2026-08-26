@@ -182,6 +182,7 @@ class UIActionResult:
     stdout: str
     stderr: str
     elapsed_ms: int
+    diagnostics: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -1066,6 +1067,37 @@ def _write_private_bytes(path: Path, content: bytes) -> None:
     _atomic_private_write_bytes(path, content)
 
 
+def _new_resume_candidate_recorder(
+    data_root: Path,
+) -> tuple[Path, Callable[[dict[str, object]], None]]:
+    """Create a private sink for one raw, explicitly non-submittable candidate."""
+
+    _reject_symlink_ancestry(data_root)
+    data_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(data_root, 0o700)
+    candidates_root = data_root / "resume-candidates"
+    candidates_root.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(candidates_root, 0o700)
+    candidate_id = (
+        f"resume-candidate-{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{uuid4().hex[:10]}"
+    )
+    path = candidates_root / f"{candidate_id}.json"
+    created_at = datetime.now(UTC).isoformat()
+
+    def record(payload: dict[str, object]) -> None:
+        _write_private_json(
+            path,
+            {
+                **payload,
+                "candidate_id": candidate_id,
+                "created_at": created_at,
+                "updated_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
+    return path, record
+
+
 def _find_soffice() -> str | None:
     candidates = [
         os.environ.get("SOLOSCALE_SOFFICE"),
@@ -1326,12 +1358,17 @@ def _build_resume_provenance_receipt(
         else:
             rewrite = rewrite_by_id[profile_entry_id]
             final_text = rewrite.text
-            source_fact_sha256s = [
-                hashlib.sha256(item.encode("utf-8")).hexdigest()
-                for item in rewrite.source_facts
-            ]
-            status = ResumeClaimVerificationStatus.SUPPORTED
-            verification_basis = "DETERMINISTIC_EVIDENCE_PRESERVING_REWRITE"
+            if final_text == source_text:
+                source_fact_sha256s = []
+                status = ResumeClaimVerificationStatus.VERIFIED
+                verification_basis = "EXACT_OPERATOR_APPROVED_PROFILE_ENTRY"
+            else:
+                source_fact_sha256s = [
+                    hashlib.sha256(item.encode("utf-8")).hexdigest()
+                    for item in rewrite.source_facts
+                ]
+                status = ResumeClaimVerificationStatus.SUPPORTED
+                verification_basis = "DETERMINISTIC_EVIDENCE_PRESERVING_REWRITE"
         expected_output_counts[final_text] = expected_output_counts.get(final_text, 0) + 1
         claim_terms = _resume_provenance_terms(f"{source_text} {final_text}")
         hiring_signal_ids = [
@@ -1490,10 +1527,12 @@ def _save_request_scoped_resume_run(
         "project_blocks_reordered": tailored.project_blocks_reordered,
         "skill_bullets_reordered": tailored.skill_bullets_reordered,
         "grounded_rewrites": tailored.grounded_rewrites,
+        "rejected_rewrites": tailored.rejected_rewrites,
         "generation_mode": tailored.generation_mode,
         "provider": tailored.provider or "template",
         "model": tailored.model,
         "model_call_performed": tailored.role_strategy is not None,
+        "model_call_profile": tailored.model_call_profile,
         "unsupported_requirement_count": (
             len(tailored.role_strategy.unsupported_requirements)
             if tailored.role_strategy is not None
@@ -1548,6 +1587,7 @@ def _save_request_scoped_resume_run(
             "generation_mode": tailored.generation_mode,
             "provider": tailored.provider or "template",
             "model": tailored.model,
+            "model_call_profile": tailored.model_call_profile,
             "final_human_review_required": True,
             "job_application_submitted": False,
         },
@@ -1577,6 +1617,7 @@ def _save_request_scoped_resume_run(
             "candidate_profile_sha256": candidate_sha256,
             "claim_provenance": provenance_summary,
             "expert_review_performed": tailored.expert_review is not None,
+            "model_call_profile": tailored.model_call_profile,
         },
     )
     return run_dir
@@ -1597,6 +1638,7 @@ def _run_user_resume(
 ) -> UIActionResult:
     """Run the local upload → evidence → workspace → DOCX flow without a subprocess."""
     started = time.perf_counter()
+    candidate_artifact_path: Path | None = None
     upload = files.get("resume_template")
     if progress is not None:
         progress("PREPARING")
@@ -1756,6 +1798,9 @@ def _run_user_resume(
                 generation_mode,
                 model=form.get("provider_model", "qwen3:8b"),
             )
+            candidate_artifact_path, candidate_recorder = (
+                _new_resume_candidate_recorder(data_root)
+            )
             tailored = tailor_resume_docx_with_gateway(
                 template_bytes,
                 job_description,
@@ -1763,6 +1808,7 @@ def _run_user_resume(
                 tailoring_instructions=tailoring_instructions,
                 template_metadata=resume_upload.template_metadata,
                 support_upload=support_upload,
+                candidate_recorder=candidate_recorder,
             )
         if timing is not None:
             timing(
@@ -1896,6 +1942,7 @@ def _run_user_resume(
                 "project_blocks_reordered": tailored.project_blocks_reordered,
                 "skill_bullets_reordered": tailored.skill_bullets_reordered,
                 "grounded_rewrites": tailored.grounded_rewrites,
+                "rejected_rewrites": tailored.rejected_rewrites,
                 "generation_mode": tailored.generation_mode,
                 "provider": tailored.provider or "template",
                 "model": tailored.model or "none",
@@ -1956,10 +2003,12 @@ def _run_user_resume(
             "project_blocks_reordered": tailored.project_blocks_reordered,
             "skill_bullets_reordered": tailored.skill_bullets_reordered,
             "grounded_rewrites": tailored.grounded_rewrites,
+            "rejected_rewrites": tailored.rejected_rewrites,
             "generation_mode": tailored.generation_mode,
             "provider": tailored.provider or "template",
             "model": tailored.model,
             "model_call_performed": tailored.role_strategy is not None,
+            "model_call_profile": tailored.model_call_profile,
             "model_gap_quotes": (
                 tailored.role_strategy.unsupported_requirements
                 if tailored.role_strategy is not None
@@ -2017,6 +2066,7 @@ def _run_user_resume(
             "provider": tailored.provider or "template",
             "model": tailored.model,
             "model_call_performed": tailored.role_strategy is not None,
+            "model_call_profile": tailored.model_call_profile,
             "model_gap_quotes": (
                 tailored.role_strategy.unsupported_requirements
                 if tailored.role_strategy is not None
@@ -2039,6 +2089,7 @@ def _run_user_resume(
         route["docx_sha256"] = tailored.output_sha256
         route["resume_provenance_sha256"] = provenance_sha256
         route["preview_generated"] = preview_created
+        route["model_call_profile"] = tailored.model_call_profile
         artifact_paths = run_payload.get("artifact_paths")
         if not isinstance(artifact_paths, list):
             artifact_paths = []
@@ -2095,10 +2146,33 @@ def _run_user_resume(
             "所选 AI 服务没有返回可验证的简历结构；本次没有生成或保存简历。",
             elapsed_ms,
         )
+    except ResumeTemplateError as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        diagnostics: dict[str, object] | None = (
+            {"resume_validation": exc.validation_diagnostics.as_dict()}
+            if exc.validation_diagnostics is not None
+            else None
+        )
+        message = str(exc)
+        if candidate_artifact_path is not None and candidate_artifact_path.is_file():
+            diagnostics = dict(diagnostics or {})
+            diagnostics["structured_candidate_path"] = str(candidate_artifact_path)
+            message = (
+                f"{message} Rejected candidate saved for offline inspection: "
+                f"{candidate_artifact_path}"
+            )
+        return UIActionResult(
+            "tailored-resume",
+            "local resume generation",
+            1,
+            "",
+            message,
+            elapsed_ms,
+            diagnostics=diagnostics,
+        )
     except (
         KnowledgeStoreError,
         OSError,
-        ResumeTemplateError,
         ResumeUploadError,
         ValueError,
     ) as exc:
@@ -2906,6 +2980,7 @@ def _user_result_card(
     project_count = user_metadata.get("project_blocks_reordered", 0)
     skill_count = user_metadata.get("skill_bullets_reordered", 0)
     grounded_count = user_metadata.get("grounded_rewrites", 0)
+    rejected_count = user_metadata.get("rejected_rewrites", 0)
     tailored_count = (project_count if isinstance(project_count, int) else 0) + (
         skill_count if isinstance(skill_count, int) else 0
     )
@@ -2914,8 +2989,8 @@ def _user_result_card(
     if generation_mode == "ai":
         result_summary = ui_text(
             locale,
-            f"已按目标 JD 排序证据，并完成 {grounded_count if isinstance(grounded_count, int) else 0} 条受支持改写；所有改写仍锚定到已批准的简历事实。",
-            f"Evidence was prioritized for the target JD and {grounded_count if isinstance(grounded_count, int) else 0} grounded bullets were rewritten. Every rewrite remains anchored to approved resume facts.",
+            f"已按目标 JD 排序证据，采用 {grounded_count if isinstance(grounded_count, int) else 0} 条受支持改写；另有 {rejected_count if isinstance(rejected_count, int) else 0} 条未通过事实校验，已保留原文。",
+            f"Evidence was prioritized for the target JD. {grounded_count if isinstance(grounded_count, int) else 0} supported rewrites were used; {rejected_count if isinstance(rejected_count, int) else 0} unsafe suggestions were rejected and kept as original bullets.",
         )
         privacy_note = ui_text(
             locale,

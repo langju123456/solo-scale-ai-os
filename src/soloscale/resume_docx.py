@@ -10,16 +10,25 @@ import hashlib
 import io
 import json
 import re
+import time
 import zipfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Annotated, Any
 from xml.etree import ElementTree
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, create_model
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    create_model,
+    model_validator,
+)
 
-from soloscale.model_gateway import ModelGateway
+from soloscale.model_gateway import ModelCallProfile, ModelGateway
 from soloscale.resume_gateway_boundary import (
     ExtractedResumeUpload,
     ResumeTemplateMetadata,
@@ -29,6 +38,7 @@ from soloscale.resume_gateway_boundary import (
 )
 from soloscale.resume_models import (
     CandidateProfile,
+    GroundedResumeBulletRewrite,
     ResumeExpertReviewResult,
     RoleStrategy,
 )
@@ -91,8 +101,78 @@ _STOP_WORDS = {
 }
 
 
+class ResumeValidationRuleCode(StrEnum):
+    """Stable, body-free rejection categories for Resume model evaluation."""
+
+    SCHEMA_PROVIDER_REJECTED = "SCHEMA_PROVIDER_REJECTED"
+    OUTPUT_SCHEMA_INVALID = "OUTPUT_SCHEMA_INVALID"
+    HIRING_SIGNAL_NOT_SOURCE_GROUNDED = "HIRING_SIGNAL_NOT_SOURCE_GROUNDED"
+    HIRING_SIGNAL_DUPLICATE = "HIRING_SIGNAL_DUPLICATE"
+    GAP_NOT_SOURCE_GROUNDED = "GAP_NOT_SOURCE_GROUNDED"
+    CLAIM_NO_EVIDENCE = "CLAIM_NO_EVIDENCE"
+    CLAIM_SOURCE_MISMATCH = "CLAIM_SOURCE_MISMATCH"
+    CLAIM_ROLE_INFLATION = "CLAIM_ROLE_INFLATION"
+    CLAIM_NEW_NUMBER = "CLAIM_NEW_NUMBER"
+    CLAIM_CONTRADICTED = "CLAIM_CONTRADICTED"
+    REWRITE_NOT_MATERIAL = "REWRITE_NOT_MATERIAL"
+    REWRITE_FACT_MUTATION = "REWRITE_FACT_MUTATION"
+    OUTPUT_DUPLICATE = "OUTPUT_DUPLICATE"
+
+
+@dataclass(frozen=True)
+class ResumeValidationFailure:
+    rule_code: ResumeValidationRuleCode
+    json_path: str
+    claim_id: str | None = None
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {
+            "rule_code": self.rule_code.value,
+            "json_path": self.json_path,
+            "claim_id": self.claim_id,
+        }
+
+
+@dataclass(frozen=True)
+class ResumeValidationDiagnostics:
+    failures: tuple[ResumeValidationFailure, ...]
+    candidate_count: int
+    verified_count: int
+    supported_count: int
+    rejected_count: int
+    duplicate_count: int
+    source_span_failure_count: int
+    validator_status: str = "rejected"
+
+    @property
+    def failure_count(self) -> int:
+        return len(self.failures)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "validator_status": self.validator_status,
+            "failure_count": self.failure_count,
+            "failures": [failure.as_dict() for failure in self.failures],
+            "candidate_count": self.candidate_count,
+            "verified_count": self.verified_count,
+            "supported_count": self.supported_count,
+            "rejected_count": self.rejected_count,
+            "duplicate_count": self.duplicate_count,
+            "source_span_failure_count": self.source_span_failure_count,
+        }
+
+
 class ResumeTemplateError(ValueError):
-    """Raised when an uploaded file is not a bounded, readable DOCX resume."""
+    """Raised when Resume input or generated output violates its contract."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        validation_diagnostics: ResumeValidationDiagnostics | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.validation_diagnostics = validation_diagnostics
 
 
 @dataclass(frozen=True)
@@ -111,9 +191,12 @@ class TailoredDocx:
     source_paragraph_count: int
     claims_preserved: bool
     grounded_rewrites: int = 0
+    rejected_rewrites: int = 0
     generation_mode: str = "template"
     provider: str | None = None
     model: str | None = None
+    model_call_profile: dict[str, object] | None = None
+    validation_diagnostics: ResumeValidationDiagnostics | None = None
     role_strategy: RoleStrategy | None = None
     expert_review: ResumeExpertReviewResult | None = None
     expert_rewrites: int = 0
@@ -400,6 +483,21 @@ def _exact_priority_validator(
     return validate
 
 
+class _ExactRoleStrategyResponse(BaseModel):
+    """Current wire contract with one ignored legacy model-authored field."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_legacy_hiring_signals(cls, value: object) -> object:
+        if isinstance(value, dict) and "top_hiring_signals" in value:
+            cleaned = dict(value)
+            cleaned.pop("top_hiring_signals", None)
+            return cleaned
+        return value
+
+
 def _exact_role_strategy_model(
     entry_ids: list[str], *, skill_ids: list[str]
 ) -> type[BaseModel]:
@@ -433,19 +531,8 @@ def _exact_role_strategy_model(
     )
     return create_model(
         "ExactRoleStrategy",
-        __config__=ConfigDict(extra="forbid"),
+        __base__=_ExactRoleStrategyResponse,
         role_summary=(str, Field(min_length=1, max_length=500)),
-        top_hiring_signals=(
-            list[str],
-            Field(
-                min_length=1,
-                max_length=8,
-                description=(
-                    "Each item must be a short exact quote copied verbatim from "
-                    "job_description, preserving its original language."
-                ),
-            ),
-        ),
         evidence_priority=(
             Annotated[
                 list[str],
@@ -490,8 +577,10 @@ def _role_strategy_from_exact(
     *,
     entry_ids: list[str],
     sanitized_skill_by_id: dict[str, str],
+    top_hiring_signals: list[str],
 ) -> RoleStrategy:
     payload = response.model_dump(mode="json")
+    payload["top_hiring_signals"] = top_hiring_signals
     rewrite_map = payload.pop("bullet_rewrites", None)
     if not isinstance(rewrite_map, dict):
         raise ResumeTemplateError("AI role strategy returned an invalid rewrite map")
@@ -518,6 +607,56 @@ def _role_strategy_from_exact(
             "AI role strategy referenced an unknown approved skill"
         ) from error
     return RoleStrategy.model_validate(payload)
+
+
+_HIRING_SIGNAL_HEADINGS = {
+    "about the job",
+    "job description",
+    "job responsibilities",
+    "preferred qualifications",
+    "qualifications",
+    "requirements",
+    "responsibilities",
+}
+
+
+def _deterministic_hiring_signals(job_description: str) -> list[str]:
+    """Select bounded exact JD spans without asking the model to restate them."""
+
+    lines = [
+        line.strip(" -•\t")
+        for line in job_description.splitlines()
+        if line.strip(" -•\t")
+    ]
+    if len(lines) == 1:
+        lines = [
+            fragment.strip()
+            for fragment in re.split(r"[.;；]", lines[0])
+            if fragment.strip()
+        ]
+    signals: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        if line.casefold().rstrip(":") in _HIRING_SIGNAL_HEADINGS:
+            continue
+        signal = line
+        if len(signal) > 240:
+            signal = signal[:240].rsplit(" ", 1)[0].rstrip(" ,;:")
+        if not signal:
+            continue
+        folded = signal.casefold()
+        if folded in seen:
+            continue
+        seen.add(folded)
+        signals.append(signal)
+        if len(signals) == 8:
+            break
+    if not signals:
+        signal = job_description.strip()[:240].rstrip()
+        if not signal:
+            raise ResumeTemplateError("Job description must not be empty")
+        signals.append(signal)
+    return signals
 
 
 _GENERIC_JD_TERMS = {
@@ -558,6 +697,18 @@ def _protected_facts(text: str) -> set[str]:
     return protected
 
 
+def _duplicate_indices(values: list[str], *, casefold: bool = False) -> list[int]:
+    seen: set[str] = set()
+    duplicates: list[int] = []
+    for index, value in enumerate(values):
+        key = value.casefold() if casefold else value
+        if key in seen:
+            duplicates.append(index)
+        else:
+            seen.add(key)
+    return duplicates
+
+
 def _validate_role_strategy(
     strategy: RoleStrategy,
     *,
@@ -566,50 +717,251 @@ def _validate_role_strategy(
 ) -> dict[str, str]:
     entries = _profile_entries(profile)
     expected_ids = set(entries)
-    if len(strategy.evidence_priority) != len(set(strategy.evidence_priority)):
-        raise ResumeTemplateError("AI role strategy contains duplicate evidence priorities")
-    if set(strategy.evidence_priority) != expected_ids:
-        raise ResumeTemplateError(
-            "AI role strategy must rank every approved Candidate Profile entry exactly once"
+    failures: list[ResumeValidationFailure] = []
+    claim_failure_ids: set[str] = set()
+    duplicate_count = 0
+    source_span_failure_count = 0
+
+    def reject(
+        rule_code: ResumeValidationRuleCode,
+        json_path: str,
+        *,
+        claim_id: str | None = None,
+        duplicate: bool = False,
+        source_span: bool = False,
+    ) -> None:
+        nonlocal duplicate_count, source_span_failure_count
+        failures.append(
+            ResumeValidationFailure(
+                rule_code=rule_code,
+                json_path=json_path,
+                claim_id=claim_id,
+            )
         )
+        if claim_id in expected_ids:
+            claim_failure_ids.add(claim_id)
+        if duplicate:
+            duplicate_count += 1
+        if source_span:
+            source_span_failure_count += 1
+
+    for index in _duplicate_indices(strategy.evidence_priority):
+        evidence_id = strategy.evidence_priority[index]
+        reject(
+            ResumeValidationRuleCode.OUTPUT_DUPLICATE,
+            f"$.evidence_priority[{index}]",
+            claim_id=evidence_id if evidence_id in expected_ids else None,
+            duplicate=True,
+        )
+    if set(strategy.evidence_priority) != expected_ids:
+        reject(
+            ResumeValidationRuleCode.OUTPUT_SCHEMA_INVALID,
+            "$.evidence_priority",
+        )
+        claim_failure_ids.update(expected_ids - set(strategy.evidence_priority))
+
     expected_skills = set(profile.skills)
-    if len(strategy.skill_priority) != len(set(strategy.skill_priority)):
-        raise ResumeTemplateError("AI role strategy contains duplicate skill priorities")
+    for index in _duplicate_indices(strategy.skill_priority):
+        reject(
+            ResumeValidationRuleCode.OUTPUT_DUPLICATE,
+            f"$.skill_priority[{index}]",
+            duplicate=True,
+        )
     if set(strategy.skill_priority) != expected_skills:
-        raise ResumeTemplateError(
-            "AI role strategy must rank only the approved skill lines"
+        reject(
+            ResumeValidationRuleCode.OUTPUT_SCHEMA_INVALID,
+            "$.skill_priority",
+        )
+
+    rewrite_ids = [item.profile_entry_id for item in strategy.bullet_rewrites]
+    for index in _duplicate_indices(rewrite_ids):
+        reject(
+            ResumeValidationRuleCode.OUTPUT_DUPLICATE,
+            f"$.bullet_rewrites[{index}].profile_entry_id",
+            claim_id=rewrite_ids[index],
+            duplicate=True,
         )
     rewrites = {item.profile_entry_id: item for item in strategy.bullet_rewrites}
-    if len(rewrites) != len(strategy.bullet_rewrites) or set(rewrites) != expected_ids:
-        raise ResumeTemplateError(
-            "AI role strategy must rewrite every approved profile entry exactly once"
+    if set(rewrites) != expected_ids:
+        reject(
+            ResumeValidationRuleCode.OUTPUT_SCHEMA_INVALID,
+            "$.bullet_rewrites",
         )
+        claim_failure_ids.update(expected_ids - set(rewrites))
+
     jd_terms = _terms(job_description) - _GENERIC_JD_TERMS
-    for entry_id, rewrite in rewrites.items():
+    for index, rewrite in enumerate(strategy.bullet_rewrites):
+        entry_id = rewrite.profile_entry_id
+        if entry_id not in entries:
+            continue
         source = entries[entry_id]
         source_folded = source.casefold()
         if any(fact.casefold() not in source_folded for fact in rewrite.source_facts):
-            raise ResumeTemplateError(
-                f"AI rewrite {entry_id} cites a fact outside its approved source bullet"
+            reject(
+                ResumeValidationRuleCode.CLAIM_SOURCE_MISMATCH,
+                f"$.bullet_rewrites[{index}].source_facts",
+                claim_id=entry_id,
+                source_span=True,
             )
         if not any(fact.casefold() in rewrite.text.casefold() for fact in rewrite.source_facts):
-            raise ResumeTemplateError(
-                f"AI rewrite {entry_id} does not retain a cited source fact"
+            reject(
+                ResumeValidationRuleCode.CLAIM_NO_EVIDENCE,
+                f"$.bullet_rewrites[{index}].text",
+                claim_id=entry_id,
             )
         invented_protected = _protected_facts(rewrite.text) - _protected_facts(source)
+        invented_numbers = {
+            match.group(0).casefold() for match in _NUMBER_RE.finditer(rewrite.text)
+        } - {match.group(0).casefold() for match in _NUMBER_RE.finditer(source)}
         invented_jd_terms = ((_terms(rewrite.text) & jd_terms) - _terms(source))
-        if invented_protected or invented_jd_terms:
-            raise ResumeTemplateError(
-                f"AI rewrite {entry_id} introduced unsupported facts"
+        if invented_numbers:
+            reject(
+                ResumeValidationRuleCode.CLAIM_NEW_NUMBER,
+                f"$.bullet_rewrites[{index}].text",
+                claim_id=entry_id,
             )
-    if any(
-        item.casefold() not in job_description.casefold()
-        for item in strategy.unsupported_requirements
-    ):
-        raise ResumeTemplateError("AI gap must quote an exact requirement from the JD")
-    if any(not (_terms(item) & _terms(job_description)) for item in strategy.top_hiring_signals):
-        raise ResumeTemplateError("AI hiring signals must be grounded in the JD")
+        if invented_protected - invented_numbers:
+            reject(
+                ResumeValidationRuleCode.REWRITE_FACT_MUTATION,
+                f"$.bullet_rewrites[{index}].text",
+                claim_id=entry_id,
+            )
+        if invented_jd_terms:
+            reject(
+                ResumeValidationRuleCode.CLAIM_ROLE_INFLATION,
+                f"$.bullet_rewrites[{index}].text",
+                claim_id=entry_id,
+            )
+
+    job_description_folded = job_description.casefold()
+    for index, item in enumerate(strategy.unsupported_requirements):
+        if item.casefold() not in job_description_folded:
+            reject(
+                ResumeValidationRuleCode.GAP_NOT_SOURCE_GROUNDED,
+                f"$.unsupported_requirements[{index}]",
+                source_span=True,
+            )
+    for index in _duplicate_indices(strategy.top_hiring_signals, casefold=True):
+        reject(
+            ResumeValidationRuleCode.HIRING_SIGNAL_DUPLICATE,
+            f"$.top_hiring_signals[{index}]",
+            duplicate=True,
+        )
+    for index, item in enumerate(strategy.top_hiring_signals):
+        if item.casefold() not in job_description_folded:
+            reject(
+                ResumeValidationRuleCode.HIRING_SIGNAL_NOT_SOURCE_GROUNDED,
+                f"$.top_hiring_signals[{index}]",
+                source_span=True,
+            )
+
+    if failures:
+        verified_count = 0
+        supported_count = 0
+        for entry_id in expected_ids - claim_failure_ids:
+            selected_rewrite = rewrites.get(entry_id)
+            if selected_rewrite is None:
+                continue
+            if selected_rewrite.text == entries[entry_id]:
+                verified_count += 1
+            else:
+                supported_count += 1
+        raise ResumeTemplateError(
+            "AI role strategy failed deterministic truth validation",
+            validation_diagnostics=ResumeValidationDiagnostics(
+                failures=tuple(failures),
+                candidate_count=len(entries),
+                verified_count=verified_count,
+                supported_count=supported_count,
+                rejected_count=len(claim_failure_ids),
+                duplicate_count=duplicate_count,
+                source_span_failure_count=source_span_failure_count,
+            ),
+        )
     return entries
+
+
+_SELECTIVE_REWRITE_FAILURES = {
+    ResumeValidationRuleCode.CLAIM_NO_EVIDENCE,
+    ResumeValidationRuleCode.CLAIM_SOURCE_MISMATCH,
+    ResumeValidationRuleCode.CLAIM_ROLE_INFLATION,
+    ResumeValidationRuleCode.CLAIM_NEW_NUMBER,
+    ResumeValidationRuleCode.CLAIM_CONTRADICTED,
+    ResumeValidationRuleCode.REWRITE_NOT_MATERIAL,
+    ResumeValidationRuleCode.REWRITE_FACT_MUTATION,
+}
+
+
+def _select_safe_rewrites(
+    strategy: RoleStrategy,
+    *,
+    profile: CandidateProfile,
+    job_description: str,
+) -> tuple[RoleStrategy, dict[str, str], ResumeValidationDiagnostics]:
+    """Keep each supported rewrite and restore only rejected claims to source."""
+
+    entries = _profile_entries(profile)
+    try:
+        _validate_role_strategy(
+            strategy,
+            profile=profile,
+            job_description=job_description,
+        )
+    except ResumeTemplateError as error:
+        diagnostics = error.validation_diagnostics
+        if diagnostics is None or any(
+            failure.rule_code not in _SELECTIVE_REWRITE_FAILURES
+            or failure.claim_id is None
+            for failure in diagnostics.failures
+        ):
+            raise
+        rejected_ids = {
+            failure.claim_id
+            for failure in diagnostics.failures
+            if failure.claim_id is not None
+        }
+        selected_rewrites = [
+            GroundedResumeBulletRewrite(
+                profile_entry_id=rewrite.profile_entry_id,
+                text=entries[rewrite.profile_entry_id],
+                source_facts=[entries[rewrite.profile_entry_id]],
+            )
+            if rewrite.profile_entry_id in rejected_ids
+            else rewrite
+            for rewrite in strategy.bullet_rewrites
+        ]
+        selected = strategy.model_copy(
+            update={"bullet_rewrites": selected_rewrites}
+        )
+        _validate_role_strategy(
+            selected,
+            profile=profile,
+            job_description=job_description,
+        )
+        return (
+            selected,
+            entries,
+            replace(diagnostics, validator_status="selective_pass"),
+        )
+
+    verified_count = sum(
+        rewrite.text == entries[rewrite.profile_entry_id]
+        for rewrite in strategy.bullet_rewrites
+    )
+    return (
+        strategy,
+        entries,
+        ResumeValidationDiagnostics(
+            failures=(),
+            candidate_count=len(entries),
+            verified_count=verified_count,
+            supported_count=len(entries) - verified_count,
+            rejected_count=0,
+            duplicate_count=0,
+            source_span_failure_count=0,
+            validator_status="accepted",
+        ),
+    )
 
 
 def _reorder_project_blocks_by_priority(
@@ -707,6 +1059,31 @@ def _replace_bullet_text(
         node.text = ""
 
 
+def _structured_candidate_artifact(
+    strategy: RoleStrategy,
+    *,
+    status: str,
+    diagnostics: ResumeValidationDiagnostics | None,
+) -> dict[str, object]:
+    """Keep the raw model candidate inspectable but never submission-eligible."""
+
+    return {
+        "schema_version": "1.0",
+        "artifact_type": "RESUME_STRUCTURED_CANDIDATE",
+        "status": status,
+        "submission_status": "NOT_FOR_SUBMISSION",
+        "label": (
+            "REJECTED / NOT FOR SUBMISSION"
+            if status == "REJECTED"
+            else "NOT FOR SUBMISSION"
+        ),
+        "structured_candidate": strategy.model_dump(mode="json"),
+        "validation_diagnostics": (
+            diagnostics.as_dict() if diagnostics is not None else None
+        ),
+    }
+
+
 def tailor_resume_docx_with_gateway(
     template: bytes,
     job_description: str,
@@ -715,6 +1092,7 @@ def tailor_resume_docx_with_gateway(
     tailoring_instructions: str = "",
     template_metadata: ResumeTemplateMetadata | None = None,
     support_upload: ExtractedResumeUpload | None = None,
+    candidate_recorder: Callable[[dict[str, object]], None] | None = None,
 ) -> TailoredDocx:
     """Use one explicit provider to rank and ground rewrites against approved bullets."""
     if not job_description.strip():
@@ -743,35 +1121,97 @@ def tailor_resume_docx_with_gateway(
             strict=True,
         )
     )
+    deterministic_signals = _deterministic_hiring_signals(
+        prepared.payload.job_description
+    )
+    model_user = prepared.payload.model_dump_json()
+    model_system = (
+        "You tailor a resume only from approved Candidate Profile facts. Return the "
+        "required JSON. Rank every profile entry and every exact skill line once. "
+        "skill_priority must contain every request-specific SKILL key exactly once; "
+        "SKILL-01 maps to the first candidate_profile.skills item, and so on. "
+        "bullet_rewrites is an object whose required PROFILE keys are fixed by the "
+        "schema; provide one grounded rewrite body for every key. Rewrite every bullet "
+        "for this JD, but retain at least one exact source fact fragment and never add "
+        "a technology, company, metric, scope, or outcome absent from that source "
+        "bullet. Use the deterministic hiring signals below as read-only targeting "
+        "context; do not return or restate them. Unsupported requirements must be exact "
+        "quotes from the JD. Preserve every __SS_PRIVATE_*__ placeholder exactly. "
+        "Deterministic hiring signals: "
+        + json.dumps(deterministic_signals, ensure_ascii=False)
+    )
+    model_started = time.perf_counter()
     exact_strategy = gateway.complete(
         response_schema,
-        system=(
-            "You tailor a resume only from approved Candidate Profile facts. Return the "
-            "required JSON. Rank every profile entry and every exact skill line once. "
-            "skill_priority must contain every request-specific SKILL key exactly once; "
-            "SKILL-01 maps to the first candidate_profile.skills item, and so on. "
-            "bullet_rewrites is an object whose required PROFILE keys are fixed by the "
-            "schema; provide one grounded rewrite body for every key. Rewrite every bullet "
-            "for this JD, but retain at least one exact source fact fragment and never add "
-            "a technology, company, metric, scope, or outcome absent from that source "
-            "bullet. Every top_hiring_signals item must be a short exact quote copied "
-            "verbatim from the JD in its original language. Unsupported requirements must "
-            "be exact quotes from the JD. Preserve "
-            "every __SS_PRIVATE_*__ placeholder exactly."
-        ),
-        user=prepared.payload.model_dump_json(),
+        system=model_system,
+        user=model_user,
         reasoning_effort="none",
     )
     strategy = _role_strategy_from_exact(
         exact_strategy,
         entry_ids=entry_ids,
         sanitized_skill_by_id=sanitized_skill_by_id,
+        top_hiring_signals=deterministic_signals,
     )
+    model_call_profile: dict[str, object] = {
+        "schema_version": "1.0",
+        "model_call_count": 1,
+        "output_contract": "selective_rewrite_v0.1",
+        "reasoning_effort": "none",
+        "gateway_wall_ms": int((time.perf_counter() - model_started) * 1000),
+        "system_chars": len(model_system),
+        "user_chars": len(model_user),
+        "schema_chars": len(
+            json.dumps(
+                response_schema.model_json_schema(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ),
+    }
+    provider_profile = getattr(gateway, "last_call_profile", None)
+    if isinstance(provider_profile, ModelCallProfile):
+        model_call_profile["provider_metrics"] = provider_profile.model_dump(
+            mode="json"
+        )
     validate_role_strategy_placeholders(strategy, prepared)
     strategy = restore_role_strategy(strategy, prepared.private_replacements)
-    validated_entries = _validate_role_strategy(
-        strategy, profile=profile, job_description=job_description
-    )
+    raw_strategy = strategy
+    if candidate_recorder is not None:
+        candidate_recorder(
+            _structured_candidate_artifact(
+                raw_strategy,
+                status="PENDING_VALIDATION",
+                diagnostics=None,
+            )
+        )
+    try:
+        strategy, validated_entries, validation_diagnostics = _select_safe_rewrites(
+            raw_strategy, profile=profile, job_description=job_description
+        )
+    except ResumeTemplateError as error:
+        if candidate_recorder is not None:
+            candidate_recorder(
+                _structured_candidate_artifact(
+                    raw_strategy,
+                    status="REJECTED",
+                    diagnostics=error.validation_diagnostics,
+                )
+            )
+        raise
+    if candidate_recorder is not None:
+        candidate_recorder(
+            _structured_candidate_artifact(
+                raw_strategy,
+                status=(
+                    "REJECTED"
+                    if validation_diagnostics.rejected_count
+                    else "VALIDATED"
+                ),
+                diagnostics=validation_diagnostics,
+            )
+        )
     members, document = _read_package(template)
     root, body = _parse_document(document)
     source_paragraphs = [
@@ -812,10 +1252,13 @@ def tailor_resume_docx_with_gateway(
         skill_bullets_reordered=skill_count,
         source_paragraph_count=len(source_paragraphs),
         claims_preserved=True,
-        grounded_rewrites=len(strategy.bullet_rewrites),
+        grounded_rewrites=validation_diagnostics.supported_count,
+        rejected_rewrites=validation_diagnostics.rejected_count,
         generation_mode="ai",
         provider=gateway.descriptor.provider.value,
         model=gateway.descriptor.model,
+        model_call_profile=model_call_profile,
+        validation_diagnostics=validation_diagnostics,
         role_strategy=strategy,
     )
 
