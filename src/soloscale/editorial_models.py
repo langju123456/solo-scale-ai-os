@@ -14,7 +14,9 @@ from soloscale.models import ContractModel
 class ProviderKind(StrEnum):
     TEMPLATE = "template"
     CODEX_SESSION = "codex_session"
+    SOLOSCALE_HOSTED = "soloscale_hosted"
     OLLAMA = "ollama"
+    OPENAI_COMPATIBLE = "openai_compatible"
     HUGGINGFACE = "huggingface"
     FUTURE_EXTERNAL = "future_external"
 

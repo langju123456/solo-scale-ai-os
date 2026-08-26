@@ -68,7 +68,7 @@ def test_evidence_get_does_not_create_catalog_or_render_private_paths(tmp_path: 
     body = output.getvalue().decode()
 
     assert not (root / "evidence" / "catalog.sqlite3").exists()
-    assert "Not initialized" in body
+    assert "尚未初始化" in body
     assert str(root) not in body
     assert "/private/" not in body
 
@@ -94,7 +94,7 @@ def test_evidence_refresh_post_redirects_and_renders_metadata_only(tmp_path: Pat
 
     assert response_headers == {
         "status": "303",
-        "Location": "/evidence?refresh=complete",
+        "Location": "/evidence?refresh=complete&lang=zh-CN",
         "Content-Length": "0",
     }
     assert "Sources" in body and "Evidence" in body and "codex_session" in body

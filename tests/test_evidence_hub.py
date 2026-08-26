@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from buildlog.models import Iteration
 
+import soloscale.evidence_hub as evidence_hub_module
 from soloscale.evidence_hub import EvidenceHub, EvidenceHubError
 from soloscale.evidence_hub_models import ReceiptStatus
 from soloscale.knowledge_models import (
@@ -243,7 +244,9 @@ def test_failed_refresh_preserves_prior_snapshot_and_records_code(tmp_path: Path
         EvidenceHub(linked_parent / ".soloscale")
 
 
-def test_buildlog_and_git_adapters_use_bounded_local_metadata(tmp_path: Path) -> None:
+def test_buildlog_and_git_adapters_use_bounded_local_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / ".soloscale"
     content_run = root / "content-runs" / "content-real-case"
     content_run.mkdir(parents=True)
@@ -275,11 +278,25 @@ def test_buildlog_and_git_adapters_use_bounded_local_metadata(tmp_path: Path) ->
         check=True,
     )
     hub = EvidenceHub(root, knowledge_store=_store(root))
+    original_run = evidence_hub_module.subprocess.run
+    observed_timeouts: list[float] = []
+
+    def record_git_command(*args: object, **kwargs: object) -> object:
+        command = args[0]
+        assert isinstance(command, list)
+        assert Path(command[0]).is_absolute()
+        timeout = kwargs.get("timeout")
+        assert isinstance(timeout, (int, float))
+        observed_timeouts.append(float(timeout))
+        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(evidence_hub_module.subprocess, "run", record_git_command)
 
     receipt = hub.refresh(buildlog_roots=[buildlog.parent.parent], git_root=git_root)
 
     assert receipt.status is ReceiptStatus.SUCCEEDED
     assert hub.status().source_count == 4
     assert hub.status().truth_class_counts["outcome_receipt"] == 1
+    assert observed_timeouts and set(observed_timeouts) == {10.0}
     assert "not read by the hub" not in hub.database_path.read_bytes().decode("latin1")
     assert "application body" not in hub.database_path.read_bytes().decode("latin1")

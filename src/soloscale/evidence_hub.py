@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
+import stat
 import subprocess
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
@@ -36,6 +38,23 @@ _SCHEMA_VERSION = "1"
 _MAX_APPLICATION_RUNS = 500
 _MAX_APPLICATION_FILES = 10_000
 _MAX_APPLICATION_FILE_BYTES = 64 * 1024 * 1024
+_GIT_TIMEOUT_SECONDS = 10
+_GIT_SEARCH_PATH = os.pathsep.join(
+    (
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        os.environ.get("PATH", ""),
+    )
+)
+
+
+def _ensure_mode(path: Path, mode: int) -> None:
+    """Avoid redundant metadata writes while preserving private-mode enforcement."""
+
+    if stat.S_IMODE(path.stat().st_mode) != mode:
+        path.chmod(mode)
 
 
 class EvidenceHubError(Exception):
@@ -1064,13 +1083,13 @@ class EvidenceHub:
         self.evidence_root.mkdir(mode=_DIRECTORY_MODE, parents=True, exist_ok=True)
         _reject_symlink_ancestry(self.data_root)
         _reject_symlink_ancestry(self.evidence_root)
-        self.evidence_root.chmod(_DIRECTORY_MODE)
+        _ensure_mode(self.evidence_root, _DIRECTORY_MODE)
         if not self.database_path.exists():
             descriptor = os.open(
                 self.database_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _FILE_MODE
             )
             os.close(descriptor)
-        self.database_path.chmod(_FILE_MODE)
+        _ensure_mode(self.database_path, _FILE_MODE)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -1087,7 +1106,7 @@ class EvidenceHub:
         finally:
             if connection is not None:
                 connection.close()
-            self.database_path.chmod(_FILE_MODE)
+            _ensure_mode(self.database_path, _FILE_MODE)
 
     def _initialize_schema(self) -> None:
         with self._connect() as connection:
@@ -1377,8 +1396,15 @@ def _sha256_path(path: Path) -> str:
 
 
 def _git(root: Path, *args: str, optional: bool = False) -> str:
+    executable = shutil.which("git", path=_GIT_SEARCH_PATH)
+    if executable is None:
+        raise EvidenceHubError("git snapshot is unavailable")
     result = subprocess.run(
-        ["git", "-C", str(root), *args], capture_output=True, check=False, text=True, timeout=2
+        [executable, "-C", str(root), *args],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=_GIT_TIMEOUT_SECONDS,
     )
     if result.returncode and not optional:
         raise EvidenceHubError("git snapshot is unavailable")

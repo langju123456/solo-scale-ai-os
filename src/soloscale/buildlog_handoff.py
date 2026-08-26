@@ -8,10 +8,15 @@ import os
 from pathlib import Path
 from typing import Literal, cast
 
-from soloscale.content_workspace import content_run_directory, load_content_run
+from soloscale.content_workspace import (
+    approved_content_artifact,
+    content_run_directory,
+    load_content_run,
+)
 from soloscale.evidence_capture import capture_assets, capture_outcome
 from soloscale.evidence_hub import EvidenceHub
 from soloscale.resume_workspace import ResumeWorkspaceStorageError, _atomic_private_write
+from soloscale.runtime_paths import resolve_resource_root
 
 Channel = Literal["linkedin", "x"]
 _SOURCE_NAMES: dict[Channel, str] = {"linkedin": "02_linkedin.md", "x": "03_x_post.md"}
@@ -30,7 +35,7 @@ def _gateway(data_root: Path, channel: Channel):  # type: ignore[no-untyped-def]
     config_root = (
         Path(config_value).expanduser().absolute()
         if config_value
-        else Path(__file__).resolve().parents[2] / "packages" / "buildlog"
+        else resolve_resource_root() / "packages" / "buildlog"
     )
     return PublishingGateway(
         data_root=data_root / "publishing",
@@ -46,7 +51,9 @@ def stage_for_buildlog(*, data_root: Path, run_id: str, channel: Channel) -> dic
     record_path = run_dir / f"12_buildlog_{channel}.json"
     if record_path.exists() or record_path.is_symlink():
         return _load_string_record(record_path)
-    source = run_dir / _SOURCE_NAMES[channel]
+    source_artifact, source, review = approved_content_artifact(
+        data_root, run_id, channel
+    )
     if source.is_symlink() or not source.is_file():
         raise BuildLogHandoffError("Content artifact is unavailable")
     try:
@@ -60,7 +67,8 @@ def stage_for_buildlog(*, data_root: Path, run_id: str, channel: Channel) -> dic
         "status": "STAGED_FOR_BUILDLOG_APPROVAL",
         "channel": channel,
         "source_run_id": run_id,
-        "source_artifact": _SOURCE_NAMES[channel],
+        "source_artifact": source_artifact,
+        "review_revision": str(review.revision),
         "buildlog_run_id": buildlog_run_id,
     }
     _write_record(record_path, record)
@@ -114,6 +122,7 @@ def publish_via_buildlog(
         raise BuildLogHandoffError("Type PUBLISH to authorize this exact publication")
     run_dir = content_run_directory(data_root, run_id)
     preview = _load_record(run_dir / f"12_buildlog_{channel}_preview.json")
+    handoff = _load_string_record(run_dir / f"12_buildlog_{channel}.json")
     required = ("buildlog_run_id", "content_hash", "account_reference")
     if any(not isinstance(preview.get(key), str) or not preview[key] for key in required):
         raise BuildLogHandoffError("BuildLog preview is incomplete; preview again")
@@ -138,7 +147,17 @@ def publish_via_buildlog(
         "source_run_id": run_id,
     }
     _write_record(run_dir / f"13_buildlog_{channel}_receipt.json", record)
-    source = run_dir / _SOURCE_NAMES[channel]
+    source_artifact = handoff.get("source_artifact", _SOURCE_NAMES[channel])
+    artifact_path = Path(source_artifact)
+    if artifact_path.is_absolute() or ".." in artifact_path.parts:
+        raise BuildLogHandoffError("BuildLog source artifact is invalid")
+    source = run_dir / source_artifact
+    try:
+        source.relative_to(run_dir)
+    except ValueError as exc:
+        raise BuildLogHandoffError("BuildLog source artifact is invalid") from exc
+    if source.is_symlink() or not source.is_file():
+        raise BuildLogHandoffError("BuildLog source artifact is unavailable")
     content_run = load_content_run(data_root, run_id)
     try:
         final_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -150,7 +169,7 @@ def publish_via_buildlog(
         run_dir=run_dir,
         owner="content",
         run_id=run_id,
-        artifact_names=[_SOURCE_NAMES[channel]],
+        artifact_names=[source_artifact],
         evidence_bundle_id=content_run.brief.evidence_bundle_id,
         evidence_item_ids=content_run.brief.evidence_item_ids,
         evidence_hub=evidence_hub,
@@ -172,7 +191,7 @@ def publish_via_buildlog(
             "published_at": receipt.published_at.isoformat(),
         },
         evidence_item_ids=content_run.brief.evidence_item_ids,
-        asset_id=captured_assets.get(_SOURCE_NAMES[channel]),
+        asset_id=captured_assets.get(source_artifact),
         evidence_hub=evidence_hub,
     )
     return record

@@ -144,6 +144,26 @@ The default persistent private root is `~/Documents/SoloScaleData` and the stabl
 
 打开终端打印的地址（默认 `http://127.0.0.1:8765`）。
 
+### macOS desktop app (local developer build)
+
+The first desktop package embeds the Python product behind a native SwiftUI window, so
+normal use does not require a Terminal or a separately managed local server. Build it on
+Apple Silicon macOS with:
+
+```bash
+uv venv .venv
+uv pip install -e '.[dev,desktop]' -e packages/buildlog
+./packaging/macos/build_backend_onedir.sh
+./scripts/build_macos_app.sh
+open "desktop/macos/dist/SoloScale AI OS.app"
+```
+
+The app preserves an existing `~/Documents/SoloScaleData` library; a fresh install uses
+`~/Library/Application Support/SoloScale AI OS`. Its random loopback port is protected by
+a per-launch private session cookie and exact Host validation. OpenAI API keys configured
+in the Desktop App are stored in macOS Keychain. This local build is unsigned and not
+notarized; signing, notarization, and public GitHub release packaging remain separate gates.
+
 ### Learning Traceability golden case
 
 Open `http://127.0.0.1:8765/learning` to build and inspect the bounded Learning
@@ -152,18 +172,24 @@ Explain/Trace response receipts; submitting a response never advances mastery au
 The local workflow makes no model or network call and keeps learning status separate from
 resume eligibility.
 
-The default `/` route is the end-user resume flow: upload an existing `.docx` resume,
-paste a Job Description, optionally add company/job metadata, then generate, preview, and
-download a targeted DOCX. Developer-oriented Knowledge, Evidence Agent, model, and source
-controls remain available at `/advanced`.
+The default `/` route presents the three connected user outcomes together: get the job,
+defend the job, and build professional visibility. The existing resume workflow lives at
+`/resume`: upload a `.docx`, paste a Job Description, review, and download a targeted DOCX.
+Learning remains at `/learning`; Content remains at `/content`; Video and Publishing remain
+available under More. `/work` lets the user explicitly add a resume, local Git project,
+standard Codex history, or a selected ChatGPT export for reuse across those outcomes; it
+does not watch arbitrary folders or read conversation bodies before approval. Knowledge,
+evidence, provider, and source controls stay at `/advanced`.
 
 Open `http://127.0.0.1:8765/content` for Content Studio. Supply concise verified or
 observed claims with receipts, plus any explicitly labeled hypotheses and planned work.
-One deterministic local run produces previewable LinkedIn, X Thread, and short-video
-script/storyboard candidates under `.soloscale/content-runs/`. The page supports copy and
-bounded downloads. The optional Creator Video Factory renders the saved storyboard into a
-local MP4 using Remotion and the installed browser; it does not call a model, connect a
-social account, upload, or publish.
+The intended default is SoloScale Hosted AI, which is explicitly marked not configured in
+this local developer build and never silently falls back. An explicit safe offline draft
+remains usable without any model, while optional Ollama and future OpenAI-compatible/BYO
+providers are selected only under Advanced. Successful runs produce previewable LinkedIn,
+X Thread, and short-video script/storyboard candidates under `.soloscale/content-runs/`.
+The optional Creator Video Factory renders a saved storyboard into a local MP4 using
+Remotion and the installed browser; it does not connect a social account or publish.
 
 ### Unified Evidence Core
 

@@ -18,6 +18,7 @@ from soloscale.resume_workspace import (
     _atomic_private_write,
     _reject_symlink_ancestry,
 )
+from soloscale.runtime_paths import resolve_resource_root
 
 EditorialChannel = Literal["linkedin", "x"]
 _X_MARKER = re.compile(r"(?m)^(?P<number>[1-9][0-9]*)/(?P<total>[1-9][0-9]*)(?:\s|$)")
@@ -39,7 +40,7 @@ def _gateway(data_root: Path, channel: EditorialChannel) -> Any:
     config_root = (
         Path(configured_root).expanduser().absolute()
         if configured_root
-        else Path(__file__).resolve().parents[2] / "packages" / "buildlog"
+        else resolve_resource_root() / "packages" / "buildlog"
     )
     return PublicationPlanGateway(
         data_root=data_root / "publishing",

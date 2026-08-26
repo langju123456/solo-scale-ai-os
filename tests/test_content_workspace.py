@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -10,14 +11,25 @@ from soloscale.buildlog_handoff import (
     publish_via_buildlog,
     stage_for_buildlog,
 )
-from soloscale.content_models import ClaimStatus, ContentBrief, ContentClaim
+from soloscale.content_models import (
+    ClaimStatus,
+    ContentBrief,
+    ContentClaim,
+    ContentDrafts,
+    ContentReviewDecision,
+    StoryboardScene,
+)
 from soloscale.content_workspace import (
     ContentWorkspaceError,
     content_download,
+    load_content_review,
     load_content_run,
     parse_claim_ledger,
     run_content_workspace,
+    run_content_workspace_with_ollama,
+    save_content_review,
 )
+from soloscale.evidence_agent import Reasoner
 from soloscale.evidence_hub import EvidenceHub
 from soloscale.video_factory import creator_video_ready, render_creator_video
 
@@ -50,6 +62,67 @@ def _brief() -> ContentBrief:
             ),
         ],
     )
+
+
+def _model_drafts(brief: ContentBrief) -> ContentDrafts:
+    claim_lines = [
+        f"{claim.status.value} · {claim.id} — {claim.text}"
+        for claim in brief.claims
+    ]
+    x_posts = [
+        f"{index}/{len(claim_lines) + 1} {line}"
+        for index, line in enumerate(claim_lines, start=1)
+    ]
+    x_posts.append(
+        f"{len(x_posts) + 1}/{len(claim_lines) + 1} {brief.call_to_action}"
+    )
+    scenes = [
+        StoryboardScene(
+            id=f"SCENE-{index:02d}",
+            start_second=(index - 1) * 6,
+            end_second=index * 6,
+            purpose=f"{claim.status.value} · {claim.id}",
+            visual="Evidence card",
+            voiceover=claim.text,
+            on_screen_text=f"{claim.status.value} · {claim.id}",
+            claim_ids=[claim.id],
+        )
+        for index, claim in enumerate(brief.claims, start=1)
+    ]
+    scenes.append(
+        StoryboardScene(
+            id=f"SCENE-{len(scenes) + 1:02d}",
+            start_second=len(scenes) * 6,
+            end_second=(len(scenes) + 1) * 6,
+            purpose="CTA",
+            visual="CTA card",
+            voiceover=brief.call_to_action,
+            on_screen_text=brief.call_to_action,
+            claim_ids=[],
+        )
+    )
+    joined = "\n".join([*claim_lines, brief.call_to_action])
+    return ContentDrafts(
+        linkedin=joined,
+        x_thread=x_posts,
+        video_script=joined,
+        storyboard=scenes,
+    )
+
+
+class _FakeContentReasoner:
+    def __init__(self, drafts: ContentDrafts) -> None:
+        self.drafts = drafts
+        self.system = ""
+        self.user = ""
+
+    def complete(
+        self, schema: object, *, system: str, user: str
+    ) -> ContentDrafts:
+        assert schema is not ContentDrafts
+        self.system = system
+        self.user = user
+        return self.drafts
 
 
 def test_parse_claim_ledger_requires_receipts_for_grounded_statuses() -> None:
@@ -88,6 +161,10 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
     video = (run_dir / "04_video_script.md").read_text(encoding="utf-8")
     verification = json.loads((run_dir / "08_verification.json").read_text())
     assert "CLAIM-01" in linkedin
+    assert (run_dir / "15_canonical_story.md").is_file()
+    assert (run_dir / "16_blog.md").is_file()
+    assert run.drafts.x_post.strip() == (run_dir / "03_x_post.md").read_text().strip()
+    assert 60 <= run.drafts.storyboard[-1].end_second <= 120
     assert "This does not prove production readiness" in linkedin
     assert "1/5" in x_thread
     assert "Claim anchors: CLAIM-01" in video
@@ -124,6 +201,69 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
 
     loaded = load_content_run(data_root, run.run_id)
     assert loaded.editorial_provenance == []
+
+
+def test_content_workspace_uses_local_ollama_and_rejects_unanchored_output(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    brief = _brief()
+    fake = _FakeContentReasoner(_model_drafts(brief))
+    run = run_content_workspace_with_ollama(
+        data_root=data_root,
+        brief=brief,
+        model="qwen3:8b",
+        reasoner=cast(Reasoner, fake),
+    )
+
+    assert run.model_used is True
+    assert run.network_used is True
+    assert run.editorial_provenance[0].provider.kind.value == "ollama"
+    assert run.editorial_provenance[0].exact_model == "qwen3:8b"
+    assert run.editorial_provenance[0].network_used is True
+    assert "required_claim_markers" in fake.user
+    verification = json.loads(
+        (
+            data_root / "content-runs" / run.run_id / "08_verification.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert verification["model_used"] is True
+    assert verification["network_used"] is True
+
+    loosely_structured = _model_drafts(brief).model_copy(
+        update={
+            "linkedin": brief.claims[0].text,
+            "x_thread": [f"N/1 {brief.claims[0].text}"],
+            "video_script": brief.claims[0].text,
+        }
+    )
+    repaired = run_content_workspace_with_ollama(
+        data_root=data_root,
+        brief=brief,
+        model="qwen3:8b",
+        reasoner=cast(Reasoner, _FakeContentReasoner(loosely_structured)),
+    )
+    for claim in brief.claims:
+        marker = f"{claim.status.value} · {claim.id}"
+        assert marker in repaired.drafts.linkedin
+        assert marker in "\n".join(repaired.drafts.x_thread)
+        assert marker in repaired.drafts.video_script
+    assert all(
+        post.startswith(f"{index}/{len(repaired.drafts.x_thread)} ")
+        for index, post in enumerate(repaired.drafts.x_thread, start=1)
+    )
+
+    invalid = _model_drafts(brief).model_copy(
+        update={"linkedin": "VERIFIED · CLAIM-99\n" + brief.call_to_action}
+    )
+    with pytest.raises(ContentWorkspaceError, match="claim ID"):
+        run_content_workspace_with_ollama(
+            data_root=data_root,
+            brief=brief,
+            model="qwen3:8b",
+            reasoner=cast(Reasoner, _FakeContentReasoner(invalid)),
+        )
+    assert len(list((data_root / "content-runs").iterdir())) == 2
 
 
 def test_content_workspace_repeat_runs_never_overwrite(tmp_path: Path) -> None:
@@ -289,10 +429,22 @@ def test_buildlog_handoff_stages_exact_artifact_and_persists_returned_receipt(
 ) -> None:
     data_root = tmp_path / ".soloscale"
     run = run_content_workspace(data_root=data_root, brief=_brief())
+    with pytest.raises(ContentWorkspaceError, match="Approve"):
+        stage_for_buildlog(data_root=data_root, run_id=run.run_id, channel="linkedin")
+    approved_linkedin = run.drafts.linkedin + "\nOwner reviewed this exact adaptation.\n"
+    browser_approved_linkedin = approved_linkedin.replace("\n", "\r\n")
+    review = save_content_review(
+        data_root=data_root,
+        run_id=run.run_id,
+        updates={"linkedin": browser_approved_linkedin},
+        decision=ContentReviewDecision.APPROVED,
+    )
+    assert review.decision is ContentReviewDecision.APPROVED
+    assert load_content_review(data_root, run.run_id) is not None
 
     class FakeGateway:
         def stage(self, **kwargs: object) -> str:
-            assert Path(str(kwargs["source_path"])).read_text() == run.drafts.linkedin
+            assert Path(str(kwargs["source_path"])).read_text() == approved_linkedin
             return "soloscale-linkedin-123"
 
         def preview(self, run_id: str) -> SimpleNamespace:
@@ -301,9 +453,9 @@ def test_buildlog_handoff_stages_exact_artifact_and_persists_returned_receipt(
                 platform=SimpleNamespace(value="linkedin"),
                 account_reference="linkedin:member:123",
                 account_display_name="Test Member",
-                content=run.drafts.linkedin,
+                content=approved_linkedin,
                 content_hash="a" * 64,
-                content_length=len(run.drafts.linkedin),
+                content_length=len(approved_linkedin),
                 duplicate_found=False,
                 indeterminate_found=False,
             )
@@ -343,5 +495,41 @@ def test_buildlog_handoff_stages_exact_artifact_and_persists_returned_receipt(
     published_asset = hub.get_asset(outcome.asset_id)
     assert published_asset is not None
     assert published_asset.private_locator is not None
-    assert published_asset.private_locator.endswith("/02_linkedin.md")
+    assert published_asset.private_locator.endswith("/reviews/review-0001/linkedin.md")
     assert published_asset.content_sha256 == outcome.final_sha256
+
+
+def test_content_review_is_versioned_and_regenerates_only_one_adaptation(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    run = run_content_workspace(data_root=data_root, brief=_brief())
+    edited_blog = run.drafts.blog + "\nA human edit that keeps every evidence anchor.\n"
+
+    first = save_content_review(
+        data_root=data_root,
+        run_id=run.run_id,
+        updates={"blog": edited_blog},
+    )
+    second = save_content_review(
+        data_root=data_root,
+        run_id=run.run_id,
+        updates={},
+        regenerate_target="blog",
+    )
+
+    assert first.revision == 1
+    assert second.revision == 2
+    assert second.reset_target == "blog"
+    latest = load_content_review(data_root, run.run_id)
+    assert latest is not None
+    assert latest[1]["blog"] == run.drafts.blog
+    assert latest[1]["linkedin"] == run.drafts.linkedin
+    review_dirs = sorted((data_root / "content-runs" / run.run_id / "reviews").iterdir())
+    assert [path.name for path in review_dirs] == ["review-0001", "review-0002"]
+    assert all(path.stat().st_mode & 0o777 == 0o700 for path in review_dirs)
+    assert all(
+        artifact.stat().st_mode & 0o777 == 0o600
+        for path in review_dirs
+        for artifact in path.iterdir()
+    )

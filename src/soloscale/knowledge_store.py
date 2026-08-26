@@ -40,6 +40,13 @@ _QUERY_TOKEN = re.compile(r"[^\W_]+", flags=re.UNICODE)
 _CJK_TOKEN = re.compile(r"^[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+$")
 
 
+def _ensure_mode(path: Path, mode: int) -> None:
+    """Avoid redundant metadata writes while preserving private-mode enforcement."""
+
+    if stat.S_IMODE(path.stat().st_mode) != mode:
+        path.chmod(mode)
+
+
 class KnowledgeStoreError(Exception):
     """Base error for the local private knowledge store."""
 
@@ -1002,12 +1009,12 @@ class KnowledgeStore:
         _reject_symlink_or_wrong_type(self.root, expected_directory=True)
         self.root.mkdir(mode=_PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
         _reject_symlink_or_wrong_type(self.root, expected_directory=True)
-        self.root.chmod(_PRIVATE_DIRECTORY_MODE)
+        _ensure_mode(self.root, _PRIVATE_DIRECTORY_MODE)
 
         _reject_symlink_or_wrong_type(self.knowledge_root, expected_directory=True)
         self.knowledge_root.mkdir(mode=_PRIVATE_DIRECTORY_MODE, exist_ok=True)
         _reject_symlink_or_wrong_type(self.knowledge_root, expected_directory=True)
-        self.knowledge_root.chmod(_PRIVATE_DIRECTORY_MODE)
+        _ensure_mode(self.knowledge_root, _PRIVATE_DIRECTORY_MODE)
 
         _reject_symlink_or_wrong_type(self.database_path, expected_directory=False)
         if not self.database_path.exists():
@@ -1017,7 +1024,7 @@ class KnowledgeStore:
             descriptor = os.open(self.database_path, flags, _PRIVATE_FILE_MODE)
             os.close(descriptor)
         _reject_symlink_or_wrong_type(self.database_path, expected_directory=False)
-        self.database_path.chmod(_PRIVATE_FILE_MODE)
+        _ensure_mode(self.database_path, _PRIVATE_FILE_MODE)
         self._tighten_sidecars()
 
     def _validate_storage(self) -> None:
@@ -1031,7 +1038,7 @@ class KnowledgeStore:
         for sidecar in self._sidecar_paths():
             _reject_symlink_or_wrong_type(sidecar, expected_directory=False)
             if sidecar.exists():
-                sidecar.chmod(_PRIVATE_FILE_MODE)
+                _ensure_mode(sidecar, _PRIVATE_FILE_MODE)
 
     def _sidecar_paths(self) -> tuple[Path, ...]:
         return tuple(
@@ -1063,7 +1070,7 @@ class KnowledgeStore:
             yield connection
         finally:
             connection.close()
-            self.database_path.chmod(_PRIVATE_FILE_MODE)
+            _ensure_mode(self.database_path, _PRIVATE_FILE_MODE)
             self._tighten_sidecars()
 
     def _initialize_schema(self) -> None:

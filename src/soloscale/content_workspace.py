@@ -8,20 +8,36 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from soloscale.content_models import (
     ClaimStatus,
     ContentBrief,
     ContentClaim,
     ContentDrafts,
+    ContentReviewDecision,
+    ContentReviewReceipt,
     ContentRun,
     StoryboardScene,
 )
 from soloscale.editorial_models import EditorialRole, ProviderIdentity, ProviderKind
 from soloscale.editorial_pipeline import make_provenance
+from soloscale.evidence_agent import Reasoner
 from soloscale.evidence_capture import capture_assets
 from soloscale.evidence_hub import EvidenceHub
+from soloscale.model_gateway import (
+    GatewayConfigurationState,
+    ModelGateway,
+    ModelGatewayInvalidResponse,
+    ModelGatewayNotConfigured,
+    ModelGatewayTransportError,
+    ModelProviderId,
+    OllamaModelGateway,
+)
+from soloscale.reference_intelligence import (
+    normalize_reference_text,
+    reject_distinctive_reference_reuse,
+)
 from soloscale.resume_workspace import (
     ResumeWorkspaceStorageError,
     _atomic_private_write,
@@ -37,10 +53,69 @@ _SECRET = re.compile(
     r"(?:sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{12,}|AKIA[A-Z0-9]{12,}|"
     r"Bearer\s+[A-Za-z0-9._~+/=-]{12,})"
 )
+_CLAIM_ID = re.compile(r"CLAIM-[0-9]{2}")
+_OLLAMA_PROMPT_VERSION = "content-ollama-writer-v1"
+_OLLAMA_SYSTEM_PROMPT = """You are the SoloScale evidence-bound content writer.
+Return only JSON matching the supplied schema. Write one canonical story and derive a
+LinkedIn draft, X thread, standalone X post, blog draft, short-video script, and
+storyboard from that same story in the requested language.
+
+Truth rules:
+- Use only facts present in the supplied claim ledger. Never invent numbers, tools,
+  results, employers, customers, user feedback, or publication outcomes.
+- Every supplied claim must appear in the canonical story, LinkedIn, X thread, blog,
+  and video script with the exact marker
+  `STATUS · CLAIM-ID`, for example `VERIFIED · CLAIM-01`.
+- The standalone X post must use at least the first supplied claim marker and may not
+  introduce an unknown claim ID.
+- Preserve each claim's VERIFIED, OBSERVED, HYPOTHESIS, or PLANNED classification.
+- Preserve stated limits and evidence gaps. Do not turn them into positive claims.
+- A supplied ContentPattern is expression guidance only. Use it for high-level structure,
+  pacing, tone, and presentation. Facts must still come only from the claim ledger.
+- Never reuse distinctive phrases, examples, or unique creative expression from a
+  reference. The raw reference is deliberately not included in this request.
+- Use the supplied CTA verbatim. Do not include private paths, credentials, or new URLs.
+- Number each X post exactly `N/TOTAL ` and keep every complete post at 280 characters
+  or fewer.
+- Storyboard claim_ids may contain only supplied claim IDs. Include every claim ID in
+  at least one scene; a final CTA scene may have no claim_ids.
+- Human review is still required. Do not claim that anything was published.
+"""
+
+
+class _OllamaStoryboardScene(BaseModel):
+    """Ollama-compatible transport schema; strict limits are enforced afterwards."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    start_second: int
+    end_second: int
+    purpose: str
+    visual: str
+    voiceover: str
+    on_screen_text: str
+    claim_ids: list[str]
+
+
+class _OllamaContentDrafts(BaseModel):
+    """Avoid JSON-Schema constraints unsupported by Ollama's grammar parser."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    canonical_story: str
+    linkedin: str
+    x_thread: list[str]
+    x_post: str
+    blog: str
+    video_script: str
+    storyboard: list[_OllamaStoryboardScene]
 _DOWNLOADS = {
+    "canonical-story.md": "15_canonical_story.md",
     "linkedin.md": "02_linkedin.md",
     "x-thread.md": "03_x_thread.md",
     "x-post.md": "03_x_post.md",
+    "blog.md": "16_blog.md",
     "video-script.md": "04_video_script.md",
     "storyboard.json": "05_storyboard.json",
     "creator-video.mp4": "10_creator_video.mp4",
@@ -49,6 +124,24 @@ _DOWNLOADS = {
     "provenance.json": "07_provenance.json",
     "editorial-provenance.json": "12_editorial_provenance.json",
     "evidence-context.json": "14_evidence_context.json",
+    "reference-pattern.json": "18_content_pattern.json",
+}
+
+_REVIEW_ARTIFACTS = {
+    "canonical_story": "canonical-story.md",
+    "linkedin": "linkedin.md",
+    "x_thread": "x-thread.md",
+    "x_post": "x-post.md",
+    "blog": "blog.md",
+    "video_script": "video-script.md",
+}
+_DOWNLOAD_REVIEW_KEYS = {
+    "canonical-story.md": "canonical_story",
+    "linkedin.md": "linkedin",
+    "x-thread.md": "x_thread",
+    "x-post.md": "x_post",
+    "blog.md": "blog",
+    "video-script.md": "video_script",
 }
 
 
@@ -115,8 +208,41 @@ def _validate_public_fields(brief: ContentBrief) -> None:
         values[f"{claim.id}.limits"] = claim.limits or ""
     for index, gap in enumerate(brief.evidence_gaps):
         values[f"evidence gap {index + 1}"] = gap
+    if brief.reference_asset is not None:
+        values["reference metadata"] = _canonical_json(
+            brief.reference_asset.model_dump(mode="json")
+        )
+    if brief.content_pattern is not None:
+        values["reference pattern"] = _canonical_json(
+            brief.content_pattern.model_dump(mode="json")
+        )
     for field, value in values.items():
         _reject_private_output(value, field=field)
+
+
+def _validate_reference_source(
+    brief: ContentBrief,
+    reference_source_text: str | None,
+) -> str | None:
+    if brief.reference_asset is None or brief.content_pattern is None:
+        if reference_source_text is not None:
+            raise ContentWorkspaceError(
+                "Reference source text requires a ReferenceAsset and ContentPattern"
+            )
+        return None
+    if reference_source_text is None:
+        raise ContentWorkspaceError(
+            "Reference source text is required for a new reference-guided run"
+        )
+    try:
+        normalized = normalize_reference_text(reference_source_text)
+    except ValueError as exc:
+        raise ContentWorkspaceError(str(exc)) from exc
+    _reject_private_output(normalized, field="reference source")
+    reference_sha256 = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    if reference_sha256 != brief.reference_asset.raw_sha256:
+        raise ContentWorkspaceError("Reference source does not match its metadata")
+    return normalized
 
 
 def _status_heading(status: ClaimStatus, language: str) -> str:
@@ -136,8 +262,8 @@ def _status_heading(status: ClaimStatus, language: str) -> str:
 
 
 def _claim_line(claim: ContentClaim, language: str) -> str:
-    label = _status_heading(claim.status, language)
-    return f"- [{label} · {claim.id}] {claim.text}"
+    del language
+    return f"- [{claim.status.value} · {claim.id}] {claim.text}"
 
 
 def _render_linkedin(brief: ContentBrief) -> str:
@@ -146,8 +272,7 @@ def _render_linkedin(brief: ContentBrief) -> str:
         status: [claim for claim in brief.claims[1:] if claim.status is status]
         for status in ClaimStatus
     }
-    first_label = _status_heading(first_claim.status, brief.language)
-    opening = f"{first_claim.text}\n[{first_label} · {first_claim.id}]"
+    opening = f"{first_claim.text}\n[{first_claim.status.value} · {first_claim.id}]"
     if brief.language == "中文":
         sections = [opening, "", f"我正在记录：{brief.topic}", ""]
         section_titles = {
@@ -193,11 +318,9 @@ def _render_linkedin(brief: ContentBrief) -> str:
 
 def _render_x_thread(brief: ContentBrief) -> list[str]:
     first_claim = brief.claims[0]
-    first_label = _status_heading(first_claim.status, brief.language)
-    posts = [f"{first_claim.text}\n[{first_label} · {first_claim.id}]"]
+    posts = [f"{first_claim.text}\n[{first_claim.status.value} · {first_claim.id}]"]
     for claim in brief.claims[1:]:
-        label = _status_heading(claim.status, brief.language)
-        post = f"[{label} · {claim.id}] {claim.text}"
+        post = f"[{claim.status.value} · {claim.id}] {claim.text}"
         if claim.limits:
             post += (
                 f"\nLimit: {claim.limits}"
@@ -218,33 +341,162 @@ def _render_x_thread(brief: ContentBrief) -> list[str]:
     return [f"{index}/{len(posts)} {post}" for index, post in enumerate(posts, start=1)]
 
 
+def _render_x_post(brief: ContentBrief) -> str:
+    claim = brief.claims[0]
+    body = f"{claim.text}\n[{claim.status.value} · {claim.id}]"
+    with_cta = f"{body}\n\n{brief.call_to_action}"
+    return (with_cta if len(with_cta) <= 280 else body).strip() + "\n"
+
+
+def _render_canonical_story(brief: ContentBrief) -> str:
+    if brief.language == "中文":
+        headings = (
+            "我想做什么",
+            "发生了什么",
+            "哪里发生了变化 / 仍有边界",
+            "我学到了什么",
+            "其他构建者可能用得上的地方",
+            "下一步",
+        )
+        lesson = "可复用的约束是：事实保留证据锚点，假设与计划保持原标签。"
+    else:
+        headings = (
+            "What I was trying to do",
+            "What happened",
+            "What changed or remains bounded",
+            "What I learned",
+            "What another builder may find useful",
+            "What I will do next",
+        )
+        lesson = (
+            "The reusable constraint is simple: keep facts attached to evidence, and "
+            "keep hypotheses and plans labeled as such."
+        )
+    boundaries = [
+        f"- [{claim.id}] {claim.limits}" for claim in brief.claims if claim.limits
+    ]
+    boundaries.extend(f"- {gap}" for gap in brief.evidence_gaps)
+    if not boundaries:
+        boundaries.append("- No external outcome is claimed by this private artifact.")
+    planned = [
+        _claim_line(claim, brief.language)
+        for claim in brief.claims
+        if claim.status is ClaimStatus.PLANNED
+    ]
+    if not planned:
+        planned = [f"- {brief.call_to_action}"]
+    lines = [
+        f"# {brief.topic}",
+        "",
+        f"## {headings[0]}",
+        brief.topic,
+        "",
+        f"## {headings[1]}",
+        *[_claim_line(claim, brief.language) for claim in brief.claims],
+        "",
+        f"## {headings[2]}",
+        *boundaries,
+        "",
+        f"## {headings[3]}",
+        lesson,
+        "",
+        f"## {headings[4]}",
+        f"Evidence source: {brief.source_label}",
+        "",
+        f"## {headings[5]}",
+        *planned,
+        "",
+        brief.call_to_action,
+    ]
+    return "\n".join(lines).strip() + "\n"
+
+
+def _render_blog(brief: ContentBrief, canonical_story: str) -> str:
+    intro = (
+        "This is a working note from one evidence-bounded owner workflow. It reports "
+        "what the current receipts support and keeps the remaining limits visible."
+        if brief.language == "English"
+        else (
+            "这是一份来自真实 owner workflow 的证据边界记录："
+            "只写当前回执能支持的事实，并保留仍未证明的边界。"
+        )
+    )
+    takeaway = (
+        "## Practical takeaway\n\nUse one evidence package to create multiple "
+        "adaptations, then review the exact text before publication."
+        if brief.language == "English"
+        else "## 可执行结论\n\n用同一个 Evidence Package 生成不同渠道适配，并在发布前审核最终文本。"
+    )
+    return f"{canonical_story.strip()}\n\n{intro}\n\n{takeaway}\n\n{brief.call_to_action}\n"
+
+
 def _render_storyboard(brief: ContentBrief) -> list[StoryboardScene]:
     scenes: list[StoryboardScene] = []
+    pattern = brief.content_pattern
+    target_duration = pattern.video.estimated_duration_seconds if pattern else 100
+    seconds = max(6, min(20, target_duration // (len(brief.claims) + 2)))
+    reference_visuals = (
+        ", ".join(pattern.video.visual_elements) if pattern else ""
+    )
     for index, claim in enumerate(brief.claims, start=1):
-        start = (index - 1) * 6
+        start = (index - 1) * seconds
         limit = f" · Limit: {claim.limits}" if claim.limits else ""
+        if pattern is not None:
+            progression = pattern.structure.progression[
+                min(index - 1, len(pattern.structure.progression) - 1)
+            ]
+            purpose = (
+                f"{pattern.structure.hook} · {progression}"
+                if index == 1
+                else f"{progression} · {_status_heading(claim.status, 'English')}"
+            )
+            visual = (
+                f"Reference-guided {pattern.video.shot_cadence} pacing"
+                + (f" with {reference_visuals}" if reference_visuals else "")
+                + "; use only operator-owned evidence visuals"
+            )
+        else:
+            purpose = "Hook" if index == 1 else _status_heading(claim.status, "English")
+            visual = (
+                "HookCard with SourceBadge"
+                if index == 1
+                else "Evidence card with source badge and restrained motion"
+            )
         scenes.append(
             StoryboardScene(
                 id=f"SCENE-{index:02d}",
                 start_second=start,
-                end_second=start + 6,
-                purpose=("Hook" if index == 1 else _status_heading(claim.status, "English")),
-                visual=(
-                    "HookCard with SourceBadge"
-                    if index == 1
-                    else "Evidence card with source badge and restrained motion"
-                ),
+                end_second=start + seconds,
+                purpose=purpose,
+                visual=visual,
                 voiceover=claim.text,
                 on_screen_text=f"{claim.status.value} · {claim.id}{limit}",
                 claim_ids=[claim.id],
             )
         )
-    start = len(scenes) * 6
+    start = len(scenes) * seconds
     scenes.append(
         StoryboardScene(
             id=f"SCENE-{len(scenes) + 1:02d}",
             start_second=start,
-            end_second=start + 6,
+            end_second=start + seconds,
+            purpose="Evidence boundary",
+            visual="Show the real SoloScale project screen or receipt metadata; hide private paths",
+            voiceover=(
+                "These receipts support the process and artifact, not an external business outcome."
+                if brief.language == "English"
+                else "这些回执只支持过程和产物，不代表已经获得外部业务结果。"
+            ),
+            on_screen_text="Evidence-backed · external outcome not claimed",
+            claim_ids=[],
+        )
+    )
+    start += seconds
+    scenes.append(
+        StoryboardScene(
+            id=f"SCENE-{len(scenes) + 1:02d}",
+            start_second=start,
+            end_second=start + seconds,
             purpose="CTA",
             visual="CTA card; no unsupported metric",
             voiceover=brief.call_to_action,
@@ -257,6 +509,22 @@ def _render_storyboard(brief: ContentBrief) -> list[StoryboardScene]:
 
 def _render_video_script(brief: ContentBrief, scenes: list[StoryboardScene]) -> str:
     lines = [f"# {brief.topic}", "", f"Audience: {brief.audience}", ""]
+    if brief.content_pattern is not None:
+        pattern = brief.content_pattern
+        lines.extend(
+            [
+                (
+                    "Reference pattern applied: "
+                    f"{pattern.structure.hook}; {pattern.video.shot_cadence} pacing; "
+                    f"{pattern.language.tone}."
+                ),
+                (
+                    "Facts source: operator claim ledger only; reference facts and "
+                    "distinctive expression are excluded."
+                ),
+                "",
+            ]
+        )
     for scene in scenes:
         lines.extend(
             [
@@ -274,13 +542,398 @@ def _render_video_script(brief: ContentBrief, scenes: list[StoryboardScene]) -> 
 
 def build_content_drafts(brief: ContentBrief) -> ContentDrafts:
     _validate_public_fields(brief)
+    canonical_story = _render_canonical_story(brief)
     storyboard = _render_storyboard(brief)
-    return ContentDrafts(
+    drafts = ContentDrafts(
+        canonical_story=canonical_story,
         linkedin=_render_linkedin(brief),
         x_thread=_render_x_thread(brief),
+        x_post=_render_x_post(brief),
+        blog=_render_blog(brief, canonical_story),
         video_script=_render_video_script(brief, storyboard),
         storyboard=storyboard,
     )
+    _validate_generated_drafts(brief, drafts)
+    return drafts
+
+
+def _ground_ollama_drafts(
+    brief: ContentBrief, transport: _OllamaContentDrafts
+) -> ContentDrafts:
+    """Apply deterministic truth anchors to model prose without adding new claims."""
+
+    allowed_ids = {claim.id for claim in brief.claims}
+    raw_text = [
+        transport.canonical_story,
+        transport.linkedin,
+        *transport.x_thread,
+        transport.x_post,
+        transport.blog,
+        transport.video_script,
+    ]
+    for scene in transport.storyboard:
+        raw_text.extend(
+            [scene.purpose, scene.visual, scene.voiceover, scene.on_screen_text]
+        )
+        if set(scene.claim_ids) - allowed_ids:
+            raise ContentWorkspaceError("Local Ollama returned an unknown claim ID")
+    joined_raw = "\n".join(raw_text)
+    _reject_private_output(joined_raw, field="Local Ollama draft")
+    if set(_CLAIM_ID.findall(joined_raw)) - allowed_ids:
+        raise ContentWorkspaceError("Local Ollama returned an unknown claim ID")
+
+    required_lines = [
+        f"{claim.status.value} · {claim.id} — {claim.text}" for claim in brief.claims
+    ]
+
+    def anchored_channel(value: str) -> str:
+        result = value.strip()
+        for claim, line in zip(brief.claims, required_lines, strict=True):
+            marker = f"{claim.status.value} · {claim.id}"
+            if marker not in result:
+                result = f"{result}\n\n{line}".strip()
+        if brief.call_to_action not in result:
+            result = f"{result}\n\n{brief.call_to_action}".strip()
+        return result
+
+    def anchored_x_post(value: str) -> str:
+        result = value.strip()
+        first = brief.claims[0]
+        marker = f"{first.status.value} · {first.id}"
+        if not result or marker not in result or len(result) > 280:
+            return _render_x_post(brief).strip()
+        if set(_CLAIM_ID.findall(result)) - allowed_ids:
+            raise ContentWorkspaceError("Local Ollama returned an unknown claim ID")
+        return result
+
+    x_bodies: list[str] = []
+    for post in transport.x_thread:
+        body = re.sub(
+            r"^\s*(?:N|[0-9]+)/(?:TOTAL|[0-9]+)\s+",
+            "",
+            post.strip(),
+            flags=re.I,
+        )
+        if body and body not in x_bodies:
+            x_bodies.append(body)
+    joined_x = "\n".join(x_bodies)
+    for claim, line in zip(brief.claims, required_lines, strict=True):
+        marker = f"{claim.status.value} · {claim.id}"
+        if marker not in joined_x:
+            x_bodies.append(line)
+    if brief.call_to_action not in "\n".join(x_bodies):
+        x_bodies.append(brief.call_to_action)
+    if len(x_bodies) > 12:
+        raise ContentWorkspaceError("Local Ollama returned too many X posts")
+    total = len(x_bodies)
+    x_thread = [
+        f"{index}/{total} {body}" for index, body in enumerate(x_bodies, start=1)
+    ]
+
+    scenes = list(transport.storyboard)
+    for claim, line in zip(brief.claims, required_lines, strict=True):
+        anchored = next(
+            (scene for scene in scenes if claim.id in scene.claim_ids), None
+        )
+        if anchored is None:
+            scenes.append(
+                _OllamaStoryboardScene(
+                    id="",
+                    start_second=0,
+                    end_second=1,
+                    purpose="Evidence anchor",
+                    visual="Evidence card",
+                    voiceover=claim.text,
+                    on_screen_text=line,
+                    claim_ids=[claim.id],
+                )
+            )
+        else:
+            scene_text = "\n".join(
+                [
+                    anchored.purpose,
+                    anchored.visual,
+                    anchored.voiceover,
+                    anchored.on_screen_text,
+                ]
+            )
+            marker = f"{claim.status.value} · {claim.id}"
+            if marker not in scene_text:
+                anchored.on_screen_text = line
+    storyboard_text = "\n".join(
+        value
+        for scene in scenes
+        for value in (
+            scene.purpose,
+            scene.visual,
+            scene.voiceover,
+            scene.on_screen_text,
+        )
+    )
+    if brief.call_to_action not in storyboard_text:
+        scenes.append(
+            _OllamaStoryboardScene(
+                id="",
+                start_second=0,
+                end_second=1,
+                purpose="CTA",
+                visual="CTA card",
+                voiceover=brief.call_to_action,
+                on_screen_text=brief.call_to_action,
+                claim_ids=[],
+            )
+        )
+    if len(scenes) > 12:
+        raise ContentWorkspaceError("Local Ollama returned too many storyboard scenes")
+    normalized_scenes = [
+        scene.model_copy(
+            update={
+                "id": f"SCENE-{index:02d}",
+                "start_second": (index - 1) * 6,
+                "end_second": index * 6,
+            }
+        ).model_dump(mode="json")
+        for index, scene in enumerate(scenes, start=1)
+    ]
+
+    try:
+        return ContentDrafts.model_validate(
+            {
+                "canonical_story": anchored_channel(transport.canonical_story),
+                "linkedin": anchored_channel(transport.linkedin),
+                "x_thread": x_thread,
+                "x_post": anchored_x_post(transport.x_post),
+                "blog": anchored_channel(transport.blog),
+                "video_script": anchored_channel(transport.video_script),
+                "storyboard": normalized_scenes,
+            }
+        )
+    except ValidationError as exc:
+        raise ContentWorkspaceError(
+            "Local Ollama returned a draft outside the required content schema."
+        ) from exc
+
+
+def generate_content_drafts_with_gateway(
+    brief: ContentBrief,
+    *,
+    gateway: ModelGateway,
+) -> ContentDrafts:
+    """Generate one schema-constrained draft set through an explicit provider."""
+
+    _validate_public_fields(brief)
+    descriptor = gateway.descriptor
+    if descriptor.configuration_state is not GatewayConfigurationState.CONFIGURED:
+        raise ModelGatewayNotConfigured(
+            f"{descriptor.display_name} is not configured in this build"
+        )
+    prompt = _canonical_json(
+        {
+            "brief": brief.model_dump(mode="json", exclude={"reference_asset"}),
+            "required_claim_markers": [
+                f"{claim.status.value} · {claim.id}" for claim in brief.claims
+            ],
+            "required_cta": brief.call_to_action,
+            "reference_policy": {
+                "facts_source": "operator_claim_ledger_only",
+                "allowed_use": ["high-level structure", "pacing", "tone", "visual pattern"],
+                "forbidden_use": [
+                    "reference facts",
+                    "distinctive phrases",
+                    "reference examples",
+                    "unique creative expression",
+                ],
+                "raw_reference_included": False,
+            },
+        }
+    )
+    try:
+        transport_drafts = gateway.complete(
+            _OllamaContentDrafts,
+            system=_OLLAMA_SYSTEM_PROMPT,
+            user=prompt,
+        )
+    except ModelGatewayTransportError as exc:
+        if descriptor.provider is ModelProviderId.OLLAMA:
+            raise ContentWorkspaceError(
+                f"Cannot reach local Ollama or model '{descriptor.model}'. "
+                "Start Ollama and make sure the model is installed."
+            ) from exc
+        raise ContentWorkspaceError("The selected AI provider could not be reached") from exc
+    except ModelGatewayInvalidResponse as exc:
+        if descriptor.provider is ModelProviderId.OLLAMA:
+            raise ContentWorkspaceError(
+                "Local Ollama returned a draft outside the required content schema."
+            ) from exc
+        raise ContentWorkspaceError(
+            "The selected AI provider returned invalid structured output"
+        ) from exc
+    drafts = _ground_ollama_drafts(brief, transport_drafts)
+    _validate_generated_drafts(brief, drafts)
+    return drafts
+
+
+def generate_content_drafts_with_ollama(
+    brief: ContentBrief,
+    *,
+    endpoint: str = "http://127.0.0.1:11434",
+    model: str = "qwen3:8b",
+    reasoner: Reasoner | None = None,
+) -> ContentDrafts:
+    """Compatibility seam for the optional loopback-only Ollama adapter."""
+
+    try:
+        gateway = OllamaModelGateway(
+            endpoint=endpoint,
+            model=model,
+            reasoner=reasoner,
+        )
+    except ValueError as exc:
+        raise ContentWorkspaceError(str(exc)) from exc
+    return generate_content_drafts_with_gateway(brief, gateway=gateway)
+
+
+def run_content_workspace_with_gateway(
+    *,
+    data_root: Path,
+    brief: ContentBrief,
+    gateway: ModelGateway,
+    evidence_hub: EvidenceHub | None = None,
+    reference_source_text: str | None = None,
+) -> ContentRun:
+    """Generate through one selected provider, then persist truthful provenance."""
+
+    normalized_reference = _validate_reference_source(
+        brief, reference_source_text
+    )
+    drafts = generate_content_drafts_with_gateway(brief, gateway=gateway)
+    descriptor = gateway.descriptor
+    provider_kinds = {
+        ModelProviderId.SOLOSCALE_HOSTED: ProviderKind.SOLOSCALE_HOSTED,
+        ModelProviderId.OLLAMA: ProviderKind.OLLAMA,
+        ModelProviderId.OPENAI_COMPATIBLE: ProviderKind.OPENAI_COMPATIBLE,
+    }
+    prompt_versions = {
+        ModelProviderId.SOLOSCALE_HOSTED: "content-hosted-writer-v1",
+        ModelProviderId.OLLAMA: _OLLAMA_PROMPT_VERSION,
+        ModelProviderId.OPENAI_COMPATIBLE: "content-openai-compatible-writer-v1",
+    }
+    return run_content_workspace(
+        data_root=data_root,
+        brief=brief,
+        evidence_hub=evidence_hub,
+        drafts=drafts,
+        provider=ProviderIdentity(
+            kind=provider_kinds[descriptor.provider],
+            provider=descriptor.provider.value,
+            model=descriptor.model,
+            base_url=descriptor.base_url,
+        ),
+        prompt_version=prompt_versions[descriptor.provider],
+        network_used=True,
+        reference_source_text=normalized_reference,
+    )
+
+
+def run_content_workspace_with_ollama(
+    *,
+    data_root: Path,
+    brief: ContentBrief,
+    model: str = "qwen3:8b",
+    endpoint: str = "http://127.0.0.1:11434",
+    reasoner: Reasoner | None = None,
+    evidence_hub: EvidenceHub | None = None,
+    reference_source_text: str | None = None,
+) -> ContentRun:
+    """Compatibility seam for existing local Ollama callers and receipts."""
+
+    try:
+        gateway = OllamaModelGateway(
+            endpoint=endpoint,
+            model=model,
+            reasoner=reasoner,
+        )
+    except ValueError as exc:
+        raise ContentWorkspaceError(str(exc)) from exc
+    return run_content_workspace_with_gateway(
+        data_root=data_root,
+        brief=brief,
+        gateway=gateway,
+        evidence_hub=evidence_hub,
+        reference_source_text=reference_source_text,
+    )
+
+
+def _validate_generated_drafts(brief: ContentBrief, drafts: ContentDrafts) -> None:
+    allowed_ids = {claim.id for claim in brief.claims}
+    text_artifacts = {
+        "canonical story": drafts.canonical_story,
+        "LinkedIn draft": drafts.linkedin,
+        "X thread": "\n\n".join(drafts.x_thread),
+        "blog draft": drafts.blog,
+        "video script": drafts.video_script,
+    }
+    for field, value in text_artifacts.items():
+        _reject_private_output(value, field=field)
+        referenced = set(_CLAIM_ID.findall(value))
+        if referenced != allowed_ids:
+            raise ContentWorkspaceError(
+                f"{field} must retain every supplied claim ID and no unknown claim IDs"
+            )
+        for claim in brief.claims:
+            marker = f"{claim.status.value} · {claim.id}"
+            if marker not in value:
+                raise ContentWorkspaceError(
+                    f"{field} must retain the truth marker for {claim.id}"
+                )
+        if brief.call_to_action not in value:
+            raise ContentWorkspaceError(f"{field} must preserve the supplied CTA")
+
+    _reject_private_output(drafts.x_post, field="standalone X post")
+    x_post_ids = set(_CLAIM_ID.findall(drafts.x_post))
+    if x_post_ids - allowed_ids:
+        raise ContentWorkspaceError("Standalone X post contains an unknown claim ID")
+    first_claim = brief.claims[0]
+    first_marker = f"{first_claim.status.value} · {first_claim.id}"
+    if first_marker not in drafts.x_post:
+        raise ContentWorkspaceError(
+            "Standalone X post must retain the first supplied truth marker"
+        )
+
+    total = len(drafts.x_thread)
+    for index, post in enumerate(drafts.x_thread, start=1):
+        if not post.startswith(f"{index}/{total} "):
+            raise ContentWorkspaceError("X thread numbering must be consecutive and exact")
+
+    scene_ids = [scene.id for scene in drafts.storyboard]
+    if len(scene_ids) != len(set(scene_ids)):
+        raise ContentWorkspaceError("Storyboard scene IDs must be unique")
+    storyboard_claim_ids: set[str] = set()
+    previous_end = 0
+    storyboard_text: list[str] = []
+    for scene in drafts.storyboard:
+        if scene.start_second < previous_end:
+            raise ContentWorkspaceError("Storyboard scenes must be ordered and non-overlapping")
+        previous_end = scene.end_second
+        unknown = set(scene.claim_ids) - allowed_ids
+        if unknown:
+            raise ContentWorkspaceError("Storyboard contains an unknown claim ID")
+        storyboard_claim_ids.update(scene.claim_ids)
+        storyboard_text.extend(
+            [scene.purpose, scene.visual, scene.voiceover, scene.on_screen_text]
+        )
+    if storyboard_claim_ids != allowed_ids:
+        raise ContentWorkspaceError("Storyboard must anchor every supplied claim ID")
+    joined_storyboard = "\n".join(storyboard_text)
+    _reject_private_output(joined_storyboard, field="storyboard")
+    for claim in brief.claims:
+        marker = f"{claim.status.value} · {claim.id}"
+        if marker not in joined_storyboard:
+            raise ContentWorkspaceError(
+                f"Storyboard must retain the truth marker for {claim.id}"
+            )
+    if brief.call_to_action not in joined_storyboard:
+        raise ContentWorkspaceError("Storyboard must preserve the supplied CTA")
 
 
 def _canonical_json(value: object) -> str:
@@ -309,9 +962,39 @@ def _new_run_dir(data_root: Path) -> tuple[str, Path]:
 
 
 def run_content_workspace(
-    *, data_root: Path, brief: ContentBrief, evidence_hub: EvidenceHub | None = None
+    *,
+    data_root: Path,
+    brief: ContentBrief,
+    evidence_hub: EvidenceHub | None = None,
+    drafts: ContentDrafts | None = None,
+    provider: ProviderIdentity | None = None,
+    prompt_version: str | None = None,
+    network_used: bool = False,
+    reference_source_text: str | None = None,
 ) -> ContentRun:
-    """Build a deterministic, private content candidate without publishing it."""
+    """Build one private content candidate without publishing it."""
+
+    normalized_reference = _validate_reference_source(brief, reference_source_text)
+    reference_context: dict[str, object] = {
+        "status": "NOT_REQUESTED",
+        "reference_id": None,
+        "pattern_id": None,
+        "raw_sha256": None,
+        "raw_reference_in_public_outputs": False,
+        "facts_source": "operator_claim_ledger_only",
+    }
+    if brief.reference_asset is not None and brief.content_pattern is not None:
+        if normalized_reference is None:
+            raise ContentWorkspaceError("Reference source text is unavailable")
+        reference_context = {
+            "status": "PATTERN_DISTILLED_LOCALLY",
+            "reference_id": brief.reference_asset.reference_id,
+            "pattern_id": brief.content_pattern.pattern_id,
+            "raw_sha256": brief.reference_asset.raw_sha256,
+            "raw_reference_in_public_outputs": False,
+            "facts_source": brief.content_pattern.facts_source,
+            "distinctive_expression_reuse_allowed": False,
+        }
 
     evidence_context: dict[str, object] = {
         "status": "NOT_REQUESTED",
@@ -360,7 +1043,53 @@ def run_content_workspace(
             ],
         }
         evidence_hub = selected_hub
-    drafts = build_content_drafts(brief)
+    if drafts is None:
+        if provider is not None or prompt_version is not None or network_used:
+            raise ContentWorkspaceError(
+                "Custom provider metadata requires generated content drafts"
+            )
+        drafts = build_content_drafts(brief)
+        selected_provider = ProviderIdentity(
+            kind=ProviderKind.TEMPLATE,
+            provider="soloscale",
+            model="deterministic-content-template-v1",
+        )
+        selected_prompt_version = "content-template-v1"
+        model_used = False
+    else:
+        if provider is None or provider.kind is ProviderKind.TEMPLATE:
+            raise ContentWorkspaceError(
+                "Generated content drafts require a non-template provider identity"
+            )
+        _validate_generated_drafts(brief, drafts)
+        selected_provider = provider
+        selected_prompt_version = prompt_version or _OLLAMA_PROMPT_VERSION
+        model_used = True
+    if normalized_reference is not None:
+        generated_values = [
+            drafts.canonical_story,
+            drafts.linkedin,
+            *drafts.x_thread,
+            drafts.x_post,
+            drafts.blog,
+            drafts.video_script,
+            *[
+                value
+                for scene in drafts.storyboard
+                for value in (
+                    scene.purpose,
+                    scene.visual,
+                    scene.voiceover,
+                    scene.on_screen_text,
+                )
+            ],
+        ]
+        try:
+            reject_distinctive_reference_reuse(
+                normalized_reference, generated_values
+            )
+        except ValueError as exc:
+            raise ContentWorkspaceError(str(exc)) from exc
     try:
         run_id, run_dir = _new_run_dir(data_root.absolute())
     except ResumeWorkspaceStorageError as exc:
@@ -379,42 +1108,49 @@ def run_content_workspace(
         "08_verification.json",
         "12_editorial_provenance.json",
         "14_evidence_context.json",
+        "15_canonical_story.md",
+        "16_blog.md",
         "run.json",
     ]
+    if normalized_reference is not None:
+        artifact_paths[-1:-1] = [
+            "17_reference_asset.json",
+            "18_content_pattern.json",
+            "19_reference_source.txt",
+        ]
     brief_payload = brief.model_dump(mode="json")
     drafts_payload = drafts.model_dump(mode="json")
     output_artifacts = {
+        "15_canonical_story.md": drafts.canonical_story,
         "02_linkedin.md": drafts.linkedin,
         "03_x_thread.md": "\n\n".join(drafts.x_thread) + "\n",
-        "03_x_post.md": drafts.x_thread[0].strip() + "\n",
+        "03_x_post.md": drafts.x_post,
+        "16_blog.md": drafts.blog,
         "04_video_script.md": drafts.video_script,
         "05_storyboard.json": _canonical_json({"scenes": drafts_payload["storyboard"]}),
     }
     editorial_provenance = make_provenance(
         role=EditorialRole.WRITER,
-        provider=ProviderIdentity(
-            kind=ProviderKind.TEMPLATE,
-            provider="soloscale",
-            model="deterministic-content-template-v1",
-        ),
-        reasoning="deterministic",
-        prompt_version="content-template-v1",
+        provider=selected_provider,
+        reasoning="deterministic" if not model_used else "schema_constrained",
+        prompt_version=selected_prompt_version,
         input_artifacts={
             "00_input.json": _canonical_json(brief_payload),
             "14_evidence_context.json": _canonical_json(evidence_context),
         },
         output_artifacts=output_artifacts,
-        network_used=False,
+        network_used=network_used,
         token_usage=None,
         cost_usd=0,
     )
     publish_pack = {
         "status": "DRAFT_REQUIRES_HUMAN_APPROVAL",
         "topic": brief.topic,
-        "channels": ["LinkedIn", "X", "Short video"],
+        "channels": ["Canonical story", "LinkedIn", "X", "Blog", "Short video"],
         "drafts": drafts_payload,
         "publication_performed": False,
         "evidence_context": evidence_context,
+        "reference_context": reference_context,
         "next_gate": "Human fact-check and explicit per-channel publish approval",
     }
     provenance = {
@@ -422,6 +1158,7 @@ def run_content_workspace(
         "claim_ledger_sha256": _sha256(brief_payload["claims"]),
         "claims": brief_payload["claims"],
         "evidence_context": evidence_context,
+        "reference_context": reference_context,
         "boundary": (
             "Citation membership and operator classification are recorded; semantic support "
             "and public suitability still require human review."
@@ -439,14 +1176,22 @@ def run_content_workspace(
         ),
         "private_path_scan_passed": True,
         "credential_shape_scan_passed": True,
-        "network_used": False,
-        "model_used": False,
+        "network_used": network_used,
+        "model_used": model_used,
         "editorial_provenance_recorded": True,
         "evidence_bundle_used": brief.evidence_bundle_id is not None,
         "evidence_item_count": len(brief.evidence_item_ids),
         "evidence_gap_count": len(brief.evidence_gaps),
         "publication_performed": False,
     }
+    if normalized_reference is not None:
+        verification.update(
+            {
+                "reference_pattern_used": True,
+                "raw_reference_in_public_outputs": False,
+                "reference_originality_scan_passed": True,
+            }
+        )
     run = ContentRun(
         run_id=run_id,
         created_at=created_at,
@@ -454,19 +1199,41 @@ def run_content_workspace(
         drafts=drafts,
         artifact_paths=artifact_paths,
         editorial_provenance=[editorial_provenance],
+        network_used=network_used,
+        model_used=model_used,
         limitations=[
-            "Drafts are deterministic editorial candidates, not semantic fact-check results.",
+            (
+                "Drafts were generated by a local schema-constrained model and still require "
+                "human semantic fact-checking."
+                if model_used
+                else (
+                    "Drafts are deterministic editorial candidates, not semantic "
+                    "fact-check results."
+                )
+            ),
             "Receipts may still need public-safe URLs before posting.",
             "No account connection or publishing action was performed.",
             "Evidence gaps remain explicit and are not converted into factual claims.",
+            *(
+                [
+                    (
+                        "The reference supplied expression guidance only; its facts, "
+                        "examples, and distinctive wording were excluded."
+                    )
+                ]
+                if normalized_reference is not None
+                else []
+            ),
         ],
     )
     artifacts = {
         "00_input.json": _canonical_json(brief_payload),
         "01_claim_ledger.json": _canonical_json({"claims": brief_payload["claims"]}),
+        "15_canonical_story.md": drafts.canonical_story,
         "02_linkedin.md": drafts.linkedin,
         "03_x_thread.md": "\n\n".join(drafts.x_thread) + "\n",
-        "03_x_post.md": drafts.x_thread[0].strip() + "\n",
+        "03_x_post.md": drafts.x_post,
+        "16_blog.md": drafts.blog,
         "04_video_script.md": drafts.video_script,
         "05_storyboard.json": _canonical_json({"scenes": drafts_payload["storyboard"]}),
         "06_publish_pack.json": _canonical_json(publish_pack),
@@ -482,6 +1249,20 @@ def run_content_workspace(
         "14_evidence_context.json": _canonical_json(evidence_context),
         "run.json": _canonical_json(run.model_dump(mode="json")),
     }
+    if normalized_reference is not None:
+        if brief.reference_asset is None or brief.content_pattern is None:
+            raise ContentWorkspaceError("Reference metadata is unavailable")
+        artifacts.update(
+            {
+                "17_reference_asset.json": _canonical_json(
+                    brief.reference_asset.model_dump(mode="json")
+                ),
+                "18_content_pattern.json": _canonical_json(
+                    brief.content_pattern.model_dump(mode="json")
+                ),
+                "19_reference_source.txt": normalized_reference + "\n",
+            }
+        )
     try:
         for name in artifact_paths:
             _atomic_private_write(run_dir / name, artifacts[name])
@@ -524,9 +1305,204 @@ def load_content_run(data_root: Path, run_id: str) -> ContentRun:
     if path.is_symlink() or not path.is_file():
         raise ContentWorkspaceError("Content run receipt is unavailable")
     try:
-        return ContentRun.model_validate_json(path.read_text(encoding="utf-8"))
+        run = ContentRun.model_validate_json(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValidationError) as exc:
         raise ContentWorkspaceError("Content run receipt is invalid") from exc
+    if not run.drafts.canonical_story or not run.drafts.x_post or not run.drafts.blog:
+        fallback = build_content_drafts(run.brief)
+        run = run.model_copy(
+            update={
+                "drafts": run.drafts.model_copy(
+                    update={
+                        "canonical_story": run.drafts.canonical_story
+                        or fallback.canonical_story,
+                        "x_post": run.drafts.x_post or fallback.x_post,
+                        "blog": run.drafts.blog or fallback.blog,
+                    }
+                )
+            }
+        )
+    return run
+
+
+def _draft_review_values(drafts: ContentDrafts) -> dict[str, str]:
+    return {
+        "canonical_story": drafts.canonical_story,
+        "linkedin": drafts.linkedin,
+        "x_thread": "\n\n".join(drafts.x_thread).strip() + "\n",
+        "x_post": drafts.x_post,
+        "blog": drafts.blog,
+        "video_script": drafts.video_script,
+    }
+
+
+def _latest_review_directory(run_dir: Path) -> Path | None:
+    reviews_root = run_dir / "reviews"
+    if reviews_root.is_symlink() or not reviews_root.is_dir():
+        return None
+    candidates = [
+        path
+        for path in reviews_root.iterdir()
+        if re.fullmatch(r"review-[0-9]{4}", path.name)
+        and path.is_dir()
+        and not path.is_symlink()
+    ]
+    return max(candidates, key=lambda path: path.name) if candidates else None
+
+
+def load_content_review(
+    data_root: Path, run_id: str
+) -> tuple[ContentReviewReceipt, dict[str, str]] | None:
+    """Load and hash-verify the latest immutable owner review revision."""
+
+    run_dir = content_run_directory(data_root, run_id)
+    review_dir = _latest_review_directory(run_dir)
+    if review_dir is None:
+        return None
+    receipt_path = review_dir / "review.json"
+    if receipt_path.is_symlink() or not receipt_path.is_file():
+        raise ContentWorkspaceError("Content review receipt is unavailable")
+    try:
+        receipt = ContentReviewReceipt.model_validate_json(
+            receipt_path.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, ValidationError) as exc:
+        raise ContentWorkspaceError("Content review receipt is invalid") from exc
+    if receipt.run_id != run_id:
+        raise ContentWorkspaceError("Content review receipt does not match this run")
+    values: dict[str, str] = {}
+    for key, filename in _REVIEW_ARTIFACTS.items():
+        path = review_dir / filename
+        if path.is_symlink() or not path.is_file():
+            raise ContentWorkspaceError("Content review artifact is unavailable")
+        try:
+            raw = path.read_bytes()
+            value = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ContentWorkspaceError("Content review artifact is invalid") from exc
+        expected = receipt.artifact_sha256.get(filename)
+        actual = hashlib.sha256(raw).hexdigest()
+        if expected != actual:
+            raise ContentWorkspaceError("Content review artifact hash does not match")
+        values[key] = _normalize_review_text(value)
+    return receipt, values
+
+
+def _review_x_thread(value: str) -> list[str]:
+    posts = [
+        post.strip()
+        for post in re.split(r"\n\s*\n(?=[0-9]+/[0-9]+\s)", value.strip())
+        if post.strip()
+    ]
+    if not posts:
+        raise ContentWorkspaceError("X thread review cannot be empty")
+    return posts
+
+
+def _normalize_review_text(value: str) -> str:
+    """Canonicalize browser and file newlines before review validation."""
+
+    return value.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+
+
+def save_content_review(
+    *,
+    data_root: Path,
+    run_id: str,
+    updates: dict[str, str] | None = None,
+    decision: ContentReviewDecision | str = ContentReviewDecision.DRAFT,
+    regenerate_target: str | None = None,
+) -> ContentReviewReceipt:
+    """Persist one non-overwriting owner edit/approval revision without publishing."""
+
+    run = load_content_run(data_root, run_id)
+    run_dir = content_run_directory(data_root, run_id)
+    if any((run_dir / f"12_buildlog_{channel}.json").exists() for channel in ("linkedin", "x")):
+        raise ContentWorkspaceError(
+            "This content is already staged in BuildLog; create a new content run to edit it"
+        )
+    unknown = set(updates or {}) - set(_REVIEW_ARTIFACTS)
+    if unknown:
+        raise ContentWorkspaceError("Content review contains an unknown adaptation")
+    previous = load_content_review(data_root, run_id)
+    values = (
+        dict(previous[1])
+        if previous is not None
+        else _draft_review_values(run.drafts)
+    )
+    for key, value in (updates or {}).items():
+        values[key] = _normalize_review_text(value)
+    if regenerate_target is not None:
+        if regenerate_target not in _REVIEW_ARTIFACTS:
+            raise ContentWorkspaceError("Select one known adaptation to regenerate")
+        regenerated = _draft_review_values(build_content_drafts(run.brief))
+        values[regenerate_target] = regenerated[regenerate_target]
+    values = {key: _normalize_review_text(value) for key, value in values.items()}
+    try:
+        reviewed_drafts = ContentDrafts(
+            canonical_story=values["canonical_story"],
+            linkedin=values["linkedin"],
+            x_thread=_review_x_thread(values["x_thread"]),
+            x_post=values["x_post"].strip(),
+            blog=values["blog"],
+            video_script=values["video_script"],
+            storyboard=run.drafts.storyboard,
+        )
+    except ValidationError as exc:
+        raise ContentWorkspaceError("Content review does not satisfy the output contract") from exc
+    _validate_generated_drafts(run.brief, reviewed_drafts)
+    values = _draft_review_values(reviewed_drafts)
+    selected_decision = ContentReviewDecision(decision)
+    previous_revision = previous[0].revision if previous is not None else 0
+    revision = previous_revision + 1
+    reviews_root = run_dir / "reviews"
+    review_dir = reviews_root / f"review-{revision:04d}"
+    try:
+        _ensure_private_directory(reviews_root)
+        if review_dir.exists() or review_dir.is_symlink():
+            raise ContentWorkspaceError("Content review revision already exists")
+        _ensure_private_directory(review_dir)
+        hashes = {
+            filename: hashlib.sha256(values[key].encode("utf-8")).hexdigest()
+            for key, filename in _REVIEW_ARTIFACTS.items()
+        }
+        receipt = ContentReviewReceipt(
+            run_id=run_id,
+            revision=revision,
+            decision=selected_decision,
+            created_at=datetime.now(UTC).isoformat(),
+            artifact_sha256=hashes,
+            reset_target=regenerate_target,
+        )
+        for key, filename in _REVIEW_ARTIFACTS.items():
+            _atomic_private_write(review_dir / filename, values[key])
+        _atomic_private_write(
+            review_dir / "review.json",
+            _canonical_json(receipt.model_dump(mode="json")),
+        )
+    except (OSError, ResumeWorkspaceStorageError) as exc:
+        raise ContentWorkspaceError("Private content review could not be saved") from exc
+    return receipt
+
+
+def approved_content_artifact(
+    data_root: Path, run_id: str, channel: str
+) -> tuple[str, Path, ContentReviewReceipt]:
+    """Return the exact owner-approved LinkedIn/X artifact for BuildLog staging."""
+
+    review = load_content_review(data_root, run_id)
+    if review is None or review[0].decision is not ContentReviewDecision.APPROVED:
+        raise ContentWorkspaceError("Approve the unified content review before BuildLog handoff")
+    key = {"linkedin": "linkedin", "x": "x_post"}.get(channel)
+    if key is None:
+        raise ContentWorkspaceError("Content publishing channel is invalid")
+    run_dir = content_run_directory(data_root, run_id)
+    review_dir = _latest_review_directory(run_dir)
+    if review_dir is None:
+        raise ContentWorkspaceError("Approved content review is unavailable")
+    path = review_dir / _REVIEW_ARTIFACTS[key]
+    relative = path.relative_to(run_dir).as_posix()
+    return relative, path, review[0]
 
 
 def content_download(data_root: Path, run_id: str, download_name: str) -> tuple[str, bytes]:
@@ -535,6 +1511,11 @@ def content_download(data_root: Path, run_id: str, download_name: str) -> tuple[
         raise ContentWorkspaceError("Content artifact is not downloadable")
     run_dir = content_run_directory(data_root, run_id)
     path = run_dir / artifact_name
+    review_key = _DOWNLOAD_REVIEW_KEYS.get(download_name)
+    if review_key is not None:
+        review_dir = _latest_review_directory(run_dir)
+        if review_dir is not None:
+            path = review_dir / _REVIEW_ARTIFACTS[review_key]
     try:
         metadata = path.lstat()
     except FileNotFoundError:
