@@ -700,7 +700,12 @@ class LocalVideoJobManager:
             record = load_local_video_job(data_root, job_id)
         except VideoStoryError:
             return None
-        total_ms = sum(record.stage_durations_ms.values())
+        try:
+            created_at = datetime.fromisoformat(record.created_at)
+            updated_at = datetime.fromisoformat(record.updated_at)
+            total_ms = max(0, int((updated_at - created_at).total_seconds() * 1000))
+        except ValueError:
+            total_ms = max(record.stage_durations_ms.values(), default=0)
         return LocalVideoJobSnapshot(
             job_id=record.job_id,
             story_id=record.story_id,

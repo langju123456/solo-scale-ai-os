@@ -173,6 +173,16 @@ def test_local_video_job_runs_in_background_and_persists_complete_package(
     finally:
         manager.shutdown()
 
+    persisted_reader = LocalVideoJobManager()
+    try:
+        persisted_latest = persisted_reader.latest(tmp_path)
+        assert persisted_latest is not None
+        assert persisted_latest.total_elapsed_ms <= sum(
+            persisted_latest.stage_durations_ms.values()
+        )
+    finally:
+        persisted_reader.shutdown()
+
 
 def test_video_page_exposes_background_progress_and_completed_downloads(tmp_path: Path) -> None:
     rendering = LocalVideoJobSnapshot(
