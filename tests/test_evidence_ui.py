@@ -4,6 +4,7 @@ import hashlib
 import io
 import subprocess
 from datetime import UTC, datetime
+from decimal import Decimal
 from email.message import Message
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from soloscale.knowledge_models import (
 )
 from soloscale.knowledge_store import KnowledgeStore
 from soloscale.local_ui import SoloScaleLocalUIHandler
+from soloscale.media_cost import load_budget_policy
 
 
 class _CapturingHandler(SoloScaleLocalUIHandler):
@@ -100,3 +102,22 @@ def test_evidence_refresh_post_redirects_and_renders_metadata_only(tmp_path: Pat
     assert "Sources" in body and "Evidence" in body and "codex_session" in body
     assert "private body" not in body
     assert "/private/thread.jsonl" not in body
+
+
+def test_heygen_budget_post_saves_policy_and_redirects(tmp_path: Path) -> None:
+    root = tmp_path / ".soloscale"
+    body = b"action=save_budget&daily_usd=1.25"
+    handler, response_headers, _ = _handler(
+        root,
+        tmp_path,
+        "/settings/media/heygen",
+        body,
+    )
+    handler.do_POST()
+
+    policy = load_budget_policy(root)
+    assert policy.daily_usd == Decimal("1.25")
+    assert response_headers["status"] == "303"
+    assert response_headers["Content-Length"] == "0"
+    assert response_headers["Location"].startswith("/settings/media/heygen?")
+    assert "provider=budget-saved" in response_headers["Location"]
