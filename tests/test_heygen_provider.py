@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,17 @@ from soloscale.heygen_provider import (
     generate_segment,
     preview_avatar_segment_request,
     save_avatar_submission_receipt,
+)
+from soloscale.media_cost import (
+    BillingUnit,
+    BudgetPolicy,
+    PaidOperationAuthorization,
+    PricingCatalog,
+    PricingRate,
+    PricingStatus,
+    authorize_paid_operation,
+    estimate_avatar_seconds,
+    evaluate_budget,
 )
 
 
@@ -43,6 +56,35 @@ def _audio(path: Path) -> Path:
     return path
 
 
+def _authorization(preview: object) -> PaidOperationAuthorization:
+    catalog = PricingCatalog(
+        entries=[
+            PricingRate(
+                provider="heygen",
+                service="avatar",
+                billing_unit=BillingUnit.SECOND,
+                usd_per_unit=Decimal("0.01"),
+                pricing_status=PricingStatus.ESTIMATED,
+                effective_date=date(2026, 8, 27),
+                source="synthetic-test-rate",
+            )
+        ]
+    )
+    estimate = estimate_avatar_seconds(
+        seconds=Decimal("6"),
+        catalog=catalog,
+    )
+    evaluation = evaluate_budget(
+        estimate=estimate,
+        policy=BudgetPolicy(per_paid_operation_usd=Decimal("1")),
+    )
+    return authorize_paid_operation(
+        estimate=estimate,
+        evaluation=evaluation,
+        subject=preview,
+    )
+
+
 def test_avatar_segment_requires_preview_and_submits_once(tmp_path: Path) -> None:
     audio = _audio(tmp_path / "voice.wav")
     preview = preview_avatar_segment_request(
@@ -51,6 +93,7 @@ def test_avatar_segment_requires_preview_and_submits_once(tmp_path: Path) -> Non
         locale="zh-CN",
         aspect_ratio=AvatarAspectRatio.LANDSCAPE,
         avatar_id="avatar_abc",
+        duration_seconds=6,
     )
     transport = _Transport()
 
@@ -58,6 +101,7 @@ def test_avatar_segment_requires_preview_and_submits_once(tmp_path: Path) -> Non
         request=preview,
         audio_path=audio,
         credential="synthetic-key",
+        authorization=_authorization(preview),
         transport=transport,
     )
 
@@ -76,6 +120,7 @@ def test_avatar_segment_fails_closed_when_audio_changes(tmp_path: Path) -> None:
         locale="en-US",
         aspect_ratio=AvatarAspectRatio.PORTRAIT,
         avatar_id="avatar_abc",
+        duration_seconds=6,
     )
     audio.write_bytes(audio.read_bytes() + b"changed")
     transport = _Transport()
@@ -85,6 +130,36 @@ def test_avatar_segment_fails_closed_when_audio_changes(tmp_path: Path) -> None:
             request=preview,
             audio_path=audio,
             credential="synthetic-key",
+            authorization=_authorization(preview),
+            transport=transport,
+        )
+
+    assert transport.uploads == []
+    assert transport.payloads == []
+
+
+def test_avatar_segment_rejects_authorization_for_another_request(
+    tmp_path: Path,
+) -> None:
+    audio = _audio(tmp_path / "voice.wav")
+    preview = preview_avatar_segment_request(
+        scene_id="scene-01",
+        audio_path=audio,
+        locale="en-US",
+        aspect_ratio=AvatarAspectRatio.PORTRAIT,
+        avatar_id="avatar_abc",
+        duration_seconds=6,
+    )
+    authorization = _authorization(preview)
+    changed = preview.model_copy(update={"scene_id": "scene-02"})
+    transport = _Transport()
+
+    with pytest.raises(HeyGenProviderError, match="budget authorization"):
+        generate_segment(
+            request=changed,
+            audio_path=audio,
+            credential="synthetic-key",
+            authorization=authorization,
             transport=transport,
         )
 
@@ -100,11 +175,13 @@ def test_avatar_receipt_persists_no_audio_path_or_credential(tmp_path: Path) -> 
         locale="zh-CN",
         aspect_ratio=AvatarAspectRatio.LANDSCAPE,
         avatar_id="avatar_abc",
+        duration_seconds=6,
     )
     receipt = generate_segment(
         request=preview,
         audio_path=audio,
         credential="synthetic-key",
+        authorization=_authorization(preview),
         transport=_Transport(),
     )
     path = save_avatar_submission_receipt(

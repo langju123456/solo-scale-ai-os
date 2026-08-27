@@ -16,6 +16,11 @@ from typing import Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from soloscale.media_cost import (
+    BudgetBlockedError,
+    PaidOperationAuthorization,
+    validate_paid_authorization,
+)
 from soloscale.resume_workspace import ResumeWorkspaceStorageError, _atomic_private_write
 
 _MAX_AUDIO_BYTES = 25 * 1024 * 1024
@@ -45,6 +50,7 @@ class AvatarSegmentRequest(BaseModel):
     avatar_style: str = Field(default="normal", pattern=r"^[A-Za-z0-9_-]{1,40}$")
     audio_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     audio_bytes: int = Field(gt=44, le=_MAX_AUDIO_BYTES)
+    duration_seconds: float = Field(gt=0, le=600)
 
 
 class AvatarSegmentSubmission(BaseModel):
@@ -183,6 +189,7 @@ def preview_avatar_segment_request(
     locale: str,
     aspect_ratio: AvatarAspectRatio,
     avatar_id: str,
+    duration_seconds: float,
 ) -> AvatarSegmentRequest:
     """Build the exact body-free preview shown before any paid provider call."""
 
@@ -194,6 +201,7 @@ def preview_avatar_segment_request(
         avatar_id=avatar_id,
         audio_sha256=hashlib.sha256(content).hexdigest(),
         audio_bytes=len(content),
+        duration_seconds=duration_seconds,
     )
 
 
@@ -202,10 +210,19 @@ def generate_segment(
     request: AvatarSegmentRequest,
     audio_path: Path,
     credential: str,
+    authorization: PaidOperationAuthorization,
     transport: HeyGenTransport | None = None,
 ) -> AvatarSegmentSubmission:
     """Submit one explicitly approved segment; never retries or polls implicitly."""
 
+    try:
+        validate_paid_authorization(
+            authorization=authorization,
+            operation="heygen.avatar_segment",
+            subject=request,
+        )
+    except BudgetBlockedError as exc:
+        raise HeyGenProviderError("HeyGen request has no valid budget authorization") from exc
     if not credential or credential != credential.strip():
         raise HeyGenProviderError("HeyGen is not configured")
     content, content_type = _audio_file(audio_path)
