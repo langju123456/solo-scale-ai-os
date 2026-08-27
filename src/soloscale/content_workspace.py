@@ -6,6 +6,7 @@ import re
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -19,6 +20,7 @@ from soloscale.content_models import (
     ContentReviewReceipt,
     ContentRun,
     StoryboardScene,
+    StoryLocaleVariant,
 )
 from soloscale.editorial_models import EditorialRole, ProviderIdentity, ProviderKind
 from soloscale.editorial_pipeline import make_provenance
@@ -59,6 +61,8 @@ _OLLAMA_SYSTEM_PROMPT = """You are the SoloScale evidence-bound content writer.
 Return only JSON matching the supplied schema. Write one canonical story and derive a
 LinkedIn draft, X thread, standalone X post, blog draft, 4–6 minute YouTube script,
 short-video script, and storyboard from that same story in the requested language.
+Create a native editorial adaptation for the requested locale. Do not translate another
+locale's finished copy literally, and do not mix Chinese and English narration in one variant.
 
 Truth rules:
 - Use only facts present in the supplied claim ledger. Never invent numbers, tools,
@@ -789,6 +793,12 @@ def generate_content_drafts_with_gateway(
     prompt = _canonical_json(
         {
             "brief": brief.model_dump(mode="json", exclude={"reference_asset"}),
+            "locale_policy": {
+                "locale": "zh-CN" if brief.language == "中文" else "en-US",
+                "adaptation": "native editorial variant, not literal translation",
+                "single_locale_output": True,
+                "shared_facts_only": True,
+            },
             "required_claim_markers": [
                 f"{claim.status.value} · {claim.id}" for claim in brief.claims
             ],
@@ -1005,6 +1015,33 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _story_locale_variant(brief: ContentBrief) -> StoryLocaleVariant:
+    locale: Literal["zh-CN", "en-US"] = (
+        "zh-CN" if brief.language == "中文" else "en-US"
+    )
+    canonical_story_id = brief.evidence_filters.get("canon_story_id") or None
+    fact_contract_sha256 = _sha256(
+        {
+            "claims": [claim.model_dump(mode="json") for claim in brief.claims],
+            "evidence_bundle_id": brief.evidence_bundle_id,
+            "evidence_item_ids": brief.evidence_item_ids,
+            "evidence_gaps": brief.evidence_gaps,
+            "source_label": brief.source_label,
+        }
+    )
+    variant_group_id = (
+        f"canonical-story:{canonical_story_id}"
+        if canonical_story_id is not None
+        else f"fact-contract:{fact_contract_sha256[:24]}"
+    )
+    return StoryLocaleVariant(
+        locale=locale,
+        variant_group_id=variant_group_id,
+        canonical_story_id=canonical_story_id,
+        fact_contract_sha256=fact_contract_sha256,
+    )
+
+
 def _new_run_dir(data_root: Path) -> tuple[str, Path]:
     _reject_symlink_ancestry(data_root)
     _ensure_private_directory(data_root, parents=True)
@@ -1181,6 +1218,8 @@ def run_content_workspace(
             "19_reference_source.txt",
         ]
     brief_payload = brief.model_dump(mode="json")
+    locale_variant = _story_locale_variant(brief)
+    locale_variant_payload = locale_variant.model_dump(mode="json")
     drafts_payload = drafts.model_dump(mode="json")
     output_artifacts = {
         "15_canonical_story.md": drafts.canonical_story,
@@ -1209,6 +1248,7 @@ def run_content_workspace(
     publish_pack = {
         "status": "DRAFT_REQUIRES_HUMAN_APPROVAL",
         "topic": brief.topic,
+        "locale_variant": locale_variant_payload,
         "channels": [
             "Canonical story",
             "LinkedIn",
@@ -1227,6 +1267,7 @@ def run_content_workspace(
         "source_label": brief.source_label,
         "claim_ledger_sha256": _sha256(brief_payload["claims"]),
         "claims": brief_payload["claims"],
+        "locale_variant": locale_variant_payload,
         "evidence_context": evidence_context,
         "reference_context": reference_context,
         "boundary": (
@@ -1253,6 +1294,9 @@ def run_content_workspace(
         "evidence_item_count": len(brief.evidence_item_ids),
         "evidence_gap_count": len(brief.evidence_gaps),
         "publication_performed": False,
+        "locale": locale_variant.locale,
+        "variant_group_id": locale_variant.variant_group_id,
+        "fact_contract_sha256": locale_variant.fact_contract_sha256,
     }
     if normalized_reference is not None:
         verification.update(
@@ -1267,6 +1311,7 @@ def run_content_workspace(
         created_at=created_at,
         brief=brief,
         drafts=drafts,
+        locale_variant=locale_variant,
         artifact_paths=artifact_paths,
         editorial_provenance=[editorial_provenance],
         network_used=network_used,

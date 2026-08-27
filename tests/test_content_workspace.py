@@ -179,6 +179,40 @@ def test_ready_month_one_story_produces_grounded_multiformat_bundle(
         content_brief_from_month_one_story("M1-23", language="中文")
 
 
+def test_month_one_bilingual_variants_share_facts_but_persist_separately(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    chinese_brief = content_brief_from_month_one_story("M1-15", language="中文")
+    english_brief = content_brief_from_month_one_story("M1-15", language="English")
+
+    chinese = run_content_workspace(data_root=data_root, brief=chinese_brief)
+    english = run_content_workspace(data_root=data_root, brief=english_brief)
+
+    assert chinese.run_id != english.run_id
+    assert chinese.locale_variant is not None
+    assert english.locale_variant is not None
+    assert chinese.locale_variant.locale == "zh-CN"
+    assert english.locale_variant.locale == "en-US"
+    assert chinese.locale_variant.variant_group_id == english.locale_variant.variant_group_id
+    assert chinese.locale_variant.canonical_story_id == "M1-15"
+    assert (
+        chinese.locale_variant.fact_contract_sha256
+        == english.locale_variant.fact_contract_sha256
+    )
+    assert chinese.brief.claims == english.brief.claims
+    assert chinese.brief.topic != english.brief.topic
+    assert chinese.brief.call_to_action != english.brief.call_to_action
+
+    for run in (chinese, english):
+        run_dir = data_root / "content-runs" / run.run_id
+        verification = json.loads((run_dir / "08_verification.json").read_text())
+        publish_pack = json.loads((run_dir / "06_publish_pack.json").read_text())
+        assert verification["locale"] == run.locale_variant.locale
+        assert publish_pack["locale_variant"] == run.locale_variant.model_dump(mode="json")
+        assert publish_pack["publication_performed"] is False
+
+
 def test_content_workspace_writes_private_reviewable_multichannel_pack(
     tmp_path: Path,
 ) -> None:
@@ -209,6 +243,7 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
     assert "This does not prove production readiness" in linkedin
     assert "1/5" in x_thread
     assert "Claim anchors: CLAIM-01" in video
+    assert run.locale_variant is not None
     assert verification == {
         "claim_count": 3,
         "credential_shape_scan_passed": True,
@@ -217,12 +252,15 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
         "evidence_bundle_used": False,
         "evidence_gap_count": 0,
         "evidence_item_count": 0,
+        "fact_contract_sha256": run.locale_variant.fact_contract_sha256,
+        "locale": "en-US",
         "model_used": False,
         "network_used": False,
         "private_path_scan_passed": True,
         "publication_performed": False,
         "status": "PASS",
         "verified_and_observed_have_receipts": True,
+        "variant_group_id": run.locale_variant.variant_group_id,
     }
 
     loaded = load_content_run(data_root, run.run_id)
@@ -263,6 +301,13 @@ def test_content_workspace_uses_local_ollama_and_rejects_unanchored_output(
     assert run.editorial_provenance[0].exact_model == "qwen3:8b"
     assert run.editorial_provenance[0].network_used is True
     assert "required_claim_markers" in fake.user
+    prompt = json.loads(fake.user)
+    assert prompt["locale_policy"] == {
+        "adaptation": "native editorial variant, not literal translation",
+        "locale": "en-US",
+        "shared_facts_only": True,
+        "single_locale_output": True,
+    }
     verification = json.loads(
         (
             data_root / "content-runs" / run.run_id / "08_verification.json"
@@ -586,6 +631,8 @@ def test_distribution_package_requires_approval_and_seals_exact_media(
     package = load_distribution_package(data_root, run.run_id)
     assert package is not None
     assert package["publication_performed"] is False
+    assert package["locale"] == "en-US"
+    assert package["variant_group_id"].startswith("fact-contract:")
     assert package["review_revision"] == review.revision
     assert package["channels"]["youtube"]["direct_upload_enabled"] is False  # type: ignore[index]
     artifacts = package["artifacts"]
@@ -599,7 +646,9 @@ def test_distribution_package_requires_approval_and_seals_exact_media(
         data_root, run.run_id, "youtube-upload.json"
     )
     assert youtube_name == "27_youtube_upload.json"
-    assert json.loads(youtube_body)["upload_performed"] is False
+    youtube_payload = json.loads(youtube_body)
+    assert youtube_payload["locale"] == "en-US"
+    assert youtube_payload["upload_performed"] is False
     with pytest.raises(ContentWorkspaceError, match="sealed"):
         save_content_review(
             data_root=data_root,

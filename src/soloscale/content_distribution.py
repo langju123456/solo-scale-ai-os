@@ -73,10 +73,20 @@ def prepare_distribution_package(*, data_root: Path, run_id: str) -> Path:
     }
     title = run.brief.topic.strip()[:100]
     description = values["canonical_story"].strip()
+    locale = (
+        run.locale_variant.locale
+        if run.locale_variant is not None
+        else ("zh-CN" if run.brief.language == "中文" else "en-US")
+    )
+    variant_group_id = (
+        run.locale_variant.variant_group_id if run.locale_variant is not None else None
+    )
     youtube = {
         "schema_version": "1.0",
         "status": "READY_FOR_HUMAN_YOUTUBE_UPLOAD",
         "run_id": run_id,
+        "locale": locale,
+        "variant_group_id": variant_group_id,
         "review_revision": receipt.revision,
         "title": title,
         "description": description,
@@ -91,6 +101,8 @@ def prepare_distribution_package(*, data_root: Path, run_id: str) -> Path:
         "schema_version": "1.0",
         "status": "READY_FOR_EXACT_CHANNEL_PREVIEW",
         "run_id": run_id,
+        "locale": locale,
+        "variant_group_id": variant_group_id,
         "review_revision": receipt.revision,
         "channels": {
             "linkedin": {

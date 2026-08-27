@@ -614,7 +614,7 @@ def _result_html(
         distribution_section = ""
     return f"""<section id="results" class="result-panel">
       <div class="result-head">
-        <div><span class="kicker">{_escape(ui_text(locale, '已生成', 'Generated'))}</span><span class="engine-badge">{_escape(engine_label)}</span><h2>{_escape(ui_text(locale, '一个主故事，五种渠道适配', 'One canonical story, five adaptations'))}</h2>
+        <div><span class="kicker">{_escape(ui_text(locale, '已生成', 'Generated'))}</span><span class="engine-badge">{_escape(engine_label)}</span><span class="engine-badge">{_escape('zh-CN' if run.brief.language == '中文' else 'en-US')}</span><h2>{_escape(ui_text(locale, '一个主故事，五种渠道适配', 'One canonical story, five adaptations'))}</h2>
           <p>{_escape(ui_text(locale, '内容已私有保存；复制或下载后，人工检查再发布。', 'Drafts are saved privately. Review them after copying or downloading and before publishing.'))}</p></div>
         <div class="downloads">{download_links}</div>
       </div>
@@ -912,8 +912,9 @@ def _month_one_canon_html(locale: UILocale) -> tuple[str, str]:
             production_actions = (
                 f'''<form method="post" action="/content/canon/{story.story_id}" class="canon-direct-form">
                 <input type="hidden" name="ui_locale" value="{locale}" />
-                <button type="submit">{_escape(ui_text(locale, '生成完整内容包', 'Generate full content package'))}</button>
-                <small>{_escape(ui_text(locale, '使用当前 AI 服务；先私有保存，不会发布。', 'Uses the current AI service, saves privately, and never publishes.'))}</small>
+                <button type="submit" name="language" value="中文">{_escape(ui_text(locale, '生成中文版', 'Generate Chinese'))}</button>
+                <button class="secondary-button" type="submit" name="language" value="English">{_escape(ui_text(locale, '生成英文版', 'Generate English'))}</button>
+                <small>{_escape(ui_text(locale, '同一故事生成独立中文或英文脚本、旁白、字幕与成片；先私有保存，不会发布。', 'Create separate Chinese or English scripts, narration, subtitles, and video packages. Saved privately; never published.'))}</small>
                 </form>'''
                 if story.status is StoryReadiness.READY_FOR_PRODUCTION
                 else f'''<button type="button" data-canon-select="{story.story_id}" data-canon-format="video">{_escape(ui_text(locale, '补充证据 / 确认', 'Add evidence / confirm'))}</button>'''
