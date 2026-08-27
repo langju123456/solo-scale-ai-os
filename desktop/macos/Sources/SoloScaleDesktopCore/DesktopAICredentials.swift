@@ -23,8 +23,46 @@ public enum DesktopOpenAIKeychain {
     public static let account = "default"
 
     public static func save(_ apiKey: String) throws {
-        let data = try desktopAIKeyPayload(apiKey)
-        var query = baseQuery
+        try DesktopSecretKeychain.save(
+            try desktopAIKeyPayload(apiKey),
+            service: service,
+            account: account
+        )
+    }
+
+    public static func delete() throws {
+        try DesktopSecretKeychain.delete(service: service, account: account)
+    }
+
+    public static func read() throws -> Data? {
+        try DesktopSecretKeychain.read(service: service, account: account)
+    }
+}
+
+public enum DesktopHeyGenKeychain {
+    public static let service = "local.soloscale.desktop.media.heygen"
+    public static let account = "default"
+
+    public static func save(_ apiKey: String) throws {
+        try DesktopSecretKeychain.save(
+            try desktopAIKeyPayload(apiKey),
+            service: service,
+            account: account
+        )
+    }
+
+    public static func delete() throws {
+        try DesktopSecretKeychain.delete(service: service, account: account)
+    }
+
+    public static func read() throws -> Data? {
+        try DesktopSecretKeychain.read(service: service, account: account)
+    }
+}
+
+private enum DesktopSecretKeychain {
+    static func save(_ data: Data, service: String, account: String) throws {
+        var query = baseQuery(service: service, account: account)
         query[kSecValueData as String] = data
         query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         query[kSecAttrSynchronizable as String] = false
@@ -38,21 +76,26 @@ public enum DesktopOpenAIKeychain {
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecAttrSynchronizable as String: false,
         ]
-        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, update as CFDictionary)
+        let updateStatus = SecItemUpdate(
+            baseQuery(service: service, account: account) as CFDictionary,
+            update as CFDictionary
+        )
         guard updateStatus == errSecSuccess else {
             throw DesktopAICredentialError.keychain(updateStatus)
         }
     }
 
-    public static func delete() throws {
-        let status = SecItemDelete(baseQuery as CFDictionary)
+    static func delete(service: String, account: String) throws {
+        let status = SecItemDelete(
+            baseQuery(service: service, account: account) as CFDictionary
+        )
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw DesktopAICredentialError.keychain(status)
         }
     }
 
-    public static func read() throws -> Data? {
-        var query = baseQuery
+    static func read(service: String, account: String) throws -> Data? {
+        var query = baseQuery(service: service, account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
@@ -67,7 +110,7 @@ public enum DesktopOpenAIKeychain {
         return data
     }
 
-    private static var baseQuery: [String: Any] {
+    private static func baseQuery(service: String, account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -78,6 +121,7 @@ public enum DesktopOpenAIKeychain {
 }
 
 public let desktopCredentialFrameMaximum = 512
+public let desktopCredentialEnvelopeMaximum = 4096
 
 /// Validates the exact API-key bytes that will be sent to the Python sidecar.
 /// Whitespace is rejected rather than trimmed so a saved key cannot differ from
@@ -98,6 +142,38 @@ public func desktopAIKeyPayload(_ apiKey: String) throws -> Data {
 public func desktopCredentialFrame(_ payload: Data?) throws -> Data {
     let body = payload ?? Data()
     guard body.count <= desktopCredentialFrameMaximum else {
+        throw DesktopAICredentialError.frameTooLarge
+    }
+    var length = UInt32(body.count).bigEndian
+    var frame = Data(bytes: &length, count: MemoryLayout<UInt32>.size)
+    frame.append(body)
+    return frame
+}
+
+/// One framed JSON envelope keeps multiple Keychain secrets off process arguments,
+/// environment variables, settings files, pages, and logs.
+public func desktopCredentialEnvelopeFrame(
+    openAIKey: Data?,
+    heygenAPIKey: Data?
+) throws -> Data {
+    var envelope: [String: Any] = ["schema_version": "1.0"]
+    if let openAIKey {
+        guard let value = String(data: openAIKey, encoding: .utf8) else {
+            throw DesktopAICredentialError.invalidKey
+        }
+        envelope["openai_api_key"] = value
+    }
+    if let heygenAPIKey {
+        guard let value = String(data: heygenAPIKey, encoding: .utf8) else {
+            throw DesktopAICredentialError.invalidKey
+        }
+        envelope["heygen_api_key"] = value
+    }
+    let body = try JSONSerialization.data(
+        withJSONObject: envelope,
+        options: [.sortedKeys]
+    )
+    guard body.count <= desktopCredentialEnvelopeMaximum else {
         throw DesktopAICredentialError.frameTooLarge
     }
     var length = UInt32(body.count).bigEndian

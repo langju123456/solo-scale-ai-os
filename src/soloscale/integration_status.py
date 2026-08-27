@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from soloscale.desktop_credentials import heygen_api_key_is_configured
+
 
 @dataclass(frozen=True)
 class IntegrationStatus:
@@ -61,7 +63,7 @@ def _x_status() -> IntegrationStatus:
 def connected_service_statuses() -> tuple[IntegrationStatus, ...]:
     """Return non-secret provider states without contacting any external service."""
 
-    heygen_configured = bool(os.environ.get("HEYGEN_API_KEY", "").strip())
+    heygen_configured = heygen_api_key_is_configured()
     youtube_configured = bool(
         os.environ.get("YOUTUBE_REFRESH_TOKEN", "").strip()
         and os.environ.get("YOUTUBE_CLIENT_ID", "").strip()
@@ -69,9 +71,13 @@ def connected_service_statuses() -> tuple[IntegrationStatus, ...]:
     return (
         IntegrationStatus(
             "HeyGen",
-            "Credential detected" if heygen_configured else "Handoff ready",
-            "Use explicit segment export/import; direct Desktop submission is not enabled.",
-            True,
+            "Connected" if heygen_configured else "Not configured",
+            (
+                "Keychain credential is ready for explicitly approved avatar segments."
+                if heygen_configured
+                else "Manual segment handoff remains available without an API key."
+            ),
+            heygen_configured,
         ),
         _linkedin_status(),
         _x_status(),

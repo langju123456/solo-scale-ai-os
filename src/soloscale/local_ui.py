@@ -57,7 +57,8 @@ from soloscale.content_workspace import (
 )
 from soloscale.desktop_credentials import (
     DesktopCredentialError,
-    configure_openai_credential_from_stdin,
+    configure_desktop_credentials_from_stdin,
+    heygen_api_key_is_configured,
     openai_api_key,
     openai_api_key_is_configured,
 )
@@ -83,6 +84,12 @@ from soloscale.learning_traceability import (
     load_interview_anchor_pack,
     run_learning_traceability,
     save_learning_response,
+)
+from soloscale.media_profile import (
+    MediaProfile,
+    MediaProfileError,
+    load_media_profile_settings,
+    save_media_profile,
 )
 from soloscale.model_gateway import (
     GatewayConfigurationState,
@@ -4615,6 +4622,8 @@ def _ai_settings_page(
             "Reconnect": ui_text(locale, "需要重新连接", "Reconnect"),
             "Needs attention": ui_text(locale, "需要处理", "Needs attention"),
             "Credential detected": ui_text(locale, "已检测到凭据", "Credential detected"),
+            "Connected": ui_text(locale, "已连接", "Connected"),
+            "Not configured": ui_text(locale, "未配置", "Not configured"),
             "Handoff ready": ui_text(locale, "分段交接可用", "Handoff ready"),
             "Export package ready": ui_text(locale, "导出包可用", "Export package ready"),
         }
@@ -4641,8 +4650,13 @@ def _ai_settings_page(
             ),
         }
         connected_cards = "".join(
-            f'''<article class="integration-card"><div><strong>{_escape(status.service)}</strong><p>{_escape(service_details[status.service])}</p></div>
-            <span class="integration-state {'pass' if status.ready else 'pending'}">{_escape(state_labels.get(status.state, status.state))}</span></article>'''
+            (
+                f'''<a class="integration-card integration-link" href="{ui_url('/settings/media/heygen', locale)}"><div><strong>{_escape(status.service)}</strong><p>{_escape(service_details[status.service])}</p></div>
+                <span class="integration-state {'pass' if status.ready else 'pending'}">{_escape(state_labels.get(status.state, status.state))} →</span></a>'''
+                if status.service == "HeyGen"
+                else f'''<article class="integration-card"><div><strong>{_escape(status.service)}</strong><p>{_escape(service_details[status.service])}</p></div>
+                <span class="integration-state {'pass' if status.ready else 'pending'}">{_escape(state_labels.get(status.state, status.state))}</span></article>'''
+            )
             for status in connected_service_statuses()
         )
         body = f"""{notice_html}<section class="current-service">
@@ -4753,7 +4767,113 @@ if(remove) remove.addEventListener('click',()=>window.webkit.messageHandlers.sol
         script=script,
         extra_css="""
 .current-service,.setup-card,.other-services,.connected-services{display:grid;gap:16px;padding:24px;border:1px solid var(--border);border-radius:20px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.current-service{grid-template-columns:1fr auto;align-items:center}.current-service .kicker,.current-service div{grid-column:1}.current-service h2{margin:4px 0}.current-service p{margin:0;color:var(--text-muted)}.current-service .ready-dot,.current-service .button-link{grid-column:2}.ready-dot{color:var(--success)}.button-link{display:inline-flex;padding:10px 14px;border-radius:12px;background:var(--brand);color:white;text-decoration:none;font-weight:800}.other-services,.connected-services{margin-top:18px;background:#fff}.service-card{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:16px;border:1px solid var(--border);border-radius:14px;text-decoration:none;color:var(--text);background:var(--surface-subtle)}.service-card span:first-child{display:grid;gap:3px}.service-card small,.service-state{color:var(--text-muted)}.connected-services h2{margin:0}.connected-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.integration-card{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:16px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.integration-card p{margin:6px 0 0;color:var(--text-muted);font-size:.9rem}.integration-state{white-space:nowrap;font-size:.85rem;font-weight:800}.integration-state.pass{color:var(--success)}.integration-state.pending{color:var(--warning)}.setup-card{max-width:780px;margin-top:16px}.setup-card h2{margin:0}.setup-card form{display:grid;gap:14px}.readiness-list{list-style:none;padding:0;display:grid;gap:8px}.readiness-list .pass{color:var(--success)}.readiness-list .pending{color:var(--warning)}.button-row{display:flex;flex-wrap:wrap;gap:10px}.button-row button,.setup-card>form>button{width:auto}.button-row .secondary,.setup-card>form>.secondary{background:var(--surface-subtle);color:var(--brand);border:1px solid var(--border)}.button-row .danger{background:#fff0ef;color:var(--danger)}.back-link{font-weight:800;text-decoration:none}
+.integration-link{text-decoration:none;color:inherit}
 @media(max-width:700px){.current-service,.connected-grid{grid-template-columns:1fr}.current-service .ready-dot,.current-service .button-link{grid-column:1;justify-self:start}.service-card,.integration-card{align-items:flex-start;flex-direction:column}}
+""",
+    )
+
+
+def _heygen_settings_page(
+    data_root: Path,
+    *,
+    locale: UILocale = DEFAULT_UI_LOCALE,
+    outcome: str | None = None,
+    desktop_mode: bool = False,
+) -> str:
+    try:
+        profile = load_media_profile_settings(data_root)
+    except MediaProfileError:
+        profile = None
+    configured = heygen_api_key_is_configured()
+    notices = {
+        "saved": ui_text(
+            locale,
+            "HeyGen API key 已安全保存到 macOS Keychain。",
+            "The HeyGen API key is securely stored in macOS Keychain.",
+        ),
+        "removed": ui_text(
+            locale,
+            "HeyGen API key 已从 macOS Keychain 移除；手工分段交接仍可使用。",
+            "The HeyGen API key was removed from Keychain. Manual segment handoff remains available.",
+        ),
+        "profile-saved": ui_text(
+            locale,
+            "Avatar 与中英文 voice 配置已保存。",
+            "Avatar and bilingual voice settings were saved.",
+        ),
+        "invalid": ui_text(
+            locale,
+            "配置未保存；请只使用 HeyGen 提供的 ID。",
+            "Settings were not saved. Use only IDs supplied by HeyGen.",
+        ),
+    }
+    notice = notices.get(outcome or "")
+    notice_html = (
+        f'<p class="notice" role="status">{_escape(notice)}</p>' if notice else ""
+    )
+    desktop_warning = (
+        ""
+        if desktop_mode
+        else f'<p class="notice warning">{_escape(ui_text(locale, "请在 SoloScale Desktop App 中保存 HeyGen key；普通浏览器不会接收它。", "Save the HeyGen key in the SoloScale Desktop App. A normal browser never accepts it."))}</p>'
+    )
+    disabled = "" if desktop_mode else " disabled"
+    profile_fields = profile or MediaProfile()
+    delete_button = (
+        f'<button id="delete-heygen-key" class="danger" type="button">{_escape(ui_text(locale, "移除 Keychain 密钥", "Remove Keychain key"))}</button>'
+        if configured and desktop_mode
+        else ""
+    )
+    body = f"""<a class="back-link" href="{ui_url('/settings/ai', locale)}">← {_escape(ui_text(locale, 'AI 与发布服务', 'AI and publishing services'))}</a>{notice_html}{desktop_warning}
+<section class="setup-card">
+  <span class="kicker">HeyGen · AvatarProvider</span>
+  <h2>{_escape(ui_text(locale, '已连接' if configured else '未配置', 'Connected' if configured else 'Not configured'))}</h2>
+  <p>{_escape(ui_text(locale, 'API key 只保存于 macOS Keychain。SoloScale 会优先复用人物素材，仅在需要新口播片段且你确认预算后调用 HeyGen。', 'The API key stays in macOS Keychain. SoloScale reuses presenter assets first and calls HeyGen only for new speaking segments after budget approval.'))}</p>
+  <form id="heygen-key-setup">
+    <label>API Key<input id="heygen-api-key" type="password" maxlength="512" autocomplete="new-password" value="" placeholder="HeyGen API key"{disabled} /></label>
+    <div class="button-row"><button type="submit"{disabled}>{_escape(ui_text(locale, '安全保存', 'Save securely'))}</button>{delete_button}</div>
+  </form>
+  <p id="heygen-key-status" role="status"></p>
+</section>
+<section class="setup-card">
+  <span class="kicker">{_escape(ui_text(locale, '人物配置', 'Presenter profile'))}</span>
+  <form method="post" action="/settings/media/heygen">
+    <input type="hidden" name="ui_locale" value="{locale}" />
+    <input type="hidden" name="action" value="save_profile" />
+    <label>{_escape(ui_text(locale, 'Avatar Group ID（可选）', 'Avatar Group ID (optional)'))}<input name="avatar_group_id" maxlength="160" value="{_escape(profile_fields.heygen_avatar_group_id or '')}" /></label>
+    <label>{_escape(ui_text(locale, 'Avatar / Look ID', 'Avatar / Look ID'))}<input name="avatar_look_id" maxlength="160" value="{_escape(profile_fields.heygen_avatar_look_id or '')}" /></label>
+    <label>{_escape(ui_text(locale, '中文 Voice ID（仅文本 voice fallback）', 'Chinese Voice ID (text-voice fallback only)'))}<input name="zh_voice_id" maxlength="160" value="{_escape(profile_fields.heygen_zh_voice_id or '')}" /></label>
+    <label>{_escape(ui_text(locale, '英文 Voice ID（仅文本 voice fallback）', 'English Voice ID (text-voice fallback only)'))}<input name="en_voice_id" maxlength="160" value="{_escape(profile_fields.heygen_en_voice_id or '')}" /></label>
+    <div class="button-row"><button type="submit">{_escape(ui_text(locale, '保存人物配置', 'Save presenter profile'))}</button><button class="secondary" type="button" disabled>{_escape(ui_text(locale, '测试 Avatar · 需先预估费用', 'Test Avatar · cost preview required'))}</button></div>
+  </form>
+  <p>{_escape(ui_text(locale, '默认路径：本地 Qwen voice → 音频 → HeyGen lip-sync/avatar。手工导出/导入路径继续保留，且 API 成本为 $0。', 'Default path: local Qwen voice → audio → HeyGen lip-sync/avatar. Manual export/import remains available at $0 API cost.'))}</p>
+</section>"""
+    script = f"""
+const setup=document.getElementById('heygen-key-setup');
+if(setup) setup.addEventListener('submit',(event)=>{{
+  event.preventDefault();
+  const status=document.getElementById('heygen-key-status');
+  const key=document.getElementById('heygen-api-key');
+  const bridge=window.webkit?.messageHandlers?.soloscaleCredentials;
+  if(!bridge){{status.textContent={json.dumps(ui_text(locale, '请在 Desktop App 中完成设置。', 'Complete setup in the Desktop App.'))};return;}}
+  if(!key.value.trim()){{status.textContent={json.dumps(ui_text(locale, '请输入 API key。', 'Enter an API key.'))};return;}}
+  const secret=key.value; key.value='';
+  bridge.postMessage({{action:'saveHeyGenKey',apiKey:secret,returnPath:{json.dumps(ui_url('/settings/media/heygen', locale, provider='saved'))}}});
+}});
+const remove=document.getElementById('delete-heygen-key');
+if(remove) remove.addEventListener('click',()=>window.webkit.messageHandlers.soloscaleCredentials.postMessage({{action:'deleteHeyGenKey',returnPath:{json.dumps(ui_url('/settings/media/heygen', locale, provider='removed'))}}}));
+"""
+    return render_app_shell(
+        active="advanced",
+        locale=locale,
+        current_url="/settings/media/heygen",
+        title="SoloScale · HeyGen",
+        eyebrow=ui_text(locale, "媒体设置", "Media settings"),
+        heading=ui_text(locale, "只为真正需要的新人物片段付费。", "Pay only for genuinely new presenter footage."),
+        description=ui_text(locale, "人物素材优先复用；凭据、调用与最终视频保持清晰边界。", "Reuse presenter assets first, with clear boundaries around credentials, calls, and final video."),
+        body=body,
+        script=script,
+        extra_css="""
+.setup-card{display:grid;gap:16px;max-width:820px;margin-top:18px;padding:24px;border:1px solid var(--border);border-radius:20px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.setup-card h2,.setup-card p{margin:0}.setup-card form{display:grid;gap:14px}.button-row{display:flex;flex-wrap:wrap;gap:10px}.button-row button{width:auto}.button-row .secondary{background:var(--surface-subtle);color:var(--brand);border:1px solid var(--border)}.button-row .danger{background:#fff0ef;color:var(--danger)}.back-link{font-weight:800;text-decoration:none}
 """,
     )
 
@@ -5692,6 +5812,21 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 outcome=query.get("provider", [""])[0],
             )
             return
+        if path == "/settings/media/heygen":
+            page = _heygen_settings_page(
+                self.ui_data_root.absolute(),
+                locale=self.ui_locale,
+                outcome=query.get("provider", [""])[0],
+                desktop_mode=self.desktop_session_token is not None,
+            )
+            body = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/advanced":
             provider_notice = {
                 "saved": ui_text(
@@ -5913,6 +6048,56 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header(
                 "Location",
                 ui_url("/settings/ai", self.ui_locale, provider="moved"),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/settings/media/heygen":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "Settings request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            if "api_key" in form or "heygen_api_key" in form:
+                self.send_error(400, "Credentials are not accepted by this endpoint")
+                return
+            outcome = "invalid"
+            if form.get("action") == "save_profile":
+                values = {
+                    "heygen_avatar_group_id": form.get("avatar_group_id", "").strip(),
+                    "heygen_avatar_look_id": form.get("avatar_look_id", "").strip(),
+                    "heygen_zh_voice_id": form.get("zh_voice_id", "").strip(),
+                    "heygen_en_voice_id": form.get("en_voice_id", "").strip(),
+                }
+                if all(
+                    not value or re.fullmatch(r"[A-Za-z0-9_-]{1,160}", value)
+                    for value in values.values()
+                ):
+                    try:
+                        profile = load_media_profile_settings(
+                            self.ui_data_root.absolute()
+                        ).model_copy(
+                            update={
+                                key: value or None for key, value in values.items()
+                            }
+                        )
+                        save_media_profile(self.ui_data_root.absolute(), profile)
+                    except (MediaProfileError, OSError, ValueError):
+                        outcome = "invalid"
+                    else:
+                        outcome = "profile-saved"
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/settings/media/heygen",
+                    self.ui_locale,
+                    provider=outcome,
+                ),
             )
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -6934,7 +7119,7 @@ def main() -> None:
         if _DESKTOP_TOKEN_RE.fullmatch(desktop_token) is None:
             parser.error("desktop mode requires a strong SOLOSCALE_DESKTOP_SESSION_TOKEN")
         try:
-            configure_openai_credential_from_stdin()
+            configure_desktop_credentials_from_stdin()
         except DesktopCredentialError:
             parser.error("desktop credential handoff is invalid")
     selected_data_root = (

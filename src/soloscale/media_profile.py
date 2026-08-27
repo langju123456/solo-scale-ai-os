@@ -46,6 +46,8 @@ class MediaProfile(BaseModel):
     heygen_avatar_group_id: str | None = None
     heygen_avatar_look_id: str | None = None
     heygen_voice_id: str | None = None
+    heygen_zh_voice_id: str | None = None
+    heygen_en_voice_id: str | None = None
 
 
 def media_profile_path(data_root: Path) -> Path:
@@ -78,11 +80,9 @@ def _resolve_private_profile_path(data_root: Path, relative: str, *, label: str)
 
 
 def load_media_profile(data_root: Path) -> MediaProfile:
-    path = _private_regular_file(media_profile_path(data_root), label="Media profile")
-    try:
-        profile = MediaProfile.model_validate_json(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise MediaProfileError("Media profile is invalid") from exc
+    profile = load_media_profile_settings(data_root)
+    path = media_profile_path(data_root)
+    _private_regular_file(path, label="Media profile")
     if profile.voice_provider is VoiceProviderId.QWEN3_TTS_MLX:
         if not profile.reference_audio_path or not profile.reference_text_path:
             raise MediaProfileError("Your local Qwen voice is not configured")
@@ -99,6 +99,20 @@ def load_media_profile(data_root: Path) -> MediaProfile:
             != profile.reference_text_sha256
         ):
             raise MediaProfileError("Voice reference transcript no longer matches its profile")
+    return profile
+
+
+def load_media_profile_settings(data_root: Path) -> MediaProfile:
+    """Load configuration without requiring optional voice assets to be installed."""
+
+    path = media_profile_path(data_root)
+    if not path.exists():
+        return MediaProfile()
+    _private_regular_file(path, label="Media profile")
+    try:
+        profile = MediaProfile.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise MediaProfileError("Media profile is invalid") from exc
     return profile
 
 

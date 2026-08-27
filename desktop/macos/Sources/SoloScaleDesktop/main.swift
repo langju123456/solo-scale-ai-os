@@ -17,12 +17,14 @@ private enum StartupDestination {
     case workProjectConnected
     case workChatGPTSelected
     case aiSettings(String?)
+    case heyGenSettings(String?)
 
     var path: String {
         switch self {
         case .home: "/"
         case .workProjectConnected, .workChatGPTSelected: "/work"
         case .aiSettings: "/settings/ai/openai"
+        case .heyGenSettings: "/settings/media/heygen"
         }
     }
 
@@ -31,7 +33,7 @@ private enum StartupDestination {
         case .home: nil
         case .workProjectConnected: "project-connected"
         case .workChatGPTSelected: "chatgpt-selected"
-        case .aiSettings: nil
+        case .aiSettings, .heyGenSettings: nil
         }
     }
 
@@ -121,7 +123,10 @@ private final class BackendController: NSObject, ObservableObject {
             try process.run()
             do {
                 try credentialPipe.fileHandleForWriting.write(
-                    desktopCredentialFrame(try DesktopOpenAIKeychain.read())
+                    desktopCredentialEnvelopeFrame(
+                        openAIKey: try DesktopOpenAIKeychain.read(),
+                        heygenAPIKey: try DesktopHeyGenKeychain.read()
+                    )
                 )
                 try credentialPipe.fileHandleForWriting.close()
             } catch {
@@ -148,6 +153,14 @@ private final class BackendController: NSObject, ObservableObject {
     func deleteOpenAIKey(returnPath: String?) throws {
         try DesktopOpenAIKeychain.delete()
         restart(destination: .aiSettings(whitelistedAISettingsReturnPath(returnPath)))
+    }
+    func saveHeyGenKey(_ apiKey: String, returnPath: String?) throws {
+        try DesktopHeyGenKeychain.save(apiKey)
+        restart(destination: .heyGenSettings(whitelistedHeyGenSettingsReturnPath(returnPath)))
+    }
+    func deleteHeyGenKey(returnPath: String?) throws {
+        try DesktopHeyGenKeychain.delete()
+        restart(destination: .heyGenSettings(whitelistedHeyGenSettingsReturnPath(returnPath)))
     }
     func failWebSession(_ message: String) { failStart(message) }
     func chooseRepository() {
@@ -463,6 +476,17 @@ private final class BackendController: NSObject, ObservableObject {
         else { return nil }
         return returnPath
     }
+    private func whitelistedHeyGenSettingsReturnPath(_ returnPath: String?) -> String? {
+        guard let returnPath,
+              let components = URLComponents(string: returnPath),
+              components.scheme == nil,
+              components.host == nil,
+              components.user == nil,
+              components.password == nil,
+              components.path == "/settings/media/heygen"
+        else { return nil }
+        return returnPath
+    }
     private func stopPolling() { pollTimer?.invalidate(); pollTimer = nil; deadline = nil }
 }
 
@@ -541,6 +565,11 @@ private struct LocalWebView: NSViewRepresentable {
                     try backend.saveOpenAIKey(apiKey, returnPath: returnPath)
                 case "deleteOpenAIKey":
                     try backend.deleteOpenAIKey(returnPath: returnPath)
+                case "saveHeyGenKey":
+                    guard let apiKey = body["apiKey"] as? String else { return }
+                    try backend.saveHeyGenKey(apiKey, returnPath: returnPath)
+                case "deleteHeyGenKey":
+                    try backend.deleteHeyGenKey(returnPath: returnPath)
                 default:
                     return
                 }
