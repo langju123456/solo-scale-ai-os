@@ -49,6 +49,7 @@ from soloscale.video_factory import (
     prepare_heygen_handoff,
     render_creator_video,
 )
+from soloscale.voice_provider import NarrationResult
 
 
 def _brief() -> ContentBrief:
@@ -455,7 +456,16 @@ def test_creator_video_render_uses_only_saved_storyboard_and_is_non_overwriting(
         return type("Result", (), {"returncode": 0})()
 
     monkeypatch.setattr("soloscale.video_factory.subprocess.run", fake_run)
-    monkeypatch.setattr("soloscale.video_factory.shutil.which", lambda _: None)
+    monkeypatch.setattr(
+        "soloscale.video_factory.create_narration_assets",
+        lambda **_: NarrationResult(
+            assets={},
+            provider="test",
+            model="test-voice",
+            locale="en-US",
+            reference_audio_sha256=None,
+        ),
+    )
     monkeypatch.setattr("soloscale.video_factory._MACOS_CHROME", fake_chrome)
     output = render_creator_video(
         data_root=data_root, run_id=run.run_id, repository_root=repository_root

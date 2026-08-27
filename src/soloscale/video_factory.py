@@ -20,6 +20,7 @@ from soloscale.content_workspace import (
     load_content_run,
 )
 from soloscale.resume_workspace import ResumeWorkspaceStorageError, _atomic_private_write
+from soloscale.voice_provider import VoiceProviderError, create_narration_assets
 
 _INPUT_NAME = "09_creator_video_input.json"
 _VIDEO_NAME = "10_creator_video.mp4"
@@ -308,64 +309,6 @@ def _avatar_public_assets(run_dir: Path, public_dir: Path) -> dict[str, str]:
     return assets
 
 
-def _create_local_narration(
-    *,
-    run: ContentRun,
-    public_dir: Path,
-    avatar_assets: dict[str, str],
-) -> dict[str, str]:
-    """Create local macOS voiceover assets for scenes without an avatar clip."""
-
-    say = shutil.which("say")
-    afconvert = shutil.which("afconvert")
-    if say is None or afconvert is None:
-        return {}
-    audio_assets: dict[str, str] = {}
-    for scene in run.drafts.storyboard:
-        if scene.id in avatar_assets:
-            continue
-        identity = hashlib.sha256(scene.id.encode("utf-8")).hexdigest()[:12]
-        aiff_path = public_dir / f"narration-{identity}.aiff"
-        wav_name = f"narration-{identity}.wav"
-        wav_path = public_dir / wav_name
-        spoken = subprocess.run(
-            [say, "-v", "Tingting", "-r", "205", "-o", str(aiff_path), scene.voiceover],
-            capture_output=True,
-            check=False,
-            timeout=45,
-        )
-        if (
-            spoken.returncode != 0
-            or not aiff_path.is_file()
-            or aiff_path.stat().st_size <= 4096
-        ):
-            return {}
-        converted = subprocess.run(
-            [
-                afconvert,
-                "-f",
-                "WAVE",
-                "-d",
-                "LEI16@22050",
-                str(aiff_path),
-                str(wav_path),
-            ],
-            capture_output=True,
-            check=False,
-            timeout=30,
-        )
-        aiff_path.unlink(missing_ok=True)
-        if (
-            converted.returncode != 0
-            or not wav_path.is_file()
-            or wav_path.stat().st_size <= 44
-        ):
-            return {}
-        os.chmod(wav_path, 0o600)
-        audio_assets[scene.id] = wav_name
-    return audio_assets
-
-
 def _srt_timestamp(seconds: int) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, secs = divmod(remainder, 60)
@@ -488,11 +431,14 @@ def render_creator_video(*, data_root: Path, run_id: str, repository_root: Path)
         with tempfile.TemporaryDirectory(prefix="soloscale-video-assets-") as raw_public:
             public_dir = Path(raw_public)
             avatar_assets = _avatar_public_assets(run_dir, public_dir)
-            audio_assets = _create_local_narration(
+            narration = create_narration_assets(
                 run=run,
                 public_dir=public_dir,
                 avatar_assets=avatar_assets,
+                data_root=data_root,
+                resource_root=repository_root,
             )
+            audio_assets = narration.assets
             short_input = _render_input(
                 run=run,
                 width=1080,
@@ -537,6 +483,7 @@ def render_creator_video(*, data_root: Path, run_id: str, repository_root: Path)
         OSError,
         ResumeWorkspaceStorageError,
         CreatorVideoError,
+        VoiceProviderError,
         subprocess.TimeoutExpired,
     ) as exc:
         for path in protected:
@@ -557,6 +504,10 @@ def render_creator_video(*, data_root: Path, run_id: str, repository_root: Path)
         "run_id": run_id,
         "avatar_segment_count": len(_avatar_map(run_dir)),
         "local_narration_scene_count": len(audio_assets),
+        "narration_provider": narration.provider,
+        "narration_model": narration.model,
+        "narration_locale": narration.locale,
+        "voice_reference_sha256": narration.reference_audio_sha256,
         "subtitles": _SUBTITLES_NAME,
         "subtitles_sha256": _sha256_bytes(subtitles_path.read_bytes()),
         "short_sha256": _sha256_bytes(output_path.read_bytes()),

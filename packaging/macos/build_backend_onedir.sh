@@ -29,4 +29,5 @@ fi
 [[ ! -e "$webpack_cache" ]] || fail "Creator Video webpack cache must not be packaged"
 [[ -f "$output_root/SoloScaleBackend/_internal/video_factory/render.mjs" ]] || fail "Creator Video renderer was not packaged"
 [[ -d "$output_root/SoloScaleBackend/_internal/video_factory/node_modules/@remotion/renderer" ]] || fail "Creator Video dependencies were not packaged"
+[[ -f "$output_root/SoloScaleBackend/_internal/media_runtime/qwen_mlx_worker.py" ]] || fail "Local Qwen media worker was not packaged"
 echo "$output_root/SoloScaleBackend"
