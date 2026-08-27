@@ -23,6 +23,10 @@ try {
   const inputProps = JSON.parse(await readFile(input, 'utf8'));
   const serveUrl = await bundle({
     entryPoint: resolve('src/entry.ts'),
+    // A packaged macOS app must remain immutable after signing. Remotion's
+    // default Webpack cache lives under node_modules/.cache, which would write
+    // into the signed app bundle at runtime and invalidate its signature.
+    enableCaching: false,
     ...(publicDir ? {publicDir} : {}),
   });
   const browserExecutable = process.env.REMOTION_BROWSER_EXECUTABLE;
