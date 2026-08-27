@@ -5,6 +5,7 @@ import html
 import json
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal, cast
@@ -31,10 +32,26 @@ from soloscale.content_workspace import (
 )
 from soloscale.editorial_publishing_handoff import editorial_publishing_status
 from soloscale.evidence_agent import Reasoner
+from soloscale.media_cost import (
+    MediaCostError,
+    PricingStatus,
+    aggregate_costs,
+    estimate_avatar_seconds,
+    evaluate_budget,
+    load_budget_policy,
+    load_cost_receipts,
+    load_pricing_catalog,
+)
 from soloscale.media_profile import (
     MediaProfileError,
     VoiceProviderId,
     load_media_profile,
+)
+from soloscale.media_quality import (
+    MediaQualityChecklist,
+    MediaQualityError,
+    load_media_quality_review,
+    require_approved_media_quality_review,
 )
 from soloscale.model_gateway import (
     ModelGateway,
@@ -371,6 +388,131 @@ def _form_from_run(run: ContentRun) -> dict[str, str]:
     }
 
 
+def _format_usd(value: Decimal) -> str:
+    return f"${value.quantize(Decimal('0.0001'))}"
+
+
+def _media_cost_panel(
+    *,
+    data_root: Path,
+    run_id: str,
+    dynamic_avatar_seconds: float,
+    reusable_asset_ratio: float,
+    locale: UILocale,
+) -> str:
+    seconds = Decimal(str(max(0.0, dynamic_avatar_seconds)))
+    try:
+        receipts = [
+            receipt
+            for receipt in load_cost_receipts(data_root)
+            if receipt.run_id == run_id
+        ]
+        summary = aggregate_costs(receipts)
+        avatar_receipts = [receipt for receipt in receipts if receipt.service == "avatar"]
+        estimate = estimate_avatar_seconds(
+            seconds=seconds,
+            catalog=load_pricing_catalog(data_root),
+        )
+        budget = evaluate_budget(
+            estimate=estimate,
+            policy=load_budget_policy(data_root),
+        )
+    except MediaCostError:
+        return f'''<section class="media-cost-panel locked"><span class="kicker">{_escape(ui_text(locale, '成本预览', 'Cost preview'))}</span>
+        <p>{_escape(ui_text(locale, '成本台账需要检查；不会自动执行任何付费操作。', 'The cost ledger needs attention. No paid operation will run automatically.'))}</p></section>'''
+
+    projected = summary.estimated_spend_usd
+    unknown = summary.unknown_cost_receipts
+    if not avatar_receipts and seconds > 0:
+        if estimate.pricing_status is PricingStatus.UNKNOWN:
+            unknown += 1
+        else:
+            projected += estimate.estimated_cost_usd or Decimal(0)
+    cost_label = (
+        f"UNKNOWN + {_format_usd(projected)} {_escape(ui_text(locale, '已知成本', 'known'))}"
+        if unknown
+        else _format_usd(projected)
+    )
+    paid_calls = sum(
+        receipt.request_count
+        for receipt in receipts
+        if receipt.pricing_status is not PricingStatus.NOT_BILLABLE
+    )
+    planned_operations = 2 + (1 if seconds > 0 else 0)
+    local_ratio = Decimal(2) / Decimal(planned_operations) * Decimal(100)
+    reuse_percent = Decimal(str(max(0.0, min(1.0, reusable_asset_ratio)))) * Decimal(100)
+    avatar_price = (
+        ui_text(locale, "不需要新 Avatar · $0 API", "No new Avatar needed · $0 API")
+        if seconds == 0
+        else (
+            ui_text(locale, "UNKNOWN · 需先配置价格或单次授权", "UNKNOWN · configure pricing or approve once")
+            if estimate.pricing_status is PricingStatus.UNKNOWN
+            else _format_usd(estimate.estimated_cost_usd or Decimal(0))
+        )
+    )
+    return f'''<section class="media-cost-panel"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, '成本预览', 'Cost preview'))}</span>
+      <h3>{_escape(ui_text(locale, '本地优先，付费步骤先确认', 'Local first, paid steps require confirmation'))}</h3></div><span class="review-status">{_escape(budget.decision.value)}</span></div>
+      <div class="reference-pattern-grid">
+        <div><strong>{_escape(ui_text(locale, '每个故事 / 视频', 'Cost / story and video'))}</strong><p>{cost_label}</p></div>
+        <div><strong>{_escape(ui_text(locale, '付费调用 / 故事', 'Paid calls / story'))}</strong><p>{paid_calls}</p></div>
+        <div><strong>{_escape(ui_text(locale, '新 Avatar', 'Dynamic Avatar'))}</strong><p>{seconds}s · {_escape(avatar_price)}</p></div>
+        <div><strong>{_escape(ui_text(locale, '素材复用率', 'Reusable asset ratio'))}</strong><p>{reuse_percent.quantize(Decimal('0.1'))}%</p></div>
+        <div><strong>{_escape(ui_text(locale, '本地处理率（计划）', 'Local processing ratio (planned)'))}</strong><p>{local_ratio.quantize(Decimal('0.1'))}%</p></div>
+        <div><strong>{_escape(ui_text(locale, '本地步骤', 'Local steps'))}</strong><p>Qwen3-TTS + Remotion · $0 API</p></div>
+      </div></section>'''
+
+
+def _media_quality_section(
+    *,
+    data_root: Path,
+    run_id: str,
+    locale: UILocale,
+    sealed: bool,
+) -> str:
+    error = ""
+    try:
+        receipt = load_media_quality_review(data_root, run_id)
+    except MediaQualityError as exc:
+        receipt = None
+        error = str(exc)
+    checklist = receipt.checklist if receipt is not None else MediaQualityChecklist()
+    labels = (
+        ("voice_natural", ui_text(locale, "声音自然", "Voice sounds natural")),
+        ("pacing_natural", ui_text(locale, "节奏自然", "Pacing feels natural")),
+        ("no_static_visual_too_long", ui_text(locale, "没有静态画面停留过久", "No static visual stays too long")),
+        ("presenter_adds_value", ui_text(locale, "人物出镜确实增加价值", "Presenter footage adds value")),
+        ("language_natural", ui_text(locale, "中文表达自然", "English sounds native")),
+        ("claims_evidence_backed", ui_text(locale, "事实都有证据支持", "Claims remain evidence-backed")),
+        ("reference_influenced_without_copying", ui_text(locale, "参考影响结构但没有复制", "Reference shaped structure without copying")),
+        ("would_publish", ui_text(locale, "我愿意发布这条成片", "I would publish this finished video")),
+    )
+    checks = "".join(
+        f'<label><input type="checkbox" name="{name}" value="on" '
+        f'{"checked" if getattr(checklist, name) else ""} />{_escape(label)}</label>'
+        for name, label in labels
+    )
+    status = receipt.decision.value if receipt is not None else "PENDING"
+    revision = f" · r{receipt.revision}" if receipt is not None else ""
+    notice = (
+        f'<p class="error" role="alert">{_escape(error)}</p>'
+        if error
+        else ""
+    )
+    if sealed:
+        form = f'<p>{_escape(ui_text(locale, "该检查已绑定到已封装的媒体文件。", "This review is bound to the sealed media files."))}</p>'
+    else:
+        notes = receipt.notes if receipt is not None else ""
+        form = f'''<form method="post" action="/content/media-quality/{run_id}" class="media-quality-form">
+          <input type="hidden" name="ui_locale" value="{locale}" />
+          <div class="quality-checklist">{checks}</div>
+          <label>{_escape(ui_text(locale, '需要修正的具体问题（可选）', 'Concrete issues to fix (optional)'))}<textarea name="notes" maxlength="2000">{_escape(notes)}</textarea></label>
+          <button class="secondary" type="submit">{_escape(ui_text(locale, '保存媒体质量检查', 'Save media-quality review'))}</button>
+        </form>'''
+    return f'''<section class="media-quality-review"><div class="result-head"><div><span class="kicker">Human Media Quality</span>
+      <h2>{_escape(ui_text(locale, '这条成片值得发布吗？', 'Is this finished video worth publishing?'))}</h2></div><span class="review-status">{status}{revision}</span></div>
+      <p>{_escape(ui_text(locale, '全部八项通过后才会解锁统一发布包；这里不会执行发布。', 'All eight checks must pass before the distribution package unlocks. Nothing is published here.'))}</p>{notice}{form}</section>'''
+
+
 def _result_html(
     run: ContentRun,
     *,
@@ -429,12 +571,15 @@ def _result_html(
     thumbnail_download = f"/content/downloads/{run_id}/video-thumbnail.png"
     subtitles_download = f"/content/downloads/{run_id}/video-subtitles.srt"
     run_dir = content_run_directory(data_root, run.run_id)
+    distribution_ready = (run_dir / "26_distribution_package.json").is_file()
     handoff_ready = (run_dir / "23_heygen_handoff.json").is_file()
     avatar_map_ready = (run_dir / "24_avatar_segments.json").is_file()
     scene_options = "".join(
         f'<option value="{_escape(scene.id)}">{_escape(scene.id)} · {_escape(scene.purpose)}</option>'
         for scene in run.drafts.storyboard
     )
+    dynamic_avatar_seconds = 0.0
+    reusable_asset_ratio = 0.0
     try:
         media_profile = load_media_profile(data_root)
         voice_label = (
@@ -456,6 +601,8 @@ def _result_html(
             run=run, library=presenter_library
         )
         presenter_plan = current_presenter_plan(data_root=data_root, run_id=run.run_id)
+        dynamic_avatar_seconds = presenter_plan.dynamic_avatar_seconds
+        reusable_asset_ratio = presenter_plan.reusable_asset_ratio
         presenter_library_label = ui_text(
             locale,
             f"可复用人物素材 · {len(presenter_library.assets)}",
@@ -481,6 +628,38 @@ def _result_html(
         presenter_plan_summary = ui_text(
             locale, "暂时无法计算人物计划", "Presenter plan is unavailable"
         )
+    cost_panel = _media_cost_panel(
+        data_root=data_root,
+        run_id=run.run_id,
+        dynamic_avatar_seconds=dynamic_avatar_seconds,
+        reusable_asset_ratio=reusable_asset_ratio,
+        locale=locale,
+    )
+    media_quality_approved = False
+    media_quality_review_available = False
+    if video_ready:
+        try:
+            media_quality_review = load_media_quality_review(data_root, run.run_id)
+        except MediaQualityError:
+            pass
+        else:
+            media_quality_review_available = media_quality_review is not None
+        try:
+            require_approved_media_quality_review(data_root, run.run_id)
+        except MediaQualityError:
+            pass
+        else:
+            media_quality_approved = True
+    media_quality_section = (
+        _media_quality_section(
+            data_root=data_root,
+            run_id=run.run_id,
+            locale=locale,
+            sealed=distribution_ready,
+        )
+        if video_ready
+        else ""
+    )
     avatar_controls = f'''<section class="avatar-handoff"><span class="kicker">HeyGen Avatar · controlled handoff</span>
       <div class="channel-pills"><span>{_escape(voice_label)}</span><span>{_escape(avatar_label)}</span><span>{_escape(presenter_library_label)}</span></div>
       <p><strong>{_escape(presenter_plan_summary)}</strong></p>
@@ -619,19 +798,31 @@ def _result_html(
         <h3>{_escape(ui_text(locale, '先批准这个统一内容包', 'Approve this unified bundle first'))}</h3>
         <p>{_escape(ui_text(locale, '批准只会解锁 BuildLog 预览，不会自动发布。', 'Approval only unlocks BuildLog preview; it does not publish.'))}</p></section>'''
     )
-    distribution_ready = (run_dir / "26_distribution_package.json").is_file()
+    quality_receipt_download = (
+        f'<a class="text-link" href="/content/downloads/{run_id}/media-quality-review.json" download>{_escape(ui_text(locale, "下载媒体质量回执", "Download media-quality receipt"))}</a>'
+        if media_quality_review_available
+        else ""
+    )
     if distribution_ready:
         distribution_section = f'''<section class="distribution-package"><span class="kicker">{_escape(ui_text(locale, '统一发布包', 'Unified distribution package'))}</span>
         <h3>{_escape(ui_text(locale, '视频、封面、字幕和已批准文案已封装', 'Video, thumbnail, subtitles, and approved copy are sealed'))}</h3>
         <p>{_escape(ui_text(locale, '这里只准备精确文件；没有执行任何平台发布。', 'This prepares exact files only; no platform publication was performed.'))}</p>
         <div class="video-actions"><a class="text-link" href="/content/downloads/{run_id}/distribution-package.json" download>{_escape(ui_text(locale, '下载发布清单', 'Download manifest'))}</a>
         <a class="text-link" href="/content/downloads/{run_id}/youtube-upload.json" download>{_escape(ui_text(locale, '下载 YouTube 上传信息', 'Download YouTube upload metadata'))}</a>
+        {quality_receipt_download}
         <a class="text-link" href="{ui_url('/publishing', locale)}">{_escape(ui_text(locale, '打开发布中心', 'Open Publishing Center'))}</a></div></section>'''
-    elif decision is ContentReviewDecision.APPROVED and video_ready:
+    elif (
+        decision is ContentReviewDecision.APPROVED
+        and video_ready
+        and media_quality_approved
+    ):
         distribution_section = f'''<section class="distribution-package"><span class="kicker">{_escape(ui_text(locale, '统一发布包', 'Unified distribution package'))}</span>
         <h3>{_escape(ui_text(locale, '已满足发布包条件', 'Ready to prepare a distribution package'))}</h3>
         <p>{_escape(ui_text(locale, '将已批准文案、双尺寸视频、封面和字幕封成一次可追溯交接；不会发布。', 'Seal approved copy, both videos, the thumbnail, and subtitles into one traceable handoff. Nothing is published.'))}</p>
         <form method="post" action="/content/distribution/{run_id}"><button class="secondary" type="submit">{_escape(ui_text(locale, '准备统一发布包', 'Prepare distribution package'))}</button></form></section>'''
+    elif decision is ContentReviewDecision.APPROVED and video_ready:
+        distribution_section = f'''<section class="distribution-package locked"><span class="kicker">{_escape(ui_text(locale, '统一发布包', 'Unified distribution package'))}</span>
+        <p>{_escape(ui_text(locale, '先完成并通过八项人工媒体质量检查，再封装发布包。', 'Complete and pass the eight-item human media-quality review before preparing the package.'))}</p></section>'''
     elif decision is ContentReviewDecision.APPROVED:
         distribution_section = f'''<section class="distribution-package locked"><span class="kicker">{_escape(ui_text(locale, '统一发布包', 'Unified distribution package'))}</span>
         <p>{_escape(ui_text(locale, '先生成 YouTube 与 Short 成片，随后即可封装发布包。', 'Render the YouTube and Short videos first, then prepare the distribution package.'))}</p></section>'''
@@ -674,6 +865,7 @@ def _result_html(
         </div>
         <pre>{_escape(review_values['video_script'])}</pre>
         <div class="storyboard">{scenes}</div>
+        {cost_panel}
         <div class="creator-video-result">
           <p><a href="{ui_url('/video', locale)}">{_escape(ui_text(locale, '使用 Google Vertex AI 生成云端视频', 'Generate a cloud video with Google Vertex AI'))}</a></p>
           <details><summary>{_escape(ui_text(locale, '实验性本地 Remotion 渲染器', 'Experimental local Remotion renderer'))}</summary>
@@ -691,6 +883,7 @@ def _result_html(
           <button class="primary" type="submit" name="review_action" value="approve">{_escape(ui_text(locale, '批准内容包', 'Approve bundle'))}</button>
           <button class="danger" type="submit" name="review_action" value="reject">{_escape(ui_text(locale, '拒绝', 'Reject'))}</button></div>
         </form></section>
+      {media_quality_section}
       <p class="review-note">{_escape(ui_text(locale, 'SoloScale 没有连接或操作你的社交账号，也没有自动发布。', 'SoloScale did not connect to or operate your social accounts, and nothing was published automatically.'))}</p>
       <details class="editorial-trace"><summary>Editorial provenance</summary>
         <ol>{editorial_trace}</ol>
@@ -1288,7 +1481,8 @@ if(document.querySelector('[data-video-job-active="true"]')){{
 .channel-pills{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin:18px 0 4px}.channel-pills span{padding:5px 10px;border-radius:999px;background:var(--brand-soft);color:var(--brand);font-size:12px;font-weight:800}.empty .secondary-button{align-self:center}.result-head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.downloads{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}.downloads a,.text-link{font-size:12px;font-weight:750;text-decoration:none;padding:8px 10px;border:1px solid var(--border);border-radius:9px}.tabs{display:flex;flex-wrap:wrap;gap:7px;margin:22px 0 14px;padding:5px;background:var(--surface-subtle);border-radius:12px}.tab{flex:1 1 110px;background:transparent;color:var(--text-muted)}.tab.active{background:white;color:var(--brand);box-shadow:0 1px 4px #17203314}.tab-panel{display:none}.tab-panel.active{display:block}.panel-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}.panel-title h3{margin:0}.copy{background:var(--brand-soft);color:var(--brand)}
 .result-panel pre{max-height:650px;overflow:auto;font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace}.x-thread,.storyboard{display:grid;gap:10px}.x-post,.scene{border:1px solid var(--border);border-radius:14px;padding:14px}.x-post span,.scene span{color:var(--brand);font-size:10px;font-weight:850;letter-spacing:.1em}.x-post p,.scene p{white-space:pre-wrap;line-height:1.5;margin:8px 0}.scene{display:grid;gap:6px}.scene small{color:var(--text-muted)}.review-note{margin:18px 0 0;background:var(--warning-soft);color:var(--warning)}.editorial-trace{margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:12px;color:var(--text-muted);font-size:12px}.editorial-trace summary{color:var(--text);font-weight:800;cursor:pointer}.recent{margin-top:18px;display:flex;gap:9px;flex-wrap:wrap;color:var(--text-muted);font-size:12px}.recent a{text-decoration:none}
 .unified-review{margin-top:24px;padding:18px;border:1px solid var(--border);border-radius:18px;background:var(--surface-subtle)}.unified-review form{display:grid;gap:14px}.review-editor{padding:13px;border:1px solid var(--border);border-radius:14px;background:white}.review-editor textarea{width:100%;min-height:180px}.review-status{padding:6px 10px;border-radius:999px;background:var(--warning-soft);color:var(--warning);font-size:12px;font-weight:850}.review-actions{display:flex;gap:9px;flex-wrap:wrap}.danger{background:#fff1f2;color:#a11b35;border:1px solid #fecdd3}.buildlog-handoff.locked{opacity:.8}.video-job{display:grid;gap:12px;padding:14px;border:1px solid var(--border);border-radius:14px;background:var(--brand-soft)}.video-job p{margin:0;color:var(--text-muted)}.progress-track{height:8px;overflow:hidden;border-radius:999px;background:#fff}.progress-track span{display:block;width:45%;height:100%;border-radius:999px;background:var(--brand);animation:video-progress 1.4s ease-in-out infinite alternate}@keyframes video-progress{from{transform:translateX(-20%)}to{transform:translateX(140%)}}
+.media-cost-panel,.media-quality-review,.distribution-package{margin-top:18px;padding:18px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.media-cost-panel h3,.media-quality-review h2{margin:6px 0}.media-quality-form{display:grid;gap:14px}.quality-checklist{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.quality-checklist label{display:flex;align-items:flex-start;gap:8px;padding:11px;border:1px solid var(--border);border-radius:12px;background:#fff}.quality-checklist input{width:auto;margin-top:2px}.media-quality-form textarea{min-height:82px}.media-quality-form button{width:auto;justify-self:start}.distribution-package.locked,.media-cost-panel.locked{opacity:.82}
 .month-one-canon{margin-bottom:22px;padding:22px;border:1px solid var(--border);border-radius:20px;background:linear-gradient(145deg,#fff,#f4f8ff)}.month-one-canon h2{margin:7px 0}.month-one-canon p{color:var(--text-muted)}.canon-filter{min-width:220px}.canon-week-nav{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}.canon-week-nav a{padding:7px 11px;border-radius:999px;background:var(--brand-soft);font-size:12px;font-weight:800;text-decoration:none}.canon-week{margin-top:22px}.canon-week-title{display:flex;align-items:baseline;gap:10px}.canon-week-title span{color:var(--brand);font-size:11px;font-weight:900;letter-spacing:.1em}.canon-week-title h3{margin:0}.canon-stories{display:grid;gap:10px;margin-top:11px}.canon-story{border:1px solid var(--border);border-radius:14px;background:#fff}.canon-story>summary{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;padding:14px;cursor:pointer;list-style:none}.canon-story>summary::-webkit-details-marker{display:none}.canon-story summary strong,.canon-story summary small{display:block}.canon-story summary small{margin-top:3px;color:var(--text-muted);font-size:11px}.canon-sequence{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--brand-soft);color:var(--brand);font-weight:900}.canon-status{padding:5px 8px;border-radius:999px;background:var(--surface-subtle);font-size:10px;font-style:normal;font-weight:850}.canon-status.ready_for_production{background:var(--success-soft);color:var(--success)}.canon-status.needs_evidence,.canon-status.needs_user_input{background:var(--warning-soft);color:var(--warning)}.canon-story-body{padding:0 16px 16px}.canon-thesis{font-weight:700;color:var(--text)!important}.six-layers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.six-layers>div,.canon-meta>div{padding:11px;border:1px solid var(--border);border-radius:11px;background:var(--surface-subtle)}.six-layers span{color:var(--brand);font-size:11px;font-weight:900}.six-layers p{margin:5px 0 0;font-size:12px}.canon-meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:9px}.canon-meta h4{margin:0 0 6px}.canon-meta ul{margin:0;padding-left:18px;color:var(--text-muted);font-size:12px}.canon-production{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;color:var(--text-muted);font-size:12px}.canon-actions{display:flex;gap:8px;margin-top:12px}.canon-actions button{width:auto}.canon-actions .secondary-button{background:var(--surface-subtle);color:var(--brand)}
-@media(max-width:900px){.use-my-work,.grid{grid-template-columns:1fr}.scan-work{align-items:flex-start;flex-direction:column}.result-head{display:block}.downloads{justify-content:flex-start;margin-top:12px}}@media(max-width:580px){.two,.reference-pattern-grid{grid-template-columns:1fr}}
+@media(max-width:900px){.use-my-work,.grid{grid-template-columns:1fr}.scan-work{align-items:flex-start;flex-direction:column}.result-head{display:block}.downloads{justify-content:flex-start;margin-top:12px}}@media(max-width:580px){.two,.reference-pattern-grid,.quality-checklist{grid-template-columns:1fr}}
 """,
     )

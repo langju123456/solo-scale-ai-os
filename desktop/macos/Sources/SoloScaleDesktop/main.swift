@@ -121,16 +121,17 @@ private final class BackendController: NSObject, ObservableObject {
                 }
             }
             try process.run()
+            let credentialWriter = credentialPipe.fileHandleForWriting
             do {
-                try credentialPipe.fileHandleForWriting.write(
+                try credentialWriter.write(
                     desktopCredentialEnvelopeFrame(
                         openAIKey: try DesktopOpenAIKeychain.read(),
                         heygenAPIKey: try DesktopHeyGenKeychain.read()
                     )
                 )
-                try credentialPipe.fileHandleForWriting.close()
+                credentialWriter.closeFile()
             } catch {
-                credentialPipe.fileHandleForWriting.closeFile()
+                credentialWriter.closeFile()
                 process.terminate()
                 throw error
             }

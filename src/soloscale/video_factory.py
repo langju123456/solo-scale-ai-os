@@ -11,6 +11,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from soloscale.content_models import ContentRun
@@ -18,6 +20,13 @@ from soloscale.content_workspace import (
     ContentWorkspaceError,
     content_run_directory,
     load_content_run,
+)
+from soloscale.media_cost import (
+    CostReceiptStatus,
+    MediaCostError,
+    estimate_local_operation,
+    make_cost_receipt,
+    save_cost_receipt,
 )
 from soloscale.presenter_assets import (
     PresenterAssetError,
@@ -425,6 +434,8 @@ def _run_renderer(
 def render_creator_video(*, data_root: Path, run_id: str, repository_root: Path) -> Path:
     """Render one saved storyboard as both 16:9 and 9:16 local MP4s."""
 
+    render_started_at = datetime.now(UTC)
+    render_started = time.monotonic()
     run = load_content_run(data_root, run_id)
     run_dir = content_run_directory(data_root, run_id)
     input_path = run_dir / _INPUT_NAME
@@ -536,6 +547,28 @@ def render_creator_video(*, data_root: Path, run_id: str, repository_root: Path)
     if not creator_video_ready(data_root, run_id):
         raise CreatorVideoError("Creator Video did not create both required outputs")
     os.chmod(thumbnail_path, 0o600)
+    render_finished_at = datetime.now(UTC)
+    render_duration_ms = max(0, int((time.monotonic() - render_started) * 1000))
+    try:
+        cost_receipt = make_cost_receipt(
+            run_id=run_id,
+            video_run_id=run_id,
+            estimate=estimate_local_operation(
+                service="remotion",
+                feature="content_video",
+                operation="render_package",
+            ),
+            status=CostReceiptStatus.SUCCEEDED,
+            started_at=render_started_at,
+            finished_at=render_finished_at,
+            duration_ms=render_duration_ms,
+            actual_cost_usd=Decimal(0),
+        )
+        save_cost_receipt(data_root, cost_receipt)
+    except (MediaCostError, OSError, ValueError) as exc:
+        raise CreatorVideoError(
+            "Creator Video rendered, but its local cost receipt could not be saved"
+        ) from exc
     receipt = {
         "status": "RENDERED_LOCAL_VIDEO_PACKAGE",
         "short_video": _VIDEO_NAME,
@@ -561,6 +594,9 @@ def render_creator_video(*, data_root: Path, run_id: str, repository_root: Path)
         "network_used": False,
         "publication_performed": False,
         "renderer": "Remotion 4.0.421",
+        "cost_receipt_id": cost_receipt.receipt_id,
+        "local_api_cost_usd": "0",
+        "render_duration_ms": render_duration_ms,
     }
     try:
         _atomic_private_write(

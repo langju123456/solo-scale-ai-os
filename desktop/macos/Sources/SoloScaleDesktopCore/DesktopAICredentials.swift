@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 public enum DesktopAICredentialError: LocalizedError {
@@ -98,9 +99,17 @@ private enum DesktopSecretKeychain {
         var query = baseQuery(service: service, account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
+        // Startup must never wait behind an invisible Keychain authorization dialog.
+        // A credential that needs interaction remains unavailable until the user
+        // reconnects it from the visible settings flow.
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
+        query[kSecUseAuthenticationContext as String] = authenticationContext
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecItemNotFound { return nil }
+        if status == errSecItemNotFound || status == errSecInteractionNotAllowed {
+            return nil
+        }
         guard status == errSecSuccess, let data = item as? Data else {
             throw DesktopAICredentialError.keychain(status)
         }

@@ -42,6 +42,8 @@ from soloscale.content_workspace import (
 )
 from soloscale.evidence_agent import Reasoner
 from soloscale.evidence_hub import EvidenceHub
+from soloscale.media_cost import load_cost_receipts
+from soloscale.media_quality import MediaQualityChecklist, save_media_quality_review
 from soloscale.video_factory import (
     CreatorVideoJobManager,
     creator_video_ready,
@@ -529,6 +531,13 @@ def test_creator_video_render_uses_only_saved_storyboard_and_is_non_overwriting(
     assert (output.parent / "22_creator_video_thumbnail.png").is_file()
     assert (output.parent / "25_creator_video_subtitles.srt").is_file()
     assert (output.parent / "11_creator_video_render.json").is_file()
+    render_receipt = json.loads(
+        (output.parent / "11_creator_video_render.json").read_text()
+    )
+    assert render_receipt["local_api_cost_usd"] == "0"
+    cost_receipts = load_cost_receipts(data_root)
+    assert len(cost_receipts) == 1
+    assert cost_receipts[0].service == "remotion"
     with pytest.raises(ValueError, match="already has"):
         render_creator_video(
             data_root=data_root,
@@ -627,6 +636,23 @@ def test_distribution_package_requires_approval_and_seals_exact_media(
     }.items():
         (run_dir / filename).write_bytes(body)
 
+    with pytest.raises(ContentDistributionError, match="media-quality"):
+        prepare_distribution_package(data_root=data_root, run_id=run.run_id)
+    quality = save_media_quality_review(
+        data_root=data_root,
+        run_id=run.run_id,
+        checklist=MediaQualityChecklist(
+            voice_natural=True,
+            pacing_natural=True,
+            no_static_visual_too_long=True,
+            presenter_adds_value=True,
+            language_natural=True,
+            claims_evidence_backed=True,
+            reference_influenced_without_copying=True,
+            would_publish=True,
+        ),
+    )
+
     path = prepare_distribution_package(data_root=data_root, run_id=run.run_id)
     package = load_distribution_package(data_root, run.run_id)
     assert package is not None
@@ -634,6 +660,7 @@ def test_distribution_package_requires_approval_and_seals_exact_media(
     assert package["locale"] == "en-US"
     assert package["variant_group_id"].startswith("fact-contract:")
     assert package["review_revision"] == review.revision
+    assert package["media_quality_review"]["revision"] == quality.revision  # type: ignore[index]
     assert package["channels"]["youtube"]["direct_upload_enabled"] is False  # type: ignore[index]
     artifacts = package["artifacts"]
     assert artifacts["video"]["filename"] == "21_creator_video_youtube.mp4"  # type: ignore[index]

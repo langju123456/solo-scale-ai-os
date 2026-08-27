@@ -22,6 +22,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from email import policy
 from email.parser import BytesParser
 from http.cookies import CookieError, SimpleCookie
@@ -85,11 +86,22 @@ from soloscale.learning_traceability import (
     run_learning_traceability,
     save_learning_response,
 )
+from soloscale.media_cost import (
+    BudgetPolicy,
+    MediaCostError,
+    load_budget_policy,
+    save_budget_policy,
+)
 from soloscale.media_profile import (
     MediaProfile,
     MediaProfileError,
     load_media_profile_settings,
     save_media_profile,
+)
+from soloscale.media_quality import (
+    MediaQualityChecklist,
+    MediaQualityError,
+    save_media_quality_review,
 )
 from soloscale.model_gateway import (
     GatewayConfigurationState,
@@ -4790,6 +4802,10 @@ def _heygen_settings_page(
         profile = load_media_profile_settings(data_root)
     except MediaProfileError:
         profile = None
+    try:
+        budget_policy = load_budget_policy(data_root)
+    except MediaCostError:
+        budget_policy = BudgetPolicy()
     configured = heygen_api_key_is_configured()
     notices = {
         "saved": ui_text(
@@ -4806,6 +4822,16 @@ def _heygen_settings_page(
             locale,
             "Avatar 与中英文 voice 配置已保存。",
             "Avatar and bilingual voice settings were saved.",
+        ),
+        "budget-saved": ui_text(
+            locale,
+            "媒体预算已保存；付费步骤会先按这些上限检查。",
+            "Media budgets were saved. Paid steps will check these limits first.",
+        ),
+        "budget-invalid": ui_text(
+            locale,
+            "预算未保存；请输入空值或不小于 0 的美元金额。",
+            "Budgets were not saved. Enter blank values or non-negative USD amounts.",
         ),
         "invalid": ui_text(
             locale,
@@ -4824,6 +4850,8 @@ def _heygen_settings_page(
     )
     disabled = "" if desktop_mode else " disabled"
     profile_fields = profile or MediaProfile()
+    def budget_value(value: Decimal | None) -> str:
+        return "" if value is None else format(value, "f")
     delete_button = (
         f'<button id="delete-heygen-key" class="danger" type="button">{_escape(ui_text(locale, "移除 Keychain 密钥", "Remove Keychain key"))}</button>'
         if configured and desktop_mode
@@ -4839,6 +4867,21 @@ def _heygen_settings_page(
     <div class="button-row"><button type="submit"{disabled}>{_escape(ui_text(locale, '安全保存', 'Save securely'))}</button>{delete_button}</div>
   </form>
   <p id="heygen-key-status" role="status"></p>
+</section>
+<section class="setup-card">
+  <span class="kicker">BudgetGuard</span>
+  <h2>{_escape(ui_text(locale, '媒体费用上限', 'Media spending limits'))}</h2>
+  <p>{_escape(ui_text(locale, '留空表示不设置该级别上限；未知价格仍会停下来要求单次确认。', 'Leave a field blank for no limit at that scope. Unknown pricing still stops for one-time approval.'))}</p>
+  <form method="post" action="/settings/media/heygen">
+    <input type="hidden" name="ui_locale" value="{locale}" />
+    <input type="hidden" name="action" value="save_budget" />
+    <label>{_escape(ui_text(locale, '每次付费操作 USD', 'Per paid operation USD'))}<input type="number" min="0" step="0.01" name="per_paid_operation_usd" value="{budget_value(budget_policy.per_paid_operation_usd)}" /></label>
+    <label>{_escape(ui_text(locale, '每个故事 USD', 'Per story USD'))}<input type="number" min="0" step="0.01" name="per_story_usd" value="{budget_value(budget_policy.per_story_usd)}" /></label>
+    <label>{_escape(ui_text(locale, '每个视频 USD', 'Per video USD'))}<input type="number" min="0" step="0.01" name="per_video_usd" value="{budget_value(budget_policy.per_video_usd)}" /></label>
+    <label>{_escape(ui_text(locale, '每日 USD', 'Daily USD'))}<input type="number" min="0" step="0.01" name="daily_usd" value="{budget_value(budget_policy.daily_usd)}" /></label>
+    <label>{_escape(ui_text(locale, '每月 USD', 'Monthly USD'))}<input type="number" min="0" step="0.01" name="monthly_usd" value="{budget_value(budget_policy.monthly_usd)}" /></label>
+    <button type="submit">{_escape(ui_text(locale, '保存预算', 'Save budgets'))}</button>
+  </form>
 </section>
 <section class="setup-card">
   <span class="kicker">{_escape(ui_text(locale, '人物配置', 'Presenter profile'))}</span>
@@ -6108,6 +6151,43 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                         outcome = "invalid"
                     else:
                         outcome = "profile-saved"
+            elif action == "save_budget":
+                try:
+                    current_policy = load_budget_policy(
+                        self.ui_data_root.absolute()
+                    )
+
+                    def optional_amount(name: str) -> Decimal | None:
+                        raw = form.get(name, "").strip()
+                        if not raw:
+                            return None
+                        value = Decimal(raw)
+                        if not value.is_finite() or value < 0:
+                            raise ValueError("budget must be a non-negative amount")
+                        return value
+
+                    save_budget_policy(
+                        self.ui_data_root.absolute(),
+                        BudgetPolicy(
+                            per_paid_operation_usd=optional_amount(
+                                "per_paid_operation_usd"
+                            ),
+                            per_story_usd=optional_amount("per_story_usd"),
+                            per_video_usd=optional_amount("per_video_usd"),
+                            daily_usd=optional_amount("daily_usd"),
+                            monthly_usd=optional_amount("monthly_usd"),
+                            warning_ratio=current_policy.warning_ratio,
+                        ),
+                    )
+                except (
+                    InvalidOperation,
+                    MediaCostError,
+                    OSError,
+                    ValueError,
+                ):
+                    outcome = "budget-invalid"
+                else:
+                    outcome = "budget-saved"
             self.send_response(303)
             self.send_header(
                 "Location",
@@ -6886,6 +6966,54 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 "/content#results", self.ui_locale, run_id=run_id
             )
             self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        media_quality_match = re.fullmatch(
+            r"/content/media-quality/(content-[^/]+)", path
+        )
+        if media_quality_match is not None:
+            run_id = media_quality_match.group(1)
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 16 * 1024:
+                self.send_error(413, "Media-quality review is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            try:
+                save_media_quality_review(
+                    data_root=self.ui_data_root.absolute(),
+                    run_id=run_id,
+                    checklist=MediaQualityChecklist(
+                        voice_natural=form.get("voice_natural") == "on",
+                        pacing_natural=form.get("pacing_natural") == "on",
+                        no_static_visual_too_long=(
+                            form.get("no_static_visual_too_long") == "on"
+                        ),
+                        presenter_adds_value=(
+                            form.get("presenter_adds_value") == "on"
+                        ),
+                        language_natural=form.get("language_natural") == "on",
+                        claims_evidence_backed=(
+                            form.get("claims_evidence_backed") == "on"
+                        ),
+                        reference_influenced_without_copying=(
+                            form.get("reference_influenced_without_copying") == "on"
+                        ),
+                        would_publish=form.get("would_publish") == "on",
+                    ),
+                    notes=form.get("notes", ""),
+                )
+            except (ContentWorkspaceError, MediaQualityError, OSError, ValueError) as exc:
+                self._send_content_page(run_id=run_id, error=str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location", ui_url("/content#results", self.ui_locale, run_id=run_id)
+            )
             self.send_header("Content-Length", "0")
             self.end_headers()
             return

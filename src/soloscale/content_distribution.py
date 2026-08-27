@@ -15,6 +15,11 @@ from soloscale.content_workspace import (
     load_content_review,
     load_content_run,
 )
+from soloscale.media_quality import (
+    MEDIA_QUALITY_FILENAME,
+    MediaQualityError,
+    require_approved_media_quality_review,
+)
 from soloscale.resume_workspace import ResumeWorkspaceStorageError, _atomic_private_write
 
 _PACKAGE_NAME = "26_distribution_package.json"
@@ -71,6 +76,11 @@ def prepare_distribution_package(*, data_root: Path, run_id: str) -> Path:
         key: _regular_artifact(run_dir, filename)
         for key, filename in _REQUIRED_MEDIA.items()
     }
+    try:
+        media_quality = require_approved_media_quality_review(data_root, run_id)
+    except MediaQualityError as exc:
+        raise ContentDistributionError(str(exc)) from exc
+    media_quality_path = _regular_artifact(run_dir, MEDIA_QUALITY_FILENAME)
     title = run.brief.topic.strip()[:100]
     description = values["canonical_story"].strip()
     locale = (
@@ -88,6 +98,7 @@ def prepare_distribution_package(*, data_root: Path, run_id: str) -> Path:
         "locale": locale,
         "variant_group_id": variant_group_id,
         "review_revision": receipt.revision,
+        "media_quality_revision": media_quality.revision,
         "title": title,
         "description": description,
         "video": media["video"].name,
@@ -104,6 +115,12 @@ def prepare_distribution_package(*, data_root: Path, run_id: str) -> Path:
         "locale": locale,
         "variant_group_id": variant_group_id,
         "review_revision": receipt.revision,
+        "media_quality_review": {
+            "filename": MEDIA_QUALITY_FILENAME,
+            "revision": media_quality.revision,
+            "decision": media_quality.decision.value,
+            "sha256": _sha256(media_quality_path),
+        },
         "channels": {
             "linkedin": {
                 "source": "approved review linkedin.md",

@@ -133,6 +133,7 @@ _DOWNLOADS = {
     "video-subtitles.srt": "25_creator_video_subtitles.srt",
     "distribution-package.json": "26_distribution_package.json",
     "youtube-upload.json": "27_youtube_upload.json",
+    "media-quality-review.json": "28_media_quality_review.json",
     "creator-video-render.json": "11_creator_video_render.json",
     "publish-pack.json": "06_publish_pack.json",
     "provenance.json": "07_provenance.json",
