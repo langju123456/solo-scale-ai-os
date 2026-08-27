@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Literal, Protocol
 from uuid import uuid4
 
+from soloscale.evidence_capture import capture_assets, capture_outcome
+from soloscale.evidence_hub import EvidenceHub
 from soloscale.knowledge_models import RetrievalHit
 from soloscale.resume_models import (
     CandidateProfile,
@@ -748,11 +750,21 @@ def run_resume_workspace(
     application_resume_metadata: dict[str, str | int | bool] | None = None,
     mode: ResumeMode = ResumeMode.LOCAL_ONLY,
     research_provider: JobResearchProvider | None = None,
+    evidence_hub: EvidenceHub | None = None,
+    evidence_bundle_id: str | None = None,
 ) -> ResumeRun:
     if not job_description.strip():
         raise ValueError("job_description must not be empty")
     if mode is ResumeMode.HYBRID and research_provider is None:
         raise ValueError("hybrid mode requires an explicit JobResearchProvider")
+    bundle_evidence_ids: list[str] = []
+    if evidence_bundle_id is not None:
+        selected_hub = evidence_hub or EvidenceHub(data_root)
+        bundle, bundle_items = selected_hub.resolve_bundle(evidence_bundle_id)
+        bundle_evidence_ids = bundle.evidence_ids
+        allowed_native_ids = {item.native_id for item in bundle_items}
+        evidence_hits = [hit for hit in evidence_hits if hit.chunk_id in allowed_native_ids]
+        evidence_hub = selected_hub
     if (application_resume_bytes is None) is not (application_resume_filename is None):
         raise ValueError("application resume bytes and filename must be supplied together")
     if application_resume_filename is not None:
@@ -965,8 +977,34 @@ def run_resume_workspace(
     run = ResumeRun(
         run_id=run_id,
         mode=mode,
+        evidence_bundle_id=evidence_bundle_id,
         route=route,
         artifact_paths=artifact_paths,
     )
     _write_json(run_dir / "run.json", run.model_dump(mode="json"))
+    captured_assets = capture_assets(
+        data_root=data_root,
+        run_dir=run_dir,
+        owner="resume",
+        run_id=run_id,
+        artifact_names=artifact_paths,
+        evidence_bundle_id=evidence_bundle_id,
+        evidence_item_ids=bundle_evidence_ids,
+        evidence_hub=evidence_hub,
+    )
+    if route["application_library_saved"] is True:
+        capture_outcome(
+            data_root=data_root,
+            run_dir=run_dir,
+            owner="resume",
+            run_id=run_id,
+            outcome_type="application_bundle",
+            platform="local_application_library",
+            status="saved_requires_human_review",
+            final_sha256=hashlib.sha256(delivery_path.read_bytes()).hexdigest(),
+            metadata={"delivery_state": "APPLICATION_LIBRARY_SAVED"},
+            evidence_item_ids=bundle_evidence_ids,
+            asset_id=captured_assets.get("delivery.json"),
+            evidence_hub=evidence_hub,
+        )
     return run

@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from soloscale import learning_traceability
+from soloscale.evidence_hub import EvidenceHub
 from soloscale.learning_models import (
     ClaimEligibility,
     CodeAnchor,
@@ -167,11 +168,16 @@ def test_golden_case_writes_private_grounded_traceability_packet(tmp_path: Path)
     for raw_anchor in all_anchors:
         assert isinstance(raw_anchor, dict)
         relative_file = str(raw_anchor["file"])
-        file_path = REPOSITORY_ROOT / relative_file
         assert _git("ls-files", "--error-unmatch", relative_file) == relative_file
-        assert raw_anchor["file_sha256"] == hashlib.sha256(file_path.read_bytes()).hexdigest()
+        committed_file = subprocess.run(
+            ["git", "show", f"{run.commit}:{relative_file}"],
+            cwd=REPOSITORY_ROOT,
+            capture_output=True,
+            check=True,
+        ).stdout
+        assert raw_anchor["file_sha256"] == hashlib.sha256(committed_file).hexdigest()
         assert 1 <= int(raw_anchor["line_start"]) <= int(raw_anchor["line_end"])
-        line_count = len(file_path.read_text(encoding="utf-8").splitlines())
+        line_count = len(committed_file.decode("utf-8").splitlines())
         assert int(raw_anchor["line_end"]) <= line_count
 
     graph = _read_json(run_dir / "04_evidence_graph.json")
@@ -205,6 +211,7 @@ def test_golden_case_writes_private_grounded_traceability_packet(tmp_path: Path)
     assert claim["approved_claim"] is None
     assert verification["tests_executed_by_learning_run"] is False
     assert verification["approved_claim_created"] is False
+    assert EvidenceHub(data_root).status().asset_count == len(ARTIFACT_FILES)
 
 
 def test_learning_material_is_cached_by_evidence_hash(tmp_path: Path) -> None:

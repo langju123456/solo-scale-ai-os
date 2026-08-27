@@ -1,0 +1,56 @@
+{
+  "id": "local-agent-001",
+  "title": "Running my first local AI agent",
+  "goal": "Run the Hugging Face Agents Course example locally with Ollama and Qwen3.",
+  "context": "The original example used a hosted model, while the goal was to understand and run the full pipeline locally.",
+  "problem": "The model backend and installed Gradio version were incompatible with the original tutorial defaults.",
+  "actions": [
+    "Replaced the hosted model wrapper with LiteLLMModel.",
+    "Connected LiteLLMModel to the local Ollama endpoint.",
+    "Used Qwen3 as the local model.",
+    "Changed only the incompatible Gradio arguments."
+  ],
+  "decisions": [
+    {
+      "decision": "Preserve the original tutorial structure.",
+      "reason": "A large rewrite would hide the pipeline being studied.",
+      "alternatives_considered": [
+        "Rewrite the application around a different framework."
+      ]
+    },
+    {
+      "decision": "Use LiteLLM as the model adapter.",
+      "reason": "The application could change model backends without changing the rest of the agent workflow.",
+      "alternatives_considered": [
+        "Call Ollama directly from every model-dependent component."
+      ]
+    }
+  ],
+  "trade_offs": [
+    "The local model may be slower than a hosted endpoint.",
+    "Preserving the tutorial structure limits architectural cleanup in this iteration."
+  ],
+  "result": "The Gradio interface successfully completed the local agent pipeline through smolagents, LiteLLM, Ollama, and Qwen3.",
+  "lessons": [
+    "Adapter layers reduce coupling between applications and model providers.",
+    "Minimal compatibility changes make debugging easier.",
+    "A working agent pipeline depends on clear boundaries between UI, framework, model adapter, and model runtime."
+  ],
+  "evidence": [
+    "Ollama served the selected Qwen3 model locally.",
+    "The Gradio interface returned a valid response.",
+    "The final execution path was Gradio -> smolagents -> LiteLLM -> Ollama -> Qwen3."
+  ],
+  "audience": "AI engineers, software engineers, and technical recruiters",
+  "metadata": {
+    "project": "Local AI Agent",
+    "language": "Python",
+    "tools": [
+      "smolagents",
+      "LiteLLM",
+      "Ollama",
+      "Qwen3",
+      "Gradio"
+    ]
+  }
+}

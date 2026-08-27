@@ -14,6 +14,9 @@ from uuid import uuid4
 
 from soloscale.knowledge_models import (
     ContentRole,
+    KnowledgeCatalogChunk,
+    KnowledgeCatalogDocument,
+    KnowledgeCatalogSnapshot,
     KnowledgeStatus,
     ParsedSource,
     RetrievalHit,
@@ -35,6 +38,13 @@ _MAX_QUERY_TOKENS = 32
 _EXCERPT_LIMIT = 1200
 _QUERY_TOKEN = re.compile(r"[^\W_]+", flags=re.UNICODE)
 _CJK_TOKEN = re.compile(r"^[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+$")
+
+
+def _ensure_mode(path: Path, mode: int) -> None:
+    """Avoid redundant metadata writes while preserving private-mode enforcement."""
+
+    if stat.S_IMODE(path.stat().st_mode) != mode:
+        path.chmod(mode)
 
 
 class KnowledgeStoreError(Exception):
@@ -225,6 +235,85 @@ class KnowledgeStore:
             source_counts=source_counts,
             last_synced_at=last_synced_at,
         )
+
+    def catalog_metadata(self) -> KnowledgeCatalogSnapshot:
+        """Return a consistent metadata-only projection for downstream catalogs.
+
+        This query intentionally does not select chunk bodies or retrieval excerpts.
+        Native IDs and locators are private provenance metadata for local catalogs.
+        """
+
+        try:
+            with self._connect() as connection:
+                with _read_snapshot(connection):
+                    document_rows = connection.execute(
+                        """
+                        SELECT document_id, source_kind, external_id, locator, parent_external_id,
+                               title, content_sha256, byte_size, observed_at, metadata_json
+                        FROM documents
+                        ORDER BY document_id
+                        """
+                    ).fetchall()
+                    chunk_rows = connection.execute(
+                        """
+                        SELECT chunk_id, document_id, ordinal, role, timestamp,
+                               text_sha256, metadata_json
+                        FROM chunks
+                        ORDER BY document_id, ordinal, chunk_id
+                        """
+                    ).fetchall()
+        except (UnsafeKnowledgePathError, CorruptKnowledgeStoreError):
+            raise
+        except sqlite3.Error:
+            raise KnowledgeStoreError("knowledge catalog metadata read failed") from None
+
+        try:
+            return KnowledgeCatalogSnapshot(
+                documents=[
+                    KnowledgeCatalogDocument(
+                        document_id=str(row["document_id"]),
+                        native_id=str(row["external_id"]),
+                        source_kind=SourceKind(str(row["source_kind"])),
+                        project=(
+                            str(row["parent_external_id"])
+                            if row["parent_external_id"] is not None
+                            else None
+                        ),
+                        locator=str(row["locator"]),
+                        title=str(row["title"]) if row["title"] is not None else None,
+                        content_sha256=str(row["content_sha256"]),
+                        byte_size=int(row["byte_size"]),
+                        observed_at=_parse_catalog_datetime(row["observed_at"]),
+                        metadata_sha256=hashlib.sha256(
+                            str(row["metadata_json"]).encode("utf-8")
+                        ).hexdigest(),
+                        metadata={
+                            str(key): str(value)
+                            for key, value in json.loads(str(row["metadata_json"])).items()
+                            if isinstance(key, str) and isinstance(value, str)
+                        },
+                    )
+                    for row in document_rows
+                ],
+                chunks=[
+                    KnowledgeCatalogChunk(
+                        chunk_id=str(row["chunk_id"]),
+                        document_id=str(row["document_id"]),
+                        ordinal=int(row["ordinal"]),
+                        role=ContentRole(str(row["role"])),
+                        timestamp=_parse_catalog_datetime(row["timestamp"]),
+                        text_sha256=str(row["text_sha256"]),
+                        metadata_sha256=hashlib.sha256(
+                            str(row["metadata_json"]).encode("utf-8")
+                        ).hexdigest(),
+                    )
+                    for row in chunk_rows
+                ],
+            )
+        except (TypeError, ValueError):
+            raise CorruptKnowledgeStoreError(
+                "knowledge store contains invalid catalog metadata"
+            ) from None
 
     def reset_index(self) -> None:
         """Delete only the derived SQLite index; preserve private agent-run receipts."""
@@ -920,12 +1009,12 @@ class KnowledgeStore:
         _reject_symlink_or_wrong_type(self.root, expected_directory=True)
         self.root.mkdir(mode=_PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
         _reject_symlink_or_wrong_type(self.root, expected_directory=True)
-        self.root.chmod(_PRIVATE_DIRECTORY_MODE)
+        _ensure_mode(self.root, _PRIVATE_DIRECTORY_MODE)
 
         _reject_symlink_or_wrong_type(self.knowledge_root, expected_directory=True)
         self.knowledge_root.mkdir(mode=_PRIVATE_DIRECTORY_MODE, exist_ok=True)
         _reject_symlink_or_wrong_type(self.knowledge_root, expected_directory=True)
-        self.knowledge_root.chmod(_PRIVATE_DIRECTORY_MODE)
+        _ensure_mode(self.knowledge_root, _PRIVATE_DIRECTORY_MODE)
 
         _reject_symlink_or_wrong_type(self.database_path, expected_directory=False)
         if not self.database_path.exists():
@@ -935,7 +1024,7 @@ class KnowledgeStore:
             descriptor = os.open(self.database_path, flags, _PRIVATE_FILE_MODE)
             os.close(descriptor)
         _reject_symlink_or_wrong_type(self.database_path, expected_directory=False)
-        self.database_path.chmod(_PRIVATE_FILE_MODE)
+        _ensure_mode(self.database_path, _PRIVATE_FILE_MODE)
         self._tighten_sidecars()
 
     def _validate_storage(self) -> None:
@@ -949,7 +1038,7 @@ class KnowledgeStore:
         for sidecar in self._sidecar_paths():
             _reject_symlink_or_wrong_type(sidecar, expected_directory=False)
             if sidecar.exists():
-                sidecar.chmod(_PRIVATE_FILE_MODE)
+                _ensure_mode(sidecar, _PRIVATE_FILE_MODE)
 
     def _sidecar_paths(self) -> tuple[Path, ...]:
         return tuple(
@@ -981,7 +1070,7 @@ class KnowledgeStore:
             yield connection
         finally:
             connection.close()
-            self.database_path.chmod(_PRIVATE_FILE_MODE)
+            _ensure_mode(self.database_path, _PRIVATE_FILE_MODE)
             self._tighten_sidecars()
 
     def _initialize_schema(self) -> None:
@@ -1133,6 +1222,13 @@ def _datetime_text(value: datetime | None) -> str | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC).isoformat()
     return value.astimezone(UTC).isoformat()
+
+
+def _parse_catalog_datetime(value: object) -> datetime | None:
+    if value is None:
+        return None
+    parsed = datetime.fromisoformat(str(value))
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 
 def _utc_now_text() -> str:

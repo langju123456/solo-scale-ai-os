@@ -33,6 +33,8 @@ from soloscale.evidence_agent import (
     EvidenceAgentError,
     OllamaReasoner,
 )
+from soloscale.evidence_hub import EvidenceHub, EvidenceHubError
+from soloscale.evidence_ui import refresh_evidence_catalog
 from soloscale.handoff import packet_from_task, render_packet_markdown
 from soloscale.knowledge_models import ParsedSource, SourceFailure, SourceKind, SyncReport
 from soloscale.knowledge_store import KnowledgeStore, KnowledgeStoreError
@@ -44,10 +46,19 @@ from soloscale.models import (
     TaskEnvelope,
 )
 from soloscale.router import route_task
+from soloscale.skill_os import (
+    SkillOSError,
+    default_registry_path,
+    load_skill_registry,
+    persist_route_receipt,
+    render_skill_route,
+    route_skill_request,
+)
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
 _DEFAULT_CODEX_HOME = Path.home() / ".codex"
+_DEFAULT_SKILL_REGISTRY = default_registry_path()
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -321,6 +332,57 @@ def task_create(
     console.print(f"[green]Created[/green] {path}")
     decision = route_task(task)
     console.print(Panel(decision.model_dump_json(indent=2), title="Route decision"))
+
+
+@app.command("skill-list")
+def skill_list(
+    registry_path: Annotated[
+        Path,
+        typer.Option("--registry", help="Tracked repo-scoped Skill registry"),
+    ] = _DEFAULT_SKILL_REGISTRY,
+) -> None:
+    """List registered Skill versions and trust status without reading private runs."""
+
+    try:
+        registry = load_skill_registry(registry_path)
+    except SkillOSError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--registry") from exc
+    table = Table(title="SoloScale Skill Registry")
+    table.add_column("Skill")
+    table.add_column("Version")
+    table.add_column("Status")
+    table.add_column("Risk")
+    for skill in registry.skills:
+        table.add_row(skill.name, skill.current_version, skill.status.value, skill.risk_class.value)
+    console.print(table)
+
+
+@app.command("skill-route")
+def skill_route(
+    request_text: Annotated[str, typer.Argument(help="High-level operator request")],
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private ignored SoloScale data root"),
+    ] = Path(".soloscale"),
+    registry_path: Annotated[
+        Path,
+        typer.Option("--registry", help="Tracked repo-scoped Skill registry"),
+    ] = _DEFAULT_SKILL_REGISTRY,
+) -> None:
+    """Normalize one high-level request, compose Skills, and save a private route receipt."""
+
+    _validate_private_data_root(data_root)
+    try:
+        registry = load_skill_registry(registry_path)
+        route = route_skill_request(request_text, registry=registry)
+        receipt, receipt_path = persist_route_receipt(route, data_root=data_root)
+    except SkillOSError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(render_skill_route(route))
+    console.print(
+        f"[green]Private receipt[/green] {receipt.receipt_id} — {receipt.final_status.value}"
+    )
+    console.print(receipt_path)
 
 
 @app.command("task-route")
@@ -720,6 +782,53 @@ def knowledge_status(
         status.last_synced_at.isoformat() if status.last_synced_at else "NEVER",
     )
     console.print(table)
+
+
+@app.command("evidence-refresh")
+def evidence_refresh(
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private ignored SoloScale data root"),
+    ] = Path(".soloscale"),
+    repository_root: Annotated[
+        Path | None,
+        typer.Option("--repository-root", help="Repository used for Git snapshot metadata"),
+    ] = None,
+    buildlog_root: Annotated[
+        list[Path] | None,
+        typer.Option("--buildlog-root", help="BuildLog root; repeat as needed"),
+    ] = None,
+) -> None:
+    """Explicitly refresh metadata-only local evidence without models or publishing."""
+
+    _validate_private_data_root(data_root)
+    try:
+        receipt = refresh_evidence_catalog(
+            data_root,
+            repository_root=repository_root or Path.cwd(),
+            buildlog_roots=buildlog_root or (),
+        )
+        status = EvidenceHub(data_root).status()
+    except (EvidenceHubError, OSError, ValueError) as exc:
+        raise typer.BadParameter("evidence refresh could not be completed") from exc
+    table = Table(title="Evidence catalog refresh")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Status", receipt.status.value)
+    table.add_row("Sources", str(status.source_count))
+    table.add_row("Evidence", str(status.evidence_count))
+    table.add_row("Assets", str(status.asset_count))
+    table.add_row("Outcomes", str(status.outcome_count))
+    table.add_row("Created", str(receipt.created_count))
+    table.add_row("Updated", str(receipt.updated_count))
+    table.add_row("Unchanged", str(receipt.unchanged_count))
+    table.add_row("Errors", str(receipt.error_count))
+    console.print(table)
+    if receipt.status.value == "failed":
+        console.print(
+            "[red]Evidence refresh failed. Review local source availability and retry.[/red]"
+        )
+        raise typer.Exit(code=1)
 
 
 @app.command("knowledge-reset")

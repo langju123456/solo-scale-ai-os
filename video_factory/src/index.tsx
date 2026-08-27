@@ -4,6 +4,9 @@ import {CreatorVideo, type CreatorVideoProps} from './video';
 const defaultProps: CreatorVideoProps = {
   topic: 'SoloScale Creator Video',
   sourceLabel: 'Operator-supplied claim ledger',
+  subtitle: 'Evidence-backed local story',
+  width: 1080,
+  height: 1920,
   scenes: [
     {
       id: 'SCENE-01',
@@ -31,6 +34,8 @@ export const RemotionRoot = () => (
         30,
         Math.max(...props.scenes.map((scene) => scene.end_second)) * 30,
       ),
+      width: props.width ?? 1080,
+      height: props.height ?? 1920,
     })}
   />
 );

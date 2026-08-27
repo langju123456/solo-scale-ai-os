@@ -106,6 +106,39 @@ class KnowledgeStatus(ContractModel):
     last_synced_at: datetime | None = None
 
 
+class KnowledgeCatalogDocument(ContractModel):
+    """Metadata-only document projection for downstream local catalogs."""
+
+    document_id: NonBlankStr
+    native_id: NonBlankStr
+    source_kind: SourceKind
+    project: str | None = None
+    locator: NonBlankStr
+    title: str | None = None
+    content_sha256: Sha256Digest
+    byte_size: NonNegativeInt
+    observed_at: datetime | None = None
+    metadata_sha256: Sha256Digest
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class KnowledgeCatalogChunk(ContractModel):
+    """Metadata-only chunk projection; deliberately has no body or locator."""
+
+    chunk_id: NonBlankStr
+    document_id: NonBlankStr
+    ordinal: NonNegativeInt
+    role: ContentRole
+    timestamp: datetime | None = None
+    text_sha256: Sha256Digest
+    metadata_sha256: Sha256Digest
+
+
+class KnowledgeCatalogSnapshot(ContractModel):
+    documents: list[KnowledgeCatalogDocument] = Field(default_factory=list)
+    chunks: list[KnowledgeCatalogChunk] = Field(default_factory=list)
+
+
 class RetrievalHit(ContractModel):
     chunk_id: NonBlankStr
     document_id: NonBlankStr

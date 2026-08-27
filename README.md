@@ -130,7 +130,44 @@ python -m soloscale.local_ui
 python -m soloscale.local_ui --host 127.0.0.1 --port 8765 --data-root .soloscale
 ```
 
+For the unified local product, install both editable packages into one environment and
+start every product route with one command:
+
+```bash
+uv venv .venv
+uv pip install -e '.[dev]' -e packages/buildlog
+./scripts/run_local_product.sh
+```
+
+The default persistent private root is `~/Documents/SoloScaleData` and the stable URL is
+`http://127.0.0.1:8765`.
+
 打开终端打印的地址（默认 `http://127.0.0.1:8765`）。
+
+### macOS desktop app (local developer build)
+
+The first desktop package embeds the Python product behind a native SwiftUI window, so
+normal use does not require a Terminal or a separately managed local server. Build it on
+Apple Silicon macOS with:
+
+```bash
+uv venv .venv
+uv pip install -e '.[dev,desktop]' -e packages/buildlog
+./packaging/macos/build_backend_onedir.sh
+./scripts/check_macos_toolchain.sh
+./scripts/build_macos_app.sh
+open "desktop/macos/dist/SoloScale AI OS.app"
+```
+
+The Desktop build uses the pinned compiler and SDK declared in
+`desktop/macos/toolchain.env`; see `desktop/macos/TOOLCHAIN.md`. The preflight rejects
+ambient toolchain drift before compilation starts.
+
+The app preserves an existing `~/Documents/SoloScaleData` library; a fresh install uses
+`~/Library/Application Support/SoloScale AI OS`. Its random loopback port is protected by
+a per-launch private session cookie and exact Host validation. OpenAI API keys configured
+in the Desktop App are stored in macOS Keychain. This local build is unsigned and not
+notarized; signing, notarization, and public GitHub release packaging remain separate gates.
 
 ### Learning Traceability golden case
 
@@ -140,18 +177,62 @@ Explain/Trace response receipts; submitting a response never advances mastery au
 The local workflow makes no model or network call and keeps learning status separate from
 resume eligibility.
 
-The default `/` route is the end-user resume flow: upload an existing `.docx` resume,
-paste a Job Description, optionally add company/job metadata, then generate, preview, and
-download a targeted DOCX. Developer-oriented Knowledge, Evidence Agent, model, and source
-controls remain available at `/advanced`.
+The default `/` route presents the three connected user outcomes together: get the job,
+defend the job, and build professional visibility. The existing resume workflow lives at
+`/resume`: upload a `.docx`, paste a Job Description, review, and download a targeted DOCX.
+Learning remains at `/learning`; Content remains at `/content`; Video and Publishing remain
+available under More. `/work` lets the user explicitly add a resume, local Git project,
+standard Codex history, or a selected ChatGPT export for reuse across those outcomes; it
+does not watch arbitrary folders or read conversation bodies before approval. Knowledge,
+evidence, provider, and source controls stay at `/advanced`.
 
 Open `http://127.0.0.1:8765/content` for Content Studio. Supply concise verified or
 observed claims with receipts, plus any explicitly labeled hypotheses and planned work.
-One deterministic local run produces previewable LinkedIn, X Thread, and short-video
-script/storyboard candidates under `.soloscale/content-runs/`. The page supports copy and
-bounded downloads. The optional Creator Video Factory renders the saved storyboard into a
-local MP4 using Remotion and the installed browser; it does not call a model, connect a
-social account, upload, or publish.
+The intended default is SoloScale Hosted AI, which is explicitly marked not configured in
+this local developer build and never silently falls back. An explicit safe offline draft
+remains usable without any model, while optional Ollama and future OpenAI-compatible/BYO
+providers are selected only under Advanced. Successful runs produce previewable LinkedIn,
+X Thread, and short-video script/storyboard candidates under `.soloscale/content-runs/`.
+The optional Creator Video Factory renders a saved storyboard into a local MP4 using
+Remotion and the installed browser; it does not connect a social account or publish.
+
+### Unified Evidence Core
+
+Open `http://127.0.0.1:8765/evidence` for the private operator-facing Evidence Center.
+It shows metadata counts, truth classes, refresh receipts, application assets, and
+outcomes without rendering source bodies, locators, credentials, or absolute paths.
+External and historical sources are refreshed explicitly—there is no watcher or daemon:
+
+```bash
+soloscale evidence-refresh \
+  --data-root "$HOME/Documents/SoloScaleData" \
+  --repository-root "$(pwd)"
+```
+
+The command reuses Conversation Knowledge metadata, local Git metadata, the private
+BuildLog publishing namespace, and existing SoloScale application-run metadata. It does
+not call a model, network service, or publisher. New Content, Resume, Learning, editorial,
+and publication-result artifacts register metadata-only hashes and lineage automatically;
+each product retains its own domain state and remains independently callable.
+
+### Reusable Skill OS
+
+Repo-scoped Skills under `.agents/skills/` turn high-level requests into a versioned Task
+Envelope, ordered Skill route, phase-specific model recommendation, human gates, and a
+private Run Receipt. They compose the existing Evidence, Content, Career, Learning, and
+BuildLog boundaries; they do not duplicate those implementations or gain new authority.
+
+```bash
+soloscale skill-list
+soloscale skill-route \
+  "Use the latest Evidence about Learning Debt. Create LinkedIn, X Thread, and one diagram. Fresh-review and revise it. Stop before publication." \
+  --data-root "$HOME/Documents/SoloScaleData"
+```
+
+The route command performs no model, network, publication, deployment, or paid API call.
+It stores the normalized envelope and exact Skill versions privately under
+`<data-root>/skills/`; a real public, paid, destructive, credential, or irreversible action
+still stops at its explicit human gate.
 
 ### Resume Intelligence Workspace v0.1
 
@@ -335,6 +416,7 @@ evaluated and remain human-gated or future opt-in evaluations.
 ├── TASK.md                           current sprint
 ├── ROADMAP.md                        milestone plan
 ├── AGENTS.md                         instructions for coding agents
+├── .agents/                          tracked Skill registry, contracts, and task templates
 ├── src/soloscale/
 │   ├── models.py                     contracts
 │   ├── router.py                     deterministic route policy
@@ -351,6 +433,8 @@ evaluated and remain human-gated or future opt-in evaluations.
 │   ├── conversation_intake.py        defensive source adapters and redaction
 │   ├── knowledge_store.py             private SQLite/FTS evidence index
 │   ├── evidence_agent.py              custom code-controlled Evidence Agent
+│   ├── skill_models.py                Skill, Task Route, and Run Receipt contracts
+│   ├── skill_os.py                    deterministic Skill discovery and routing
 │   └── cli.py                        local CLI
 ├── tests/                            deterministic tests
 ├── examples/                         dogfooding inputs

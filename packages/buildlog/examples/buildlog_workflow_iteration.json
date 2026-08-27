@@ -1,0 +1,79 @@
+{
+  "id": "buildlog-workflow-001",
+  "title": "Making BuildLog prompt experiments reproducible",
+  "goal": "Compare prompt behavior across real runs while preserving enough provenance to explain which prompts, model, and artifacts produced each result.",
+  "context": "BuildLog already wrote readable stage artifacts to filesystem run directories and indexed run relationships in SQLite. The first implementation loaded only v1 prompt filenames, which was sufficient until the output-quality iteration needed a controlled v1 and v2 comparison.",
+  "problem": "Overwriting v1 prompts with revised text would destroy the original experiment. Keeping multiple prompt files without version selection, hashes, and run associations would still make it difficult to reproduce or audit a generated post.",
+  "actions": [
+    "Preserved all four v1 prompt files unchanged.",
+    "Added separate v2 files for planner, writer, evaluator, and reviser.",
+    "Added BUILDLOG_PROMPT_VERSION as an explicit runtime setting.",
+    "Validated prompt names and version strings before constructing prompt paths.",
+    "Computed SHA-256 hashes for prompt and generated artifact files.",
+    "Stored prompt version records and hashes in SQLite.",
+    "Recorded the model and stage prompt versions in each run_metadata.json file.",
+    "Ran the same architecture input with v1 and v2 prompts.",
+    "Documented automated scores, human review, hashes, and experiment limitations in one comparison report.",
+    "Added prompt loader and version-selection tests."
+  ],
+  "decisions": [
+    {
+      "decision": "Create immutable v2 prompt files instead of overwriting v1.",
+      "reason": "Versioned files keep both sides of the output comparison inspectable and hashable.",
+      "alternatives_considered": [
+        "Edit the v1 prompt files in place.",
+        "Store the active prompt text only inside generated run artifacts."
+      ]
+    },
+    {
+      "decision": "Use deterministic SHA-256 hashes as identity evidence.",
+      "reason": "Hashes can show that a prompt or artifact file is byte-for-byte identical across records without claiming that the content is correct.",
+      "alternatives_considered": [
+        "Record filenames without content hashes."
+      ]
+    },
+    {
+      "decision": "Keep filesystem traces and SQLite metadata together.",
+      "reason": "Markdown and JSON remain easy to inspect, while SQLite preserves relationships among runs, prompts, evaluations, and artifacts.",
+      "alternatives_considered": [
+        "Move all generated content into SQLite.",
+        "Keep comparison metadata only in a Markdown report."
+      ]
+    }
+  ],
+  "trade_offs": [
+    "Every prompt revision creates another set of files that must be maintained.",
+    "A hash proves content identity but not correctness, groundedness, or quality.",
+    "The first v1 and v2 experiment used unequal maximum output ceilings, so its score comparison is not fully controlled.",
+    "The local non-zero temperature means rerunning the same configuration can still produce different prose."
+  ],
+  "result": "BuildLog produced a reproducible v1 and v2 comparison for the same architecture evidence. Both prompt sets remained available, each run retained readable artifacts and prompt-version metadata, SQLite linked runs to exact prompt hashes, and the test suite increased from 15 to 17 passing tests.",
+  "lessons": [
+    "Prompt text is executable product behavior and should be versioned like other source inputs.",
+    "Reproducibility requires the model, prompt identity, runtime settings, and output artifacts to be considered together.",
+    "Hashes support traceability but should never be described as evidence that generated claims are correct.",
+    "Human review belongs beside automated scores when the evaluator shares the writer's model biases."
+  ],
+  "evidence": [
+    "The prompts directory contains planner, writer, evaluator, and reviser files for both v1 and v2.",
+    "The v1 and v2 architecture runs record their stage prompt versions in run_metadata.json.",
+    "docs/output_quality_baseline.md records SHA-256 hashes for all eight prompt files and both final outputs.",
+    "SQLite prompt_versions records are associated with persisted runs.",
+    "tests/test_prompt_loader.py verifies version selection, missing files, and invalid prompt versions.",
+    "The complete deterministic test suite passed 17 tests after version selection was added."
+  ],
+  "audience": "Software engineers and AI engineers designing repeatable prompt experiments",
+  "metadata": {
+    "project": "BuildLog",
+    "language": "Python",
+    "tools": [
+      "Python",
+      "SHA-256",
+      "SQLite",
+      "SQLAlchemy 2.0",
+      "Pytest",
+      "Ollama",
+      "Qwen3"
+    ]
+  }
+}

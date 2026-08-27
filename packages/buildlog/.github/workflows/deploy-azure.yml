@@ -1,0 +1,94 @@
+name: Deploy Azure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Protected GitHub environment
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: buildlog-${{ inputs.environment }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to Azure with workload identity
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Provision or update infrastructure
+        id: infrastructure
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          LOCATION: ${{ vars.AZURE_LOCATION }}
+          NAME_PREFIX: ${{ vars.BUILDLOG_NAME_PREFIX }}
+          WEB_API_KEY: ${{ secrets.BUILDLOG_WEB_API_KEY }}
+          POSTGRES_PASSWORD: ${{ secrets.BUILDLOG_POSTGRES_PASSWORD }}
+          LLM_API_KEY: ${{ secrets.BUILDLOG_LLM_API_KEY }}
+          LLM_MODEL: ${{ vars.BUILDLOG_LLM_MODEL }}
+          LLM_API_BASE: ${{ vars.BUILDLOG_LLM_API_BASE }}
+        run: |
+          set -euo pipefail
+          az group create --name "$RESOURCE_GROUP" --location "$LOCATION" >/dev/null
+          APP_NAME="${NAME_PREFIX}-app"
+          if az containerapp show --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" >/dev/null 2>&1; then
+            BOOT_IMAGE="$(az containerapp show --resource-group "$RESOURCE_GROUP" --name "$APP_NAME" --query 'properties.template.containers[0].image' -o tsv)"
+          else
+            BOOT_IMAGE="mcr.microsoft.com/azuredocs/containerapps-helloworld:latest"
+          fi
+          az deployment group create \
+            --name "buildlog-${GITHUB_RUN_ID}" \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file infra/azure/main.bicep \
+            --parameters \
+              namePrefix="$NAME_PREFIX" \
+              location="$LOCATION" \
+              containerImage="$BOOT_IMAGE" \
+              webApiKey="$WEB_API_KEY" \
+              postgresAdminPassword="$POSTGRES_PASSWORD" \
+              llmModel="$LLM_MODEL" \
+              llmApiKey="$LLM_API_KEY" \
+              llmApiBase="$LLM_API_BASE" \
+            --query properties.outputs -o json > deployment-outputs.json
+          echo "registry=$(jq -r '.registryName.value' deployment-outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "app=$(jq -r '.applicationName.value' deployment-outputs.json)" >> "$GITHUB_OUTPUT"
+          echo "url=$(jq -r '.applicationUrl.value' deployment-outputs.json)" >> "$GITHUB_OUTPUT"
+      - name: Build immutable image in Azure Container Registry
+        env:
+          REGISTRY: ${{ steps.infrastructure.outputs.registry }}
+        run: az acr build --registry "$REGISTRY" --image "buildlog:${GITHUB_SHA}" .
+      - name: Roll out image and verify health
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          APP_NAME: ${{ steps.infrastructure.outputs.app }}
+          APP_URL: ${{ steps.infrastructure.outputs.url }}
+          REGISTRY: ${{ steps.infrastructure.outputs.registry }}
+        run: |
+          set -euo pipefail
+          LOGIN_SERVER="$(az acr show --name "$REGISTRY" --query loginServer -o tsv)"
+          az containerapp update \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$APP_NAME" \
+            --image "${LOGIN_SERVER}/buildlog:${GITHUB_SHA}" >/dev/null
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error "${APP_URL}/health/ready"; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Deployment did not become ready" >&2
+          exit 1

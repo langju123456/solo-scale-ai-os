@@ -1,0 +1,66 @@
+{
+  "id": "buildlog-debugging-001",
+  "title": "Tracing an empty Qwen3 evaluator response to the output ceiling",
+  "goal": "Complete the v2 output-quality run by isolating the evaluator failure without changing the model, prompts, temperature, or pipeline architecture.",
+  "context": "BuildLog had already completed the architecture example with v1 prompts. The first v2 attempt used the same local Ollama Qwen3:8b model, a temperature of 0.4, and a maximum output setting of 2200 tokens.",
+  "problem": "The v2 planner and writer completed, but the evaluator consumed the available generation budget in reasoning and returned no final content. BuildLog correctly rejected the empty response, so the run stopped before writing an evaluation or final Markdown file.",
+  "actions": [
+    "Inspected the failed run directory instead of treating the whole pipeline as a black box.",
+    "Confirmed that the input, normalized input, plan, and draft existed while the evaluation and final output did not.",
+    "Located the failure at the evaluator boundary where the LLM client raises an error for empty model content.",
+    "Kept the v2 prompts, Qwen3:8b model, temperature, input, and pipeline unchanged.",
+    "Raised only the maximum output ceiling from 2200 to 4000 tokens.",
+    "Preserved the failed run as trace evidence.",
+    "Ran the same input again and inspected the completed evaluation and final output.",
+    "Documented the unequal token ceilings as a limitation of the v1 and v2 comparison."
+  ],
+  "decisions": [
+    {
+      "decision": "Change only the maximum output ceiling before retrying.",
+      "reason": "Holding the prompts, model, temperature, and input constant isolated the generation budget as the variable under test.",
+      "alternatives_considered": [
+        "Rewrite the evaluator prompt immediately.",
+        "Change the model and token ceiling at the same time."
+      ]
+    },
+    {
+      "decision": "Keep the incomplete run directory.",
+      "reason": "The partial artifacts showed exactly which stages completed and made the failure traceable.",
+      "alternatives_considered": [
+        "Delete the failed run and keep only the successful retry."
+      ]
+    }
+  ],
+  "trade_offs": [
+    "The successful retry does not prove that 4000 tokens are sufficient for every Qwen3 evaluation.",
+    "A higher output ceiling may increase latency and local inference cost.",
+    "Using different token ceilings made the original v1 and v2 quality comparison less controlled."
+  ],
+  "result": "The retry completed with the same architecture input, v2 prompts, Ollama Qwen3:8b model, and temperature after the output ceiling increased to 4000 tokens. BuildLog produced the evaluator JSON and final Markdown, performed no revision, and retained the failed run for comparison.",
+  "lessons": [
+    "A thinking model can exhaust a generation budget before returning the structured final response.",
+    "Stage-level artifacts make it possible to locate a model failure without guessing which part of the pipeline broke.",
+    "Changing one runtime variable at a time produces stronger debugging evidence than rewriting prompts during an infrastructure failure.",
+    "A successful retry should be recorded together with the experimental limitation it introduced."
+  ],
+  "evidence": [
+    "The failed run directory runs/2026-07-27T15-16-22_buildlog-architecture-001 contains artifacts through 03_draft.md but no 04_evaluation.json or 06_final.md.",
+    "The LLM client raises ModelResponseError when the model returns empty content.",
+    "The completed retry is runs/2026-07-27T15-23-21_buildlog-architecture-001.",
+    "The completed retry contains 04_evaluation.json, 06_final.md, and run_metadata.json.",
+    "The completed run metadata records ollama_chat/qwen3:8b and v2 for all four prompt stages.",
+    "The output-quality report records 2200 tokens for the failed attempt and 4000 for the completed retry."
+  ],
+  "audience": "Software engineers and AI engineers debugging structured local-model pipelines",
+  "metadata": {
+    "project": "BuildLog",
+    "language": "Python",
+    "tools": [
+      "Ollama",
+      "Qwen3",
+      "LiteLLM",
+      "Pydantic",
+      "Filesystem Traces"
+    ]
+  }
+}

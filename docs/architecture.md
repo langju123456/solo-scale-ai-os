@@ -177,6 +177,61 @@ bodies or locators. It derives document/chunk counts, source counts, completed/f
 pending runs, current state, and one exact next action. States include not synced, empty
 index, ready for question, recovery review, human confirmation, and attention required.
 
+### Unified Evidence Core
+
+EvidenceHub is a compatibility catalog over the existing private stores, not a replacement
+database and not another RAG index:
+
+```mermaid
+flowchart LR
+    K["Conversation Knowledge metadata"] --> H["EvidenceHub catalog"]
+    B["BuildLog safe run projections"] --> H
+    G["Local Git snapshot metadata"] --> H
+    A["Existing application-run metadata"] --> H
+    H --> E["Application-neutral EvidenceBundle"]
+    E --> C["Career Studio"]
+    E --> L["Learning Tower"]
+    E --> N["Content Studio"]
+    E --> P["BuildLog-compatible projection"]
+    C --> R["Asset / Outcome receipts"]
+    L --> R
+    N --> R
+    P --> R
+    R --> H
+```
+
+The private SQLite catalog stores stable IDs, hashes, classifications, relationships, and
+private locators, but never copies conversation bodies or retrieval excerpts. The
+`/evidence` operator page hides locators and paths. External history enters only through an
+explicit, bounded `evidence-refresh`; internal product artifacts register after the
+originating domain operation succeeds. A failed evidence registration writes a retry
+warning and never changes the Resume, Learning, Content, or BuildLog truth state. BuildLog
+remains the sole authority for OAuth, final publication approval, platform calls, and
+publication receipts.
+
+### Reusable Skill execution layer
+
+Skill OS is a tracked workflow registry plus a private invocation record; it is not a new
+agent framework or domain database:
+
+```mermaid
+flowchart LR
+    O["High-level operator request"] --> T["Normalized Skill Task Envelope"]
+    T --> R["Tracked Skill Registry"]
+    R --> C["Ordered Skill composition"]
+    C --> D["Existing domain contracts"]
+    D --> V["Deterministic validation"]
+    V --> P["Private Skill Run Receipt"]
+    P --> U["Human-reviewed update proposal"]
+```
+
+The registry is discovery and routing truth; existing domain stores remain execution
+truth. Receipts retain exact Skill versions, recommendations, observed provider/model/
+reasoning/agent identities when known, hashes, checks, gates, retries, and distinct
+workflow/artifact/approval/publication/outcome states. Unknown execution identity remains
+unknown rather than being inferred. Public, paid,
+credential, destructive, migration, history, and deployment boundaries remain human-gated.
+
 ### Retrieval evaluation boundary
 
 The synthetic bilingual retrieval/context fixture covers eight queries and three context
@@ -227,6 +282,12 @@ An append-only self-assessment for one of Explain, Trace, Rebuild, Debug, or Def
 Passing attempts require an archived receipt; `needs-work` attempts require an explicit
 note and may optionally include one. Mastery status is derived from the latest attempt
 for each stage.
+
+### Skill Registry and Skill Run Receipt
+
+The tracked registry describes versioned bounded workflows, while each private Run Receipt
+records the normalized invocation, exact Skill versions, route, observed execution facts,
+and non-collapsed outcome states. One successful Run cannot auto-promote a Skill.
 
 ## 3. Bounded topology
 

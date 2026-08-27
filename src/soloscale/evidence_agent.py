@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import tempfile
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -88,6 +89,42 @@ class EvidenceAgentArtifactError(EvidenceAgentError):
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class OllamaCallProfile(_StrictModel):
+    """Body-free performance metadata from one local Ollama completion."""
+
+    schema_version: Literal["1.0"] = "1.0"
+    model: str
+    system_chars: int = Field(ge=0)
+    user_chars: int = Field(ge=0)
+    schema_chars: int = Field(ge=0)
+    max_output_tokens: int = Field(ge=1)
+    thinking_enabled: Literal[False] = False
+    prompt_eval_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    wall_ms: int = Field(ge=0)
+    total_duration_ms: int | None = Field(default=None, ge=0)
+    load_duration_ms: int | None = Field(default=None, ge=0)
+    prompt_eval_duration_ms: int | None = Field(default=None, ge=0)
+    eval_duration_ms: int | None = Field(default=None, ge=0)
+    done_reason: str | None = Field(default=None, max_length=80)
+    response_chars: int = Field(ge=0)
+    thinking_chars: int = Field(ge=0)
+
+
+def _ollama_metric_ms(envelope: Mapping[str, Any], key: str) -> int | None:
+    value = envelope.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return value // 1_000_000
+
+
+def _ollama_metric_count(envelope: Mapping[str, Any], key: str) -> int | None:
+    value = envelope.get(key)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return value
 
 
 class QueryPlan(_StrictModel):
@@ -229,6 +266,7 @@ class OllamaReasoner:
         self.model = model
         self.timeout = timeout
         self.max_tokens = max_tokens
+        self.last_call_profile: OllamaCallProfile | None = None
         if opener is None:
             direct_opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({}),
@@ -245,6 +283,8 @@ class OllamaReasoner:
         system: str,
         user: str,
     ) -> ResponseModelT:
+        self.last_call_profile = None
+        response_schema = schema.model_json_schema()
         payload = {
             "model": self.model,
             "messages": [
@@ -253,7 +293,7 @@ class OllamaReasoner:
             ],
             "stream": False,
             "think": False,
-            "format": schema.model_json_schema(),
+            "format": response_schema,
             "options": {
                 "temperature": 0,
                 "num_predict": self.max_tokens,
@@ -265,6 +305,7 @@ class OllamaReasoner:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        started = time.perf_counter()
         try:
             with self._opener(request, timeout=self.timeout) as response:
                 raw = response.read(_MAX_REASONER_RESPONSE_BYTES + 1)
@@ -287,6 +328,33 @@ class OllamaReasoner:
             content = message.get("content")
             if not isinstance(content, str) or not content.strip():
                 raise TypeError
+            thinking = message.get("thinking")
+            thinking_text = thinking if isinstance(thinking, str) else ""
+            done_reason = envelope.get("done_reason")
+            safe_done_reason = (
+                done_reason[:80] if isinstance(done_reason, str) else None
+            )
+            self.last_call_profile = OllamaCallProfile(
+                model=self.model,
+                system_chars=len(system),
+                user_chars=len(user),
+                schema_chars=len(_canonical_json_bytes(response_schema)),
+                max_output_tokens=self.max_tokens,
+                prompt_eval_tokens=_ollama_metric_count(
+                    envelope, "prompt_eval_count"
+                ),
+                output_tokens=_ollama_metric_count(envelope, "eval_count"),
+                wall_ms=int((time.perf_counter() - started) * 1000),
+                total_duration_ms=_ollama_metric_ms(envelope, "total_duration"),
+                load_duration_ms=_ollama_metric_ms(envelope, "load_duration"),
+                prompt_eval_duration_ms=_ollama_metric_ms(
+                    envelope, "prompt_eval_duration"
+                ),
+                eval_duration_ms=_ollama_metric_ms(envelope, "eval_duration"),
+                done_reason=safe_done_reason,
+                response_chars=len(content),
+                thinking_chars=len(thinking_text),
+            )
             return schema.model_validate_json(content)
         except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValidationError):
             raise ReasonerInvalidResponseError(

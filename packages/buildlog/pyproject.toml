@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "buildlog"
+version = "0.2.0"
+description = "Transform engineering evidence into reviewable communication and human-approved publishing workflows."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "authlib>=1.6,<2.0",
+  "httpx>=0.27,<1.0",
+  "litellm>=1.0",
+  "pillow>=10.0,<13.0",
+  "pydantic>=2.0",
+  "python-dotenv>=1.0",
+  "sqlalchemy>=2.0,<3.0",
+]
+
+[project.scripts]
+buildlog = "buildlog.main:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+canvas = [
+  "playwright>=1.45,<2.0",
+]
+web = [
+  "fastapi>=0.116,<1.0",
+  "prometheus-client>=0.22,<1.0",
+  "uvicorn[standard]>=0.35,<1.0",
+]
+cloud = [
+  "alembic>=1.16,<2.0",
+  "azure-identity>=1.23,<2.0",
+  "azure-storage-blob>=12.26,<13.0",
+  "psycopg[binary]>=3.2,<4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+buildlog = ["web_static/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

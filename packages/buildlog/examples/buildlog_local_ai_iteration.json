@@ -1,0 +1,66 @@
+{
+  "id": "buildlog-local-ai-001",
+  "title": "Keeping a local AI workflow moving after a model setup failure",
+  "goal": "Run the local agent and BuildLog workflows through Ollama without depending on a hosted model endpoint.",
+  "context": "The local setup used Ollama as the model runtime and LiteLLM as the adapter for Python applications. Qwen2:7b and Qwen3:8b were the candidate local models during setup.",
+  "problem": "The Qwen2:7b setup path encountered a connection reset and repeated model commands did not produce the working application path needed for the iteration. Continuing to retry the same path would have blocked validation of the rest of the local agent pipeline.",
+  "actions": [
+    "Installed and started Ollama locally.",
+    "Attempted the Qwen2:7b model path.",
+    "Switched the active application path to Qwen3:8b after the connection reset.",
+    "Kept LiteLLM as the model adapter instead of coupling application components directly to Ollama.",
+    "Ran Qwen3:8b through the local Ollama endpoint.",
+    "Completed the Gradio to smolagents to LiteLLM to Ollama to Qwen3 execution path.",
+    "Reused the same local Qwen3:8b model for BuildLog quality experiments.",
+    "Recorded the installed model identifier and digest for later run comparison."
+  ],
+  "decisions": [
+    {
+      "decision": "Switch to the already workable Qwen3:8b path instead of blocking on Qwen2:7b.",
+      "reason": "The iteration goal was to validate the complete local application path, not to diagnose every model download or connection failure.",
+      "alternatives_considered": [
+        "Keep retrying Qwen2:7b before testing the application.",
+        "Replace Ollama with a hosted model endpoint."
+      ]
+    },
+    {
+      "decision": "Keep LiteLLM between the application and Ollama.",
+      "reason": "The adapter allowed the selected local model to change without rewriting each model-dependent stage.",
+      "alternatives_considered": [
+        "Call the Ollama API directly from every component."
+      ]
+    }
+  ],
+  "trade_offs": [
+    "Switching models allowed application validation to continue but did not diagnose the original connection reset.",
+    "A local 8B model uses more local storage and compute than a smaller model.",
+    "One successful local run does not establish production reliability or model quality across tasks."
+  ],
+  "result": "The local agent pipeline completed through Qwen3:8b, and BuildLog later completed real planner, writer, evaluator, and trace runs with ollama_chat/qwen3:8b. The local Ollama installation currently lists both qwen2:7b and qwen3:8b, while the recorded BuildLog quality baseline uses the Qwen3:8b digest.",
+  "lessons": [
+    "A model adapter makes model substitution a contained runtime decision.",
+    "Separating environment recovery from application validation prevents one setup failure from obscuring the rest of the system.",
+    "A successful local run is evidence of a working path, not proof of general model viability.",
+    "Recording a model digest makes later output comparisons more meaningful than recording only a model name."
+  ],
+  "evidence": [
+    "Shell history contains repeated Ollama model commands followed by ollama run qwen3:8b.",
+    "The successful local agent execution path was Gradio -> smolagents -> LiteLLM -> Ollama -> Qwen3.",
+    "Ollama currently lists qwen3:8b with model ID 500a1f067a9f and qwen2:7b with model ID dd314f039b9d.",
+    "The BuildLog output-quality baseline records the full Qwen3:8b digest as 500a1f067a9f782620b40bee6f7b0c89e17ae61f686b92c24933e4ca4b2b8b41.",
+    "The completed BuildLog v2 run metadata records ollama_chat/qwen3:8b for the model."
+  ],
+  "audience": "AI engineers and developers building local model workflows",
+  "metadata": {
+    "project": "Local AI Workflow",
+    "language": "Python",
+    "tools": [
+      "Ollama",
+      "Qwen2",
+      "Qwen3",
+      "LiteLLM",
+      "smolagents",
+      "Gradio"
+    ]
+  }
+}
