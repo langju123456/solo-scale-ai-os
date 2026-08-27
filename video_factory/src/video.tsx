@@ -31,6 +31,7 @@ export type CreatorScene = {
   audio_data_url?: string | null;
   audio_asset?: string | null;
   avatar_clip_asset?: string | null;
+  presenter_layout?: 'FULL_FRAME' | 'PICTURE_IN_PICTURE' | 'SIDE_PANEL' | null;
 };
 
 export type CreatorVideoProps = {
@@ -185,19 +186,20 @@ export const CreatorVideo: React.FC<CreatorVideoProps> = ({topic, sourceLabel, s
           <div
             style={{
               position: 'absolute',
-              right: landscape ? 72 : 70,
-              top: landscape ? 170 : 510,
-              width: landscape ? 520 : 760,
-              height: landscape ? 600 : 760,
+              right: item.presenter_layout === 'FULL_FRAME' ? 0 : item.presenter_layout === 'SIDE_PANEL' ? 0 : landscape ? 72 : 70,
+              top: item.presenter_layout === 'FULL_FRAME' || item.presenter_layout === 'SIDE_PANEL' ? 0 : landscape ? 170 : 510,
+              width: item.presenter_layout === 'FULL_FRAME' ? '100%' : item.presenter_layout === 'SIDE_PANEL' ? (landscape ? 620 : 540) : landscape ? 520 : 760,
+              height: item.presenter_layout === 'FULL_FRAME' || item.presenter_layout === 'SIDE_PANEL' ? '100%' : landscape ? 600 : 760,
               overflow: 'hidden',
-              borderRadius: 36,
-              border: `2px solid ${accent}99`,
+              borderRadius: item.presenter_layout === 'FULL_FRAME' || item.presenter_layout === 'SIDE_PANEL' ? 0 : 36,
+              border: item.presenter_layout === 'FULL_FRAME' ? 'none' : `2px solid ${accent}99`,
               boxShadow: `0 30px 90px ${accent}44`,
-              zIndex: 2,
+              zIndex: item.presenter_layout === 'FULL_FRAME' ? 0 : 2,
             }}
           >
             <OffthreadVideo
               src={staticFile(item.avatar_clip_asset)}
+              muted={Boolean(item.audio_data_url || item.audio_asset)}
               style={{width: '100%', height: '100%', objectFit: 'cover'}}
             />
           </div>

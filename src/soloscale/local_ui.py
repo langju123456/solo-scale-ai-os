@@ -93,6 +93,15 @@ from soloscale.model_gateway import (
     ModelProviderId,
     model_gateway_for,
 )
+from soloscale.presenter_assets import (
+    MAX_PRESENTER_ASSET_BYTES,
+    PresenterAssetCategory,
+    PresenterAssetError,
+    PresenterAssetKind,
+    PresenterLayout,
+    import_presenter_asset,
+    save_presenter_preferences,
+)
 from soloscale.resume_docx import (
     ResumeTemplateError,
     TailoredDocx,
@@ -178,6 +187,7 @@ from soloscale.work_ui import (
 COMMAND_TIMEOUT_SECONDS = 120
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 MAX_WORK_IMPORT_BYTES = 256 * 1024 * 1024
+_PRESENTER_ASSET_FORM_OVERHEAD_BYTES = 1024 * 1024
 _DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _RUN_ID_RE = re.compile(r"resume-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10}")
 _RESUME_JOB_ID_RE = re.compile(r"resume-job-[a-f0-9]{12}")
@@ -6448,6 +6458,97 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        presenter_asset_match = re.fullmatch(
+            r"/content/presenter-asset/(content-[^/]+)", path
+        )
+        if presenter_asset_match is not None:
+            run_id = presenter_asset_match.group(1)
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            max_request_bytes = (
+                MAX_PRESENTER_ASSET_BYTES + _PRESENTER_ASSET_FORM_OVERHEAD_BYTES
+            )
+            if length < 0 or length > max_request_bytes:
+                self.send_error(413, "Presenter asset is too large")
+                return
+            try:
+                submission = _parse_submission(
+                    self.rfile.read(length),
+                    self.headers.get("Content-Type", ""),
+                    max_bytes=max_request_bytes,
+                )
+                self._adopt_ui_locale(submission.fields)
+                upload = submission.files.get("presenter_asset")
+                if upload is None:
+                    raise PresenterAssetError("Choose one presenter MP4")
+                import_presenter_asset(
+                    data_root=self.ui_data_root.absolute(),
+                    display_name=submission.fields.get("display_name", ""),
+                    category=PresenterAssetCategory(
+                        submission.fields.get("category", "")
+                    ),
+                    source_kind=PresenterAssetKind(
+                        submission.fields.get("source_kind", "")
+                    ),
+                    layout=PresenterLayout(submission.fields.get("layout", "")),
+                    duration_seconds=float(
+                        submission.fields.get("duration_seconds", "0")
+                    ),
+                    source_filename=upload.filename,
+                    content=upload.content,
+                    locale=submission.fields.get("locale") or None,
+                )
+            except (OSError, PresenterAssetError, ValueError) as exc:
+                self._send_content_page(run_id=run_id, error=str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location", ui_url("/content#results", self.ui_locale, run_id=run_id)
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        presenter_plan_match = re.fullmatch(
+            r"/content/presenter-plan/(content-[^/]+)", path
+        )
+        if presenter_plan_match is not None:
+            run_id = presenter_plan_match.group(1)
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 64 * 1024:
+                self.send_error(413, "Presenter plan request is too large")
+                return
+            try:
+                values = urllib.parse.parse_qs(
+                    self.rfile.read(length).decode("utf-8"),
+                    keep_blank_values=False,
+                    strict_parsing=False,
+                )
+                self._adopt_ui_locale(
+                    {key: items[0] for key, items in values.items() if items}
+                )
+                save_presenter_preferences(
+                    data_root=self.ui_data_root.absolute(),
+                    run_id=run_id,
+                    evidence_visual_scene_ids=set(
+                        values.get("evidence_visual_scene", [])
+                    ),
+                )
+            except (OSError, PresenterAssetError, UnicodeError, ValueError) as exc:
+                self._send_content_page(run_id=run_id, error=str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location", ui_url("/content#results", self.ui_locale, run_id=run_id)
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         avatar_handoff_match = re.fullmatch(
             r"/content/avatar-handoff/(content-[^/]+)", path
         )
@@ -6458,7 +6559,12 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     data_root=self.ui_data_root.absolute(),
                     run_id=run_id,
                 )
-            except (ContentWorkspaceError, CreatorVideoError, OSError) as exc:
+            except (
+                ContentWorkspaceError,
+                CreatorVideoError,
+                OSError,
+                PresenterAssetError,
+            ) as exc:
                 self._send_content_page(run_id=run_id, error=str(exc))
                 return
             self.send_response(303)

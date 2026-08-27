@@ -91,6 +91,10 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     assert "生成 YouTube + Short 成片" in page
     assert f"/content/downloads/{result.run_id}/youtube-script.md" in page
     assert f'action="/content/avatar-handoff/{result.run_id}"' in page
+    assert f'action="/content/presenter-asset/{result.run_id}"' in page
+    assert f'action="/content/presenter-plan/{result.run_id}"' in page
+    assert "可复用人物素材 · 0" in page
+    assert "新 Avatar 3" in page
     assert f'action="/content/review/{result.run_id}"' in page
     assert "先批准这个统一内容包" in page
 

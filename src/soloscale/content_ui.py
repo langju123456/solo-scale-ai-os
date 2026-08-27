@@ -31,11 +31,23 @@ from soloscale.content_workspace import (
 )
 from soloscale.editorial_publishing_handoff import editorial_publishing_status
 from soloscale.evidence_agent import Reasoner
+from soloscale.media_profile import (
+    MediaProfileError,
+    VoiceProviderId,
+    load_media_profile,
+)
 from soloscale.model_gateway import (
     ModelGateway,
     ModelGatewayNotConfigured,
     ModelProviderId,
     model_gateway_for,
+)
+from soloscale.presenter_assets import (
+    PresenterAssetError,
+    PresenterMode,
+    current_presenter_plan,
+    load_presenter_library,
+    plan_presenter_assets,
 )
 from soloscale.reference_intelligence import extract_content_pattern
 from soloscale.ui_shell import (
@@ -398,8 +410,70 @@ def _result_html(
         f'<option value="{_escape(scene.id)}">{_escape(scene.id)} · {_escape(scene.purpose)}</option>'
         for scene in run.drafts.storyboard
     )
+    try:
+        media_profile = load_media_profile(data_root)
+        voice_label = (
+            ui_text(locale, "你的声音 · 本地 Qwen3-TTS", "Your voice · Local Qwen3-TTS")
+            if media_profile.voice_provider is VoiceProviderId.QWEN3_TTS_MLX
+            else ui_text(locale, "macOS 系统音色 · 手动选择", "macOS system voice · Explicit fallback")
+        )
+        avatar_label = (
+            ui_text(locale, "Ju 数字分身已连接", "Ju Digital Twin connected")
+            if media_profile.heygen_avatar_look_id
+            else ui_text(locale, "数字分身尚未连接", "Digital Twin not connected")
+        )
+    except MediaProfileError:
+        voice_label = ui_text(locale, "本地声音尚未配置", "Local voice not configured")
+        avatar_label = ui_text(locale, "数字分身尚未连接", "Digital Twin not connected")
+    try:
+        presenter_library = load_presenter_library(data_root)
+        baseline_presenter_plan = plan_presenter_assets(
+            run=run, library=presenter_library
+        )
+        presenter_plan = current_presenter_plan(data_root=data_root, run_id=run.run_id)
+        presenter_library_label = ui_text(
+            locale,
+            f"可复用人物素材 · {len(presenter_library.assets)}",
+            f"Reusable presenter assets · {len(presenter_library.assets)}",
+        )
+        evidence_visual_options = "".join(
+            f'<label><input type="checkbox" name="evidence_visual_scene" value="{_escape(item.scene_id)}" '
+            f'{"checked" if next(current.mode for current in presenter_plan.scenes if current.scene_id == item.scene_id) is PresenterMode.NONE else ""} />'
+            f'{_escape(item.scene_id)} · {_escape(ui_text(locale, "改用证据画面", "Use evidence visual"))}</label>'
+            for item in baseline_presenter_plan.scenes
+            if item.mode is PresenterMode.DYNAMIC_AVATAR
+        )
+        presenter_plan_summary = ui_text(
+            locale,
+            f"人物场景 {presenter_plan.presenter_scenes} · 复用 {presenter_plan.reusable_presenter_scenes} · 新 Avatar {presenter_plan.dynamic_avatar_scenes} / {presenter_plan.dynamic_avatar_seconds}s",
+            f"Presenter scenes {presenter_plan.presenter_scenes} · reused {presenter_plan.reusable_presenter_scenes} · new Avatar {presenter_plan.dynamic_avatar_scenes} / {presenter_plan.dynamic_avatar_seconds}s",
+        )
+    except PresenterAssetError:
+        presenter_library_label = ui_text(
+            locale, "人物素材库需要检查", "Presenter library needs attention"
+        )
+        evidence_visual_options = ""
+        presenter_plan_summary = ui_text(
+            locale, "暂时无法计算人物计划", "Presenter plan is unavailable"
+        )
     avatar_controls = f'''<section class="avatar-handoff"><span class="kicker">HeyGen Avatar · controlled handoff</span>
+      <div class="channel-pills"><span>{_escape(voice_label)}</span><span>{_escape(avatar_label)}</span><span>{_escape(presenter_library_label)}</span></div>
+      <p><strong>{_escape(presenter_plan_summary)}</strong></p>
       <p>{_escape(ui_text(locale, 'SoloScale 只导出选定场景的精确旁白；不会上传原始对话或项目文件。', 'SoloScale exports only the exact selected-scene narration. Raw conversations and project files are never uploaded.'))}</p>
+      <details><summary>{_escape(ui_text(locale, '管理可复用人物素材', 'Manage reusable presenter assets'))}</summary>
+        <form method="post" action="/content/presenter-asset/{run_id}" enctype="multipart/form-data" class="avatar-import-form">
+          <input type="hidden" name="ui_locale" value="{locale}" />
+          <label>{_escape(ui_text(locale, '素材名称', 'Asset name'))}<input name="display_name" maxlength="120" required /></label>
+          <label>{_escape(ui_text(locale, '类型', 'Category'))}<select name="category"><option value="INTRO">Intro</option><option value="GESTURE">Gesture</option><option value="OUTRO">Outro</option></select></label>
+          <label>{_escape(ui_text(locale, '来源', 'Source'))}<select name="source_kind"><option value="REAL_FOOTAGE">Real footage</option><option value="AVATAR_OUTPUT">Existing avatar output</option><option value="USER_IMPORTED">Other user import</option></select></label>
+          <label>{_escape(ui_text(locale, '布局', 'Layout'))}<select name="layout"><option value="PICTURE_IN_PICTURE">Picture in picture</option><option value="SIDE_PANEL">Side panel</option><option value="FULL_FRAME">Full frame</option></select></label>
+          <label>{_escape(ui_text(locale, '素材时长（秒）', 'Asset duration (seconds)'))}<input type="number" name="duration_seconds" min="0.1" max="600" step="0.1" required /></label>
+          <label>{_escape(ui_text(locale, '语言（可选）', 'Locale (optional)'))}<select name="locale"><option value="">Any</option><option value="zh-CN">zh-CN</option><option value="en-US">en-US</option></select></label>
+          <label>{_escape(ui_text(locale, '选择 MP4（最多 80 MB）', 'Choose MP4 (up to 80 MB)'))}<input type="file" name="presenter_asset" accept="video/mp4,.mp4" required /></label>
+          <button class="secondary" type="submit">{_escape(ui_text(locale, '加入素材库', 'Add to library'))}</button>
+        </form>
+      </details>
+      {f'<form method="post" action="/content/presenter-plan/{run_id}" class="avatar-import-form"><input type="hidden" name="ui_locale" value="{locale}" /><strong>{_escape(ui_text(locale, "降低 Avatar 使用", "Reduce Avatar usage"))}</strong>{evidence_visual_options}<button class="secondary" type="submit">{_escape(ui_text(locale, "保存人物计划", "Save presenter plan"))}</button></form>' if evidence_visual_options else ''}
       {f'<a class="secondary-button" href="/content/downloads/{run_id}/heygen-handoff.json" download>{_escape(ui_text(locale, "下载 HeyGen 分段包", "Download HeyGen segment handoff"))}</a>' if handoff_ready else f'<form method="post" action="/content/avatar-handoff/{run_id}"><button class="secondary" type="submit">{_escape(ui_text(locale, "准备 HeyGen 分段包", "Prepare HeyGen segment handoff"))}</button></form>'}
       <form method="post" action="/content/avatar-import/{run_id}" enctype="multipart/form-data" class="avatar-import-form">
         <input type="hidden" name="ui_locale" value="{locale}" />

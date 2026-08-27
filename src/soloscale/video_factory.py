@@ -19,6 +19,12 @@ from soloscale.content_workspace import (
     content_run_directory,
     load_content_run,
 )
+from soloscale.presenter_assets import (
+    PresenterAssetError,
+    PresenterMode,
+    materialize_reusable_presenter_assets,
+    prepare_presenter_plan,
+)
 from soloscale.resume_workspace import ResumeWorkspaceStorageError, _atomic_private_write
 from soloscale.voice_provider import VoiceProviderError, create_narration_assets
 
@@ -175,19 +181,40 @@ def prepare_heygen_handoff(*, data_root: Path, run_id: str) -> Path:
     run = load_content_run(data_root, run_id)
     run_dir = content_run_directory(data_root, run_id)
     path = run_dir / _HANDOFF_NAME
+    plan = prepare_presenter_plan(data_root=data_root, run_id=run_id)
+    plan_summary = {
+        "total_scenes": plan.total_scenes,
+        "presenter_scenes": plan.presenter_scenes,
+        "reusable_presenter_scenes": plan.reusable_presenter_scenes,
+        "dynamic_avatar_scenes": plan.dynamic_avatar_scenes,
+        "dynamic_avatar_seconds": plan.dynamic_avatar_seconds,
+        "reusable_asset_ratio": plan.reusable_asset_ratio,
+    }
     if path.exists() or path.is_symlink():
-        if path.is_file() and not path.is_symlink():
+        if not path.is_file() or path.is_symlink():
+            raise CreatorVideoError("HeyGen handoff path is unsafe")
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise CreatorVideoError("HeyGen handoff is invalid") from exc
+        if existing.get("presenter_plan") == plan_summary:
             return path
-        raise CreatorVideoError("HeyGen handoff path is unsafe")
-    scenes = run.drafts.storyboard
-    indices = sorted({0, len(scenes) // 2, len(scenes) - 1})
+    scenes_by_id = {scene.id: scene for scene in run.drafts.storyboard}
+    dynamic_scenes = [
+        item for item in plan.scenes if item.mode is PresenterMode.DYNAMIC_AVATAR
+    ]
     payload = {
         "schema_version": "1.0",
-        "status": "READY_FOR_MANUAL_HEYGEN_EXPORT",
+        "status": (
+            "READY_FOR_MANUAL_HEYGEN_EXPORT"
+            if dynamic_scenes
+            else "NO_DYNAMIC_AVATAR_REQUIRED"
+        ),
         "run_id": run_id,
         "provider": "heygen",
         "network_used": False,
         "publication_performed": False,
+        "presenter_plan": plan_summary,
         "instructions": (
             "Generate only these short presenter segments in HeyGen, download each MP4, "
             "then import it into the matching SoloScale scene."
@@ -200,15 +227,13 @@ def prepare_heygen_handoff(*, data_root: Path, run_id: str) -> Path:
         },
         "segments": [
             {
-                "scene_id": scenes[index].id,
-                "purpose": scenes[index].purpose,
-                "voiceover": scenes[index].voiceover,
-                "preferred_duration_seconds": (
-                    scenes[index].end_second - scenes[index].start_second
-                ),
+                "scene_id": scene_plan.scene_id,
+                "purpose": scenes_by_id[scene_plan.scene_id].purpose,
+                "voiceover": scenes_by_id[scene_plan.scene_id].voiceover,
+                "preferred_duration_seconds": scene_plan.duration_seconds,
                 "required_exports": ["16:9", "9:16"],
             }
-            for index in indices
+            for scene_plan in dynamic_scenes
         ],
     }
     try:
@@ -332,6 +357,7 @@ def _render_input(
     height: int,
     avatar_assets: dict[str, str],
     audio_assets: dict[str, str],
+    presenter_layouts: dict[str, str],
 ) -> dict[str, object]:
     return {
         "topic": run.brief.topic,
@@ -349,6 +375,7 @@ def _render_input(
                 "claim_ids": scene.claim_ids,
                 "avatar_clip_asset": avatar_assets.get(scene.id),
                 "audio_asset": audio_assets.get(scene.id),
+                "presenter_layout": presenter_layouts.get(scene.id),
             }
             for scene in run.drafts.storyboard
         ],
@@ -430,11 +457,23 @@ def render_creator_video(*, data_root: Path, run_id: str, repository_root: Path)
     try:
         with tempfile.TemporaryDirectory(prefix="soloscale-video-assets-") as raw_public:
             public_dir = Path(raw_public)
-            avatar_assets = _avatar_public_assets(run_dir, public_dir)
+            presenter_plan = prepare_presenter_plan(data_root=data_root, run_id=run_id)
+            reusable_assets = materialize_reusable_presenter_assets(
+                data_root=data_root,
+                plan=presenter_plan,
+                public_dir=public_dir,
+            )
+            dynamic_avatar_assets = _avatar_public_assets(run_dir, public_dir)
+            avatar_assets = {**reusable_assets, **dynamic_avatar_assets}
+            presenter_layouts = {
+                item.scene_id: item.layout.value
+                for item in presenter_plan.scenes
+                if item.mode is not PresenterMode.NONE
+            }
             narration = create_narration_assets(
                 run=run,
                 public_dir=public_dir,
-                avatar_assets=avatar_assets,
+                avatar_assets=dynamic_avatar_assets,
                 data_root=data_root,
                 resource_root=repository_root,
             )
@@ -445,6 +484,7 @@ def render_creator_video(*, data_root: Path, run_id: str, repository_root: Path)
                 height=1920,
                 avatar_assets=avatar_assets,
                 audio_assets=audio_assets,
+                presenter_layouts=presenter_layouts,
             )
             youtube_input = _render_input(
                 run=run,
@@ -452,6 +492,7 @@ def render_creator_video(*, data_root: Path, run_id: str, repository_root: Path)
                 height=1080,
                 avatar_assets=avatar_assets,
                 audio_assets=audio_assets,
+                presenter_layouts=presenter_layouts,
             )
             _atomic_private_write(subtitles_path, _render_subtitles(run))
             _atomic_private_write(
@@ -483,6 +524,7 @@ def render_creator_video(*, data_root: Path, run_id: str, repository_root: Path)
         OSError,
         ResumeWorkspaceStorageError,
         CreatorVideoError,
+        PresenterAssetError,
         VoiceProviderError,
         subprocess.TimeoutExpired,
     ) as exc:
@@ -503,6 +545,10 @@ def render_creator_video(*, data_root: Path, run_id: str, repository_root: Path)
         "youtube_input": _YOUTUBE_INPUT_NAME,
         "run_id": run_id,
         "avatar_segment_count": len(_avatar_map(run_dir)),
+        "reusable_presenter_scene_count": presenter_plan.reusable_presenter_scenes,
+        "dynamic_avatar_scene_count": presenter_plan.dynamic_avatar_scenes,
+        "dynamic_avatar_seconds": presenter_plan.dynamic_avatar_seconds,
+        "reusable_asset_ratio": presenter_plan.reusable_asset_ratio,
         "local_narration_scene_count": len(audio_assets),
         "narration_provider": narration.provider,
         "narration_model": narration.model,
