@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from soloscale.ui_shell import SourceState, render_source_state
 from soloscale.work_ui import (
     import_chatgpt_export,
     import_codex_history,
@@ -86,9 +87,21 @@ def test_work_page_is_read_only_and_hides_private_implementation_details(
     )
 
     assert not data_root.exists()
-    assert "我的工作资料" in page
+    assert "你的工作资料" in page
+    assert "选择 SoloScale 可以使用的资料。以后随时可以修改。" in page
+    assert "只读取你明确选择的资料。本地优先，不扫描整台 Mac。" in page
+    assert "了解数据边界" in page
+    assert "已连接" in page
+    assert "添加更多" in page
+    assert "暂不可用" in page
+    assert 'data-source-state="NOT_CONNECTED"' in page
+    assert 'data-source-state="UNAVAILABLE"' in page
+    assert 'id="work-processing"' in page
+    assert 'data-source-state="PROCESSING"' in page
     assert "soloscale://choose-work-repository" in page
     assert "soloscale://choose-chatgpt-export" in page
+    assert "完成并继续" in page
+    assert 'href="/?lang=zh-CN"' in page
     assert "EvidenceHub" not in page
     assert "FTS" not in page
     assert "provenance_locator" not in page
@@ -119,6 +132,9 @@ def test_chatgpt_import_is_explicit_source_preserving_and_body_free_in_ui(
     assert private_text not in page
     assert export.name not in page
     assert str(tmp_path) not in page
+    assert 'data-source="chatgpt-export"' in page
+    assert 'data-source-state="READY"' in page
+    assert "已导入 1 个对话" in page
 
 
 def test_codex_import_and_selected_git_project_reuse_existing_intake(
@@ -154,9 +170,50 @@ def test_codex_import_and_selected_git_project_reuse_existing_intake(
         notice="本地 Git 项目已连接。",
     )
     assert "本地 Git 项目已连接" in page
-    assert "下一步" in page
+    assert "project · 已选择" in page
+    assert "更换项目" in page
     assert "准备这个项目" in page
-    assert "正在准备项目快照" in page
+    assert 'data-processing-source="Local Git"' in page
+    assert "正在准备本地项目快照" in page
+    assert 'data-processing-source="Codex"' in page
+    assert "正在建立本地索引" in page
     assert "不会上传项目代码" in page
     assert 'action="/work/refresh"' in page
     assert str(project) not in page
+
+
+def test_work_page_english_copy_actions_and_states_are_truthful(tmp_path: Path) -> None:
+    page = work_page(
+        data_root=tmp_path / "data",
+        workspace_root=None,
+        locale="en",
+        desktop_mode=True,
+        chatgpt_export_selected=True,
+    )
+
+    assert "Your Work Context" in page
+    assert "Choose the work sources SoloScale can use. You can change them anytime." in page
+    assert "Only work you explicitly choose is read. Local first; no whole-Mac scanning." in page
+    assert "Connected" in page
+    assert "Add More" in page
+    assert "Not Available Yet" in page
+    assert "File selected; waiting for your import approval" in page
+    assert 'action="/work/import-chatgpt"' in page
+    assert "Continue" in page
+    assert "Connect GitHub" not in page
+
+
+def test_shared_source_states_have_stable_semantics() -> None:
+    expected: dict[SourceState, str] = {
+        "READY": "✓",
+        "PROCESSING": "●",
+        "AVAILABLE": "＋",
+        "NOT_CONNECTED": "○",
+        "UNAVAILABLE": "—",
+        "NEEDS_ATTENTION": "!",
+    }
+
+    for state, symbol in expected.items():
+        rendered = render_source_state(state, "en")
+        assert f'data-source-state="{state}"' in rendered
+        assert symbol in rendered

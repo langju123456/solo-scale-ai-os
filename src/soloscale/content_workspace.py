@@ -6,6 +6,7 @@ import re
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -19,6 +20,7 @@ from soloscale.content_models import (
     ContentReviewReceipt,
     ContentRun,
     StoryboardScene,
+    StoryLocaleVariant,
 )
 from soloscale.editorial_models import EditorialRole, ProviderIdentity, ProviderKind
 from soloscale.editorial_pipeline import make_provenance
@@ -35,6 +37,7 @@ from soloscale.model_gateway import (
     OllamaModelGateway,
 )
 from soloscale.reference_intelligence import (
+    ReferenceSourceKind,
     normalize_reference_text,
     reject_distinctive_reference_reuse,
 )
@@ -59,6 +62,8 @@ _OLLAMA_SYSTEM_PROMPT = """You are the SoloScale evidence-bound content writer.
 Return only JSON matching the supplied schema. Write one canonical story and derive a
 LinkedIn draft, X thread, standalone X post, blog draft, 4–6 minute YouTube script,
 short-video script, and storyboard from that same story in the requested language.
+Create a native editorial adaptation for the requested locale. Do not translate another
+locale's finished copy literally, and do not mix Chinese and English narration in one variant.
 
 Truth rules:
 - Use only facts present in the supplied claim ledger. Never invent numbers, tools,
@@ -128,6 +133,7 @@ _DOWNLOADS = {
     "video-subtitles.srt": "25_creator_video_subtitles.srt",
     "distribution-package.json": "26_distribution_package.json",
     "youtube-upload.json": "27_youtube_upload.json",
+    "media-quality-review.json": "28_media_quality_review.json",
     "creator-video-render.json": "11_creator_video_render.json",
     "publish-pack.json": "06_publish_pack.json",
     "provenance.json": "07_provenance.json",
@@ -239,6 +245,12 @@ def _validate_reference_source(
         if reference_source_text is not None:
             raise ContentWorkspaceError(
                 "Reference source text requires a ReferenceAsset and ContentPattern"
+            )
+        return None
+    if brief.reference_asset.source_kind is ReferenceSourceKind.LOCAL_VIDEO:
+        if reference_source_text is not None:
+            raise ContentWorkspaceError(
+                "Raw local-video transcripts must remain in the private reference library"
             )
         return None
     if reference_source_text is None:
@@ -789,6 +801,12 @@ def generate_content_drafts_with_gateway(
     prompt = _canonical_json(
         {
             "brief": brief.model_dump(mode="json", exclude={"reference_asset"}),
+            "locale_policy": {
+                "locale": "zh-CN" if brief.language == "中文" else "en-US",
+                "adaptation": "native editorial variant, not literal translation",
+                "single_locale_output": True,
+                "shared_facts_only": True,
+            },
             "required_claim_markers": [
                 f"{claim.status.value} · {claim.id}" for claim in brief.claims
             ],
@@ -1005,6 +1023,33 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _story_locale_variant(brief: ContentBrief) -> StoryLocaleVariant:
+    locale: Literal["zh-CN", "en-US"] = (
+        "zh-CN" if brief.language == "中文" else "en-US"
+    )
+    canonical_story_id = brief.evidence_filters.get("canon_story_id") or None
+    fact_contract_sha256 = _sha256(
+        {
+            "claims": [claim.model_dump(mode="json") for claim in brief.claims],
+            "evidence_bundle_id": brief.evidence_bundle_id,
+            "evidence_item_ids": brief.evidence_item_ids,
+            "evidence_gaps": brief.evidence_gaps,
+            "source_label": brief.source_label,
+        }
+    )
+    variant_group_id = (
+        f"canonical-story:{canonical_story_id}"
+        if canonical_story_id is not None
+        else f"fact-contract:{fact_contract_sha256[:24]}"
+    )
+    return StoryLocaleVariant(
+        locale=locale,
+        variant_group_id=variant_group_id,
+        canonical_story_id=canonical_story_id,
+        fact_contract_sha256=fact_contract_sha256,
+    )
+
+
 def _new_run_dir(data_root: Path) -> tuple[str, Path]:
     _reject_symlink_ancestry(data_root)
     _ensure_private_directory(data_root, parents=True)
@@ -1044,10 +1089,17 @@ def run_content_workspace(
         "facts_source": "operator_claim_ledger_only",
     }
     if brief.reference_asset is not None and brief.content_pattern is not None:
-        if normalized_reference is None:
+        if (
+            brief.reference_asset.source_kind is ReferenceSourceKind.MANUAL_TEXT
+            and normalized_reference is None
+        ):
             raise ContentWorkspaceError("Reference source text is unavailable")
         reference_context = {
-            "status": "PATTERN_DISTILLED_LOCALLY",
+            "status": (
+                "VIDEO_PATTERN_ANALYZED_LOCALLY"
+                if brief.reference_asset.source_kind is ReferenceSourceKind.LOCAL_VIDEO
+                else "PATTERN_DISTILLED_LOCALLY"
+            ),
             "reference_id": brief.reference_asset.reference_id,
             "pattern_id": brief.content_pattern.pattern_id,
             "raw_sha256": brief.reference_asset.raw_sha256,
@@ -1174,13 +1226,16 @@ def run_content_workspace(
         "20_youtube_script.md",
         "run.json",
     ]
-    if normalized_reference is not None:
+    if brief.reference_asset is not None:
         artifact_paths[-1:-1] = [
             "17_reference_asset.json",
             "18_content_pattern.json",
-            "19_reference_source.txt",
         ]
+        if normalized_reference is not None:
+            artifact_paths[-1:-1] = ["19_reference_source.txt"]
     brief_payload = brief.model_dump(mode="json")
+    locale_variant = _story_locale_variant(brief)
+    locale_variant_payload = locale_variant.model_dump(mode="json")
     drafts_payload = drafts.model_dump(mode="json")
     output_artifacts = {
         "15_canonical_story.md": drafts.canonical_story,
@@ -1209,6 +1264,7 @@ def run_content_workspace(
     publish_pack = {
         "status": "DRAFT_REQUIRES_HUMAN_APPROVAL",
         "topic": brief.topic,
+        "locale_variant": locale_variant_payload,
         "channels": [
             "Canonical story",
             "LinkedIn",
@@ -1227,6 +1283,7 @@ def run_content_workspace(
         "source_label": brief.source_label,
         "claim_ledger_sha256": _sha256(brief_payload["claims"]),
         "claims": brief_payload["claims"],
+        "locale_variant": locale_variant_payload,
         "evidence_context": evidence_context,
         "reference_context": reference_context,
         "boundary": (
@@ -1253,13 +1310,16 @@ def run_content_workspace(
         "evidence_item_count": len(brief.evidence_item_ids),
         "evidence_gap_count": len(brief.evidence_gaps),
         "publication_performed": False,
+        "locale": locale_variant.locale,
+        "variant_group_id": locale_variant.variant_group_id,
+        "fact_contract_sha256": locale_variant.fact_contract_sha256,
     }
-    if normalized_reference is not None:
+    if brief.reference_asset is not None:
         verification.update(
             {
                 "reference_pattern_used": True,
                 "raw_reference_in_public_outputs": False,
-                "reference_originality_scan_passed": True,
+                "reference_originality_scan_passed": normalized_reference is not None,
             }
         )
     run = ContentRun(
@@ -1267,6 +1327,7 @@ def run_content_workspace(
         created_at=created_at,
         brief=brief,
         drafts=drafts,
+        locale_variant=locale_variant,
         artifact_paths=artifact_paths,
         editorial_provenance=[editorial_provenance],
         network_used=network_used,
@@ -1291,7 +1352,7 @@ def run_content_workspace(
                         "examples, and distinctive wording were excluded."
                     )
                 ]
-                if normalized_reference is not None
+                if brief.reference_asset is not None
                 else []
             ),
         ],
@@ -1320,7 +1381,7 @@ def run_content_workspace(
         "14_evidence_context.json": _canonical_json(evidence_context),
         "run.json": _canonical_json(run.model_dump(mode="json")),
     }
-    if normalized_reference is not None:
+    if brief.reference_asset is not None:
         if brief.reference_asset is None or brief.content_pattern is None:
             raise ContentWorkspaceError("Reference metadata is unavailable")
         artifacts.update(
@@ -1331,9 +1392,10 @@ def run_content_workspace(
                 "18_content_pattern.json": _canonical_json(
                     brief.content_pattern.model_dump(mode="json")
                 ),
-                "19_reference_source.txt": normalized_reference + "\n",
             }
         )
+        if normalized_reference is not None:
+            artifacts["19_reference_source.txt"] = normalized_reference + "\n"
     try:
         for name in artifact_paths:
             _atomic_private_write(run_dir / name, artifacts[name])

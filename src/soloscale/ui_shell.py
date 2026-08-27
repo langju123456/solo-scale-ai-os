@@ -9,6 +9,23 @@ from typing import Literal
 
 UILocale = Literal["zh-CN", "en"]
 DEFAULT_UI_LOCALE: UILocale = "zh-CN"
+SourceState = Literal[
+    "READY",
+    "PROCESSING",
+    "AVAILABLE",
+    "NOT_CONNECTED",
+    "UNAVAILABLE",
+    "NEEDS_ATTENTION",
+]
+
+_SOURCE_STATE_PRESENTATION: dict[SourceState, tuple[str, str, str]] = {
+    "READY": ("✓", "已就绪", "Ready"),
+    "PROCESSING": ("●", "处理中", "Processing"),
+    "AVAILABLE": ("＋", "可添加", "Available"),
+    "NOT_CONNECTED": ("○", "未连接", "Not connected"),
+    "UNAVAILABLE": ("—", "暂不可用", "Unavailable"),
+    "NEEDS_ATTENTION": ("!", "需处理", "Needs attention"),
+}
 
 _NAV_ITEMS: tuple[tuple[str, str, str, str], ...] = (
     ("home", "/", "首页", "Home"),
@@ -42,6 +59,21 @@ def ui_url(path: str, locale: UILocale, **query: str) -> str:
     values["lang"] = locale
     return urllib.parse.urlunsplit(
         ("", "", split.path or "/", urllib.parse.urlencode(values), split.fragment)
+    )
+
+
+def render_source_state(state: SourceState, locale: UILocale) -> str:
+    """Render one reusable, semantic data-source state indicator."""
+
+    symbol, chinese, english = _SOURCE_STATE_PRESENTATION[state]
+    label = ui_text(locale, chinese, english)
+    css_state = state.casefold().replace("_", "-")
+    return (
+        f'<span class="source-state source-state-{css_state}" '
+        f'data-source-state="{state}" title="{state}" '
+        f'aria-label="{html.escape(label)}">'
+        f'<span class="source-state-symbol" aria-hidden="true">{symbol}</span>'
+        f"<span>{html.escape(label)}</span></span>"
     )
 
 
@@ -189,6 +221,13 @@ button:hover,.primary:hover,.primary-button:hover,.button-link:hover { backgroun
 .status-badge { display:inline-flex; align-items:center; min-height:28px; padding:3px 9px;
   border-radius:999px; background:var(--brand-soft); color:var(--brand); font-size:12px;
   font-weight:800; }
+.source-state { display:inline-flex; align-items:center; gap:6px; width:max-content; min-height:27px;
+  padding:3px 9px; border-radius:999px; background:var(--surface-subtle); color:var(--text-muted);
+  font-size:11px; font-weight:850; letter-spacing:.02em; white-space:nowrap; }
+.source-state-symbol { min-width:12px; text-align:center; font-size:13px; line-height:1; }
+.source-state-ready { background:var(--success-soft); color:var(--success); }
+.source-state-processing,.source-state-available { background:var(--brand-soft); color:var(--brand); }
+.source-state-needs-attention { background:var(--warning-soft); color:var(--warning); }
 pre,code { overflow-wrap:anywhere; }
 pre { white-space:pre-wrap; padding:16px; border:1px solid var(--border); border-radius:14px;
   background:#fafbfc; color:#2c3548; }

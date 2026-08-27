@@ -28,6 +28,7 @@ from soloscale.local_ui import (
     _apply_ai_provider_preference,
     _create_resume_pdf_preview,
     _finalize_resume_preview,
+    _heygen_settings_page,
     _home_page,
     _interview_defense_panel,
     _learning_page,
@@ -568,6 +569,7 @@ def test_ai_service_pages_show_one_default_and_keep_openai_secret_out_of_html(
     assert "选择一次，所有工作流自动使用" in overview
     assert "创作与发布服务" in overview
     assert "HeyGen" in overview
+    assert 'href="/settings/media/heygen?lang=zh-CN"' in overview
     assert "LinkedIn" in overview
     assert "YouTube" in overview
 
@@ -605,6 +607,12 @@ def test_ai_service_pages_show_one_default_and_keep_openai_secret_out_of_html(
         assert sentinel not in desktop_openai
     finally:
         _clear_for_tests()
+
+    browser_heygen = _heygen_settings_page(data_root)
+    assert "普通浏览器不会接收它" in browser_heygen
+    assert "测试 Avatar · 需先预估费用" in browser_heygen
+    assert 'id="heygen-api-key"' in browser_heygen
+    assert "HEYGEN_API_KEY" not in browser_heygen
 
 
 def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(

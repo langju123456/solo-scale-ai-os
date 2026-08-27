@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class _StrictModel(BaseModel):
@@ -16,21 +16,54 @@ class _StrictModel(BaseModel):
 
 class ReferenceSourceKind(StrEnum):
     MANUAL_TEXT = "manual_text"
+    LOCAL_VIDEO = "local_video"
 
 
 class ReferenceAsset(_StrictModel):
-    """Private metadata for operator-supplied inspiration text."""
+    """Private metadata for an operator-supplied inspiration source."""
 
     reference_id: str = Field(pattern=r"^reference-[a-f0-9]{16}$")
-    source_kind: Literal[ReferenceSourceKind.MANUAL_TEXT] = (
-        ReferenceSourceKind.MANUAL_TEXT
-    )
+    source_kind: ReferenceSourceKind = ReferenceSourceKind.MANUAL_TEXT
     title: str | None = Field(default=None, max_length=180)
     author: str | None = Field(default=None, max_length=120)
     raw_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    raw_character_count: int = Field(ge=40, le=20_000)
+    raw_character_count: int = Field(ge=0, le=200_000)
+    source_filename: str | None = Field(default=None, max_length=240)
+    source_bytes: int | None = Field(default=None, ge=1, le=200 * 1024 * 1024)
+    duration_seconds: float | None = Field(default=None, gt=0, le=3_600)
+    width: int | None = Field(default=None, gt=0, le=16_384)
+    height: int | None = Field(default=None, gt=0, le=16_384)
+    frames_per_second: float | None = Field(default=None, gt=0, le=240)
+    has_audio: bool | None = None
+    transcript_status: Literal["not_applicable", "complete", "not_available"] = (
+        "not_applicable"
+    )
+    transcript_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
     raw_retained_private: Literal[True] = True
     external_facts_authorized: Literal[False] = False
+
+    @model_validator(mode="after")
+    def source_metadata_matches_kind(self) -> ReferenceAsset:
+        if self.source_kind is ReferenceSourceKind.MANUAL_TEXT:
+            if self.raw_character_count < 40:
+                raise ValueError("Manual reference text requires at least 40 characters")
+            if self.source_filename is not None or self.source_bytes is not None:
+                raise ValueError("Manual reference text cannot include video metadata")
+        else:
+            required = (
+                self.source_filename,
+                self.source_bytes,
+                self.duration_seconds,
+                self.width,
+                self.height,
+                self.frames_per_second,
+                self.has_audio,
+            )
+            if any(value is None for value in required):
+                raise ValueError("Local video reference metadata is incomplete")
+            if self.transcript_status == "complete" and self.transcript_sha256 is None:
+                raise ValueError("A completed transcript requires its SHA-256")
+        return self
 
 
 class ReferenceContentPattern(_StrictModel):
@@ -56,11 +89,25 @@ class ReferenceLanguagePattern(_StrictModel):
 
 
 class ReferenceVideoPattern(_StrictModel):
-    estimated_duration_seconds: int = Field(ge=20, le=180)
+    estimated_duration_seconds: int = Field(ge=1, le=3_600)
     shot_cadence: Literal["fast", "moderate", "steady"]
     visual_elements: list[str] = Field(default_factory=list, max_length=8)
     captions: Literal["observed", "not_observed", "unknown"] = "unknown"
     transitions: Literal["observed", "not_observed", "unknown"] = "unknown"
+    measured_duration_seconds: float | None = Field(default=None, gt=0, le=3_600)
+    shot_count: int | None = Field(default=None, ge=1, le=10_000)
+    shot_timestamps_seconds: list[float] = Field(default_factory=list, max_length=256)
+    shot_durations_seconds: list[float] = Field(default_factory=list, max_length=256)
+    average_shot_duration_seconds: float | None = Field(default=None, gt=0, le=3_600)
+    cuts_per_minute: float | None = Field(default=None, ge=0, le=3_600)
+    opening_segment_seconds: float | None = Field(default=None, gt=0, le=3_600)
+    ending_segment_seconds: float | None = Field(default=None, gt=0, le=3_600)
+    aspect_ratio: str | None = Field(default=None, max_length=32)
+    frame_sample_count: int = Field(default=0, ge=0, le=24)
+    has_audio: bool | None = None
+    dominant_visual_type: Literal[
+        "talking_head", "screen", "diagram", "b_roll", "UNKNOWN"
+    ] = "UNKNOWN"
 
 
 class ReferenceAudiencePattern(_StrictModel):

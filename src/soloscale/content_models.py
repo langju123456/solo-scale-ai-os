@@ -117,12 +117,22 @@ class ContentReviewReceipt(_StrictModel):
     publication_performed: Literal[False] = False
 
 
+class StoryLocaleVariant(_StrictModel):
+    """Identity and fact boundary shared by one story's locale-specific drafts."""
+
+    locale: Literal["zh-CN", "en-US"]
+    variant_group_id: str = Field(min_length=1, max_length=160)
+    canonical_story_id: str | None = Field(default=None, max_length=80)
+    fact_contract_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
 class ContentRun(_StrictModel):
     status: Literal["DRAFT_REQUIRES_HUMAN_APPROVAL"] = "DRAFT_REQUIRES_HUMAN_APPROVAL"
     run_id: str
     created_at: str
     brief: ContentBrief
     drafts: ContentDrafts
+    locale_variant: StoryLocaleVariant | None = None
     artifact_paths: list[str]
     editorial_provenance: list[EditorialProvenance] = Field(default_factory=list)
     network_used: bool = False

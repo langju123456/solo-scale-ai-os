@@ -207,6 +207,43 @@ class OpenAICompatibleGatewayTransport(Protocol):
     def send(self, request: OpenAICompatibleGatewayRequest) -> str: ...
 
 
+def _external_model_call_profile(
+    *,
+    provider: ModelProviderId,
+    model: str,
+    system: str,
+    user: str,
+    response_json_schema: dict[str, object],
+    max_output_tokens: int,
+    reasoning_effort: Literal["none", "low"],
+    wall_ms: int,
+    response_chars: int,
+) -> ModelCallProfile:
+    """Capture available metadata without inventing provider token usage."""
+
+    return ModelCallProfile(
+        provider=provider,
+        model=model,
+        system_chars=len(system),
+        user_chars=len(user),
+        schema_chars=len(
+            json.dumps(
+                response_json_schema,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ),
+        max_output_tokens=max_output_tokens,
+        thinking_enabled=reasoning_effort != "none",
+        prompt_eval_tokens=None,
+        output_tokens=None,
+        wall_ms=wall_ms,
+        response_chars=response_chars,
+        thinking_chars=0,
+    )
+
+
 class MockHostedGatewayTransport:
     """In-memory scripted transport for focused tests and local contract demos."""
 
@@ -615,6 +652,7 @@ class OpenAICompatibleModelGateway:
         self._endpoint = endpoint
         self._model = model
         self._transport = transport
+        self.last_call_profile: ModelCallProfile | None = None
         self.descriptor = GatewayDescriptor(
             provider=ModelProviderId.OPENAI_COMPATIBLE,
             display_name="OpenAI-compatible provider",
@@ -632,6 +670,7 @@ class OpenAICompatibleModelGateway:
         user: str,
         reasoning_effort: Literal["none", "low"] = "low",
     ) -> ResponseModelT:
+        self.last_call_profile = None
         correlation_id = f"gateway-{secrets.token_hex(12)}"
         started = time.monotonic()
         request = OpenAICompatibleGatewayRequest(
@@ -648,21 +687,56 @@ class OpenAICompatibleModelGateway:
         try:
             response = self._transport.send(request)
         except ModelGatewayError:
+            self.last_call_profile = _external_model_call_profile(
+                provider=ModelProviderId.OPENAI_COMPATIBLE,
+                model=self._model,
+                system=system,
+                user=user,
+                response_json_schema=request.response_json_schema,
+                max_output_tokens=request.max_output_tokens,
+                reasoning_effort=reasoning_effort,
+                wall_ms=max(0, int((time.monotonic() - started) * 1000)),
+                response_chars=0,
+            )
             raise
         except Exception:
+            wall_ms = max(0, int((time.monotonic() - started) * 1000))
+            self.last_call_profile = _external_model_call_profile(
+                provider=ModelProviderId.OPENAI_COMPATIBLE,
+                model=self._model,
+                system=system,
+                user=user,
+                response_json_schema=request.response_json_schema,
+                max_output_tokens=request.max_output_tokens,
+                reasoning_effort=reasoning_effort,
+                wall_ms=wall_ms,
+                response_chars=0,
+            )
             details = GatewayFailureDetails(
                 correlation_id=correlation_id,
                 model=self._model,
                 category=GatewayErrorCategory.UPSTREAM,
                 gateway_error_type="transport_exception",
                 gateway_error_code="transport_failed",
-                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+                duration_ms=wall_ms,
                 retryable=False,
             )
             _log_gateway_failure(details)
             raise ModelGatewayTransportError(
                 "custom model request failed", details=details
             ) from None
+        wall_ms = max(0, int((time.monotonic() - started) * 1000))
+        self.last_call_profile = _external_model_call_profile(
+            provider=ModelProviderId.OPENAI_COMPATIBLE,
+            model=self._model,
+            system=system,
+            user=user,
+            response_json_schema=request.response_json_schema,
+            max_output_tokens=request.max_output_tokens,
+            reasoning_effort=reasoning_effort,
+            wall_ms=wall_ms,
+            response_chars=len(response),
+        )
         try:
             decoded = json.loads(response)
             return schema.model_validate(decoded)
@@ -674,7 +748,7 @@ class OpenAICompatibleModelGateway:
                 upstream_http_status=200,
                 gateway_error_type="invalid_structured_response",
                 gateway_error_code="response_validation_failed",
-                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+                duration_ms=wall_ms,
                 retryable=False,
             )
             _log_gateway_failure(details)
@@ -741,6 +815,7 @@ class SoloScaleHostedModelGateway:
             raise ValueError("hosted gateway credential is not configured")
         self._config = config
         self._transport = transport
+        self.last_call_profile: ModelCallProfile | None = None
         self.descriptor = GatewayDescriptor(
             provider=ModelProviderId.SOLOSCALE_HOSTED,
             display_name="SoloScale Hosted AI",
@@ -758,6 +833,7 @@ class SoloScaleHostedModelGateway:
         user: str,
         reasoning_effort: Literal["none", "low"] = "low",
     ) -> ResponseModelT:
+        self.last_call_profile = None
         correlation_id = f"gateway-{secrets.token_hex(12)}"
         started = time.monotonic()
         request = HostedGatewayRequest(
@@ -777,8 +853,31 @@ class SoloScaleHostedModelGateway:
         try:
             response = self._transport.send(request)
         except ModelGatewayError:
+            self.last_call_profile = _external_model_call_profile(
+                provider=ModelProviderId.SOLOSCALE_HOSTED,
+                model=self._config.model,
+                system=system,
+                user=user,
+                response_json_schema=request.response_json_schema,
+                max_output_tokens=request.max_output_tokens,
+                reasoning_effort=reasoning_effort,
+                wall_ms=max(0, int((time.monotonic() - started) * 1000)),
+                response_chars=0,
+            )
             raise
         except Exception:
+            wall_ms = max(0, int((time.monotonic() - started) * 1000))
+            self.last_call_profile = _external_model_call_profile(
+                provider=ModelProviderId.SOLOSCALE_HOSTED,
+                model=self._config.model,
+                system=system,
+                user=user,
+                response_json_schema=request.response_json_schema,
+                max_output_tokens=request.max_output_tokens,
+                reasoning_effort=reasoning_effort,
+                wall_ms=wall_ms,
+                response_chars=0,
+            )
             details = GatewayFailureDetails(
                 correlation_id=correlation_id,
                 model=self._config.model,
@@ -786,13 +885,25 @@ class SoloScaleHostedModelGateway:
                 gateway_error_type="transport_exception",
                 gateway_error_code="transport_failed",
                 provider=self._config.model.split("/", maxsplit=1)[0],
-                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+                duration_ms=wall_ms,
                 retryable=False,
             )
             _log_gateway_failure(details)
             raise ModelGatewayTransportError(
                 "hosted model request failed", details=details
             ) from None
+        wall_ms = max(0, int((time.monotonic() - started) * 1000))
+        self.last_call_profile = _external_model_call_profile(
+            provider=ModelProviderId.SOLOSCALE_HOSTED,
+            model=self._config.model,
+            system=system,
+            user=user,
+            response_json_schema=request.response_json_schema,
+            max_output_tokens=request.max_output_tokens,
+            reasoning_effort=reasoning_effort,
+            wall_ms=wall_ms,
+            response_chars=len(response),
+        )
         try:
             decoded = json.loads(response)
             return schema.model_validate(decoded)
@@ -805,7 +916,7 @@ class SoloScaleHostedModelGateway:
                 gateway_error_type="invalid_structured_response",
                 gateway_error_code="response_validation_failed",
                 provider=self._config.model.split("/", maxsplit=1)[0],
-                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+                duration_ms=wall_ms,
                 retryable=False,
             )
             _log_gateway_failure(details)

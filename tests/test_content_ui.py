@@ -7,6 +7,7 @@ from soloscale.content_models import ContentReviewDecision
 from soloscale.content_scan import scan_recent_work
 from soloscale.content_ui import ContentFormStatus, content_page, run_content_form
 from soloscale.content_workspace import load_content_run, save_content_review
+from soloscale.media_quality import MediaQualityChecklist, save_media_quality_review
 
 
 def _form() -> dict[str, str]:
@@ -91,6 +92,10 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     assert "生成 YouTube + Short 成片" in page
     assert f"/content/downloads/{result.run_id}/youtube-script.md" in page
     assert f'action="/content/avatar-handoff/{result.run_id}"' in page
+    assert f'action="/content/presenter-asset/{result.run_id}"' in page
+    assert f'action="/content/presenter-plan/{result.run_id}"' in page
+    assert "可复用人物素材 · 0" in page
+    assert "新 Avatar 3" in page
     assert f'action="/content/review/{result.run_id}"' in page
     assert "先批准这个统一内容包" in page
 
@@ -139,6 +144,34 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     assert f'/content/downloads/{result.run_id}/video-subtitles.srt" download' in rendered
     assert f'/content/downloads/{result.run_id}/video-thumbnail.png" download' in rendered
     assert "下载封面" in rendered
+    assert "成本预览" in rendered
+    assert f'action="/content/media-quality/{result.run_id}"' in rendered
+    assert "先完成并通过八项人工媒体质量检查" in rendered
+
+    legacy_package = run_dir / "26_distribution_package.json"
+    legacy_package.write_text("{}", encoding="utf-8")
+    legacy_page = content_page(data_root=data_root, run_id=result.run_id)
+    assert "media-quality-review.json" not in legacy_page
+    legacy_package.unlink()
+
+    save_media_quality_review(
+        data_root=data_root,
+        run_id=result.run_id,
+        checklist=MediaQualityChecklist(
+            voice_natural=True,
+            pacing_natural=True,
+            no_static_visual_too_long=True,
+            presenter_adds_value=True,
+            language_natural=True,
+            claims_evidence_backed=True,
+            reference_influenced_without_copying=True,
+            would_publish=True,
+        ),
+    )
+    quality_approved = content_page(data_root=data_root, run_id=result.run_id)
+    assert "Human Media Quality" in quality_approved
+    assert "APPROVED · r1" in quality_approved
+    assert f'action="/content/distribution/{result.run_id}"' in quality_approved
 
     rerendered = content_page(data_root=data_root, run_id=result.run_id)
     assert 'name="generation_mode" value="template"' in rerendered

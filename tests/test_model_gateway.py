@@ -179,6 +179,13 @@ def test_openai_compatible_transport_posts_structured_schema_and_redacts_key(
     assert "max_tokens" not in body
     assert secret not in gateway.descriptor.model_dump_json()
     assert secret not in json.dumps(body)
+    profile = getattr(gateway, "last_call_profile", None)
+    assert profile is not None
+    assert profile.provider is ModelProviderId.OPENAI_COMPATIBLE
+    assert profile.prompt_eval_tokens is None
+    assert profile.output_tokens is None
+    assert profile.response_chars > 0
+    assert profile.thinking_enabled is False
 
 
 def test_openai_wire_schema_is_projected_without_weakening_domain_schema(
@@ -293,6 +300,11 @@ def test_hosted_gateway_is_feature_flagged_and_injected_transport_is_schema_vali
     assert gateway.complete(_Reply, system="system", user="typed-payload") == _Reply(
         value="grounded"
     )
+    profile = getattr(gateway, "last_call_profile", None)
+    assert profile is not None
+    assert profile.provider is ModelProviderId.SOLOSCALE_HOSTED
+    assert profile.prompt_eval_tokens is None
+    assert profile.output_tokens is None
     request = scripted.requests[0]
     assert request.endpoint == "https://ai-gateway.vercel.sh/v1/chat/completions"
     assert request.model == "zai/glm-5.2"
