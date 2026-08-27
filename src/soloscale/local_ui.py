@@ -6127,7 +6127,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "Credentials are not accepted by this endpoint")
                 return
             outcome = "invalid"
-            if form.get("action") == "save_profile":
+            action = form.get("action")
+            if action == "save_profile":
                 values = {
                     "heygen_avatar_group_id": form.get("avatar_group_id", "").strip(),
                     "heygen_avatar_look_id": form.get("avatar_look_id", "").strip(),
