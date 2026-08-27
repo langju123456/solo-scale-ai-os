@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 from typing import Literal, TypeVar
 
 import pytest
+from PIL import Image
 from pydantic import BaseModel
 
 from soloscale.content_models import (
@@ -25,6 +27,11 @@ from soloscale.model_gateway import (
     ModelProviderId,
 )
 from soloscale.reference_intelligence import extract_content_pattern
+from soloscale.reference_video import (
+    ReferenceVideoError,
+    _detect_shot_timestamps,
+    analyze_reference_video,
+)
 
 _DISTINCTIVE_REFERENCE_PHRASE = (
     "violet compasses only point north when the silent workshop bell rings"
@@ -229,4 +236,138 @@ def test_content_ui_accepts_reference_text_and_shows_only_the_pattern(
 
     empty_page = content_page(data_root=tmp_path / ".soloscale")
     assert 'name="reference_text"' in empty_page
-    assert "第一版不抓取 URL" in empty_page
+    assert 'action="/content/reference-video"' in empty_page
+    assert 'accept="video/mp4,.mp4"' in empty_page
+    assert "也可以在上方选择本地 MP4" in empty_page
+
+
+def test_local_reference_video_is_analyzed_once_and_only_pattern_enters_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / ".soloscale"
+
+    monkeypatch.setattr(
+        "soloscale.reference_video._media_tools",
+        lambda _: (tmp_path / "ffmpeg", tmp_path / "ffprobe", {}),
+    )
+    monkeypatch.setattr(
+        "soloscale.reference_video._probe",
+        lambda *args, **kwargs: (42.5, 1080, 1920, 30.0, False),
+    )
+    monkeypatch.setattr(
+        "soloscale.reference_video._shot_times",
+        lambda *args, **kwargs: [2.0, 5.5, 11.0, 19.0],
+    )
+
+    def sample_frames(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        frames_dir = args[1]
+        assert isinstance(frames_dir, Path)
+        frames_dir.mkdir(mode=0o700)
+        frame = frames_dir / "frame-01.jpg"
+        frame.write_bytes(b"safe-frame")
+        return [{"filename": frame.name, "sha256": "a" * 64, "bytes": 10}]
+
+    monkeypatch.setattr("soloscale.reference_video._sample_frames", sample_frames)
+    analysis = analyze_reference_video(
+        data_root=data_root,
+        resource_root=tmp_path,
+        filename="inspiration.mp4",
+        content=b"\x00\x00\x00\x18ftypmp42" + b"private-video",
+        title="A pacing reference",
+    )
+
+    form = {
+        "topic": "A grounded debugging lesson",
+        "audience": "AI builders",
+        "language": "English",
+        "source_label": "https://example.test/verified-receipt",
+        "verified_claims": (
+            "The trace reached its configured output-token limit. | "
+            "https://example.test/verified-receipt | Synthetic trace only."
+        ),
+        "observed_claims": "",
+        "hypotheses": "",
+        "planned": "",
+        "call_to_action": "What would you inspect first?",
+        "generation_mode": "template",
+        "reference_id": analysis.asset.reference_id,
+    }
+    result = run_content_form(form, data_root)
+    assert result.status is ContentFormStatus.GENERATED
+    assert result.run_id is not None
+    run_dir = data_root / "content-runs" / result.run_id
+    assert (run_dir / "17_reference_asset.json").is_file()
+    assert (run_dir / "18_content_pattern.json").is_file()
+    assert not (run_dir / "19_reference_source.txt").exists()
+    assert (analysis.library_path / "source.mp4").is_file()
+    assert analysis.pattern.video.shot_count == 5
+    assert analysis.pattern.video.shot_durations_seconds == [2.0, 3.5, 5.5, 8.0, 23.5]
+    assert analysis.pattern.video.cuts_per_minute == pytest.approx(5.647)
+    assert analysis.pattern.video.opening_segment_seconds == 2.0
+    assert analysis.pattern.video.ending_segment_seconds == 23.5
+    assert analysis.pattern.video.dominant_visual_type == "UNKNOWN"
+    page = content_page(data_root=data_root, run_id=result.run_id)
+    assert "A pacing reference" in page
+    assert "portrait framing" in page
+    assert "private-video" not in page
+
+
+def test_local_shot_detection_uses_visual_changes_without_ffmpeg_scene_filters(
+    tmp_path: Path,
+) -> None:
+    frames: list[Path] = []
+    for index, color in enumerate(
+        [(12, 12, 12), (14, 14, 14), (240, 240, 240), (238, 238, 238)]
+    ):
+        frame = tmp_path / f"frame-{index:04d}.jpg"
+        Image.new("RGB", (160, 90), color=color).save(frame)
+        frames.append(frame)
+
+    assert _detect_shot_timestamps(frames, sample_rate=2.0) == [1.0]
+
+
+def test_local_reference_video_keeps_asr_optional_and_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    monkeypatch.setattr(
+        "soloscale.reference_video._media_tools",
+        lambda _: (tmp_path / "ffmpeg", tmp_path / "ffprobe", {}),
+    )
+    monkeypatch.setattr(
+        "soloscale.reference_video._probe",
+        lambda *args, **kwargs: (12.0, 1920, 1080, 30.0, True),
+    )
+    monkeypatch.setattr(
+        "soloscale.reference_video._shot_times", lambda *args, **kwargs: []
+    )
+
+    def sample_frames(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        frames_dir = args[1]
+        assert isinstance(frames_dir, Path)
+        frames_dir.mkdir(mode=0o700)
+        frame = frames_dir / "frame-01.jpg"
+        frame.write_bytes(b"safe-frame")
+        return [{"filename": frame.name, "sha256": "b" * 64, "bytes": 10}]
+
+    monkeypatch.setattr("soloscale.reference_video._sample_frames", sample_frames)
+    monkeypatch.setattr(
+        "soloscale.reference_video._transcribe",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ReferenceVideoError("Local Qwen transcription runtime is unavailable")
+        ),
+    )
+    analysis = analyze_reference_video(
+        data_root=data_root,
+        resource_root=tmp_path,
+        filename="spoken-reference.mp4",
+        content=b"\x00\x00\x00\x18ftypmp42" + b"private-spoken-video",
+    )
+
+    assert analysis.asset.has_audio is True
+    assert analysis.asset.transcript_status == "not_available"
+    assert analysis.asset.transcript_sha256 is None
+    assert not (analysis.library_path / "transcript.txt").exists()
+    receipt = json.loads((analysis.library_path / "analysis.json").read_text())
+    assert receipt["transcript_error_code"] == "local_asr_unavailable"
+    assert receipt["network_used_for_media"] is False

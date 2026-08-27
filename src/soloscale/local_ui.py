@@ -109,6 +109,11 @@ from soloscale.presenter_assets import (
     import_presenter_asset,
     save_presenter_preferences,
 )
+from soloscale.reference_video import (
+    MAX_REFERENCE_VIDEO_BYTES,
+    ReferenceVideoError,
+    analyze_reference_video,
+)
 from soloscale.resume_docx import (
     ResumeTemplateError,
     TailoredDocx,
@@ -194,6 +199,7 @@ from soloscale.work_ui import (
 COMMAND_TIMEOUT_SECONDS = 120
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 MAX_WORK_IMPORT_BYTES = 256 * 1024 * 1024
+_REFERENCE_VIDEO_FORM_OVERHEAD_BYTES = 1024 * 1024
 _PRESENTER_ASSET_FORM_OVERHEAD_BYTES = 1024 * 1024
 _DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 _RUN_ID_RE = re.compile(r"resume-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10}")
@@ -5854,6 +5860,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.latest_content_form, self.ui_data_root.absolute()
             )
             run_id = query.get("run_id", [""])[0]
+            reference_id = query.get("reference_id", [""])[0]
+            if reference_id:
+                self.latest_content_form["reference_id"] = reference_id
             review_notice = {
                 "saved": ui_text(self.ui_locale, "修改已保存。", "Edits saved."),
                 "approved": ui_text(
@@ -5870,9 +5879,18 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     "The selected adaptation was regenerated with the safe offline template.",
                 ),
             }.get(query.get("review", [""])[0])
+            reference_notice = (
+                ui_text(
+                    self.ui_locale,
+                    "参考视频已在本机分析完成，并已选入当前内容表单。",
+                    "The reference video was analyzed locally and selected for this content form.",
+                )
+                if query.get("reference", [""])[0] == "analyzed"
+                else None
+            )
             self._send_content_page(
                 run_id=run_id or None,
-                notice=review_notice,
+                notice=review_notice or reference_notice,
                 scan_range=query.get("scan_range", [None])[0],
                 candidate_id=query.get("candidate_id", [None])[0],
             )
@@ -6504,6 +6522,52 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         canon_generate_match = re.fullmatch(r"/content/canon/(M1-[0-9]{2})", path)
+        if path == "/content/reference-video":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            max_request_bytes = (
+                MAX_REFERENCE_VIDEO_BYTES + _REFERENCE_VIDEO_FORM_OVERHEAD_BYTES
+            )
+            if length < 0 or length > max_request_bytes:
+                self.send_error(413, "Reference video is too large")
+                return
+            try:
+                submission = _parse_submission(
+                    self.rfile.read(length),
+                    self.headers.get("Content-Type", ""),
+                    max_bytes=max_request_bytes,
+                )
+                self._adopt_ui_locale(submission.fields)
+                upload = submission.files.get("reference_video")
+                if upload is None:
+                    raise ReferenceVideoError("Choose one local reference MP4")
+                analyzed = analyze_reference_video(
+                    data_root=self.ui_data_root.absolute(),
+                    resource_root=self.creator_video_root,
+                    filename=upload.filename,
+                    content=upload.content,
+                    title=submission.fields.get("reference_title", ""),
+                    author=submission.fields.get("reference_author", ""),
+                )
+            except (OSError, ReferenceVideoError, ValueError) as exc:
+                self._send_content_page(error=str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/content",
+                    self.ui_locale,
+                    reference_id=analyzed.asset.reference_id,
+                    reference="analyzed",
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if canon_generate_match is not None:
             try:
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -6519,7 +6583,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             content_result = run_month_one_story(
                 canon_generate_match.group(1),
                 self.ui_data_root.absolute(),
-                language="中文" if self.ui_locale == "zh-CN" else "English",
+                language="中文" if form.get("language") == "中文" else "English",
                 gateway=_gateway_from_preference(preference),
             )
             if content_result.run_id is None:

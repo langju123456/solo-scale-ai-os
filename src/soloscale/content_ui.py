@@ -49,7 +49,12 @@ from soloscale.presenter_assets import (
     load_presenter_library,
     plan_presenter_assets,
 )
-from soloscale.reference_intelligence import extract_content_pattern
+from soloscale.reference_intelligence import ReferenceSourceKind, extract_content_pattern
+from soloscale.reference_video import (
+    ReferenceVideoError,
+    load_reference_video,
+    recent_reference_videos,
+)
 from soloscale.ui_shell import (
     DEFAULT_UI_LOCALE,
     UILocale,
@@ -105,7 +110,9 @@ def _ungrounded_lines(raw: str, status: str) -> list[str]:
     return [f"{status} | {line.strip()}" for line in raw.splitlines() if line.strip()]
 
 
-def _brief_from_form(form: dict[str, str]) -> tuple[ContentBrief, str | None]:
+def _brief_from_form(
+    form: dict[str, str], data_root: Path
+) -> tuple[ContentBrief, str | None]:
     ledger_lines = [
         *_grounded_lines(form.get("verified_claims", ""), "VERIFIED"),
         *_grounded_lines(form.get("observed_claims", ""), "OBSERVED"),
@@ -117,7 +124,19 @@ def _brief_from_form(form: dict[str, str]) -> tuple[ContentBrief, str | None]:
     reference_asset = None
     content_pattern = None
     normalized_reference: str | None = None
-    if reference_text:
+    reference_id = form.get("reference_id", "").strip()
+    if reference_text and reference_id:
+        raise ContentWorkspaceError(
+            "Choose either one analyzed reference video or pasted reference text"
+        )
+    if reference_id:
+        try:
+            analyzed = load_reference_video(data_root, reference_id)
+        except ReferenceVideoError as exc:
+            raise ContentWorkspaceError(str(exc)) from exc
+        reference_asset = analyzed.asset
+        content_pattern = analyzed.pattern
+    elif reference_text:
         reference_asset, content_pattern, normalized_reference = extract_content_pattern(
             reference_text,
             title=form.get("reference_title", ""),
@@ -153,7 +172,7 @@ def run_content_form(
 ) -> ContentFormResult:
     started = time.perf_counter()
     try:
-        brief, reference_source_text = _brief_from_form(form)
+        brief, reference_source_text = _brief_from_form(form, data_root)
         generation_mode = form.get(
             "generation_mode", ModelProviderId.SOLOSCALE_HOSTED.value
         ).strip().lower()
@@ -343,6 +362,12 @@ def _form_from_run(run: ContentRun) -> dict[str, str]:
         "reference_author": "",
         "reference_text": "",
         "reference_visual_notes": "",
+        "reference_id": (
+            run.brief.reference_asset.reference_id
+            if run.brief.reference_asset is not None
+            and run.brief.reference_asset.source_kind is ReferenceSourceKind.LOCAL_VIDEO
+            else ""
+        ),
     }
 
 
@@ -1106,7 +1131,23 @@ def content_page(
         scan, selected_candidate_id=candidate_id, locale=locale
     )
     canon_section, canon_script = _month_one_canon_html(locale)
-    body = f"""{work_summary}{canon_section}{scan_section}<div class="grid">
+    reference_videos = recent_reference_videos(data_root)
+    selected_reference_id = values.get("reference_id", "")
+    reference_options = "".join(
+        f'<option value="{_escape(item.asset.reference_id)}" {"selected" if item.asset.reference_id == selected_reference_id else ""}>{_escape(item.asset.title or item.asset.source_filename or item.asset.reference_id)} · {item.asset.duration_seconds:.1f}s · {_escape(item.pattern.video.shot_cadence)}</option>'
+        for item in reference_videos
+    )
+    reference_upload = f'''<section class="reference-video-upload"><div class="result-head"><div><span class="kicker">Reference Video Intelligence · Local</span>
+      <h3>{_escape(ui_text(locale, '分析本地参考视频', 'Analyze a local reference video'))}</h3>
+      <p class="hint">{_escape(ui_text(locale, '只读取你主动选择的 MP4；本地提取转录、关键帧、镜头节奏和画面结构。原视频与转录不会进入公开内容。', 'Only the MP4 you choose is read. Transcript, keyframes, shot timing, and visual structure are analyzed locally. Raw media and transcript never enter public output.'))}</p></div><span class="reference-badge">{len(reference_videos)} {_escape(ui_text(locale, '个本地参考', 'local references'))}</span></div>
+      <form method="post" action="/content/reference-video" enctype="multipart/form-data" class="reference-video-form">
+        <input type="hidden" name="ui_locale" value="{locale}" />
+        <div class="two"><label>{_escape(ui_text(locale, '参考标题（可选）', 'Reference title (optional)'))}<input name="reference_title" maxlength="180" /></label>
+        <label>{_escape(ui_text(locale, '作者（可选）', 'Author (optional)'))}<input name="reference_author" maxlength="120" /></label></div>
+        <label>{_escape(ui_text(locale, '选择 MP4（最多 200 MB）', 'Choose an MP4 (up to 200 MB)'))}<input type="file" name="reference_video" accept="video/mp4,.mp4" required /></label>
+        <button class="secondary" type="submit">{_escape(ui_text(locale, '本地分析并加入参考库', 'Analyze locally and add to library'))}</button>
+      </form></section>'''
+    body = f"""{work_summary}{canon_section}{scan_section}{reference_upload}<div class="grid">
 <section class="form-card">
 <span class="kicker">{_escape(ui_text(locale, '输入', 'Input'))}</span><h2>{_escape(ui_text(locale, '证据 + 受众 + CTA', 'Evidence + audience + CTA'))}</h2>
 <p class="hint">{_escape(ui_text(locale, '第一条已验证事实会成为开头。数字、结果和结论都应附证据。', 'The first verified fact becomes the opening. Numbers, outcomes, and conclusions should include evidence.'))}</p>
@@ -1141,8 +1182,11 @@ def content_page(
 <section class="reference-intake">
   <div class="result-head"><div><span class="kicker">Reference Intelligence · {_escape(ui_text(locale, '可选', 'Optional'))}</span>
     <h3>{_escape(ui_text(locale, '把参考内容蒸馏成表达模式', 'Distill a reference into a presentation pattern'))}</h3>
-    <p class="hint">{_escape(ui_text(locale, '粘贴文案或 transcript。SoloScale 只学习高层结构、节奏和视觉提示；事实、例子和独特措辞不会进入你的内容。', 'Paste copy or a transcript. SoloScale learns only high-level structure, pacing, and visual cues; reference facts, examples, and distinctive wording are excluded.'))}</p></div>
+    <p class="hint">{_escape(ui_text(locale, '选择已分析视频，或粘贴文案 / transcript。SoloScale 只学习高层结构、节奏和视觉提示；事实、例子和独特措辞不会进入你的内容。', 'Choose an analyzed video, or paste copy / a transcript. SoloScale learns only high-level structure, pacing, and visual cues; reference facts, examples, and distinctive wording are excluded.'))}</p></div>
     <span class="reference-badge">{_escape(ui_text(locale, '本地分析', 'Local analysis'))}</span></div>
+  <label>{_escape(ui_text(locale, '已分析的本地参考视频（可选）', 'Analyzed local reference video (optional)'))}
+    <select name="reference_id"><option value="">{_escape(ui_text(locale, '不使用视频参考', 'No video reference'))}</option>{reference_options}</select>
+  </label>
   <div class="two">
     <label>{_escape(ui_text(locale, '参考标题（可选）', 'Reference title (optional)'))}
       <input name="reference_title" maxlength="180" value="{_escape(values.get('reference_title', ''))}" />
@@ -1153,7 +1197,7 @@ def content_page(
   </div>
   <label>{_escape(ui_text(locale, '粘贴 Reference 文本 / Transcript', 'Paste reference text / transcript'))}
     <textarea class="large" name="reference_text" maxlength="20000"
-      placeholder="{_escape(ui_text(locale, '粘贴外部文章、帖子或视频转录稿；第一版不抓取 URL。', 'Paste an external article, post, or transcript. v0.1 does not fetch URLs.'))}"
+      placeholder="{_escape(ui_text(locale, '粘贴外部文章、帖子或视频转录稿；也可以在上方选择本地 MP4。', 'Paste an external article, post, or transcript; or select a local MP4 above.'))}"
     >{_escape(values.get('reference_text', ''))}</textarea>
   </label>
   <label>{_escape(ui_text(locale, '视觉备注（可选）', 'Visual notes (optional)'))}

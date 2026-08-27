@@ -37,6 +37,7 @@ from soloscale.model_gateway import (
     OllamaModelGateway,
 )
 from soloscale.reference_intelligence import (
+    ReferenceSourceKind,
     normalize_reference_text,
     reject_distinctive_reference_reuse,
 )
@@ -243,6 +244,12 @@ def _validate_reference_source(
         if reference_source_text is not None:
             raise ContentWorkspaceError(
                 "Reference source text requires a ReferenceAsset and ContentPattern"
+            )
+        return None
+    if brief.reference_asset.source_kind is ReferenceSourceKind.LOCAL_VIDEO:
+        if reference_source_text is not None:
+            raise ContentWorkspaceError(
+                "Raw local-video transcripts must remain in the private reference library"
             )
         return None
     if reference_source_text is None:
@@ -1081,10 +1088,17 @@ def run_content_workspace(
         "facts_source": "operator_claim_ledger_only",
     }
     if brief.reference_asset is not None and brief.content_pattern is not None:
-        if normalized_reference is None:
+        if (
+            brief.reference_asset.source_kind is ReferenceSourceKind.MANUAL_TEXT
+            and normalized_reference is None
+        ):
             raise ContentWorkspaceError("Reference source text is unavailable")
         reference_context = {
-            "status": "PATTERN_DISTILLED_LOCALLY",
+            "status": (
+                "VIDEO_PATTERN_ANALYZED_LOCALLY"
+                if brief.reference_asset.source_kind is ReferenceSourceKind.LOCAL_VIDEO
+                else "PATTERN_DISTILLED_LOCALLY"
+            ),
             "reference_id": brief.reference_asset.reference_id,
             "pattern_id": brief.content_pattern.pattern_id,
             "raw_sha256": brief.reference_asset.raw_sha256,
@@ -1211,12 +1225,13 @@ def run_content_workspace(
         "20_youtube_script.md",
         "run.json",
     ]
-    if normalized_reference is not None:
+    if brief.reference_asset is not None:
         artifact_paths[-1:-1] = [
             "17_reference_asset.json",
             "18_content_pattern.json",
-            "19_reference_source.txt",
         ]
+        if normalized_reference is not None:
+            artifact_paths[-1:-1] = ["19_reference_source.txt"]
     brief_payload = brief.model_dump(mode="json")
     locale_variant = _story_locale_variant(brief)
     locale_variant_payload = locale_variant.model_dump(mode="json")
@@ -1298,12 +1313,12 @@ def run_content_workspace(
         "variant_group_id": locale_variant.variant_group_id,
         "fact_contract_sha256": locale_variant.fact_contract_sha256,
     }
-    if normalized_reference is not None:
+    if brief.reference_asset is not None:
         verification.update(
             {
                 "reference_pattern_used": True,
                 "raw_reference_in_public_outputs": False,
-                "reference_originality_scan_passed": True,
+                "reference_originality_scan_passed": normalized_reference is not None,
             }
         )
     run = ContentRun(
@@ -1336,7 +1351,7 @@ def run_content_workspace(
                         "examples, and distinctive wording were excluded."
                     )
                 ]
-                if normalized_reference is not None
+                if brief.reference_asset is not None
                 else []
             ),
         ],
@@ -1365,7 +1380,7 @@ def run_content_workspace(
         "14_evidence_context.json": _canonical_json(evidence_context),
         "run.json": _canonical_json(run.model_dump(mode="json")),
     }
-    if normalized_reference is not None:
+    if brief.reference_asset is not None:
         if brief.reference_asset is None or brief.content_pattern is None:
             raise ContentWorkspaceError("Reference metadata is unavailable")
         artifacts.update(
@@ -1376,9 +1391,10 @@ def run_content_workspace(
                 "18_content_pattern.json": _canonical_json(
                     brief.content_pattern.model_dump(mode="json")
                 ),
-                "19_reference_source.txt": normalized_reference + "\n",
             }
         )
+        if normalized_reference is not None:
+            artifacts["19_reference_source.txt"] = normalized_reference + "\n"
     try:
         for name in artifact_paths:
             _atomic_private_write(run_dir / name, artifacts[name])
