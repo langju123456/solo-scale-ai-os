@@ -27,7 +27,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: pip install -e '.[dev]'
+      - run: pip install -e '.[dev]' -e packages/buildlog
       - run: ruff check .
       - run: mypy src tests
       - run: pytest -q

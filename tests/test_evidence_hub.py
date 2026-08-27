@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 from buildlog.models import Iteration
 
-import soloscale.evidence_hub as evidence_hub_module
 from soloscale.evidence_hub import EvidenceHub, EvidenceHubError
 from soloscale.evidence_hub_models import ReceiptStatus
 from soloscale.knowledge_models import (
@@ -257,8 +258,6 @@ def test_buildlog_and_git_adapters_use_bounded_local_metadata(
     (buildlog / "03_draft.md").write_text("not read by the hub", encoding="utf-8")
     git_root = tmp_path / "repository"
     git_root.mkdir()
-    import subprocess
-
     subprocess.run(["git", "init", "-q", str(git_root)], check=True)
     (git_root / "note.txt").write_text("private", encoding="utf-8")
     subprocess.run(["git", "-C", str(git_root), "add", "note.txt"], check=True)
@@ -278,19 +277,31 @@ def test_buildlog_and_git_adapters_use_bounded_local_metadata(
         check=True,
     )
     hub = EvidenceHub(root, knowledge_store=_store(root))
-    original_run = evidence_hub_module.subprocess.run
+    original_run = subprocess.run
     observed_timeouts: list[float] = []
 
-    def record_git_command(*args: object, **kwargs: object) -> object:
-        command = args[0]
-        assert isinstance(command, list)
+    def record_git_command(
+        command: list[str],
+        *,
+        capture_output: bool,
+        check: bool,
+        text: bool,
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
         assert Path(command[0]).is_absolute()
-        timeout = kwargs.get("timeout")
-        assert isinstance(timeout, (int, float))
         observed_timeouts.append(float(timeout))
-        return original_run(*args, **kwargs)  # type: ignore[arg-type]
+        return cast(
+            subprocess.CompletedProcess[str],
+            original_run(
+                command,
+                capture_output=capture_output,
+                check=check,
+                text=text,
+                timeout=timeout,
+            ),
+        )
 
-    monkeypatch.setattr(evidence_hub_module.subprocess, "run", record_git_command)
+    monkeypatch.setattr(subprocess, "run", record_git_command)
 
     receipt = hub.refresh(buildlog_roots=[buildlog.parent.parent], git_root=git_root)
 
