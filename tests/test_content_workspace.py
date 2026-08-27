@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -10,6 +12,15 @@ from soloscale.buildlog_handoff import (
     preview_for_buildlog,
     publish_via_buildlog,
     stage_for_buildlog,
+)
+from soloscale.content_canon_pipeline import (
+    ContentCanonError,
+    content_brief_from_month_one_story,
+)
+from soloscale.content_distribution import (
+    ContentDistributionError,
+    load_distribution_package,
+    prepare_distribution_package,
 )
 from soloscale.content_models import (
     ClaimStatus,
@@ -31,7 +42,13 @@ from soloscale.content_workspace import (
 )
 from soloscale.evidence_agent import Reasoner
 from soloscale.evidence_hub import EvidenceHub
-from soloscale.video_factory import creator_video_ready, render_creator_video
+from soloscale.video_factory import (
+    CreatorVideoJobManager,
+    creator_video_ready,
+    import_avatar_segment,
+    prepare_heygen_handoff,
+    render_creator_video,
+)
 
 
 def _brief() -> ContentBrief:
@@ -105,6 +122,7 @@ def _model_drafts(brief: ContentBrief) -> ContentDrafts:
     return ContentDrafts(
         linkedin=joined,
         x_thread=x_posts,
+        youtube_script=joined,
         video_script=joined,
         storyboard=scenes,
     )
@@ -136,6 +154,28 @@ def test_parse_claim_ledger_requires_receipts_for_grounded_statuses() -> None:
 
     with pytest.raises(ContentWorkspaceError, match="does not satisfy"):
         parse_claim_ledger("OBSERVED | Users preferred the new flow.")
+
+
+def test_ready_month_one_story_produces_grounded_multiformat_bundle(
+    tmp_path: Path,
+) -> None:
+    brief = content_brief_from_month_one_story("M1-15", language="中文")
+    assert brief.evidence_filters["canon_story_id"] == "M1-15"
+    assert len(brief.claims) == 8
+    assert all(
+        claim.receipt
+        for claim in brief.claims
+        if claim.status in {ClaimStatus.VERIFIED, ClaimStatus.OBSERVED}
+    )
+
+    run = run_content_workspace(data_root=tmp_path / ".soloscale", brief=brief)
+    run_dir = tmp_path / ".soloscale" / "content-runs" / run.run_id
+    assert (run_dir / "20_youtube_script.md").is_file()
+    assert "CLAIM-01" in run.drafts.youtube_script
+    assert "CLAIM-08" in run.drafts.youtube_script
+
+    with pytest.raises(ContentCanonError, match="needs evidence or owner input"):
+        content_brief_from_month_one_story("M1-23", language="中文")
 
 
 def test_content_workspace_writes_private_reviewable_multichannel_pack(
@@ -394,16 +434,29 @@ def test_creator_video_render_uses_only_saved_storyboard_and_is_non_overwriting(
     data_root = tmp_path / ".soloscale"
     run = run_content_workspace(data_root=data_root, brief=_brief())
     repository_root = tmp_path / "repo"
-    renderer = repository_root / "video_factory" / "render.mjs"
-    renderer.parent.mkdir(parents=True)
+    factory_root = repository_root / "video_factory"
+    renderer = factory_root / "render.mjs"
+    (factory_root / "node_modules" / "@remotion" / "renderer").mkdir(
+        parents=True
+    )
+    bundled_node = factory_root / "runtime" / "node"
+    bundled_node.parent.mkdir(parents=True)
+    bundled_node.write_text("#!/bin/sh\n", encoding="utf-8")
+    bundled_node.chmod(0o700)
+    fake_chrome = tmp_path / "Google Chrome"
+    fake_chrome.write_bytes(b"chrome")
     renderer.write_text("// test renderer", encoding="utf-8")
 
     def fake_run(command: list[str], **_: object) -> object:
-        output = Path(command[-1])
+        output = Path(command[command.index("--output") + 1])
         output.write_bytes(b"mp4")
+        if "--thumbnail" in command:
+            Path(command[command.index("--thumbnail") + 1]).write_bytes(b"png")
         return type("Result", (), {"returncode": 0})()
 
     monkeypatch.setattr("soloscale.video_factory.subprocess.run", fake_run)
+    monkeypatch.setattr("soloscale.video_factory.shutil.which", lambda _: None)
+    monkeypatch.setattr("soloscale.video_factory._MACOS_CHROME", fake_chrome)
     output = render_creator_video(
         data_root=data_root, run_id=run.run_id, repository_root=repository_root
     )
@@ -412,6 +465,14 @@ def test_creator_video_render_uses_only_saved_storyboard_and_is_non_overwriting(
     assert creator_video_ready(data_root, run.run_id) is True
     input_payload = json.loads((output.parent / "09_creator_video_input.json").read_text())
     assert input_payload["scenes"][0]["claim_ids"] == ["CLAIM-01"]
+    youtube_payload = json.loads(
+        (output.parent / "21_creator_video_youtube_input.json").read_text()
+    )
+    assert youtube_payload["width"] == 1920
+    assert input_payload["height"] == 1920
+    assert (output.parent / "21_creator_video_youtube.mp4").is_file()
+    assert (output.parent / "22_creator_video_thumbnail.png").is_file()
+    assert (output.parent / "25_creator_video_subtitles.srt").is_file()
     assert (output.parent / "11_creator_video_render.json").is_file()
     with pytest.raises(ValueError, match="already has"):
         render_creator_video(
@@ -422,6 +483,119 @@ def test_creator_video_render_uses_only_saved_storyboard_and_is_non_overwriting(
     artifact_name, artifact = content_download(data_root, run.run_id, "creator-video.mp4")
     assert artifact_name == output.name
     assert artifact == b"mp4"
+
+
+def test_creator_video_job_runs_without_blocking_the_caller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    def fake_render(**_: object) -> Path:
+        entered.set()
+        release.wait(timeout=2)
+        return tmp_path / "video.mp4"
+
+    monkeypatch.setattr("soloscale.video_factory.render_creator_video", fake_render)
+    manager = CreatorVideoJobManager()
+    try:
+        snapshot = manager.start(
+            data_root=tmp_path / ".soloscale",
+            run_id="content-test",
+            repository_root=tmp_path,
+        )
+        assert snapshot.phase in {"QUEUED", "RENDERING"}
+        assert entered.wait(timeout=1)
+        assert manager.get("content-test").phase == "RENDERING"  # type: ignore[union-attr]
+        release.set()
+        for _ in range(100):
+            completed = manager.get("content-test")
+            if completed is not None and completed.phase == "COMPLETE":
+                break
+            time.sleep(0.005)
+        assert completed is not None
+        assert completed.phase == "COMPLETE"
+    finally:
+        release.set()
+        manager.shutdown()
+
+
+def test_heygen_handoff_and_avatar_import_are_scene_scoped(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    run = run_content_workspace(data_root=data_root, brief=_brief())
+    handoff = prepare_heygen_handoff(data_root=data_root, run_id=run.run_id)
+    payload = json.loads(handoff.read_text(encoding="utf-8"))
+    assert payload["network_used"] is False
+    assert payload["external_submission_preview"]["raw_conversations_included"] is False
+    assert len(payload["segments"]) == 3
+
+    content = b"\x00\x00\x00\x18ftypmp42" + b"safe-avatar"
+    imported = import_avatar_segment(
+        data_root=data_root,
+        run_id=run.run_id,
+        scene_id="SCENE-01",
+        source_filename="presenter.mp4",
+        content=content,
+    )
+    assert imported.read_bytes() == content
+    mapping = json.loads((imported.parent.parent / "24_avatar_segments.json").read_text())
+    assert mapping["segments"]["SCENE-01"]["sha256"]
+    with pytest.raises(ValueError, match="valid storyboard scene"):
+        import_avatar_segment(
+            data_root=data_root,
+            run_id=run.run_id,
+            scene_id="SCENE-99",
+            source_filename="presenter.mp4",
+            content=content,
+        )
+
+
+def test_distribution_package_requires_approval_and_seals_exact_media(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    run = run_content_workspace(data_root=data_root, brief=_brief())
+    with pytest.raises(ContentDistributionError, match="Approve"):
+        prepare_distribution_package(data_root=data_root, run_id=run.run_id)
+
+    review = save_content_review(
+        data_root=data_root,
+        run_id=run.run_id,
+        decision=ContentReviewDecision.APPROVED,
+    )
+    run_dir = data_root / "content-runs" / run.run_id
+    for filename, body in {
+        "21_creator_video_youtube.mp4": b"youtube-video",
+        "10_creator_video.mp4": b"short-video",
+        "22_creator_video_thumbnail.png": b"thumbnail",
+        "25_creator_video_subtitles.srt": b"1\n00:00:00,000 --> 00:00:05,000\nSafe\n",
+    }.items():
+        (run_dir / filename).write_bytes(body)
+
+    path = prepare_distribution_package(data_root=data_root, run_id=run.run_id)
+    package = load_distribution_package(data_root, run.run_id)
+    assert package is not None
+    assert package["publication_performed"] is False
+    assert package["review_revision"] == review.revision
+    assert package["channels"]["youtube"]["direct_upload_enabled"] is False  # type: ignore[index]
+    artifacts = package["artifacts"]
+    assert artifacts["video"]["filename"] == "21_creator_video_youtube.mp4"  # type: ignore[index]
+    assert artifacts["video"]["download_path"].endswith("/youtube-video.mp4")  # type: ignore[index]
+    assert artifacts["short"]["download_path"].endswith("/creator-video.mp4")  # type: ignore[index]
+    assert artifacts["thumbnail"]["download_path"].endswith("/video-thumbnail.png")  # type: ignore[index]
+    assert artifacts["subtitles"]["download_path"].endswith("/video-subtitles.srt")  # type: ignore[index]
+    assert path.stat().st_mode & 0o777 == 0o600
+    youtube_name, youtube_body = content_download(
+        data_root, run.run_id, "youtube-upload.json"
+    )
+    assert youtube_name == "27_youtube_upload.json"
+    assert json.loads(youtube_body)["upload_performed"] is False
+    with pytest.raises(ContentWorkspaceError, match="sealed"):
+        save_content_review(
+            data_root=data_root,
+            run_id=run.run_id,
+            decision=ContentReviewDecision.APPROVED,
+        )
 
 
 def test_buildlog_handoff_stages_exact_artifact_and_persists_returned_receipt(

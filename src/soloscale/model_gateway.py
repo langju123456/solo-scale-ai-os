@@ -195,6 +195,7 @@ class OpenAICompatibleGatewayRequest(ContractModel):
     system: str
     user: str
     response_json_schema: dict[str, object]
+    reasoning_effort: Literal["none", "low"] = "low"
     max_output_tokens: int = Field(default=_HOSTED_MAX_OUTPUT_TOKENS, ge=1, le=128_000)
     timeout_seconds: int = Field(ge=1, le=120)
     max_retries: int = Field(ge=0, le=2)
@@ -548,7 +549,8 @@ class OpenAICompatibleHTTPTransport:
                     {"role": "user", "content": request.user},
                 ],
                 "stream": False,
-                "max_tokens": request.max_output_tokens,
+                "reasoning_effort": request.reasoning_effort,
+                "max_completion_tokens": request.max_output_tokens,
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {
@@ -630,7 +632,6 @@ class OpenAICompatibleModelGateway:
         user: str,
         reasoning_effort: Literal["none", "low"] = "low",
     ) -> ResponseModelT:
-        del reasoning_effort
         correlation_id = f"gateway-{secrets.token_hex(12)}"
         started = time.monotonic()
         request = OpenAICompatibleGatewayRequest(
@@ -640,6 +641,7 @@ class OpenAICompatibleModelGateway:
             system=system,
             user=user,
             response_json_schema=schema.model_json_schema(),
+            reasoning_effort=reasoning_effort,
             timeout_seconds=_HOSTED_REQUEST_TIMEOUT_SECONDS,
             max_retries=_HOSTED_MAX_RETRIES,
         )

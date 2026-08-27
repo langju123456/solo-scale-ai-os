@@ -60,8 +60,9 @@ def test_content_workspace_exposes_month_one_library_without_generation(
     assert "第一个月：从自动化幻想到可用结果" in page
     assert 'id="canon-status-filter"' in page
     assert 'data-canon-select="M1-01"' in page
-    assert "选择做视频" in page
-    assert "选择写博客" in page
+    assert "补充证据 / 确认" in page
+    assert "打开并编辑输入" in page
+    assert "生成完整内容包" in page
     assert "month-one-canon:" in page
     assert "Fact" in page
     assert "Architecture" in page
@@ -77,5 +78,6 @@ def test_content_workspace_exposes_month_one_library_without_generation(
 
     english = content_page(data_root=data_root, locale="en")
     assert "Month 1: From automation ambition to useful outcomes" in english
-    assert "Select for video" in english
-    assert "Select for blog" in english
+    assert "Add evidence / confirm" in english
+    assert "Open and edit input" in english
+    assert "Generate full content package" in english

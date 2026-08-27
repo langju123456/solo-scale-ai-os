@@ -19,7 +19,9 @@ trap 'rm -rf "$work_root"' EXIT
 "$python_bin" -m PyInstaller --noconfirm --distpath "$output_root" --workpath "$work_root" "$spec_file"
 sidecar="$output_root/SoloScaleBackend/SoloScaleBackend"
 [[ -x "$sidecar" ]] || fail "PyInstaller did not create an executable sidecar"
-if find "$output_root/SoloScaleBackend" \( -iname '.env' -o -iname '.env.*' -o -iname '.soloscale' -o -iname 'credentials' -o -iname 'node_modules' -o -iname '*remotion*' -o -iname '*chrome*' -o -iname '*libreoffice*' \) -print -quit | grep -q .; then
+if find "$output_root/SoloScaleBackend" \( -iname '.env' -o -iname '.env.*' -o -iname '.soloscale' -o -iname 'credentials' -o -iname '*libreoffice*' -o -iname 'Google Chrome.app' -o -iname 'chrome-headless-shell' \) -print -quit | grep -q .; then
   fail "refusing output containing excluded private or unsupported runtime data"
 fi
+[[ -f "$output_root/SoloScaleBackend/_internal/video_factory/render.mjs" ]] || fail "Creator Video renderer was not packaged"
+[[ -d "$output_root/SoloScaleBackend/_internal/video_factory/node_modules/@remotion/renderer" ]] || fail "Creator Video dependencies were not packaged"
 echo "$output_root/SoloScaleBackend"

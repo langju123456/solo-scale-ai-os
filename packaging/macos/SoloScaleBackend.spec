@@ -29,6 +29,8 @@ def tracked_files(*prefixes):
 
 datas = tracked_files(".agents", "packages/buildlog/prompts")
 datas.extend(collect_data_files("soloscale", includes=["content_data/*.json"]))
+datas.extend(tracked_files("video_factory/render.mjs", "video_factory/src", "video_factory/package.json", "video_factory/package-lock.json", "video_factory/tsconfig.json"))
+datas.append((str(ROOT / "video_factory" / "node_modules"), "video_factory/node_modules"))
 datas.append(
     (
         str(ROOT / "packages" / "buildlog" / "src" / "buildlog" / "web_static"),

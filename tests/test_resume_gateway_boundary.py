@@ -217,6 +217,7 @@ def test_gateway_payload_removes_identifiers_and_has_strict_metadata_allowlist()
         "request_id",
         "job_description",
         "tailoring_instructions",
+        "positioning_brief",
         "candidate_profile",
         "support_context",
         "template_metadata",
@@ -240,6 +241,9 @@ def test_gateway_payload_removes_identifiers_and_has_strict_metadata_allowlist()
         )
 
     sanitized_entry = prepared.payload.candidate_profile.entries[0]
+    fact_ids_by_source: dict[str, list[str]] = {}
+    for fact in prepared.payload.candidate_profile.atomic_facts:
+        fact_ids_by_source.setdefault(fact.profile_entry_id, []).append(fact.fact_id)
     strategy = RoleStrategy(
         role_summary="Grounded AI role.",
         top_hiring_signals=["RAG"],
@@ -249,12 +253,12 @@ def test_gateway_payload_removes_identifiers_and_has_strict_metadata_allowlist()
             GroundedResumeBulletRewrite(
                 profile_entry_id="PROFILE-01",
                 text=sanitized_entry.text,
-                source_facts=["delivered AI workflows"],
+                source_fact_ids=fact_ids_by_source["PROFILE-01"],
             ),
             GroundedResumeBulletRewrite(
                 profile_entry_id="PROFILE-02",
                 text="Built grounded RAG and agent workflows.",
-                source_facts=["grounded RAG"],
+                source_fact_ids=fact_ids_by_source["PROFILE-02"],
             ),
         ],
         rewrite_guidance="Prioritize grounded AI delivery.",
@@ -264,8 +268,10 @@ def test_gateway_payload_removes_identifiers_and_has_strict_metadata_allowlist()
     assert "Lang Ju" in restored.bullet_rewrites[0].text
     assert "https://github.com/langju/private" in restored.bullet_rewrites[0].text
     malformed_payload = strategy.model_dump(mode="json")
-    malformed_payload["bullet_rewrites"][0]["text"] = "Delivered AI workflows."
-    with pytest.raises(ResumeUploadError, match="did not preserve"):
+    malformed_payload["bullet_rewrites"][0]["text"] += (
+        " __SS_PRIVATE_UNKNOWN_99__"
+    )
+    with pytest.raises(ResumeUploadError, match="unknown private placeholder"):
         validate_role_strategy_placeholders(
             RoleStrategy.model_validate(malformed_payload), prepared
         )

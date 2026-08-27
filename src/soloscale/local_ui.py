@@ -36,12 +36,17 @@ from soloscale.buildlog_handoff import (
     preview_for_buildlog,
     publish_via_buildlog,
 )
+from soloscale.content_distribution import (
+    ContentDistributionError,
+    prepare_distribution_package,
+)
 from soloscale.content_models import ContentReviewDecision
 from soloscale.content_ui import (
     ContentFormResult,
     content_page,
     editorial_publishing_page,
     run_content_form,
+    run_month_one_story,
 )
 from soloscale.content_workspace import (
     ContentWorkspaceError,
@@ -65,6 +70,7 @@ from soloscale.editorial_publishing_handoff import (
 )
 from soloscale.evidence_hub import EvidenceHubError
 from soloscale.evidence_ui import evidence_page, refresh_evidence_catalog
+from soloscale.integration_status import connected_service_statuses
 from soloscale.knowledge_models import RetrievalHit
 from soloscale.knowledge_store import (
     InvalidKnowledgeQueryError,
@@ -115,6 +121,7 @@ from soloscale.resume_models import (
     ResumeHiringSignalReceipt,
     ResumeMode,
     ResumeProvenanceReceipt,
+    build_resume_atomic_facts,
 )
 from soloscale.resume_workspace import (
     ResumeWorkspaceStorageError,
@@ -134,7 +141,13 @@ from soloscale.ui_shell import (
     ui_text,
     ui_url,
 )
-from soloscale.video_factory import CreatorVideoError, render_creator_video
+from soloscale.video_factory import (
+    CreatorVideoError,
+    CreatorVideoJobManager,
+    creator_video_runtime_available,
+    import_avatar_segment,
+    prepare_heygen_handoff,
+)
 from soloscale.video_generation import (
     GoogleVeoClient,
     VideoGenerationError,
@@ -1399,7 +1412,7 @@ def _build_resume_provenance_receipt(
     profile: CandidateProfile,
     tailored: TailoredDocx,
 ) -> ResumeProvenanceReceipt:
-    """Bind every exported bullet to one approved profile entry or fail closed."""
+    """Bind every rendered Summary/bullet to all approved sources or fail closed."""
 
     profile_entries = {
         f"PROFILE-{index:02d}": text
@@ -1410,11 +1423,14 @@ def _build_resume_provenance_receipt(
     }
     if not profile_entries:
         raise ResumeTemplateError("Resume provenance requires approved profile bullets")
-    output_bullets = [
-        paragraph.text
-        for paragraph in read_template_paragraphs(tailored.content)
-        if paragraph.is_bullet
-    ]
+    provenance_facts = (
+        tailored.candidate_evidence_pack.atomic_facts
+        if tailored.candidate_evidence_pack is not None
+        else build_resume_atomic_facts(profile)
+    )
+    atomic_fact_by_id = {item.fact_id: item for item in provenance_facts}
+    output_profile = extract_candidate_profile(tailored.content)
+    output_bullets = output_profile.experience_bullets + output_profile.project_bullets
     strategy = tailored.role_strategy
     signal_text_by_id: dict[str, str] = {}
     signal_receipts: list[ResumeHiringSignalReceipt] = []
@@ -1443,16 +1459,93 @@ def _build_resume_provenance_receipt(
         ]
 
     claims: list[ResumeClaimProvenance] = []
-    expected_output_counts: dict[str, int] = {}
-    for index, (profile_entry_id, source_text) in enumerate(
-        profile_entries.items(), start=1
-    ):
+
+    def evidence_sources_for(fact_ids: list[str]) -> tuple[list[str], list[str]]:
+        ordered_ids: list[str] = []
+        hashes_by_id: dict[str, str] = {}
+        for fact_id in fact_ids:
+            fact = atomic_fact_by_id[fact_id]
+            if fact.evidence_id not in hashes_by_id:
+                ordered_ids.append(fact.evidence_id)
+                hashes_by_id[fact.evidence_id] = fact.source_sha256
+        return ordered_ids, [hashes_by_id[evidence_id] for evidence_id in ordered_ids]
+
+    def signal_ids_for(value: str) -> list[str]:
+        claim_terms = _resume_provenance_terms(value)
+        return [
+            signal_id
+            for signal_id, signal in signal_text_by_id.items()
+            if claim_terms & _resume_provenance_terms(signal)
+        ]
+
+    if profile.summary is not None:
+        summary_rewrite = strategy.summary_rewrite if strategy is not None else None
+        summary_text = summary_rewrite.text if summary_rewrite is not None else profile.summary
+        if output_profile.summary != summary_text:
+            raise ResumeTemplateError(
+                "Resume provenance does not match the exported Summary"
+            )
+        if summary_rewrite is None:
+            summary_evidence_ids = ["SUMMARY"]
+            summary_evidence_hashes = [
+                hashlib.sha256(profile.summary.encode("utf-8")).hexdigest()
+            ]
+            summary_fact_hashes: list[str] = []
+            summary_status = ResumeClaimVerificationStatus.VERIFIED
+            summary_basis: Literal[
+                "EXACT_OPERATOR_APPROVED_PROFILE_ENTRY",
+                "DETERMINISTIC_EVIDENCE_PRESERVING_REWRITE",
+                "DETERMINISTIC_MULTI_SOURCE_SYNTHESIS",
+            ] = "EXACT_OPERATOR_APPROVED_PROFILE_ENTRY"
+        else:
+            summary_evidence_ids, summary_evidence_hashes = evidence_sources_for(
+                summary_rewrite.source_fact_ids
+            )
+            summary_fact_hashes = [
+                atomic_fact_by_id[fact_id].fact_sha256
+                for fact_id in summary_rewrite.source_fact_ids
+            ]
+            summary_fact_ids = summary_rewrite.source_fact_ids
+            summary_status = ResumeClaimVerificationStatus.SUPPORTED
+            summary_basis = "DETERMINISTIC_MULTI_SOURCE_SYNTHESIS"
+        if summary_rewrite is None:
+            summary_fact_ids = []
+        claims.append(
+            ResumeClaimProvenance(
+                claim_id="CLAIM-01",
+                render_location="SUMMARY",
+                final_text=summary_text,
+                final_text_sha256=hashlib.sha256(
+                    summary_text.encode("utf-8")
+                ).hexdigest(),
+                profile_entry_id="SUMMARY",
+                approved_source_sha256=hashlib.sha256(
+                    profile.summary.encode("utf-8")
+                ).hexdigest(),
+                evidence_ids=summary_evidence_ids,
+                approved_evidence_sha256s=summary_evidence_hashes,
+                fact_ids=summary_fact_ids,
+                source_fact_sha256s=summary_fact_hashes,
+                hiring_signal_ids=signal_ids_for(summary_text),
+                status=summary_status,
+                verification_basis=summary_basis,
+            )
+        )
+
+    expected_output_bullets: list[str] = []
+    for profile_entry_id, source_text in profile_entries.items():
         verification_basis: Literal[
             "EXACT_OPERATOR_APPROVED_PROFILE_ENTRY",
             "DETERMINISTIC_EVIDENCE_PRESERVING_REWRITE",
+            "DETERMINISTIC_MULTI_SOURCE_SYNTHESIS",
         ]
         if strategy is None:
             final_text = source_text
+            evidence_ids = [profile_entry_id]
+            approved_evidence_sha256s = [
+                hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+            ]
+            fact_ids: list[str] = []
             source_fact_sha256s: list[str] = []
             status = ResumeClaimVerificationStatus.VERIFIED
             verification_basis = "EXACT_OPERATOR_APPROVED_PROFILE_ENTRY"
@@ -1460,40 +1553,50 @@ def _build_resume_provenance_receipt(
             rewrite = rewrite_by_id[profile_entry_id]
             final_text = rewrite.text
             if final_text == source_text:
+                evidence_ids = [profile_entry_id]
+                approved_evidence_sha256s = [
+                    hashlib.sha256(source_text.encode("utf-8")).hexdigest()
+                ]
+                fact_ids = []
                 source_fact_sha256s = []
                 status = ResumeClaimVerificationStatus.VERIFIED
                 verification_basis = "EXACT_OPERATOR_APPROVED_PROFILE_ENTRY"
             else:
+                fact_ids = rewrite.source_fact_ids
+                evidence_ids, approved_evidence_sha256s = evidence_sources_for(
+                    fact_ids
+                )
                 source_fact_sha256s = [
-                    hashlib.sha256(item.encode("utf-8")).hexdigest()
-                    for item in rewrite.source_facts
+                    atomic_fact_by_id[fact_id].fact_sha256
+                    for fact_id in fact_ids
                 ]
                 status = ResumeClaimVerificationStatus.SUPPORTED
-                verification_basis = "DETERMINISTIC_EVIDENCE_PRESERVING_REWRITE"
-        expected_output_counts[final_text] = expected_output_counts.get(final_text, 0) + 1
-        claim_terms = _resume_provenance_terms(f"{source_text} {final_text}")
-        hiring_signal_ids = [
-            signal_id
-            for signal_id, signal in signal_text_by_id.items()
-            if claim_terms & _resume_provenance_terms(signal)
-        ]
+                verification_basis = (
+                    "DETERMINISTIC_MULTI_SOURCE_SYNTHESIS"
+                    if rewrite.kind == "SYNTHESIS"
+                    else "DETERMINISTIC_EVIDENCE_PRESERVING_REWRITE"
+                )
+        expected_output_bullets.append(final_text)
         claims.append(
             ResumeClaimProvenance(
-                claim_id=f"CLAIM-{index:02d}",
+                claim_id=f"CLAIM-{len(claims) + 1:02d}",
+                render_location="BULLET",
                 final_text=final_text,
                 final_text_sha256=hashlib.sha256(final_text.encode("utf-8")).hexdigest(),
                 profile_entry_id=profile_entry_id,
                 approved_source_sha256=hashlib.sha256(
                     source_text.encode("utf-8")
                 ).hexdigest(),
-                evidence_ids=[profile_entry_id],
+                evidence_ids=evidence_ids,
+                approved_evidence_sha256s=approved_evidence_sha256s,
+                fact_ids=fact_ids,
                 source_fact_sha256s=source_fact_sha256s,
-                hiring_signal_ids=hiring_signal_ids,
+                hiring_signal_ids=signal_ids_for(f"{source_text} {final_text}"),
                 status=status,
                 verification_basis=verification_basis,
             )
         )
-    if any(output_bullets.count(text) < count for text, count in expected_output_counts.items()):
+    if sorted(output_bullets) != sorted(expected_output_bullets):
         raise ResumeTemplateError(
             "Resume provenance does not match the exported DOCX bullets"
         )
@@ -1599,12 +1702,59 @@ def _save_request_scoped_resume_run(
     )
     _atomic_private_write(run_dir / "04_resume.md", resume_text + "\n")
     coverage, gaps = _request_scoped_coverage(job_description, profile)
+    pack = tailored.candidate_evidence_pack
+    positioning = tailored.positioning_brief
+    if pack is not None:
+        _write_private_json(
+            run_dir / "03_candidate_evidence_pack.json",
+            {
+                "schema_version": "1.0",
+                "pack_sha256": pack.pack_sha256,
+                "fact_count": len(pack.atomic_facts),
+                "profile_fact_count": sum(
+                    fact.source_kind == "PROFILE_ENTRY" for fact in pack.atomic_facts
+                ),
+                "candidate_evidence_fact_count": sum(
+                    fact.source_kind == "CANDIDATE_EVIDENCE"
+                    for fact in pack.atomic_facts
+                ),
+                "sources": [
+                    source.model_dump(mode="json") for source in pack.sources
+                ],
+                "fact_ids": [fact.fact_id for fact in pack.atomic_facts],
+                "fact_bodies_retained": False,
+            },
+        )
+    if positioning is not None:
+        _write_private_json(
+            run_dir / "02_positioning_brief.json",
+            {
+                "schema_version": "1.0",
+                "job_description_sha256": positioning.job_description_sha256,
+                "role_title_sha256": hashlib.sha256(
+                    positioning.role_title.encode("utf-8")
+                ).hexdigest(),
+                "role_title_retained": False,
+                "hiring_signal_sha256s": [
+                    hashlib.sha256(signal.encode("utf-8")).hexdigest()
+                    for signal in positioning.top_hiring_signals
+                ],
+                "technical_themes": positioning.technical_themes,
+                "priority_fact_ids": positioning.priority_fact_ids,
+                "first_resume_focus": positioning.first_resume_focus,
+                "jd_source_spans_retained": False,
+            },
+        )
     _write_private_json(run_dir / "05_gaps.json", {"gaps": gaps, "learning_tasks": []})
     _write_private_json(
         run_dir / "07_verification.json",
         {
             "candidate_lineage_replayable": True,
-            "resume_claim_source": "operator_selected_resume_only",
+            "resume_claim_source": (
+                "operator_resume_plus_verified_candidate_evidence_pack"
+                if pack is not None and pack.sources
+                else "operator_selected_resume_only"
+            ),
             "semantic_requirement_coverage_verified": False,
             "coverage": coverage,
             "claim_provenance": provenance_summary,
@@ -1628,12 +1778,22 @@ def _save_request_scoped_resume_run(
         "project_blocks_reordered": tailored.project_blocks_reordered,
         "skill_bullets_reordered": tailored.skill_bullets_reordered,
         "grounded_rewrites": tailored.grounded_rewrites,
+        "synthesized_rewrites": tailored.synthesized_rewrites,
+        "summary_rewritten": tailored.summary_rewritten,
         "rejected_rewrites": tailored.rejected_rewrites,
         "generation_mode": tailored.generation_mode,
         "provider": tailored.provider or "template",
         "model": tailored.model,
         "model_call_performed": tailored.role_strategy is not None,
         "model_call_profile": tailored.model_call_profile,
+        "candidate_evidence_pack_sha256": pack.pack_sha256 if pack else None,
+        "candidate_evidence_fact_count": len(pack.atomic_facts) if pack else 0,
+        "candidate_evidence_projects": (
+            list(dict.fromkeys(source.project for source in pack.sources))
+            if pack
+            else []
+        ),
+        "positioning_role_title": None,
         "unsupported_requirement_count": (
             len(tailored.role_strategy.unsupported_requirements)
             if tailored.role_strategy is not None
@@ -1702,6 +1862,10 @@ def _save_request_scoped_resume_run(
         "12_resume_provenance.json",
         "application_receipt.json",
     ]
+    if positioning is not None:
+        artifacts.append("02_positioning_brief.json")
+    if pack is not None:
+        artifacts.append("03_candidate_evidence_pack.json")
     if preview_created:
         artifacts.append("10_resume_preview.pdf")
     if expert_review_sha256 is not None:
@@ -1719,6 +1883,9 @@ def _save_request_scoped_resume_run(
             "claim_provenance": provenance_summary,
             "expert_review_performed": tailored.expert_review is not None,
             "model_call_profile": tailored.model_call_profile,
+            "candidate_evidence_pack_sha256": pack.pack_sha256 if pack else None,
+            "candidate_evidence_fact_count": len(pack.atomic_facts) if pack else 0,
+            "positioning_role_title": None,
         },
     )
     return run_dir
@@ -2043,6 +2210,8 @@ def _run_user_resume(
                 "project_blocks_reordered": tailored.project_blocks_reordered,
                 "skill_bullets_reordered": tailored.skill_bullets_reordered,
                 "grounded_rewrites": tailored.grounded_rewrites,
+                "synthesized_rewrites": tailored.synthesized_rewrites,
+                "summary_rewritten": tailored.summary_rewritten,
                 "rejected_rewrites": tailored.rejected_rewrites,
                 "generation_mode": tailored.generation_mode,
                 "provider": tailored.provider or "template",
@@ -2104,6 +2273,8 @@ def _run_user_resume(
             "project_blocks_reordered": tailored.project_blocks_reordered,
             "skill_bullets_reordered": tailored.skill_bullets_reordered,
             "grounded_rewrites": tailored.grounded_rewrites,
+            "synthesized_rewrites": tailored.synthesized_rewrites,
+            "summary_rewritten": tailored.summary_rewritten,
             "rejected_rewrites": tailored.rejected_rewrites,
             "generation_mode": tailored.generation_mode,
             "provider": tailored.provider or "template",
@@ -3081,7 +3252,16 @@ def _user_result_card(
     project_count = user_metadata.get("project_blocks_reordered", 0)
     skill_count = user_metadata.get("skill_bullets_reordered", 0)
     grounded_count = user_metadata.get("grounded_rewrites", 0)
+    synthesis_count = user_metadata.get("synthesized_rewrites", 0)
+    summary_rewritten = user_metadata.get("summary_rewritten") is True
     rejected_count = user_metadata.get("rejected_rewrites", 0)
+    evidence_fact_count = user_metadata.get("candidate_evidence_fact_count", 0)
+    evidence_projects = user_metadata.get("candidate_evidence_projects", [])
+    if not isinstance(evidence_projects, list):
+        evidence_projects = []
+    positioning_role = str(
+        user_metadata.get("positioning_role_title") or ui_text(locale, "目标岗位", "Target role")
+    )
     tailored_count = (project_count if isinstance(project_count, int) else 0) + (
         skill_count if isinstance(skill_count, int) else 0
     )
@@ -3090,13 +3270,13 @@ def _user_result_card(
     if generation_mode == "ai":
         result_summary = ui_text(
             locale,
-            f"已按目标 JD 排序证据，采用 {grounded_count if isinstance(grounded_count, int) else 0} 条受支持改写；另有 {rejected_count if isinstance(rejected_count, int) else 0} 条未通过事实校验，已保留原文。",
-            f"Evidence was prioritized for the target JD. {grounded_count if isinstance(grounded_count, int) else 0} supported rewrites were used; {rejected_count if isinstance(rejected_count, int) else 0} unsafe suggestions were rejected and kept as original bullets.",
+            f"已按目标 JD 优化整份简历，采用 {grounded_count if isinstance(grounded_count, int) else 0} 项受支持改写，其中 {synthesis_count if isinstance(synthesis_count, int) else 0} 条为多证据综合；Summary{'已重写' if summary_rewritten else '保留原文'}。另有 {rejected_count if isinstance(rejected_count, int) else 0} 项未通过事实校验，已逐项回退。",
+            f"The full resume was optimized for the target JD. {grounded_count if isinstance(grounded_count, int) else 0} supported changes were used, including {synthesis_count if isinstance(synthesis_count, int) else 0} multi-evidence bullet syntheses. The Summary was {'rewritten' if summary_rewritten else 'preserved'}. {rejected_count if isinstance(rejected_count, int) else 0} unsafe suggestions were rejected and individually restored.",
         )
         privacy_note = ui_text(
             locale,
-            f"本次使用 {provider}。只提交了 JD 与你批准的简历事实；其他本地资料正文未发送。",
-            f"This run used {provider}. Only the JD and approved resume facts were submitted; other local source bodies were not sent.",
+            f"本次使用 {provider}。提交了 JD、已批准简历事实与 {evidence_fact_count} 条紧凑候选证据事实；原始对话、项目文件和未选资料未发送。",
+            f"This run used {provider}. It submitted the JD, approved resume facts, and {evidence_fact_count} compact candidate-evidence facts. Raw conversations, project files, and unselected material were not sent.",
         )
         if user_metadata.get("expert_review_performed") is True:
             expert_rewrites = user_metadata.get("expert_rewrites", 0)
@@ -3220,6 +3400,7 @@ def _user_result_card(
     <div><strong>{_escape(str(coverage.get("lexical_candidate_partial", 0)))}</strong><span>{_escape(ui_text(locale, '部分证据候选', 'Partial candidates'))}</span></div>
     <div><strong>{_escape(str(coverage.get("no_lexical_candidate", 0)))}</strong><span>{_escape(ui_text(locale, '待补证', 'Needs evidence'))}</span></div>
   </div>
+  <p class="privacy-note"><strong>{_escape(ui_text(locale, 'JD 定位', 'JD positioning'))}:</strong> {_escape(positioning_role)} · <strong>{_escape(ui_text(locale, '候选证据包', 'Candidate Evidence Pack'))}:</strong> {_escape(str(evidence_fact_count))} {_escape(ui_text(locale, '条事实', 'facts'))}{(' · ' + _escape(', '.join(str(item) for item in evidence_projects))) if evidence_projects else ''}</p>
   <div class="result-grid">
     <div>
       <div class="preview-heading"><h3>{_escape(ui_text(locale, '简历预览', 'Resume preview'))}</h3>{preview_action}</div>
@@ -4418,13 +4599,52 @@ def _ai_settings_page(
             )
             if provider is not preference.provider
         )
+        state_labels = {
+            "Ready": ui_text(locale, "已就绪", "Ready"),
+            "Not connected": ui_text(locale, "未连接", "Not connected"),
+            "Reconnect": ui_text(locale, "需要重新连接", "Reconnect"),
+            "Needs attention": ui_text(locale, "需要处理", "Needs attention"),
+            "Credential detected": ui_text(locale, "已检测到凭据", "Credential detected"),
+            "Handoff ready": ui_text(locale, "分段交接可用", "Handoff ready"),
+            "Export package ready": ui_text(locale, "导出包可用", "Export package ready"),
+        }
+        service_details = {
+            "HeyGen": ui_text(
+                locale,
+                "可导出精确分段并把下载后的 Avatar 视频映射回场景。",
+                "Export exact segments and map downloaded Avatar clips back to scenes.",
+            ),
+            "LinkedIn": ui_text(
+                locale,
+                "由 BuildLog 管理授权、精确预览、去重和发布回执。",
+                "BuildLog owns authorization, exact preview, duplicate checks, and receipts.",
+            ),
+            "X": ui_text(
+                locale,
+                "由 BuildLog 管理授权、单帖或 Thread 发布和回执。",
+                "BuildLog owns authorization, post or thread publishing, and receipts.",
+            ),
+            "YouTube": ui_text(
+                locale,
+                "当前准备视频、封面、字幕和元数据；直接上传尚未启用。",
+                "Currently prepares video, thumbnail, subtitles, and metadata; direct upload is not enabled.",
+            ),
+        }
+        connected_cards = "".join(
+            f'''<article class="integration-card"><div><strong>{_escape(status.service)}</strong><p>{_escape(service_details[status.service])}</p></div>
+            <span class="integration-state {'pass' if status.ready else 'pending'}">{_escape(state_labels.get(status.state, status.state))}</span></article>'''
+            for status in connected_service_statuses()
+        )
         body = f"""{notice_html}<section class="current-service">
   <span class="kicker">{_escape(ui_text(locale, '当前 AI 服务', 'Current AI service'))}</span>
   <div><h2>{_escape(provider_names[preference.provider])}</h2><p>{_escape(models[preference.provider])}</p></div>
   <strong class="ready-dot">● {_escape(status_map[preference.provider])}</strong>
   <a class="button-link" href="{ui_url('/settings/ai/' + {'ollama':'local','soloscale_hosted':'hosted','openai_compatible':'openai'}[preference.provider.value], locale)}">{_escape(ui_text(locale, '管理', 'Manage'))}</a>
 </section>
-<section class="other-services"><span class="kicker">{_escape(ui_text(locale, '其他选择', 'Other options'))}</span>{other_cards}</section>"""
+<section class="other-services"><span class="kicker">{_escape(ui_text(locale, '其他选择', 'Other options'))}</span>{other_cards}</section>
+<section class="connected-services"><span class="kicker">{_escape(ui_text(locale, '创作与发布服务', 'Creation and publishing services'))}</span>
+<h2>{_escape(ui_text(locale, '连接状态一目了然', 'Connection status at a glance'))}</h2>
+<div class="connected-grid">{connected_cards}</div></section>"""
         current_url = "/settings/ai"
         script = ""
     elif detail == "local":
@@ -4522,8 +4742,8 @@ if(remove) remove.addEventListener('click',()=>window.webkit.messageHandlers.sol
         body=body,
         script=script,
         extra_css="""
-.current-service,.setup-card,.other-services{display:grid;gap:16px;padding:24px;border:1px solid var(--border);border-radius:20px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.current-service{grid-template-columns:1fr auto;align-items:center}.current-service .kicker,.current-service div{grid-column:1}.current-service h2{margin:4px 0}.current-service p{margin:0;color:var(--text-muted)}.current-service .ready-dot,.current-service .button-link{grid-column:2}.ready-dot{color:var(--success)}.button-link{display:inline-flex;padding:10px 14px;border-radius:12px;background:var(--brand);color:white;text-decoration:none;font-weight:800}.other-services{margin-top:18px;background:#fff}.service-card{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:16px;border:1px solid var(--border);border-radius:14px;text-decoration:none;color:var(--text);background:var(--surface-subtle)}.service-card span:first-child{display:grid;gap:3px}.service-card small,.service-state{color:var(--text-muted)}.setup-card{max-width:780px;margin-top:16px}.setup-card h2{margin:0}.setup-card form{display:grid;gap:14px}.readiness-list{list-style:none;padding:0;display:grid;gap:8px}.readiness-list .pass{color:var(--success)}.readiness-list .pending{color:var(--warning)}.button-row{display:flex;flex-wrap:wrap;gap:10px}.button-row button,.setup-card>form>button{width:auto}.button-row .secondary,.setup-card>form>.secondary{background:var(--surface-subtle);color:var(--brand);border:1px solid var(--border)}.button-row .danger{background:#fff0ef;color:var(--danger)}.back-link{font-weight:800;text-decoration:none}
-@media(max-width:700px){.current-service{grid-template-columns:1fr}.current-service .ready-dot,.current-service .button-link{grid-column:1;justify-self:start}.service-card{align-items:flex-start;flex-direction:column}}
+.current-service,.setup-card,.other-services,.connected-services{display:grid;gap:16px;padding:24px;border:1px solid var(--border);border-radius:20px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.current-service{grid-template-columns:1fr auto;align-items:center}.current-service .kicker,.current-service div{grid-column:1}.current-service h2{margin:4px 0}.current-service p{margin:0;color:var(--text-muted)}.current-service .ready-dot,.current-service .button-link{grid-column:2}.ready-dot{color:var(--success)}.button-link{display:inline-flex;padding:10px 14px;border-radius:12px;background:var(--brand);color:white;text-decoration:none;font-weight:800}.other-services,.connected-services{margin-top:18px;background:#fff}.service-card{display:flex;justify-content:space-between;gap:16px;align-items:center;padding:16px;border:1px solid var(--border);border-radius:14px;text-decoration:none;color:var(--text);background:var(--surface-subtle)}.service-card span:first-child{display:grid;gap:3px}.service-card small,.service-state{color:var(--text-muted)}.connected-services h2{margin:0}.connected-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.integration-card{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:16px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.integration-card p{margin:6px 0 0;color:var(--text-muted);font-size:.9rem}.integration-state{white-space:nowrap;font-size:.85rem;font-weight:800}.integration-state.pass{color:var(--success)}.integration-state.pending{color:var(--warning)}.setup-card{max-width:780px;margin-top:16px}.setup-card h2{margin:0}.setup-card form{display:grid;gap:14px}.readiness-list{list-style:none;padding:0;display:grid;gap:8px}.readiness-list .pass{color:var(--success)}.readiness-list .pending{color:var(--warning)}.button-row{display:flex;flex-wrap:wrap;gap:10px}.button-row button,.setup-card>form>button{width:auto}.button-row .secondary,.setup-card>form>.secondary{background:var(--surface-subtle);color:var(--brand);border:1px solid var(--border)}.button-row .danger{background:#fff0ef;color:var(--danger)}.back-link{font-weight:800;text-decoration:none}
+@media(max-width:700px){.current-service,.connected-grid{grid-template-columns:1fr}.current-service .ready-dot,.current-service .button-link{grid-column:1;justify-self:start}.service-card,.integration-card{align-items:flex-start;flex-direction:column}}
 """,
     )
 
@@ -4783,7 +5003,13 @@ def _resume_run_artifact(data_root: Path, run_id: str, filename: str) -> Path | 
     return target
 
 
-def _serve_resume_download(handler: BaseHTTPRequestHandler, data_root: Path, run_id: str) -> None:
+def _serve_resume_download(
+    handler: BaseHTTPRequestHandler,
+    data_root: Path,
+    run_id: str,
+    *,
+    desktop_mode: bool = False,
+) -> None:
     target = _resume_run_artifact(data_root, run_id, "08_resume.docx")
     if target is None:
         handler.send_error(404, "Resume not found")
@@ -4793,6 +5019,51 @@ def _serve_resume_download(handler: BaseHTTPRequestHandler, data_root: Path, run
     filename = str(metadata.get("output_filename", "Tailored_Resume.docx"))
     safe_ascii = _safe_filename_component(Path(filename).stem, "Tailored_Resume") + ".docx"
     content = target.read_bytes()
+    if desktop_mode:
+        downloads = Path.home() / "Downloads"
+        _reject_symlink_ancestry(downloads)
+        if downloads.is_symlink() or not downloads.is_dir():
+            handler.send_error(500, "Downloads folder is unavailable")
+            return
+        destination = downloads / safe_ascii
+        if destination.exists():
+            destination = downloads / (
+                f"{Path(safe_ascii).stem}-{uuid4().hex[:12]}.docx"
+            )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            file_descriptor = os.open(destination, flags, 0o600)
+            with os.fdopen(file_descriptor, "wb") as output:
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+        except OSError:
+            destination.unlink(missing_ok=True)
+            handler.send_error(500, "Resume could not be saved to Downloads")
+            return
+        metadata["external_docx"] = str(destination)
+        _write_private_json(run_dir / "09_user_ui.json", metadata)
+        _record_resume_event(
+            data_root,
+            ResumeFunnelEventType.RESUME_EXPORTED,
+            run_id=run_id,
+        )
+        locale = getattr(handler, "ui_locale", DEFAULT_UI_LOCALE)
+        body = f"""<!doctype html><html lang="{_escape(locale)}"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{_escape(ui_text(locale, '简历已保存', 'Resume saved'))}</title></head><body>
+<main><h1>{_escape(ui_text(locale, '简历已保存到 Downloads', 'Resume saved to Downloads'))}</h1>
+<p>{_escape(str(destination))}</p>
+<p><a href="{_escape(ui_url('/', locale))}">{_escape(ui_text(locale, '返回首页', 'Return home'))}</a></p>
+</main></body></html>""".encode()
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/html; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Cache-Control", "private, no-store")
+        handler.send_header("X-Content-Type-Options", "nosniff")
+        handler.end_headers()
+        handler.wfile.write(body)
+        return
     _record_resume_event(data_root, ResumeFunnelEventType.RESUME_EXPORTED, run_id=run_id)
     handler.send_response(200)
     handler.send_header("Content-Type", _DOCX_CONTENT_TYPE)
@@ -4861,6 +5132,7 @@ border-radius:12px;padding:18px;line-height:1.55}}</style></head><body>
 class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     ui_data_root: Path = Path(".soloscale")
     repo_root: Path = _repo_root()
+    creator_video_root: Path = resolve_runtime_paths().resource_root
     workspace_root: Path | None = None
     pending_chatgpt_export: Path | None = None
     desktop_session_token: str | None = None
@@ -4876,6 +5148,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     latest_content_form: dict[str, str] = {}
     resume_job_manager: ResumeJobManager | None = None
     video_story_job_manager: LocalVideoJobManager | None = None
+    creator_video_job_manager: CreatorVideoJobManager | None = None
 
     def log_message(self, format: str, *args: object) -> None:
         if self.desktop_session_token is not None:
@@ -5175,6 +5448,11 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         scan_range: str | None = None,
         candidate_id: str | None = None,
     ) -> None:
+        video_snapshot = (
+            self.creator_video_job_manager.get(run_id)
+            if self.creator_video_job_manager is not None and run_id is not None
+            else None
+        )
         page = content_page(
             data_root=self.ui_data_root.absolute(),
             form=self.latest_content_form,
@@ -5187,10 +5465,14 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 else notice
             ),
             locale=self.ui_locale,
-            creator_video_available=(self.repo_root / "video_factory" / "render.mjs").is_file(),
+            creator_video_available=creator_video_runtime_available(
+                self.creator_video_root
+            ),
             repository_root=self.workspace_root,
             scan_range=scan_range,
             candidate_id=candidate_id,
+            creator_video_phase=(video_snapshot.phase if video_snapshot else None),
+            creator_video_error=(video_snapshot.error if video_snapshot else None),
         )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -5558,6 +5840,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 if filename.endswith(".json")
                 else "video/mp4"
                 if filename.endswith(".mp4")
+                else "image/png"
+                if filename.endswith(".png")
                 else "text/markdown; charset=utf-8"
             )
             self.send_response(200)
@@ -5579,7 +5863,12 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             return
         download_match = re.fullmatch(r"/downloads/([^/]+)/resume\.docx", path)
         if download_match is not None:
-            _serve_resume_download(self, self.ui_data_root.absolute(), download_match.group(1))
+            _serve_resume_download(
+                self,
+                self.ui_data_root.absolute(),
+                download_match.group(1),
+                desktop_mode=self.desktop_session_token is not None,
+            )
             return
         preview_match = re.fullmatch(r"/previews/([^/]+)/resume\.pdf", path)
         if preview_match is not None:
@@ -5969,12 +6258,12 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0") or 0)
             form = _parse_form(self.rfile.read(length))
             self._adopt_ui_locale(form)
-            manager = self.video_story_job_manager
-            if manager is None:
+            video_story_manager = self.video_story_job_manager
+            if video_story_manager is None:
                 self.send_error(503, "Local video worker is unavailable")
                 return
             try:
-                job_id = manager.submit(
+                job_id = video_story_manager.submit(
                     data_root=self.ui_data_root.absolute(),
                     repository_root=self.repo_root,
                 )
@@ -6017,6 +6306,40 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header(
                 "Location", ui_url("/video", self.ui_locale, job_id=job_id)
             )
+            self.end_headers()
+            return
+        canon_generate_match = re.fullmatch(r"/content/canon/(M1-[0-9]{2})", path)
+        if canon_generate_match is not None:
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if length < 0 or length > MAX_UPLOAD_BYTES:
+                self.send_error(413, "Content request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            preference = _load_ai_provider_preference(self.ui_data_root.absolute())
+            content_result = run_month_one_story(
+                canon_generate_match.group(1),
+                self.ui_data_root.absolute(),
+                language="中文" if self.ui_locale == "zh-CN" else "English",
+                gateway=_gateway_from_preference(preference),
+            )
+            if content_result.run_id is None:
+                self._send_content_page(result=content_result)
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/content#results",
+                    self.ui_locale,
+                    run_id=content_result.run_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
             self.end_headers()
             return
         if path == "/content/generate":
@@ -6097,6 +6420,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     "x_thread",
                     "x_post",
                     "blog",
+                    "youtube_script",
                     "video_script",
                 )
             }
@@ -6124,26 +6448,109 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        avatar_handoff_match = re.fullmatch(
+            r"/content/avatar-handoff/(content-[^/]+)", path
+        )
+        if avatar_handoff_match is not None:
+            run_id = avatar_handoff_match.group(1)
+            try:
+                prepare_heygen_handoff(
+                    data_root=self.ui_data_root.absolute(),
+                    run_id=run_id,
+                )
+            except (ContentWorkspaceError, CreatorVideoError, OSError) as exc:
+                self._send_content_page(run_id=run_id, error=str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location", ui_url("/content#results", self.ui_locale, run_id=run_id)
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        avatar_import_match = re.fullmatch(
+            r"/content/avatar-import/(content-[^/]+)", path
+        )
+        if avatar_import_match is not None:
+            run_id = avatar_import_match.group(1)
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if length < 0 or length > MAX_UPLOAD_BYTES:
+                self.send_error(413, "Avatar segment is too large")
+                return
+            try:
+                submission = _parse_submission(
+                    self.rfile.read(length),
+                    self.headers.get("Content-Type", ""),
+                )
+                self._adopt_ui_locale(submission.fields)
+                clip = submission.files.get("avatar_clip")
+                if clip is None:
+                    raise CreatorVideoError("Choose one Avatar MP4")
+                import_avatar_segment(
+                    data_root=self.ui_data_root.absolute(),
+                    run_id=run_id,
+                    scene_id=submission.fields.get("scene_id", ""),
+                    source_filename=clip.filename,
+                    content=clip.content,
+                )
+            except (ContentWorkspaceError, CreatorVideoError, OSError, ValueError) as exc:
+                self._send_content_page(run_id=run_id, error=str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location", ui_url("/content#results", self.ui_locale, run_id=run_id)
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         content_render_match = re.fullmatch(r"/content/render/(content-[^/]+)", path)
         if content_render_match is not None:
-            if not (self.repo_root / "video_factory" / "render.mjs").is_file():
+            if not creator_video_runtime_available(self.creator_video_root):
                 self.send_error(404, "Experimental Creator Video runtime is unavailable")
                 return
             run_id = content_render_match.group(1)
+            creator_manager = self.creator_video_job_manager
+            if creator_manager is None:
+                self.send_error(503, "Creator Video background service is unavailable")
+                return
             try:
-                render_creator_video(
+                creator_manager.start(
                     data_root=self.ui_data_root.absolute(),
                     run_id=run_id,
-                    repository_root=self.repo_root,
+                    repository_root=self.creator_video_root,
                 )
-            except (ContentWorkspaceError, CreatorVideoError, OSError, subprocess.TimeoutExpired):
-                self.send_error(422, "Creator Video render failed")
+            except (ContentWorkspaceError, CreatorVideoError, OSError):
+                self.send_error(422, "Creator Video render could not start")
                 return
             self.send_response(303)
             location = ui_url(
                 "/content#results", self.ui_locale, run_id=run_id
             )
             self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        distribution_match = re.fullmatch(
+            r"/content/distribution/(content-[^/]+)", path
+        )
+        if distribution_match is not None:
+            run_id = distribution_match.group(1)
+            try:
+                prepare_distribution_package(
+                    data_root=self.ui_data_root.absolute(),
+                    run_id=run_id,
+                )
+            except (ContentDistributionError, ContentWorkspaceError, OSError) as exc:
+                self._send_content_page(run_id=run_id, error=str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location", ui_url("/content#results", self.ui_locale, run_id=run_id)
+            )
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -6349,8 +6756,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     openai_endpoint=_OPENAI_CHAT_COMPLETIONS_URL,
                     openai_api_key=openai_api_key(),
                 )
-            manager = self.resume_job_manager
-            if manager is None:
+            resume_manager = self.resume_job_manager
+            if resume_manager is None:
                 self.send_error(503, "Resume background worker is unavailable")
                 return
             post_response_ms = (
@@ -6359,7 +6766,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 else 0
             )
             try:
-                job_id = manager.submit(
+                job_id = resume_manager.submit(
                     form=submission.fields,
                     files=submission.files,
                     data_root=data_root,
@@ -6439,6 +6846,7 @@ def main() -> None:
     handler = SoloScaleLocalUIHandler
     handler.ui_data_root = paths.data_root
     handler.repo_root = paths.repository_root
+    handler.creator_video_root = paths.resource_root
     handler.workspace_root = (
         paths.workspace_root
         if args.workspace_root is not None
@@ -6464,6 +6872,8 @@ def main() -> None:
     handler.resume_job_manager = resume_job_manager
     video_story_job_manager = LocalVideoJobManager()
     handler.video_story_job_manager = video_story_job_manager
+    creator_video_job_manager = CreatorVideoJobManager()
+    handler.creator_video_job_manager = creator_video_job_manager
 
     server = HTTPServer((args.host, args.port), handler)
     raw_host, port = server.server_address[:2]
@@ -6507,6 +6917,8 @@ def main() -> None:
         handler.resume_job_manager = None
         video_story_job_manager.shutdown()
         handler.video_story_job_manager = None
+        creator_video_job_manager.shutdown()
+        handler.creator_video_job_manager = None
         if readiness_path is not None:
             try:
                 readiness_path.unlink()

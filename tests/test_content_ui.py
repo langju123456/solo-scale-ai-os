@@ -88,9 +88,20 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     assert _form()["topic"] in page
     assert _form()["verified_claims"] in page
     assert f'action="/content/render/{result.run_id}"' in page
-    assert "生成 MP4 视频" in page
+    assert "生成 YouTube + Short 成片" in page
+    assert f"/content/downloads/{result.run_id}/youtube-script.md" in page
+    assert f'action="/content/avatar-handoff/{result.run_id}"' in page
     assert f'action="/content/review/{result.run_id}"' in page
     assert "先批准这个统一内容包" in page
+
+    rendering = content_page(
+        data_root=data_root,
+        run_id=result.run_id,
+        creator_video_phase="RENDERING",
+    )
+    assert "正在生成旁白、字幕与双尺寸成片" in rendering
+    assert 'data-video-job-active="true"' in rendering
+    assert "window.setTimeout" in rendering
 
     save_content_review(
         data_root=data_root,
@@ -100,6 +111,7 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     approved = content_page(data_root=data_root, run_id=result.run_id)
     assert "已批准内容包，可以进入精确发布预览" in approved
     assert f'action="/content/buildlog/{result.run_id}/linkedin"' in approved
+    assert "先生成 YouTube 与 Short 成片" in approved
 
     english = content_page(
         data_root=data_root,
@@ -112,6 +124,21 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     assert "The desktop app does not bundle the experimental Remotion runtime" in english
     assert f'action="/content/render/{result.run_id}"' not in english
     assert "button.textContent = \"Copied\"" in english
+
+    run_dir = data_root / "content-runs" / result.run_id
+    for filename in (
+        "10_creator_video.mp4",
+        "21_creator_video_youtube.mp4",
+        "22_creator_video_thumbnail.png",
+        "25_creator_video_subtitles.srt",
+    ):
+        (run_dir / filename).write_bytes(b"artifact")
+    rendered = content_page(data_root=data_root, run_id=result.run_id)
+    assert f'/content/downloads/{result.run_id}/youtube-video.mp4" download' in rendered
+    assert f'/content/downloads/{result.run_id}/creator-video.mp4" download' in rendered
+    assert f'/content/downloads/{result.run_id}/video-subtitles.srt" download' in rendered
+    assert f'/content/downloads/{result.run_id}/video-thumbnail.png" download' in rendered
+    assert "下载封面" in rendered
 
     rerendered = content_page(data_root=data_root, run_id=result.run_id)
     assert 'name="generation_mode" value="template"' in rerendered

@@ -18,8 +18,13 @@ try {
   const output = resolve(valueFor('--output'));
   const thumbnailIndex = args.indexOf('--thumbnail');
   const thumbnail = thumbnailIndex === -1 ? null : resolve(valueFor('--thumbnail'));
+  const publicIndex = args.indexOf('--public-dir');
+  const publicDir = publicIndex === -1 ? null : resolve(valueFor('--public-dir'));
   const inputProps = JSON.parse(await readFile(input, 'utf8'));
-  const serveUrl = await bundle({entryPoint: resolve('src/entry.ts')});
+  const serveUrl = await bundle({
+    entryPoint: resolve('src/entry.ts'),
+    ...(publicDir ? {publicDir} : {}),
+  });
   const browserExecutable = process.env.REMOTION_BROWSER_EXECUTABLE;
   const composition = await selectComposition({
     serveUrl,

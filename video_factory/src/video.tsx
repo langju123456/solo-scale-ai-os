@@ -3,8 +3,10 @@ import {
   AbsoluteFill,
   Audio,
   interpolate,
+  OffthreadVideo,
   Sequence,
   spring,
+  staticFile,
   useCurrentFrame,
   useVideoConfig,
 } from 'remotion';
@@ -27,6 +29,8 @@ export type CreatorScene = {
     | 'evolution';
   detail_lines?: string[];
   audio_data_url?: string | null;
+  audio_asset?: string | null;
+  avatar_clip_asset?: string | null;
 };
 
 export type CreatorVideoProps = {
@@ -34,6 +38,8 @@ export type CreatorVideoProps = {
   sourceLabel: string;
   subtitle?: string;
   scenes: CreatorScene[];
+  width?: number;
+  height?: number;
 };
 
 const palette = ['#7c83fd', '#61a5fa', '#38bdf8', '#a78bfa', '#fb7185'];
@@ -135,7 +141,8 @@ const Diagram: React.FC<{scene: CreatorScene; accent: string; progress: number}>
 
 export const CreatorVideo: React.FC<CreatorVideoProps> = ({topic, sourceLabel, subtitle, scenes}) => {
   const frame = useCurrentFrame();
-  const {fps} = useVideoConfig();
+  const {fps, width, height} = useVideoConfig();
+  const landscape = width > height;
   const second = frame / fps;
   const sceneIndex = Math.min(
     scenes.length - 1,
@@ -161,32 +168,60 @@ export const CreatorVideo: React.FC<CreatorVideoProps> = ({topic, sourceLabel, s
         background: `radial-gradient(circle at 84% 10%, ${accent}aa, #10182f 38%, #07101f 75%)`,
         color: '#f8fafc',
         fontFamily: 'Arial, sans-serif',
-        padding: '74px 70px 68px',
+        padding: landscape ? '50px 72px 46px' : '74px 70px 68px',
       }}
     >
-      {scenes.map((item) => item.audio_data_url ? (
+      {scenes.map((item) => item.audio_data_url || item.audio_asset ? (
         <Sequence key={item.id} from={item.start_second * fps} durationInFrames={(item.end_second - item.start_second) * fps}>
-          <Audio src={item.audio_data_url} volume={0.94} />
+          <Audio src={item.audio_data_url ?? staticFile(item.audio_asset as string)} volume={0.94} />
+        </Sequence>
+      ) : null)}
+      {scenes.map((item) => item.avatar_clip_asset ? (
+        <Sequence
+          key={`avatar-${item.id}`}
+          from={item.start_second * fps}
+          durationInFrames={(item.end_second - item.start_second) * fps}
+        >
+          <div
+            style={{
+              position: 'absolute',
+              right: landscape ? 72 : 70,
+              top: landscape ? 170 : 510,
+              width: landscape ? 520 : 760,
+              height: landscape ? 600 : 760,
+              overflow: 'hidden',
+              borderRadius: 36,
+              border: `2px solid ${accent}99`,
+              boxShadow: `0 30px 90px ${accent}44`,
+              zIndex: 2,
+            }}
+          >
+            <OffthreadVideo
+              src={staticFile(item.avatar_clip_asset)}
+              style={{width: '100%', height: '100%', objectFit: 'cover'}}
+            />
+          </div>
         </Sequence>
       ) : null)}
       <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 24, fontWeight: 850, letterSpacing: 2.4, opacity: 0.82}}>
         <span>SOLOSCALE · ENGINEERING STORY</span>
         <span>{String(sceneIndex + 1).padStart(2, '0')} / {String(scenes.length).padStart(2, '0')}</span>
       </div>
-      <div style={{marginTop: 70, fontSize: 48, lineHeight: 1.13, fontWeight: 900, letterSpacing: -1.5}}>{topic}</div>
+      <div style={{marginTop: landscape ? 34 : 70, fontSize: landscape ? 38 : 48, lineHeight: 1.13, fontWeight: 900, letterSpacing: -1.5}}>{topic}</div>
       {subtitle ? <div style={{color: '#cbd5e1', fontSize: 26, lineHeight: 1.35, marginTop: 18}}>{subtitle}</div> : null}
       <div
         style={{
-          marginTop: 58,
+          marginTop: landscape ? 34 : 58,
           opacity,
           transform: `translateY(${translateY}px) scale(${0.96 + entrance * 0.04})`,
+          maxWidth: landscape && scene.avatar_clip_asset ? 1080 : undefined,
         }}
       >
         <div style={{color: accent, fontSize: 25, fontWeight: 900, letterSpacing: 2.2, textTransform: 'uppercase'}}>{scene.purpose}</div>
-        <div style={{fontSize: 58, fontWeight: 900, lineHeight: 1.16, marginTop: 22}}>{scene.on_screen_text}</div>
-        <Diagram scene={scene} accent={accent} progress={progress} />
+        <div style={{fontSize: landscape ? 46 : 58, fontWeight: 900, lineHeight: 1.16, marginTop: 22}}>{scene.on_screen_text}</div>
+        {!scene.avatar_clip_asset ? <Diagram scene={scene} accent={accent} progress={progress} /> : null}
       </div>
-      <div style={{marginTop: 'auto', background: 'rgba(2,8,23,.82)', border: '1px solid rgba(255,255,255,.15)', borderRadius: 26, fontSize: 31, fontWeight: 760, lineHeight: 1.52, padding: '24px 30px', textAlign: 'center'}}>
+      <div style={{marginTop: 'auto', background: 'rgba(2,8,23,.82)', border: '1px solid rgba(255,255,255,.15)', borderRadius: 26, fontSize: landscape ? 26 : 31, fontWeight: 760, lineHeight: 1.52, padding: landscape ? '18px 28px' : '24px 30px', textAlign: 'center', zIndex: 3}}>
         {scene.voiceover}
       </div>
       <div style={{display: 'flex', justifyContent: 'space-between', marginTop: 22, fontSize: 20, opacity: 0.63}}>

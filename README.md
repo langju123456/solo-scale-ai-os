@@ -154,9 +154,14 @@ Apple Silicon macOS with:
 uv venv .venv
 uv pip install -e '.[dev,desktop]' -e packages/buildlog
 ./packaging/macos/build_backend_onedir.sh
+./scripts/check_macos_toolchain.sh
 ./scripts/build_macos_app.sh
 open "desktop/macos/dist/SoloScale AI OS.app"
 ```
+
+The Desktop build uses the pinned compiler and SDK declared in
+`desktop/macos/toolchain.env`; see `desktop/macos/TOOLCHAIN.md`. The preflight rejects
+ambient toolchain drift before compilation starts.
 
 The app preserves an existing `~/Documents/SoloScaleData` library; a fresh install uses
 `~/Library/Application Support/SoloScale AI OS`. Its random loopback port is protected by

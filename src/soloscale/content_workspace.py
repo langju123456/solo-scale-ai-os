@@ -57,8 +57,8 @@ _CLAIM_ID = re.compile(r"CLAIM-[0-9]{2}")
 _OLLAMA_PROMPT_VERSION = "content-ollama-writer-v1"
 _OLLAMA_SYSTEM_PROMPT = """You are the SoloScale evidence-bound content writer.
 Return only JSON matching the supplied schema. Write one canonical story and derive a
-LinkedIn draft, X thread, standalone X post, blog draft, short-video script, and
-storyboard from that same story in the requested language.
+LinkedIn draft, X thread, standalone X post, blog draft, 4–6 minute YouTube script,
+short-video script, and storyboard from that same story in the requested language.
 
 Truth rules:
 - Use only facts present in the supplied claim ledger. Never invent numbers, tools,
@@ -108,6 +108,7 @@ class _OllamaContentDrafts(BaseModel):
     x_thread: list[str]
     x_post: str
     blog: str
+    youtube_script: str
     video_script: str
     storyboard: list[_OllamaStoryboardScene]
 _DOWNLOADS = {
@@ -116,9 +117,17 @@ _DOWNLOADS = {
     "x-thread.md": "03_x_thread.md",
     "x-post.md": "03_x_post.md",
     "blog.md": "16_blog.md",
+    "youtube-script.md": "20_youtube_script.md",
     "video-script.md": "04_video_script.md",
     "storyboard.json": "05_storyboard.json",
     "creator-video.mp4": "10_creator_video.mp4",
+    "youtube-video.mp4": "21_creator_video_youtube.mp4",
+    "video-thumbnail.png": "22_creator_video_thumbnail.png",
+    "heygen-handoff.json": "23_heygen_handoff.json",
+    "avatar-segments.json": "24_avatar_segments.json",
+    "video-subtitles.srt": "25_creator_video_subtitles.srt",
+    "distribution-package.json": "26_distribution_package.json",
+    "youtube-upload.json": "27_youtube_upload.json",
     "creator-video-render.json": "11_creator_video_render.json",
     "publish-pack.json": "06_publish_pack.json",
     "provenance.json": "07_provenance.json",
@@ -133,6 +142,7 @@ _REVIEW_ARTIFACTS = {
     "x_thread": "x-thread.md",
     "x_post": "x-post.md",
     "blog": "blog.md",
+    "youtube_script": "youtube-script.md",
     "video_script": "video-script.md",
 }
 _DOWNLOAD_REVIEW_KEYS = {
@@ -141,6 +151,7 @@ _DOWNLOAD_REVIEW_KEYS = {
     "x-thread.md": "x_thread",
     "x-post.md": "x_post",
     "blog.md": "blog",
+    "youtube-script.md": "youtube_script",
     "video-script.md": "video_script",
 }
 
@@ -540,6 +551,51 @@ def _render_video_script(brief: ContentBrief, scenes: list[StoryboardScene]) -> 
     return "\n".join(lines).strip() + "\n"
 
 
+def _render_youtube_script(brief: ContentBrief) -> str:
+    """Render a safe long-form fallback from the same grounded claim ledger."""
+
+    if brief.language == "中文":
+        opening = (
+            "这不是一个成功学故事，而是一次真实工程过程的复盘。"
+            "下面每个事实都保留 SoloScale 的证据状态与 claim 锚点。"
+        )
+        sections = (
+            "开场：真正的问题",
+            "发生了什么",
+            "架构和决策",
+            "失败与意外",
+            "可以复用的结论",
+            "下一步",
+        )
+    else:
+        opening = (
+            "This is not a victory story. It is a grounded account of a real engineering "
+            "process, with every factual statement retaining its SoloScale claim anchor."
+        )
+        sections = (
+            "Hook: the real problem",
+            "What happened",
+            "Architecture and decisions",
+            "Failure and surprise",
+            "The reusable lesson",
+            "What happens next",
+        )
+    grouped: list[list[ContentClaim]] = [[] for _ in sections]
+    for index, claim in enumerate(brief.claims):
+        grouped[min(index, len(sections) - 1)].append(claim)
+    lines = [f"# {brief.topic}", "", "Format: 4–6 minute YouTube narration", "", opening]
+    for heading, claims in zip(sections, grouped, strict=True):
+        lines.extend(["", f"## {heading}", ""])
+        if claims:
+            lines.extend(_claim_line(claim, brief.language) for claim in claims)
+        else:
+            lines.append(
+                "- Keep this transition grounded in the preceding verified material."
+            )
+    lines.extend(["", brief.call_to_action, ""])
+    return "\n".join(lines)
+
+
 def build_content_drafts(brief: ContentBrief) -> ContentDrafts:
     _validate_public_fields(brief)
     canonical_story = _render_canonical_story(brief)
@@ -550,6 +606,7 @@ def build_content_drafts(brief: ContentBrief) -> ContentDrafts:
         x_thread=_render_x_thread(brief),
         x_post=_render_x_post(brief),
         blog=_render_blog(brief, canonical_story),
+        youtube_script=_render_youtube_script(brief),
         video_script=_render_video_script(brief, storyboard),
         storyboard=storyboard,
     )
@@ -569,6 +626,7 @@ def _ground_ollama_drafts(
         *transport.x_thread,
         transport.x_post,
         transport.blog,
+        transport.youtube_script,
         transport.video_script,
     ]
     for scene in transport.storyboard:
@@ -704,6 +762,7 @@ def _ground_ollama_drafts(
                 "x_thread": x_thread,
                 "x_post": anchored_x_post(transport.x_post),
                 "blog": anchored_channel(transport.blog),
+                "youtube_script": anchored_channel(transport.youtube_script),
                 "video_script": anchored_channel(transport.video_script),
                 "storyboard": normalized_scenes,
             }
@@ -871,6 +930,7 @@ def _validate_generated_drafts(brief: ContentBrief, drafts: ContentDrafts) -> No
         "LinkedIn draft": drafts.linkedin,
         "X thread": "\n\n".join(drafts.x_thread),
         "blog draft": drafts.blog,
+        "YouTube script": drafts.youtube_script,
         "video script": drafts.video_script,
     }
     for field, value in text_artifacts.items():
@@ -1072,6 +1132,7 @@ def run_content_workspace(
             *drafts.x_thread,
             drafts.x_post,
             drafts.blog,
+            drafts.youtube_script,
             drafts.video_script,
             *[
                 value
@@ -1110,6 +1171,7 @@ def run_content_workspace(
         "14_evidence_context.json",
         "15_canonical_story.md",
         "16_blog.md",
+        "20_youtube_script.md",
         "run.json",
     ]
     if normalized_reference is not None:
@@ -1126,6 +1188,7 @@ def run_content_workspace(
         "03_x_thread.md": "\n\n".join(drafts.x_thread) + "\n",
         "03_x_post.md": drafts.x_post,
         "16_blog.md": drafts.blog,
+        "20_youtube_script.md": drafts.youtube_script,
         "04_video_script.md": drafts.video_script,
         "05_storyboard.json": _canonical_json({"scenes": drafts_payload["storyboard"]}),
     }
@@ -1146,7 +1209,14 @@ def run_content_workspace(
     publish_pack = {
         "status": "DRAFT_REQUIRES_HUMAN_APPROVAL",
         "topic": brief.topic,
-        "channels": ["Canonical story", "LinkedIn", "X", "Blog", "Short video"],
+        "channels": [
+            "Canonical story",
+            "LinkedIn",
+            "X",
+            "Blog",
+            "YouTube",
+            "Short video",
+        ],
         "drafts": drafts_payload,
         "publication_performed": False,
         "evidence_context": evidence_context,
@@ -1234,6 +1304,7 @@ def run_content_workspace(
         "03_x_thread.md": "\n\n".join(drafts.x_thread) + "\n",
         "03_x_post.md": drafts.x_post,
         "16_blog.md": drafts.blog,
+        "20_youtube_script.md": drafts.youtube_script,
         "04_video_script.md": drafts.video_script,
         "05_storyboard.json": _canonical_json({"scenes": drafts_payload["storyboard"]}),
         "06_publish_pack.json": _canonical_json(publish_pack),
@@ -1318,6 +1389,8 @@ def load_content_run(data_root: Path, run_id: str) -> ContentRun:
                         or fallback.canonical_story,
                         "x_post": run.drafts.x_post or fallback.x_post,
                         "blog": run.drafts.blog or fallback.blog,
+                        "youtube_script": run.drafts.youtube_script
+                        or fallback.youtube_script,
                     }
                 )
             }
@@ -1332,6 +1405,7 @@ def _draft_review_values(drafts: ContentDrafts) -> dict[str, str]:
         "x_thread": "\n\n".join(drafts.x_thread).strip() + "\n",
         "x_post": drafts.x_post,
         "blog": drafts.blog,
+        "youtube_script": drafts.youtube_script,
         "video_script": drafts.video_script,
     }
 
@@ -1417,9 +1491,11 @@ def save_content_review(
 
     run = load_content_run(data_root, run_id)
     run_dir = content_run_directory(data_root, run_id)
-    if any((run_dir / f"12_buildlog_{channel}.json").exists() for channel in ("linkedin", "x")):
+    if any((run_dir / f"12_buildlog_{channel}.json").exists() for channel in ("linkedin", "x")) or (
+        run_dir / "26_distribution_package.json"
+    ).exists():
         raise ContentWorkspaceError(
-            "This content is already staged in BuildLog; create a new content run to edit it"
+            "This content is already sealed for distribution; create a new content run to edit it"
         )
     unknown = set(updates or {}) - set(_REVIEW_ARTIFACTS)
     if unknown:
@@ -1445,6 +1521,7 @@ def save_content_review(
             x_thread=_review_x_thread(values["x_thread"]),
             x_post=values["x_post"].strip(),
             blog=values["blog"],
+            youtube_script=values["youtube_script"],
             video_script=values["video_script"],
             storyboard=run.drafts.storyboard,
         )

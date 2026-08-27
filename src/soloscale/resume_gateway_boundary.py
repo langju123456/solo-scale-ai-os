@@ -24,7 +24,15 @@ from xml.etree import ElementTree
 from pydantic import BaseModel, Field
 
 from soloscale.models import ContractModel, utc_now
-from soloscale.resume_models import CandidateProfile, RoleStrategy
+from soloscale.resume_evidence_pack import build_jd_positioning_brief
+from soloscale.resume_models import (
+    CandidateEvidencePack,
+    CandidateProfile,
+    JDPositioningBrief,
+    ResumeAtomicFact,
+    RoleStrategy,
+    build_resume_atomic_facts,
+)
 
 MAX_RESUME_FILE_BYTES = 5 * 1024 * 1024
 MAX_RESUME_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -157,6 +165,7 @@ class GatewayCandidateProfile(ContractModel):
     summary: str | None = Field(default=None, max_length=4_000)
     skills: list[str] = Field(default_factory=list, max_length=80)
     entries: list[GatewayResumeEntry] = Field(min_length=1, max_length=80)
+    atomic_facts: list[ResumeAtomicFact] = Field(min_length=1, max_length=960)
 
 
 class GatewaySupportSummary(ContractModel):
@@ -184,6 +193,7 @@ class GatewayPayload(ContractModel):
     request_id: str = Field(pattern=r"^resume-request-[a-f0-9]{24}$")
     job_description: str = Field(min_length=1, max_length=_MAX_EXTRACTED_TEXT)
     tailoring_instructions: str = Field(default="", max_length=1_200)
+    positioning_brief: JDPositioningBrief
     candidate_profile: GatewayCandidateProfile
     support_context: list[GatewaySupportSummary] = Field(default_factory=list, max_length=1)
     template_metadata: ResumeTemplateMetadata
@@ -757,6 +767,7 @@ def prepare_resume_gateway_payload(
     provider_allowlist: tuple[str, ...] = ("zai",),
     request_id: str | None = None,
     output_schema: type[BaseModel] = RoleStrategy,
+    candidate_evidence_pack: CandidateEvidencePack | None = None,
 ) -> PreparedGatewayPayload:
     """Build the sole typed payload after deterministic direct-identifier removal."""
 
@@ -784,6 +795,54 @@ def prepare_resume_gateway_payload(
         )
         for index, value in enumerate(entries, start=1)
     ]
+    sanitized_profile = CandidateProfile(
+        summary=sanitized_summary,
+        skills=sanitized_skills,
+        experience_bullets=[
+            item.text for item in sanitized_entries[: len(profile.experience_bullets)]
+        ],
+        project_bullets=[
+            item.text for item in sanitized_entries[len(profile.experience_bullets) :]
+        ],
+    )
+    sanitized_profile_facts = {
+        fact.fact_id: fact for fact in build_resume_atomic_facts(sanitized_profile)
+    }
+    source_facts = (
+        candidate_evidence_pack.atomic_facts
+        if candidate_evidence_pack is not None
+        else build_resume_atomic_facts(profile)
+    )
+    sanitized_facts: list[ResumeAtomicFact] = []
+    for fact in source_facts:
+        if fact.source_kind == "PROFILE_ENTRY":
+            sanitized_facts.append(sanitized_profile_facts[fact.fact_id])
+            continue
+        sanitized_text = sanitizer.sanitize(fact.text, known_name=known_name)
+        sanitized_facts.append(
+            ResumeAtomicFact(
+                fact_id=fact.fact_id,
+                profile_entry_id=fact.profile_entry_id,
+                evidence_id=fact.evidence_id,
+                source_kind=fact.source_kind,
+                project=(
+                    sanitizer.sanitize(fact.project, known_name=known_name)
+                    if fact.project
+                    else None
+                ),
+                capability_tags=fact.capability_tags,
+                metric=(
+                    sanitizer.sanitize(fact.metric, known_name=known_name)
+                    if fact.metric
+                    else None
+                ),
+                text=sanitized_text,
+                source_sha256=fact.source_sha256,
+                fact_sha256=hashlib.sha256(
+                    f"{fact.fact_id}\0{fact.profile_entry_id}\0{sanitized_text}".encode()
+                ).hexdigest(),
+            )
+        )
     support_context: list[GatewaySupportSummary] = []
     if support_upload is not None:
         support_context.append(
@@ -802,10 +861,14 @@ def prepare_resume_gateway_payload(
         request_id=request_id or f"resume-request-{secrets.token_hex(12)}",
         job_description=sanitized_job,
         tailoring_instructions=sanitized_instructions,
+        positioning_brief=build_jd_positioning_brief(
+            sanitized_job, sanitized_facts
+        ),
         candidate_profile=GatewayCandidateProfile(
             summary=sanitized_summary,
             skills=sanitized_skills,
             entries=sanitized_entries,
+            atomic_facts=sanitized_facts,
         ),
         support_context=support_context,
         template_metadata=_safe_template_metadata(template_metadata),
@@ -852,16 +915,36 @@ def validate_role_strategy_placeholders(
     returned_tokens = set(_PRIVATE_TOKEN_RE.findall(serialized))
     if returned_tokens - allowed_tokens:
         raise ResumeUploadError("Model output contains an unknown private placeholder")
-    source_by_id = {
-        item.profile_entry_id: item.text
-        for item in prepared.payload.candidate_profile.entries
+    fact_by_id = {
+        item.fact_id: item for item in prepared.payload.candidate_profile.atomic_facts
     }
     for rewrite in strategy.bullet_rewrites:
         source_tokens = set(
-            _PRIVATE_TOKEN_RE.findall(source_by_id.get(rewrite.profile_entry_id, ""))
+            _PRIVATE_TOKEN_RE.findall(
+                " ".join(
+                    fact_by_id[fact_id].text
+                    for fact_id in rewrite.source_fact_ids
+                    if fact_id in fact_by_id
+                )
+            )
         )
         rewrite_tokens = set(_PRIVATE_TOKEN_RE.findall(rewrite.text))
-        if rewrite_tokens != source_tokens:
+        if not rewrite_tokens <= source_tokens:
+            raise ResumeUploadError(
+                "Model output did not preserve direct-identifier placeholders"
+            )
+    if strategy.summary_rewrite is not None:
+        summary_source_tokens = set(
+            _PRIVATE_TOKEN_RE.findall(
+                " ".join(
+                    fact_by_id[fact_id].text
+                    for fact_id in strategy.summary_rewrite.source_fact_ids
+                    if fact_id in fact_by_id
+                )
+            )
+        )
+        summary_tokens = set(_PRIVATE_TOKEN_RE.findall(strategy.summary_rewrite.text))
+        if not summary_tokens <= summary_source_tokens:
             raise ResumeUploadError(
                 "Model output did not preserve direct-identifier placeholders"
             )

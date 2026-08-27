@@ -17,6 +17,7 @@ from soloscale.model_gateway import (
     ModelGatewayNotConfigured,
     ModelGatewayTransportError,
     ModelProviderId,
+    OllamaModelGateway,
     hosted_gateway_runtime_config,
     model_gateway_for,
 )
@@ -82,6 +83,7 @@ def test_optional_ollama_gateway_delegates_only_to_the_supplied_reasoner() -> No
         model="qwen3:8b",
         reasoner=reasoner,  # type: ignore[arg-type]
     )
+    assert isinstance(gateway, OllamaModelGateway)
     assert gateway.descriptor.provider is ModelProviderId.OLLAMA
     assert gateway.descriptor.configuration_state is GatewayConfigurationState.CONFIGURED
     assert gateway.descriptor.transport_scope is GatewayTransportScope.LOOPBACK
@@ -153,9 +155,12 @@ def test_openai_compatible_transport_posts_structured_schema_and_redacts_key(
     )
 
     assert gateway.descriptor.configuration_state is GatewayConfigurationState.CONFIGURED
-    assert gateway.complete(_Reply, system="grounded-system", user="synthetic-user") == _Reply(
-        value="grounded"
-    )
+    assert gateway.complete(
+        _Reply,
+        system="grounded-system",
+        user="synthetic-user",
+        reasoning_effort="none",
+    ) == _Reply(value="grounded")
     assert captured["url"] == "https://api.openai.com/v1/chat/completions"
     assert captured["authorization"] == f"Bearer {secret}"
     assert captured["timeout"] == 105
@@ -169,7 +174,9 @@ def test_openai_compatible_transport_posts_structured_schema_and_redacts_key(
     assert body["response_format"]["type"] == "json_schema"
     assert body["response_format"]["json_schema"]["strict"] is True
     assert body["response_format"]["json_schema"]["schema"]["title"] == "_Reply"
-    assert "reasoning" not in body
+    assert body["reasoning_effort"] == "none"
+    assert body["max_completion_tokens"] == 8_192
+    assert "max_tokens" not in body
     assert secret not in gateway.descriptor.model_dump_json()
     assert secret not in json.dumps(body)
 

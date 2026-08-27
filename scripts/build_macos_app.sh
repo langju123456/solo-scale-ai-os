@@ -3,6 +3,7 @@ set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 desktop_root="$project_root/desktop/macos"
+toolchain_config="${SOLOSCALE_TOOLCHAIN_CONFIG:-$desktop_root/toolchain.env}"
 output_root="${SOLOSCALE_APP_OUTPUT:-$project_root/desktop/macos/dist}"
 app_root="$output_root/SoloScale AI OS.app"
 sidecar_root="${SOLOSCALE_SIDECAR_ROOT:-$project_root/packaging/macos/dist/SoloScaleBackend}"
@@ -14,15 +15,21 @@ codesign_identity="${SOLOSCALE_CODESIGN_IDENTITY:-}"
 fail() { echo "macOS app build: $*" >&2; exit 1; }
 
 [[ "$(uname -s)" == "Darwin" ]] || fail "must run on macOS"
-command -v swift >/dev/null || fail "Swift Command Line Tools are required"
+[[ -f "$toolchain_config" ]] || fail "toolchain config is missing: $toolchain_config"
+SOLOSCALE_TOOLCHAIN_CONFIG="$toolchain_config" "$project_root/scripts/check_macos_toolchain.sh"
+# shellcheck disable=SC1090
+source "$toolchain_config"
+export DEVELOPER_DIR="$SOLOSCALE_DEVELOPER_DIR"
+export SDKROOT="$SOLOSCALE_SDKROOT"
+swift_executable="$(/usr/bin/xcrun --find swift)"
 [[ -f "$desktop_root/Package.swift" && -f "$desktop_root/Info.plist.template" ]] || fail "Swift app inputs are missing"
 [[ -x "$sidecar_root/SoloScaleBackend" ]] || fail "backend sidecar is missing; run packaging/macos/build_backend_onedir.sh first"
 [[ ! -e "$app_root" ]] || fail "output already exists: $app_root"
 [[ "$bundle_identifier" =~ ^[A-Za-z0-9.-]+$ ]] || fail "invalid bundle identifier"
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || fail "invalid version"
 [[ "$build_number" =~ ^[0-9]+$ ]] || fail "invalid build number"
-swift build --package-path "$desktop_root" --scratch-path "$swift_scratch" --configuration release
-swift_bin_root="$(swift build --package-path "$desktop_root" --scratch-path "$swift_scratch" --configuration release --show-bin-path)"
+"$swift_executable" build --package-path "$desktop_root" --scratch-path "$swift_scratch" --configuration release
+swift_bin_root="$("$swift_executable" build --package-path "$desktop_root" --scratch-path "$swift_scratch" --configuration release --show-bin-path)"
 binary="$swift_bin_root/SoloScaleDesktop"
 [[ -x "$binary" ]] || fail "Swift build did not create SoloScaleDesktop"
 mkdir -p "$app_root/Contents/MacOS" "$app_root/Contents/Resources"

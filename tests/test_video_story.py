@@ -101,35 +101,40 @@ def test_resume_latency_story_requires_and_preserves_measured_evidence(
 def test_local_video_job_runs_in_background_and_persists_complete_package(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    def synthetic_story() -> EngineeringStory:
+        return EngineeringStory.model_validate(
+            {
+                "story_id": "resume-latency-system-design-v1",
+                "title": "Synthetic story",
+                "subtitle": "Measured locally",
+                "duration_seconds": 84,
+                "layers": {
+                    "fact": "fact",
+                    "architecture": "architecture",
+                    "decision": "decision",
+                    "implementation": "implementation",
+                    "failure_and_surprise": "surprise",
+                    "evolution": "evolution",
+                },
+                "evidence": [],
+                "scenes": [
+                    {
+                        "id": f"SCENE-{index:02d}",
+                        "start_second": (index - 1) * 12,
+                        "end_second": index * 12,
+                        "purpose": "Synthetic",
+                        "visual_kind": "hook",
+                        "voiceover": "Synthetic narration",
+                        "on_screen_text": "Synthetic",
+                    }
+                    for index in range(1, 8)
+                ],
+            }
+        )
+
     monkeypatch.setattr(
         "soloscale.video_story.build_resume_latency_story",
-        lambda **_: EngineeringStory(
-            story_id="resume-latency-system-design-v1",
-            title="Synthetic story",
-            subtitle="Measured locally",
-            duration_seconds=84,
-            layers={
-                "fact": "fact",
-                "architecture": "architecture",
-                "decision": "decision",
-                "implementation": "implementation",
-                "failure_and_surprise": "surprise",
-                "evolution": "evolution",
-            },
-            evidence=[],
-            scenes=[
-                {
-                    "id": f"SCENE-{index:02d}",
-                    "start_second": (index - 1) * 12,
-                    "end_second": index * 12,
-                    "purpose": "Synthetic",
-                    "visual_kind": "hook",
-                    "voiceover": "Synthetic narration",
-                    "on_screen_text": "Synthetic",
-                }
-                for index in range(1, 8)
-            ],
-        ),
+        lambda **_: synthetic_story(),
     )
 
     def fake_render(*, job_dir: Path, **_: object) -> bool:
@@ -137,6 +142,12 @@ def test_local_video_job_runs_in_background_and_persists_complete_package(
         (job_dir / "engineering-story-thumbnail.png").write_bytes(b"synthetic-thumbnail")
         return True
 
+    monkeypatch.setattr(
+        "soloscale.video_story._create_local_narration",
+        lambda _job_dir, story: {
+            scene.id: "data:audio/wav;base64,c3ludGhldGlj" for scene in story.scenes
+        },
+    )
     monkeypatch.setattr("soloscale.video_story._render_with_remotion", fake_render)
     manager = LocalVideoJobManager()
     try:
@@ -177,8 +188,8 @@ def test_local_video_job_runs_in_background_and_persists_complete_package(
     try:
         persisted_latest = persisted_reader.latest(tmp_path)
         assert persisted_latest is not None
-        assert persisted_latest.total_elapsed_ms <= sum(
-            persisted_latest.stage_durations_ms.values()
+        assert persisted_latest.total_elapsed_ms >= max(
+            persisted_latest.stage_durations_ms.values(), default=0
         )
     finally:
         persisted_reader.shutdown()

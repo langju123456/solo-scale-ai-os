@@ -517,6 +517,8 @@ private struct LocalWebView: NSViewRepresentable {
     final class Coordinator: NSObject, WKDownloadDelegate, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         let backend: BackendController
         weak var webView: WKWebView?
+        private var activeDownloads: [ObjectIdentifier: WKDownload] = [:]
+        private var downloadDestinations: [ObjectIdentifier: URL] = [:]
         init(backend: BackendController) { self.backend = backend }
         func userContentController(
             _ userContentController: WKUserContentController,
@@ -610,14 +612,35 @@ private struct LocalWebView: NSViewRepresentable {
             navigationAction: WKNavigationAction,
             didBecome download: WKDownload
         ) {
-            download.delegate = self
+            retain(download)
         }
         func webView(
             _ webView: WKWebView,
             navigationResponse: WKNavigationResponse,
             didBecome download: WKDownload
         ) {
+            retain(download)
+        }
+
+        private func retain(_ download: WKDownload) {
+            activeDownloads[ObjectIdentifier(download)] = download
             download.delegate = self
+        }
+
+        private func release(_ download: WKDownload) -> URL? {
+            let identifier = ObjectIdentifier(download)
+            activeDownloads.removeValue(forKey: identifier)
+            return downloadDestinations.removeValue(forKey: identifier)
+        }
+
+        private func showDownloadAlert(title: String, detail: String, warning: Bool = false) {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.alertStyle = warning ? .warning : .informational
+                alert.messageText = title
+                alert.informativeText = detail
+                alert.runModal()
+            }
         }
         func download(
             _ download: WKDownload,
@@ -625,11 +648,26 @@ private struct LocalWebView: NSViewRepresentable {
             suggestedFilename: String,
             completionHandler: @escaping (URL?) -> Void
         ) {
-            guard let downloads = FileManager.default.urls(
-                for: .downloadsDirectory,
-                in: .userDomainMask
-            ).first else {
+            let downloads: URL
+            do {
+                downloads = try FileManager.default.url(
+                    for: .downloadsDirectory,
+                    in: .userDomainMask,
+                    appropriateFor: nil,
+                    create: true
+                )
+                try FileManager.default.createDirectory(
+                    at: downloads,
+                    withIntermediateDirectories: true
+                )
+            } catch {
+                _ = release(download)
                 completionHandler(nil)
+                showDownloadAlert(
+                    title: "SoloScale could not save the download",
+                    detail: error.localizedDescription,
+                    warning: true
+                )
                 return
             }
             let filename = URL(fileURLWithPath: suggestedFilename).lastPathComponent
@@ -638,6 +676,7 @@ private struct LocalWebView: NSViewRepresentable {
                 isDirectory: false
             )
             guard FileManager.default.fileExists(atPath: requested.path) else {
+                downloadDestinations[ObjectIdentifier(download)] = requested
                 completionHandler(requested)
                 return
             }
@@ -646,20 +685,29 @@ private struct LocalWebView: NSViewRepresentable {
             let uniqueName = suffix.isEmpty
                 ? "\(stem)-\(UUID().uuidString)"
                 : "\(stem)-\(UUID().uuidString).\(suffix)"
-            completionHandler(downloads.appendingPathComponent(uniqueName))
+            let destination = downloads.appendingPathComponent(uniqueName)
+            downloadDestinations[ObjectIdentifier(download)] = destination
+            completionHandler(destination)
+        }
+
+        func downloadDidFinish(_ download: WKDownload) {
+            guard let destination = release(download) else { return }
+            showDownloadAlert(
+                title: "Download saved",
+                detail: destination.path
+            )
         }
         func download(
             _ download: WKDownload,
             didFailWithError error: Error,
             resumeData: Data?
         ) {
-            DispatchQueue.main.async {
-                let alert = NSAlert()
-                alert.alertStyle = .warning
-                alert.messageText = "SoloScale could not save the download"
-                alert.informativeText = error.localizedDescription
-                alert.runModal()
-            }
+            _ = release(download)
+            showDownloadAlert(
+                title: "SoloScale could not save the download",
+                detail: error.localizedDescription,
+                warning: true
+            )
         }
         func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for action: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
             if let target = action.request.url, !backend.isAllowed(target) { openExternal(target) }
@@ -672,7 +720,7 @@ private struct LocalWebView: NSViewRepresentable {
             completionHandler: @escaping ([URL]?) -> Void
         ) {
             let panel = NSOpenPanel()
-            panel.title = "Choose a Resume or Job Document"
+            panel.title = "Choose a SoloScale File"
             panel.prompt = "Choose"
             panel.allowsMultipleSelection = parameters.allowsMultipleSelection
             panel.canChooseDirectories = parameters.allowsDirectories
@@ -683,6 +731,7 @@ private struct LocalWebView: NSViewRepresentable {
                     UTType.pdf,
                     UTType.plainText,
                     UTType(filenameExtension: "md"),
+                    UTType.mpeg4Movie,
                 ].compactMap { $0 }
             }
             completionHandler(panel.runModal() == .OK ? panel.urls : nil)

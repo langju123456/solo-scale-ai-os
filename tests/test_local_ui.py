@@ -194,6 +194,14 @@ class RecordingResumeGateway:
         assert "top_hiring_signals" not in schema.model_json_schema()["properties"]
         assert reasoning_effort == "none"
         self.requests.append(user)
+        request_payload = json.loads(user)
+        fact_ids_by_source: dict[str, list[str]] = {}
+        for fact in request_payload["candidate_profile"]["atomic_facts"]:
+            if fact["source_kind"] != "PROFILE_ENTRY":
+                continue
+            fact_ids_by_source.setdefault(fact["profile_entry_id"], []).append(
+                fact["fact_id"]
+            )
         exact = {
             "PROFILE-01": (
                 "Improved agent reliability for customer-facing stakeholder delivery "
@@ -207,44 +215,72 @@ class RecordingResumeGateway:
             ),
             "PROFILE-04": "Designed BuildLog architecture for AI-assisted development and evals.",
         }
-        source_facts = {
-            "PROFILE-01": "customer-facing stakeholder delivery and requirements translation",
-            "PROFILE-02": "Ardent Mills and Kangni stakeholders",
-            "PROFILE-03": "SoloScale full-stack GenAI workflows with RAG and agents",
-            "PROFILE-04": "BuildLog architecture for AI-assisted development and evals",
-        }
         if "Engineer in Residence" in user:
             priority = ["PROFILE-03", "PROFILE-04", "PROFILE-01", "PROFILE-02"]
-            skills = ["Python, RAG, agents, evals", "Customer delivery, requirements, stakeholders"]
+            skills = [
+                "Python, RAG, agents, evals",
+                "Customer delivery, requirements, stakeholders",
+            ]
             rewrites = dict(exact)
             rewrites["PROFILE-03"] = (
-                "Rapidly prototyped SoloScale full-stack GenAI workflows with RAG and agents "
-                "through iterative delivery."
+                "SoloScale full-stack GenAI workflows with RAG and agents; "
+                "BuildLog architecture for AI-assisted development and evals."
             )
-            rewrites["PROFILE-04"] = (
-                "Designed BuildLog architecture for AI-assisted development and evals with "
-                "iterative delivery."
-            )
+            synthesis_target = "PROFILE-03"
+            synthesis_sources = ["PROFILE-03", "PROFILE-04"]
+            summary_rewrite: dict[str, object] | None = {
+                "text": (
+                    "SoloScale full-stack GenAI workflows with RAG and agents; "
+                    "BuildLog architecture for AI-assisted development and evals."
+                ),
+                "source_fact_ids": [
+                    fact_id
+                    for source_id in synthesis_sources
+                    for fact_id in fact_ids_by_source[source_id]
+                ],
+            }
             unsupported: list[str] = []
             guidance = "Lead with product prototyping and architecture iteration."
         elif "FPGA compiler" in user:
             priority = list(exact)
-            skills = ["Python, RAG, agents, evals", "Customer delivery, requirements, stakeholders"]
+            skills = [
+                "Python, RAG, agents, evals",
+                "Customer delivery, requirements, stakeholders",
+            ]
             rewrites = dict(exact)
-            unsupported = ["Required: FPGA compiler design and semiconductor verification."]
-            guidance = "Keep approved facts unchanged and expose the unrelated requirement gap."
+            synthesis_target = None
+            synthesis_sources = []
+            summary_rewrite = None
+            unsupported = [
+                "Required: FPGA compiler design and semiconductor verification."
+            ]
+            guidance = (
+                "Keep approved facts unchanged and expose the unrelated requirement gap."
+            )
         else:
             priority = ["PROFILE-01", "PROFILE-02", "PROFILE-03", "PROFILE-04"]
-            skills = ["Customer delivery, requirements, stakeholders", "Python, RAG, agents, evals"]
+            skills = [
+                "Customer delivery, requirements, stakeholders",
+                "Python, RAG, agents, evals",
+            ]
             rewrites = dict(exact)
             rewrites["PROFILE-01"] = (
-                "Improved agent reliability for customer-facing stakeholder delivery "
-                "and requirements translation in direct execution."
+                "customer-facing stakeholder delivery and requirements translation with "
+                "Ardent Mills and Kangni stakeholders."
             )
-            rewrites["PROFILE-02"] = (
-                "Translated customer requirements with Ardent Mills and Kangni "
-                "stakeholders with coordinated delivery."
-            )
+            synthesis_target = "PROFILE-01"
+            synthesis_sources = ["PROFILE-01", "PROFILE-02"]
+            summary_rewrite = {
+                "text": (
+                    "customer-facing stakeholder delivery and requirements translation; "
+                    "Ardent Mills and Kangni stakeholders."
+                ),
+                "source_fact_ids": [
+                    fact_id
+                    for source_id in synthesis_sources
+                    for fact_id in fact_ids_by_source[source_id]
+                ],
+            }
             unsupported = []
             guidance = "Lead with customer delivery and requirements translation."
         skill_ids = {
@@ -258,11 +294,25 @@ class RecordingResumeGateway:
                 "skill_priority": [skill_ids[item] for item in skills],
                 "bullet_rewrites": {
                     entry_id: {
+                        "kind": (
+                            "SYNTHESIS"
+                            if entry_id == synthesis_target
+                            else "REWRITE"
+                        ),
                         "text": text,
-                        "source_facts": [source_facts[entry_id]],
+                        "source_fact_ids": [
+                            fact_id
+                            for source_id in (
+                                synthesis_sources
+                                if entry_id == synthesis_target
+                                else [entry_id]
+                            )
+                            for fact_id in fact_ids_by_source[source_id]
+                        ],
                     }
                     for entry_id, text in rewrites.items()
                 },
+                "summary_rewrite": summary_rewrite,
                 "unsupported_requirements": unsupported,
                 "rewrite_guidance": guidance,
             }
@@ -308,8 +358,9 @@ class RecordingExpertReviewGateway:
                             before.encode("utf-8")
                         ).hexdigest(),
                         "after": (
-                            "Rapidly prototyped SoloScale full-stack GenAI workflows "
-                            "with RAG and agents."
+                            "Integrated SoloScale full-stack GenAI workflows with RAG "
+                            "and agents and BuildLog architecture for AI-assisted "
+                            "development and evals."
                         ),
                         "new_factual_claims": (
                             ["Served thousands of users"]
@@ -515,6 +566,10 @@ def test_ai_service_pages_show_one_default_and_keep_openai_secret_out_of_html(
     assert 'href="/settings/ai/local?lang=zh-CN"' in overview
     assert 'href="/settings/ai/openai?lang=zh-CN"' in overview
     assert "选择一次，所有工作流自动使用" in overview
+    assert "创作与发布服务" in overview
+    assert "HeyGen" in overview
+    assert "LinkedIn" in overview
+    assert "YouTube" in overview
 
     local_page = _ai_settings_page(data_root, detail="local")
     assert 'value="use_default" type="submit" disabled' in local_page
@@ -1269,7 +1324,10 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
         assert metadata["generation_mode"] == "ai"
         assert metadata["provider"] == "ollama"
         assert metadata["model_call_profile"]["model_call_count"] == 1
-        assert metadata["model_call_profile"]["output_contract"] == "selective_rewrite_v0.1"
+        assert (
+            metadata["model_call_profile"]["output_contract"]
+            == "evidence_backed_resume_composition_v0.1"
+        )
         assert not (run_dir / "11_role_strategy.json").exists()
         provenance = json.loads((run_dir / "12_resume_provenance.json").read_text())
         assert provenance["contains_source_bodies"] is False
@@ -1277,11 +1335,16 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
         statuses = {claim["status"] for claim in provenance["claims"]}
         if run_dir == unrelated_run:
             assert statuses == {"VERIFIED"}
+            assert metadata["synthesized_rewrites"] == 0
+            assert metadata["summary_rewritten"] is False
             assert all(
-                not claim["source_fact_sha256s"] for claim in provenance["claims"]
+                not claim["fact_ids"] and not claim["source_fact_sha256s"]
+                for claim in provenance["claims"]
             )
         else:
             assert statuses == {"SUPPORTED", "VERIFIED"}
+            assert metadata["synthesized_rewrites"] == 1
+            assert metadata["summary_rewritten"] is True
             assert sum(
                 claim["status"] == "SUPPORTED" for claim in provenance["claims"]
             ) == 2
@@ -1289,6 +1352,29 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
                 bool(claim["source_fact_sha256s"])
                 == (claim["status"] == "SUPPORTED")
                 for claim in provenance["claims"]
+            )
+            assert all(
+                len(claim["fact_ids"]) == len(claim["source_fact_sha256s"])
+                for claim in provenance["claims"]
+            )
+            synthesis_claims = [
+                claim
+                for claim in provenance["claims"]
+                if claim["verification_basis"]
+                == "DETERMINISTIC_MULTI_SOURCE_SYNTHESIS"
+            ]
+            assert len(synthesis_claims) == 2
+            assert {claim["render_location"] for claim in synthesis_claims} == {
+                "SUMMARY",
+                "BULLET",
+            }
+            assert all(
+                len(claim["evidence_ids"])
+                == len(claim["approved_evidence_sha256s"])
+                == 2
+                and len(claim["fact_ids"])
+                == len(claim["source_fact_sha256s"])
+                for claim in synthesis_claims
             )
         assert all(
             claim["final_text"] in paragraphs_by_run[run_dir]
@@ -1327,8 +1413,9 @@ def test_resume_ui_rejects_only_unsafe_rewrite_and_keeps_original_bullet(
             assert isinstance(rewrites, dict)
             unsafe = dict(rewrites)
             unsafe["PROFILE-03"] = {
+                "kind": "REWRITE",
                 "text": "Led an unsupported FPGA compiler program by 40%.",
-                "source_facts": ["SoloScale full-stack GenAI workflows"],
+                "source_fact_ids": rewrites["PROFILE-03"]["source_fact_ids"],
             }
             payload["bullet_rewrites"] = unsafe
             return schema.model_validate(payload)
@@ -1383,7 +1470,8 @@ def test_resume_ui_rejects_only_unsafe_rewrite_and_keeps_original_bullet(
     raw_rewrites = candidate["structured_candidate"]["bullet_rewrites"]
     assert any("FPGA compiler" in rewrite["text"] for rewrite in raw_rewrites)
     rendered = _user_page(result, tmp_path / "data", {})
-    assert "1 条未通过事实校验，已保留原文" in rendered
+    assert "1 项未通过事实校验，已逐项回退" in rendered
+    assert "Summary已重写" in rendered
 
 
 def test_resume_ui_persists_globally_rejected_candidate_before_validation(

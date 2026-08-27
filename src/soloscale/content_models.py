@@ -94,6 +94,7 @@ class ContentDrafts(_StrictModel):
     x_thread: list[str] = Field(min_length=1, max_length=12)
     x_post: str = Field(default="", max_length=280)
     blog: str = Field(default="", max_length=24_000)
+    youtube_script: str = Field(default="", max_length=32_000)
     video_script: str = Field(min_length=1, max_length=16_000)
     storyboard: list[StoryboardScene] = Field(min_length=1, max_length=12)
 

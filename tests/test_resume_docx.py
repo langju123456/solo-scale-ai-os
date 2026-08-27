@@ -2,26 +2,56 @@ import hashlib
 import io
 import json
 import zipfile
+from xml.etree import ElementTree
 
 import pytest
+from pydantic import ValidationError
 
 from soloscale.resume_docx import (
     ResumeTemplateError,
     ResumeValidationRuleCode,
     _deterministic_hiring_signals,
+    _remove_trailing_empty_paragraphs,
     _select_safe_rewrites,
     _validate_role_strategy,
     extract_candidate_profile,
     read_template_paragraphs,
     tailor_resume_docx,
 )
+from soloscale.resume_evidence_pack import (
+    build_candidate_evidence_pack,
+    build_jd_positioning_brief,
+)
 from soloscale.resume_models import (
     CandidateProfile,
     GroundedResumeBulletRewrite,
+    GroundedResumeSummaryRewrite,
+    ResumeClaimProvenance,
+    ResumeClaimVerificationStatus,
     RoleStrategy,
+    build_resume_atomic_facts,
 )
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _fact_ids(profile: CandidateProfile, *source_ids: str) -> list[str]:
+    return [
+        fact.fact_id
+        for fact in build_resume_atomic_facts(profile)
+        if fact.profile_entry_id in source_ids
+    ]
+
+
+def test_blank_page_guard_removes_only_body_final_empty_paragraphs() -> None:
+    body = ElementTree.fromstring(
+        f'<w:body xmlns:w="{W_NS}"><w:p><w:r><w:t>Keep</w:t></w:r></w:p>'
+        '<w:p><w:pPr><w:pStyle w:val="BodyText"/></w:pPr></w:p>'
+        '<w:bookmarkEnd w:id="0"/><w:sectPr/></w:body>'
+    )
+
+    assert _remove_trailing_empty_paragraphs(body) == 1
+    assert [node.text for node in body.iter(f"{{{W_NS}}}t")] == ["Keep"]
 
 
 def _paragraph(text: str, *, bullet: bool = False) -> str:
@@ -117,7 +147,7 @@ def test_hiring_signal_must_be_an_exact_jd_quote() -> None:
             GroundedResumeBulletRewrite(
                 profile_entry_id="PROFILE-01",
                 text=source,
-                source_facts=[source],
+                source_fact_ids=_fact_ids(profile, "PROFILE-01"),
             )
         ],
         rewrite_guidance="Preserve the approved fact.",
@@ -163,7 +193,7 @@ def test_truth_validation_diagnostics_are_aggregated_and_body_free() -> None:
             GroundedResumeBulletRewrite(
                 profile_entry_id="PROFILE-01",
                 text="Improved Python service by 25% with Django.",
-                source_facts=["private unsupported source fragment"],
+                source_fact_ids=["FACT-PROFILE-99-01"],
             )
         ],
         unsupported_requirements=["Kubernetes private requirement"],
@@ -180,9 +210,11 @@ def test_truth_validation_diagnostics_are_aggregated_and_body_free() -> None:
     diagnostics = failure.value.validation_diagnostics
     assert diagnostics is not None
     payload = diagnostics.as_dict()
+    failures = payload["failures"]
+    assert isinstance(failures, list)
     codes = {
         item["rule_code"]
-        for item in payload["failures"]
+        for item in failures
         if isinstance(item, dict)
     }
     assert {
@@ -199,7 +231,6 @@ def test_truth_validation_diagnostics_are_aggregated_and_body_free() -> None:
     assert payload["rejected_count"] == 1
     serialized = json.dumps(payload)
     assert source not in serialized
-    assert "private unsupported source fragment" not in serialized
     assert "Kubernetes private requirement" not in serialized
     assert "Improved Python service" not in serialized
 
@@ -224,6 +255,40 @@ Requirements:
     assert all(signal in job_description for signal in signals)
 
 
+def test_candidate_evidence_pack_adds_compact_verified_soloscale_facts() -> None:
+    profile = CandidateProfile(
+        skills=["Python, RAG"],
+        project_bullets=["Built SoloScale AI OS with evidence-grounded workflows."],
+    )
+
+    first = build_candidate_evidence_pack(profile)
+    second = build_candidate_evidence_pack(profile)
+
+    assert first.pack_sha256 == second.pack_sha256
+    assert {source.evidence_id for source in first.sources} == {
+        "EVIDENCE-M1-13",
+        "EVIDENCE-M1-14",
+        "EVIDENCE-M1-15",
+    }
+    candidate_facts = [
+        fact for fact in first.atomic_facts if fact.source_kind == "CANDIDATE_EVIDENCE"
+    ]
+    assert len(candidate_facts) >= 15
+    assert {fact.profile_entry_id for fact in candidate_facts} == {"PROFILE-01"}
+
+    brief = build_jd_positioning_brief(
+        "AI Engineer\nBuild Python RAG pipelines and reliable background jobs.",
+        first.atomic_facts,
+    )
+    assert brief.top_hiring_signals == [
+        "AI Engineer",
+        "Build Python RAG pipelines and reliable background jobs.",
+    ]
+    assert set(brief.priority_fact_ids) <= {
+        fact.fact_id for fact in first.atomic_facts
+    }
+
+
 def test_selective_rewrite_keeps_supported_claim_and_restores_rejected_claim() -> None:
     first_source = "Built Python service for users."
     second_source = "Delivered RAG system."
@@ -239,13 +304,13 @@ def test_selective_rewrite_keeps_supported_claim_and_restores_rejected_claim() -
         bullet_rewrites=[
             GroundedResumeBulletRewrite(
                 profile_entry_id="PROFILE-01",
-                text="Built reliable Python service for users.",
-                source_facts=["Python service for users"],
+                text="Engineered a reliable Python service supporting users.",
+                source_fact_ids=_fact_ids(profile, "PROFILE-01"),
             ),
             GroundedResumeBulletRewrite(
                 profile_entry_id="PROFILE-02",
-                text="Built a RAG system.",
-                source_facts=["Delivered RAG system"],
+                text="Built a Django RAG system.",
+                source_fact_ids=_fact_ids(profile, "PROFILE-02"),
             ),
         ],
         rewrite_guidance="Prefer grounded wording.",
@@ -261,7 +326,7 @@ def test_selective_rewrite_keeps_supported_claim_and_restores_rejected_claim() -
         item.profile_entry_id: item.text for item in selected.bullet_rewrites
     }
     assert rewrites == {
-        "PROFILE-01": "Built reliable Python service for users.",
+        "PROFILE-01": "Engineered a reliable Python service supporting users.",
         "PROFILE-02": second_source,
     }
     assert diagnostics.validator_status == "selective_pass"
@@ -269,4 +334,123 @@ def test_selective_rewrite_keeps_supported_claim_and_restores_rejected_claim() -
     assert diagnostics.rejected_count == 1
     assert {
         failure.rule_code for failure in diagnostics.failures
-    } == {ResumeValidationRuleCode.CLAIM_NO_EVIDENCE}
+    } >= {ResumeValidationRuleCode.CLAIM_TECHNOLOGY_INFLATION}
+
+
+def test_multi_source_synthesis_uses_union_and_falls_back_only_unsafe_slots() -> None:
+    first_source = "Built RAG retrieval."
+    second_source = "Added FastAPI orchestration."
+    third_source = "Validated citations."
+    profile = CandidateProfile(
+        summary="Evidence-grounded engineer.",
+        skills=["RAG", "FastAPI"],
+        project_bullets=[first_source, second_source, third_source],
+    )
+    strategy = RoleStrategy(
+        role_summary="RAG and FastAPI role",
+        top_hiring_signals=["Required: RAG and FastAPI."],
+        evidence_priority=["PROFILE-01", "PROFILE-02", "PROFILE-03"],
+        skill_priority=["RAG", "FastAPI"],
+        bullet_rewrites=[
+            GroundedResumeBulletRewrite(
+                profile_entry_id="PROFILE-01",
+                kind="SYNTHESIS",
+                text="Built RAG retrieval with FastAPI orchestration.",
+                source_profile_entry_ids=["PROFILE-01", "PROFILE-02"],
+                source_fact_ids=_fact_ids(
+                    profile, "PROFILE-01", "PROFILE-02"
+                ),
+            ),
+            GroundedResumeBulletRewrite(
+                profile_entry_id="PROFILE-02",
+                text=second_source,
+                source_fact_ids=_fact_ids(profile, "PROFILE-02"),
+            ),
+            GroundedResumeBulletRewrite(
+                profile_entry_id="PROFILE-03",
+                text=(
+                    "Led Django citations for clients in production and increased "
+                    "results by 40%."
+                ),
+                source_fact_ids=_fact_ids(profile, "PROFILE-03"),
+            ),
+        ],
+        summary_rewrite=GroundedResumeSummaryRewrite(
+            text="Built RAG retrieval with FastAPI orchestration for 40% more clients.",
+            source_profile_entry_ids=["PROFILE-01", "PROFILE-02"],
+            source_fact_ids=_fact_ids(profile, "PROFILE-01", "PROFILE-02"),
+        ),
+        rewrite_guidance="Synthesize only approved facts.",
+    )
+
+    selected, _entries, diagnostics = _select_safe_rewrites(
+        strategy,
+        profile=profile,
+        job_description="Required: RAG and FastAPI.",
+    )
+
+    selected_by_id = {
+        rewrite.profile_entry_id: rewrite for rewrite in selected.bullet_rewrites
+    }
+    assert selected_by_id["PROFILE-01"].kind == "SYNTHESIS"
+    assert selected_by_id["PROFILE-01"].text == (
+        "Built RAG retrieval with FastAPI orchestration."
+    )
+    assert selected_by_id["PROFILE-03"].text == third_source
+    assert selected.summary_rewrite is None
+    assert diagnostics.validator_status == "selective_pass"
+    assert diagnostics.rejected_count == 2
+    assert {
+        failure.claim_id
+        for failure in diagnostics.failures
+        if failure.claim_id is not None
+    } == {"PROFILE-03", "SUMMARY"}
+    assert {
+        failure.rule_code for failure in diagnostics.failures
+    } >= {
+        ResumeValidationRuleCode.CLAIM_ROLE_INFLATION,
+        ResumeValidationRuleCode.CLAIM_CLIENT_INFLATION,
+        ResumeValidationRuleCode.CLAIM_SCALE_INFLATION,
+        ResumeValidationRuleCode.CLAIM_OUTCOME_INFLATION,
+        ResumeValidationRuleCode.CLAIM_TECHNOLOGY_INFLATION,
+        ResumeValidationRuleCode.CLAIM_NEW_NUMBER,
+    }
+
+
+def test_synthesis_provenance_rejects_misaligned_target_source_hash() -> None:
+    final_text = "Built RAG retrieval with FastAPI orchestration."
+    first_source_hash = hashlib.sha256(b"Built RAG retrieval.").hexdigest()
+    second_source_hash = hashlib.sha256(b"Added FastAPI orchestration.").hexdigest()
+    claim = ResumeClaimProvenance(
+        claim_id="CLAIM-01",
+        render_location="BULLET",
+        final_text=final_text,
+        final_text_sha256=hashlib.sha256(final_text.encode()).hexdigest(),
+        profile_entry_id="PROFILE-01",
+        approved_source_sha256=first_source_hash,
+        evidence_ids=["PROFILE-01", "PROFILE-02"],
+        approved_evidence_sha256s=[first_source_hash, second_source_hash],
+        fact_ids=["FACT-PROFILE-01-01", "FACT-PROFILE-02-01"],
+        source_fact_sha256s=[
+            hashlib.sha256(
+                b"FACT-PROFILE-01-01\0PROFILE-01\0Built RAG retrieval"
+            ).hexdigest(),
+            hashlib.sha256(
+                b"FACT-PROFILE-02-01\0PROFILE-02\0FastAPI orchestration"
+            ).hexdigest(),
+        ],
+        status=ResumeClaimVerificationStatus.SUPPORTED,
+        verification_basis="DETERMINISTIC_MULTI_SOURCE_SYNTHESIS",
+    )
+
+    assert claim.evidence_ids == ["PROFILE-01", "PROFILE-02"]
+    with pytest.raises(ValidationError, match="target source hash"):
+        ResumeClaimProvenance.model_validate(
+            {
+                **claim.model_dump(mode="json"),
+                "approved_evidence_sha256s": [
+                    second_source_hash,
+                    first_source_hash,
+                ],
+            }
+        )

@@ -13,10 +13,16 @@ from pydantic import ValidationError
 
 from soloscale.buildlog_handoff import buildlog_handoff_status
 from soloscale.content_canon import StoryReadiness, load_month_one_canon
+from soloscale.content_canon_pipeline import (
+    ContentCanonError,
+    content_brief_from_month_one_story,
+)
+from soloscale.content_distribution import recent_distribution_packages
 from soloscale.content_models import ContentBrief, ContentReviewDecision, ContentRun
 from soloscale.content_scan import RecentWorkScan, ScanRange, scan_recent_work
 from soloscale.content_workspace import (
     ContentWorkspaceError,
+    content_run_directory,
     load_content_review,
     load_content_run,
     parse_claim_ledger,
@@ -202,6 +208,58 @@ def run_content_form(
     )
 
 
+def run_month_one_story(
+    story_id: str,
+    data_root: Path,
+    *,
+    language: Literal["English", "中文"],
+    gateway: ModelGateway | None,
+) -> ContentFormResult:
+    """Produce the complete Content Studio bundle from one READY canon story."""
+
+    started = time.perf_counter()
+    try:
+        brief = content_brief_from_month_one_story(story_id, language=language)
+        if gateway is None:
+            run = run_content_workspace(data_root=data_root, brief=brief)
+        else:
+            run = run_content_workspace_with_gateway(
+                data_root=data_root,
+                brief=brief,
+                gateway=gateway,
+            )
+    except ModelGatewayNotConfigured:
+        return ContentFormResult(
+            status=ContentFormStatus.PROVIDER_NOT_CONFIGURED,
+            run_id=None,
+            message=ui_text(
+                "zh-CN" if language == "中文" else "en",
+                "当前 AI 服务尚未配置；故事仍保留在 Content Canon 中。",
+                "The current AI service is not configured. The story remains in the Content Canon.",
+            ),
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+        )
+    except (
+        ContentCanonError,
+        ContentWorkspaceError,
+        OSError,
+        ValidationError,
+        ValueError,
+    ) as exc:
+        return ContentFormResult(
+            status=ContentFormStatus.FAILED,
+            run_id=None,
+            message=str(exc) or "Content production stopped safely.",
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+        )
+    return ContentFormResult(
+        status=ContentFormStatus.GENERATED,
+        run_id=run.run_id,
+        message=None,
+        elapsed_ms=int((time.perf_counter() - started) * 1000),
+    )
+
+
 def _recent_runs(data_root: Path) -> list[str]:
     runs_root = data_root / "content-runs"
     if runs_root.is_symlink() or not runs_root.is_dir():
@@ -282,6 +340,8 @@ def _result_html(
     data_root: Path,
     video_ready: bool,
     creator_video_available: bool,
+    creator_video_phase: str | None = None,
+    creator_video_error: str | None = None,
     locale: UILocale = DEFAULT_UI_LOCALE,
 ) -> str:
     run_id = _escape(run.run_id)
@@ -295,6 +355,7 @@ def _result_html(
             "x_thread": "\n\n".join(run.drafts.x_thread).strip() + "\n",
             "x_post": run.drafts.x_post,
             "blog": run.drafts.blog,
+            "youtube_script": run.drafts.youtube_script,
             "video_script": run.drafts.video_script,
         }
     )
@@ -317,6 +378,7 @@ def _result_html(
         ("X Thread", "x-thread.md"),
         ("X Post", "x-post.md"),
         (ui_text(locale, "博客", "Blog"), "blog.md"),
+        ("YouTube", "youtube-script.md"),
         (ui_text(locale, "视频脚本", "Video script"), "video-script.md"),
         ("Storyboard", "storyboard.json"),
         ("Publish Pack", "publish-pack.json"),
@@ -326,17 +388,56 @@ def _result_html(
             (ui_text(locale, "参考 Pattern", "Reference pattern"), "reference-pattern.json"),
         )
     video_download = f"/content/downloads/{run_id}/creator-video.mp4"
+    youtube_video_download = f"/content/downloads/{run_id}/youtube-video.mp4"
+    thumbnail_download = f"/content/downloads/{run_id}/video-thumbnail.png"
+    subtitles_download = f"/content/downloads/{run_id}/video-subtitles.srt"
+    run_dir = content_run_directory(data_root, run.run_id)
+    handoff_ready = (run_dir / "23_heygen_handoff.json").is_file()
+    avatar_map_ready = (run_dir / "24_avatar_segments.json").is_file()
+    scene_options = "".join(
+        f'<option value="{_escape(scene.id)}">{_escape(scene.id)} · {_escape(scene.purpose)}</option>'
+        for scene in run.drafts.storyboard
+    )
+    avatar_controls = f'''<section class="avatar-handoff"><span class="kicker">HeyGen Avatar · controlled handoff</span>
+      <p>{_escape(ui_text(locale, 'SoloScale 只导出选定场景的精确旁白；不会上传原始对话或项目文件。', 'SoloScale exports only the exact selected-scene narration. Raw conversations and project files are never uploaded.'))}</p>
+      {f'<a class="secondary-button" href="/content/downloads/{run_id}/heygen-handoff.json" download>{_escape(ui_text(locale, "下载 HeyGen 分段包", "Download HeyGen segment handoff"))}</a>' if handoff_ready else f'<form method="post" action="/content/avatar-handoff/{run_id}"><button class="secondary" type="submit">{_escape(ui_text(locale, "准备 HeyGen 分段包", "Prepare HeyGen segment handoff"))}</button></form>'}
+      <form method="post" action="/content/avatar-import/{run_id}" enctype="multipart/form-data" class="avatar-import-form">
+        <input type="hidden" name="ui_locale" value="{locale}" />
+        <label>{_escape(ui_text(locale, '映射到场景', 'Map to scene'))}<select name="scene_id">{scene_options}</select></label>
+        <label>{_escape(ui_text(locale, '选择下载的 Avatar MP4（最多 12 MB）', 'Choose the downloaded Avatar MP4 (up to 12 MB)'))}<input type="file" name="avatar_clip" accept="video/mp4,.mp4" required /></label>
+        <button class="secondary" type="submit">{_escape(ui_text(locale, '导入 Avatar 分段', 'Import Avatar segment'))}</button>
+      </form>
+      {f'<p class="notice">{_escape(ui_text(locale, "已导入 Avatar 分段；下一次渲染会自动映射。", "Avatar segments are imported and will be mapped into the next render."))}</p>' if avatar_map_ready else ''}
+    </section>'''
     if video_ready:
         video_action = (
         f'''<video class="creator-video" controls preload="metadata">
           <source src="{video_download}" type="video/mp4" />
         </video>
-        <a class="text-link" href="{video_download}" download>{_escape(ui_text(locale, '下载 MP4', 'Download MP4'))}</a>'''
+        <div class="video-actions"><a class="text-link" href="{youtube_video_download}" download>{_escape(ui_text(locale, '下载 16:9 YouTube MP4', 'Download 16:9 YouTube MP4'))}</a>
+        <a class="text-link" href="{video_download}" download>{_escape(ui_text(locale, '下载 9:16 Short MP4', 'Download 9:16 Short MP4'))}</a>
+        <a class="text-link" href="{subtitles_download}" download>{_escape(ui_text(locale, '下载字幕', 'Download subtitles'))}</a>
+        <a class="text-link" href="{thumbnail_download}" download>{_escape(ui_text(locale, '下载封面', 'Download thumbnail'))}</a></div>'''
         )
+    elif creator_video_phase in {"QUEUED", "RENDERING"}:
+        phase_label = ui_text(
+            locale,
+            "正在排队"
+            if creator_video_phase == "QUEUED"
+            else "正在生成旁白、字幕与双尺寸成片",
+            "Queued"
+            if creator_video_phase == "QUEUED"
+            else "Rendering narration, subtitles, and both video sizes",
+        )
+        video_action = f'''<div class="video-job" data-video-job-active="true" role="status"><span class="status-badge">{_escape(phase_label)}</span>
+        <div class="progress-track"><span></span></div><p>{_escape(ui_text(locale, '你可以继续使用其他页面；完成后这里会自动刷新。', 'You can keep using other pages; this view refreshes automatically when complete.'))}</p></div>'''
+    elif creator_video_phase == "FAILED":
+        video_action = f'''<div class="error" role="alert">{_escape(creator_video_error or ui_text(locale, '本地视频生成失败。', 'Local video render failed.'))}</div>
+        <form method="post" action="/content/render/{run_id}" class="render-form"><button class="secondary" type="submit">{_escape(ui_text(locale, '重新生成', 'Try again'))}</button></form>'''
     elif creator_video_available:
         video_action = f"""<form method="post" action="/content/render/{run_id}" class="render-form">
-          <button class="primary" type="submit">{_escape(ui_text(locale, '生成 MP4 视频', 'Generate MP4 video'))}</button>
-          <small>{_escape(ui_text(locale, '本机 Remotion 实验渲染；只使用本次 storyboard，不会发布。', 'Experimental local Remotion render using only this storyboard; nothing is published.'))}</small>
+          <button class="primary" type="submit">{_escape(ui_text(locale, '生成 YouTube + Short 成片', 'Render YouTube + Short videos'))}</button>
+          <small>{_escape(ui_text(locale, '本机 Remotion 会生成 16:9、9:16 和封面；只使用本次 storyboard，不会发布。', 'Local Remotion creates 16:9, 9:16, and a thumbnail from this storyboard. Nothing is published.'))}</small>
         </form>"""
     else:
         video_action = f"""<p class="hint">{_escape(ui_text(locale, '桌面安装包不包含实验性 Remotion 运行时；请使用上方云端视频入口。', 'The desktop app does not bundle the experimental Remotion runtime. Use the cloud-video entry above.'))}</p>"""
@@ -399,6 +500,7 @@ def _result_html(
         ("x_thread", "X Thread"),
         ("x_post", "X standalone"),
         ("blog", ui_text(locale, "博客", "Blog")),
+        ("youtube_script", "YouTube 4–6 min"),
         ("video_script", ui_text(locale, "视频脚本", "Video script")),
     )
     review_editors = "".join(
@@ -418,6 +520,24 @@ def _result_html(
         <h3>{_escape(ui_text(locale, '先批准这个统一内容包', 'Approve this unified bundle first'))}</h3>
         <p>{_escape(ui_text(locale, '批准只会解锁 BuildLog 预览，不会自动发布。', 'Approval only unlocks BuildLog preview; it does not publish.'))}</p></section>'''
     )
+    distribution_ready = (run_dir / "26_distribution_package.json").is_file()
+    if distribution_ready:
+        distribution_section = f'''<section class="distribution-package"><span class="kicker">{_escape(ui_text(locale, '统一发布包', 'Unified distribution package'))}</span>
+        <h3>{_escape(ui_text(locale, '视频、封面、字幕和已批准文案已封装', 'Video, thumbnail, subtitles, and approved copy are sealed'))}</h3>
+        <p>{_escape(ui_text(locale, '这里只准备精确文件；没有执行任何平台发布。', 'This prepares exact files only; no platform publication was performed.'))}</p>
+        <div class="video-actions"><a class="text-link" href="/content/downloads/{run_id}/distribution-package.json" download>{_escape(ui_text(locale, '下载发布清单', 'Download manifest'))}</a>
+        <a class="text-link" href="/content/downloads/{run_id}/youtube-upload.json" download>{_escape(ui_text(locale, '下载 YouTube 上传信息', 'Download YouTube upload metadata'))}</a>
+        <a class="text-link" href="{ui_url('/publishing', locale)}">{_escape(ui_text(locale, '打开发布中心', 'Open Publishing Center'))}</a></div></section>'''
+    elif decision is ContentReviewDecision.APPROVED and video_ready:
+        distribution_section = f'''<section class="distribution-package"><span class="kicker">{_escape(ui_text(locale, '统一发布包', 'Unified distribution package'))}</span>
+        <h3>{_escape(ui_text(locale, '已满足发布包条件', 'Ready to prepare a distribution package'))}</h3>
+        <p>{_escape(ui_text(locale, '将已批准文案、双尺寸视频、封面和字幕封成一次可追溯交接；不会发布。', 'Seal approved copy, both videos, the thumbnail, and subtitles into one traceable handoff. Nothing is published.'))}</p>
+        <form method="post" action="/content/distribution/{run_id}"><button class="secondary" type="submit">{_escape(ui_text(locale, '准备统一发布包', 'Prepare distribution package'))}</button></form></section>'''
+    elif decision is ContentReviewDecision.APPROVED:
+        distribution_section = f'''<section class="distribution-package locked"><span class="kicker">{_escape(ui_text(locale, '统一发布包', 'Unified distribution package'))}</span>
+        <p>{_escape(ui_text(locale, '先生成 YouTube 与 Short 成片，随后即可封装发布包。', 'Render the YouTube and Short videos first, then prepare the distribution package.'))}</p></section>'''
+    else:
+        distribution_section = ""
     return f"""<section id="results" class="result-panel">
       <div class="result-head">
         <div><span class="kicker">{_escape(ui_text(locale, '已生成', 'Generated'))}</span><span class="engine-badge">{_escape(engine_label)}</span><h2>{_escape(ui_text(locale, '一个主故事，五种渠道适配', 'One canonical story, five adaptations'))}</h2>
@@ -431,6 +551,7 @@ def _result_html(
         <button type="button" class="tab" data-tab="x-thread">X Thread</button>
         <button type="button" class="tab" data-tab="x-post">X Post</button>
         <button type="button" class="tab" data-tab="blog">{_escape(ui_text(locale, '博客', 'Blog'))}</button>
+        <button type="button" class="tab" data-tab="youtube">YouTube</button>
         <button type="button" class="tab" data-tab="video">{_escape(ui_text(locale, '短视频脚本', 'Short-video script'))}</button>
       </div>
       <div class="tab-panel active" data-panel="canonical"><pre>{_escape(review_values['canonical_story'])}</pre></div>
@@ -446,6 +567,7 @@ def _result_html(
       </div>
       <div class="tab-panel" data-panel="x-post"><pre>{_escape(review_values['x_post'])}</pre></div>
       <div class="tab-panel" data-panel="blog"><pre>{_escape(review_values['blog'])}</pre></div>
+      <div class="tab-panel" data-panel="youtube"><pre>{_escape(review_values['youtube_script'])}</pre></div>
       <div class="tab-panel" data-panel="video">
         <div class="panel-title"><h3>{run.drafts.storyboard[-1].end_second} {_escape(ui_text(locale, '秒视频设计', 'second video design'))}</h3>
           <a class="text-link" href="/content/downloads/{run_id}/video-script.md"
@@ -458,6 +580,7 @@ def _result_html(
           <details><summary>{_escape(ui_text(locale, '实验性本地 Remotion 渲染器', 'Experimental local Remotion renderer'))}</summary>
             {video_action}
           </details>
+          {avatar_controls}
         </div>
       </div>
       <section class="unified-review"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, '统一审核', 'Unified review'))}</span>
@@ -476,6 +599,7 @@ def _result_html(
         <a class="text-link" href="/content/downloads/{run_id}/editorial-provenance.json"
           download>{_escape(ui_text(locale, '下载溯源记录', 'Download provenance record'))}</a>
       </details>
+      {distribution_section}
       {buildlog_section}
     </section>"""
 
@@ -527,7 +651,19 @@ def editorial_publishing_page(
         _editorial_channel_html(data_root, channel, locale=locale) for channel in channels
     )
     error_html = f'<p class="error" role="alert">{_escape(error)}</p>' if error else ""
-    body = f"""<section class="panel publishing-intake">
+    packages = recent_distribution_packages(data_root)
+    package_cards = "".join(
+        f'''<article class="package-history-card"><span class="status-badge">{_escape(ui_text(locale, '预览就绪', 'Preview ready'))}</span>
+        <strong>{_escape(str(package['run_id']))}</strong>
+        <p>{_escape(ui_text(locale, 'LinkedIn / X 由 BuildLog 控制；YouTube 为人工上传包。', 'LinkedIn / X remain BuildLog-controlled; YouTube is a manual upload package.'))}</p>
+        <a href="{ui_url('/content', locale, run_id=str(package['run_id']))}">{_escape(ui_text(locale, '打开完整内容包', 'Open full content package'))} →</a></article>'''
+        for package in packages
+    ) or f'''<article class="package-history-card empty"><strong>{_escape(ui_text(locale, '还没有统一发布包', 'No unified distribution package yet'))}</strong>
+    <p>{_escape(ui_text(locale, '在 Content 中批准文案并生成双尺寸视频后即可准备。', 'Approve copy and render both video sizes in Content to prepare one.'))}</p></article>'''
+    body = f"""<section class="panel package-history"><span class="kicker">{_escape(ui_text(locale, 'SoloScale 内容历史', 'SoloScale content history'))}</span>
+<h2>{_escape(ui_text(locale, '已批准、可继续处理的发布包', 'Approved packages ready for the next action'))}</h2>
+<div class="package-history-grid">{package_cards}</div></section>
+<section class="panel publishing-intake">
 <span class="status-badge">{_escape(ui_text(locale, '需要你确认', 'Needs your review'))}</span>
 <h2>{_escape(ui_text(locale, '已完成内容 → BuildLog 发布计划', 'Finalized content → BuildLog publishing plan'))}</h2>
 <p>{_escape(ui_text(locale, '选择已完成的 editorial day 目录。SoloScale 会校验回执、文件哈希和图片，再让 BuildLog 生成精确预览；这里不会读取 token，也不会自动发布。', 'Choose a finalized editorial day directory. SoloScale verifies receipts, file hashes, and the image before BuildLog creates an exact preview. This page never reads tokens or publishes automatically.'))}</p>
@@ -547,8 +683,8 @@ def editorial_publishing_page(
         description=ui_text(locale, "先校验、再看精确预览，只有你明确确认后 BuildLog 才能调用平台。", "Verify first, inspect the exact preview, and let BuildLog call a platform only after your explicit confirmation."),
         body=body,
         extra_css="""
-.publishing-intake{max-width:900px;margin:0 auto 22px}.publishing-intake h2{margin:12px 0 8px}.publishing-intake form{grid-template-columns:minmax(0,1fr) 180px auto;align-items:end}.publishing-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:22px}.channel{min-width:0}.channel h2{margin-top:0}.channel p,.channel small{color:var(--text-muted)}.channel pre{max-height:380px;overflow:auto}.channel img{border-color:var(--border)!important}.meta{font-size:.9rem}.channel code{color:var(--brand)}
-@media(max-width:900px){.publishing-intake form,.publishing-grid{grid-template-columns:1fr}}
+.package-history{margin-bottom:22px}.package-history h2{margin:10px 0 16px}.package-history-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.package-history-card{display:grid;gap:8px;padding:16px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.package-history-card p{margin:0;color:var(--text-muted)}.package-history-card a{font-weight:800;text-decoration:none}.publishing-intake{max-width:900px;margin:0 auto 22px}.publishing-intake h2{margin:12px 0 8px}.publishing-intake form{grid-template-columns:minmax(0,1fr) 180px auto;align-items:end}.publishing-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:22px}.channel{min-width:0}.channel h2{margin-top:0}.channel p,.channel small{color:var(--text-muted)}.channel pre{max-height:380px;overflow:auto}.channel img{border-color:var(--border)!important}.meta{font-size:.9rem}.channel code{color:var(--brand)}
+@media(max-width:900px){.publishing-intake form,.publishing-grid,.package-history-grid{grid-template-columns:1fr}}
 """,
     )
 
@@ -699,6 +835,15 @@ def _month_one_canon_html(locale: UILocale) -> tuple[str, str]:
                 f"<li>{_escape(item)}</li>" for item in story.overclaim_guardrails
             )
             secondary = " · ".join(story.secondary_formats)
+            production_actions = (
+                f'''<form method="post" action="/content/canon/{story.story_id}" class="canon-direct-form">
+                <input type="hidden" name="ui_locale" value="{locale}" />
+                <button type="submit">{_escape(ui_text(locale, '生成完整内容包', 'Generate full content package'))}</button>
+                <small>{_escape(ui_text(locale, '使用当前 AI 服务；先私有保存，不会发布。', 'Uses the current AI service, saves privately, and never publishes.'))}</small>
+                </form>'''
+                if story.status is StoryReadiness.READY_FOR_PRODUCTION
+                else f'''<button type="button" data-canon-select="{story.story_id}" data-canon-format="video">{_escape(ui_text(locale, '补充证据 / 确认', 'Add evidence / confirm'))}</button>'''
+            )
             cards.append(
                 f'''<details class="canon-story" data-canon-status="{story.status.value}" id="canon-{story.story_id.lower()}">
                 <summary><span class="canon-sequence">{story.sequence:02d}</span><span><strong>{_escape(story.title_cn if locale == 'zh-CN' else story.working_title_en)}</strong><small>{_escape(story.working_title_en if locale == 'zh-CN' else story.title_cn)}</small></span><em class="canon-status {story.status.value.lower()}">{_escape(status_labels[story.status])}</em></summary>
@@ -706,7 +851,7 @@ def _month_one_canon_html(locale: UILocale) -> tuple[str, str]:
                 <div class="six-layers">{layers}</div>
                 <div class="canon-meta"><div><h4>{_escape(ui_text(locale, '证据候选', 'Evidence candidates'))}</h4><ul>{evidence}</ul></div><div><h4>{_escape(ui_text(locale, '已核验指标', 'Verified metrics'))}</h4><ul>{metrics}</ul></div><div><h4>{_escape(ui_text(locale, '防止过度表达', 'Overclaim guardrails'))}</h4><ul>{guardrails}</ul></div></div>
                 <div class="canon-production"><span>{_escape(ui_text(locale, '主格式', 'Primary'))}: {_escape(story.primary_format)}</span><span>{_escape(ui_text(locale, '可复用', 'Repurpose'))}: {_escape(secondary)}</span></div>
-                <div class="canon-actions"><button type="button" data-canon-select="{story.story_id}" data-canon-format="video">{_escape(ui_text(locale, '选择做视频', 'Select for video'))}</button><button class="secondary-button" type="button" data-canon-select="{story.story_id}" data-canon-format="blog">{_escape(ui_text(locale, '选择写博客', 'Select for blog'))}</button></div></div></details>'''
+                <div class="canon-actions">{production_actions}<button class="secondary-button" type="button" data-canon-select="{story.story_id}" data-canon-format="blog">{_escape(ui_text(locale, '打开并编辑输入', 'Open and edit input'))}</button></div></div></details>'''
             )
             story_payload[story.story_id] = {
                 "title": story.title_cn if locale == "zh-CN" else story.working_title_en,
@@ -764,6 +909,8 @@ def content_page(
     repository_root: Path | None = None,
     scan_range: str | None = None,
     candidate_id: str | None = None,
+    creator_video_phase: str | None = None,
+    creator_video_error: str | None = None,
 ) -> str:
     values = dict(form or {})
     scan: RecentWorkScan | None = None
@@ -810,6 +957,8 @@ def content_page(
             data_root=data_root,
             video_ready=creator_video_ready(data_root, run.run_id),
             creator_video_available=creator_video_available,
+            creator_video_phase=creator_video_phase,
+            creator_video_error=creator_video_error,
             locale=locale,
         )
         if run is not None
@@ -998,6 +1147,9 @@ document.querySelectorAll('.copy').forEach(button => {{
     }}
   }});
 }});
+if(document.querySelector('[data-video-job-active="true"]')){{
+  window.setTimeout(() => window.location.reload(), 1800);
+}}
 """
     return render_app_shell(
         active="content",
@@ -1016,7 +1168,7 @@ document.querySelectorAll('.copy').forEach(button => {{
 .reference-intake,.reference-card{padding:18px;border:1px solid #cfe1d8;border-radius:18px;background:linear-gradient(145deg,#fbfffd,#eef8f3)}.reference-intake{display:grid;gap:14px}.reference-intake h3,.reference-card h3{margin:5px 0}.reference-intake p,.reference-card p{margin:4px 0}.reference-badge{display:inline-flex;align-self:flex-start;padding:6px 10px;border-radius:999px;background:#e4f3eb;color:#286b4d;font-size:11px;font-weight:850;white-space:nowrap}.reference-card{margin:18px 0}.reference-pattern-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:15px 0}.reference-pattern-grid>div{padding:12px;border:1px solid #d8e8df;border-radius:13px;background:#fff}.reference-pattern-grid strong{font-size:12px;color:var(--brand)}.reference-card details{font-size:13px}.reference-card summary{cursor:pointer;font-weight:800}.reference-boundary{margin-top:12px!important;padding:10px;border-radius:10px;background:var(--brand-soft);font-size:12px}
 .channel-pills{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin:18px 0 4px}.channel-pills span{padding:5px 10px;border-radius:999px;background:var(--brand-soft);color:var(--brand);font-size:12px;font-weight:800}.empty .secondary-button{align-self:center}.result-head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.downloads{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}.downloads a,.text-link{font-size:12px;font-weight:750;text-decoration:none;padding:8px 10px;border:1px solid var(--border);border-radius:9px}.tabs{display:flex;flex-wrap:wrap;gap:7px;margin:22px 0 14px;padding:5px;background:var(--surface-subtle);border-radius:12px}.tab{flex:1 1 110px;background:transparent;color:var(--text-muted)}.tab.active{background:white;color:var(--brand);box-shadow:0 1px 4px #17203314}.tab-panel{display:none}.tab-panel.active{display:block}.panel-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}.panel-title h3{margin:0}.copy{background:var(--brand-soft);color:var(--brand)}
 .result-panel pre{max-height:650px;overflow:auto;font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace}.x-thread,.storyboard{display:grid;gap:10px}.x-post,.scene{border:1px solid var(--border);border-radius:14px;padding:14px}.x-post span,.scene span{color:var(--brand);font-size:10px;font-weight:850;letter-spacing:.1em}.x-post p,.scene p{white-space:pre-wrap;line-height:1.5;margin:8px 0}.scene{display:grid;gap:6px}.scene small{color:var(--text-muted)}.review-note{margin:18px 0 0;background:var(--warning-soft);color:var(--warning)}.editorial-trace{margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:12px;color:var(--text-muted);font-size:12px}.editorial-trace summary{color:var(--text);font-weight:800;cursor:pointer}.recent{margin-top:18px;display:flex;gap:9px;flex-wrap:wrap;color:var(--text-muted);font-size:12px}.recent a{text-decoration:none}
-.unified-review{margin-top:24px;padding:18px;border:1px solid var(--border);border-radius:18px;background:var(--surface-subtle)}.unified-review form{display:grid;gap:14px}.review-editor{padding:13px;border:1px solid var(--border);border-radius:14px;background:white}.review-editor textarea{width:100%;min-height:180px}.review-status{padding:6px 10px;border-radius:999px;background:var(--warning-soft);color:var(--warning);font-size:12px;font-weight:850}.review-actions{display:flex;gap:9px;flex-wrap:wrap}.danger{background:#fff1f2;color:#a11b35;border:1px solid #fecdd3}.buildlog-handoff.locked{opacity:.8}
+.unified-review{margin-top:24px;padding:18px;border:1px solid var(--border);border-radius:18px;background:var(--surface-subtle)}.unified-review form{display:grid;gap:14px}.review-editor{padding:13px;border:1px solid var(--border);border-radius:14px;background:white}.review-editor textarea{width:100%;min-height:180px}.review-status{padding:6px 10px;border-radius:999px;background:var(--warning-soft);color:var(--warning);font-size:12px;font-weight:850}.review-actions{display:flex;gap:9px;flex-wrap:wrap}.danger{background:#fff1f2;color:#a11b35;border:1px solid #fecdd3}.buildlog-handoff.locked{opacity:.8}.video-job{display:grid;gap:12px;padding:14px;border:1px solid var(--border);border-radius:14px;background:var(--brand-soft)}.video-job p{margin:0;color:var(--text-muted)}.progress-track{height:8px;overflow:hidden;border-radius:999px;background:#fff}.progress-track span{display:block;width:45%;height:100%;border-radius:999px;background:var(--brand);animation:video-progress 1.4s ease-in-out infinite alternate}@keyframes video-progress{from{transform:translateX(-20%)}to{transform:translateX(140%)}}
 .month-one-canon{margin-bottom:22px;padding:22px;border:1px solid var(--border);border-radius:20px;background:linear-gradient(145deg,#fff,#f4f8ff)}.month-one-canon h2{margin:7px 0}.month-one-canon p{color:var(--text-muted)}.canon-filter{min-width:220px}.canon-week-nav{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}.canon-week-nav a{padding:7px 11px;border-radius:999px;background:var(--brand-soft);font-size:12px;font-weight:800;text-decoration:none}.canon-week{margin-top:22px}.canon-week-title{display:flex;align-items:baseline;gap:10px}.canon-week-title span{color:var(--brand);font-size:11px;font-weight:900;letter-spacing:.1em}.canon-week-title h3{margin:0}.canon-stories{display:grid;gap:10px;margin-top:11px}.canon-story{border:1px solid var(--border);border-radius:14px;background:#fff}.canon-story>summary{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;padding:14px;cursor:pointer;list-style:none}.canon-story>summary::-webkit-details-marker{display:none}.canon-story summary strong,.canon-story summary small{display:block}.canon-story summary small{margin-top:3px;color:var(--text-muted);font-size:11px}.canon-sequence{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--brand-soft);color:var(--brand);font-weight:900}.canon-status{padding:5px 8px;border-radius:999px;background:var(--surface-subtle);font-size:10px;font-style:normal;font-weight:850}.canon-status.ready_for_production{background:var(--success-soft);color:var(--success)}.canon-status.needs_evidence,.canon-status.needs_user_input{background:var(--warning-soft);color:var(--warning)}.canon-story-body{padding:0 16px 16px}.canon-thesis{font-weight:700;color:var(--text)!important}.six-layers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.six-layers>div,.canon-meta>div{padding:11px;border:1px solid var(--border);border-radius:11px;background:var(--surface-subtle)}.six-layers span{color:var(--brand);font-size:11px;font-weight:900}.six-layers p{margin:5px 0 0;font-size:12px}.canon-meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:9px}.canon-meta h4{margin:0 0 6px}.canon-meta ul{margin:0;padding-left:18px;color:var(--text-muted);font-size:12px}.canon-production{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;color:var(--text-muted);font-size:12px}.canon-actions{display:flex;gap:8px;margin-top:12px}.canon-actions button{width:auto}.canon-actions .secondary-button{background:var(--surface-subtle);color:var(--brand)}
 @media(max-width:900px){.use-my-work,.grid{grid-template-columns:1fr}.scan-work{align-items:flex-start;flex-direction:column}.result-head{display:block}.downloads{justify-content:flex-start;margin-top:12px}}@media(max-width:580px){.two,.reference-pattern-grid{grid-template-columns:1fr}}
 """,
