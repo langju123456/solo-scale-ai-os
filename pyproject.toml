@@ -36,6 +36,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+soloscale = ["content_data/*.json"]
+
 [tool.setuptools.data-files]
 "share/soloscale-ai-os/.agents" = [".agents/README.md"]
 "share/soloscale-ai-os/.agents/task-templates" = [

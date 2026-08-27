@@ -4,7 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = Path(SPECPATH).resolve().parents[1]
 
@@ -28,6 +28,7 @@ def tracked_files(*prefixes):
 
 
 datas = tracked_files(".agents", "packages/buildlog/prompts")
+datas.extend(collect_data_files("soloscale", includes=["content_data/*.json"]))
 datas.append(
     (
         str(ROOT / "packages" / "buildlog" / "src" / "buildlog" / "web_static"),

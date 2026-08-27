@@ -12,6 +12,7 @@ from typing import Literal, cast
 from pydantic import ValidationError
 
 from soloscale.buildlog_handoff import buildlog_handoff_status
+from soloscale.content_canon import StoryReadiness, load_month_one_canon
 from soloscale.content_models import ContentBrief, ContentReviewDecision, ContentRun
 from soloscale.content_scan import RecentWorkScan, ScanRange, scan_recent_work
 from soloscale.content_workspace import (
@@ -651,6 +652,106 @@ def _scan_html(
       <div class="candidate-grid">{''.join(cards)}</div></section>'''
 
 
+def _month_one_canon_html(locale: UILocale) -> tuple[str, str]:
+    canon = load_month_one_canon()
+    status_labels = {
+        StoryReadiness.READY_FOR_PRODUCTION: ui_text(
+            locale, "证据已就绪", "Evidence ready"
+        ),
+        StoryReadiness.NEEDS_EVIDENCE: ui_text(
+            locale, "需要补证", "Needs evidence"
+        ),
+        StoryReadiness.NEEDS_USER_INPUT: ui_text(
+            locale, "需要你确认", "Needs your input"
+        ),
+        StoryReadiness.DRAFT: ui_text(locale, "草稿", "Draft"),
+    }
+    week_labels = {
+        1: ui_text(locale, "为什么 SoloScale 必须存在", "Why SoloScale had to exist"),
+        2: ui_text(locale, "事实、学习与面试防守", "Truth, learning, and interview defense"),
+        3: ui_text(locale, "性能、模型与架构取舍", "Performance, models, and architecture"),
+        4: ui_text(locale, "失败隔离、求职与内容复利", "Failure isolation and compounding"),
+    }
+    layer_labels = (
+        ("fact", "Fact", "事实"),
+        ("architecture", "Architecture", "架构"),
+        ("decision", "Decision", "决策"),
+        ("implementation", "Implementation", "实现"),
+        ("failure", "Failure", "失败"),
+        ("evolution", "Evolution", "演进"),
+    )
+    week_sections: list[str] = []
+    story_payload: dict[str, dict[str, str]] = {}
+    for week in range(1, 5):
+        cards: list[str] = []
+        for story in (item for item in canon.stories if item.week == week):
+            layers = "".join(
+                f'''<div><span>{_escape(ui_text(locale, label_zh, label_en))}</span><p>{_escape(getattr(story, field))}</p></div>'''
+                for field, label_en, label_zh in layer_labels
+            )
+            evidence = "".join(
+                f"<li>{_escape(item)}</li>" for item in story.evidence_candidates
+            )
+            metrics = "".join(
+                f"<li>{_escape(item)}</li>" for item in story.verified_metrics
+            ) or f"<li>{_escape(ui_text(locale, '尚无可发布的精确指标。', 'No publication-ready exact metric yet.'))}</li>"
+            guardrails = "".join(
+                f"<li>{_escape(item)}</li>" for item in story.overclaim_guardrails
+            )
+            secondary = " · ".join(story.secondary_formats)
+            cards.append(
+                f'''<details class="canon-story" data-canon-status="{story.status.value}" id="canon-{story.story_id.lower()}">
+                <summary><span class="canon-sequence">{story.sequence:02d}</span><span><strong>{_escape(story.title_cn if locale == 'zh-CN' else story.working_title_en)}</strong><small>{_escape(story.working_title_en if locale == 'zh-CN' else story.title_cn)}</small></span><em class="canon-status {story.status.value.lower()}">{_escape(status_labels[story.status])}</em></summary>
+                <div class="canon-story-body"><p class="canon-thesis">{_escape(story.one_sentence_thesis)}</p>
+                <div class="six-layers">{layers}</div>
+                <div class="canon-meta"><div><h4>{_escape(ui_text(locale, '证据候选', 'Evidence candidates'))}</h4><ul>{evidence}</ul></div><div><h4>{_escape(ui_text(locale, '已核验指标', 'Verified metrics'))}</h4><ul>{metrics}</ul></div><div><h4>{_escape(ui_text(locale, '防止过度表达', 'Overclaim guardrails'))}</h4><ul>{guardrails}</ul></div></div>
+                <div class="canon-production"><span>{_escape(ui_text(locale, '主格式', 'Primary'))}: {_escape(story.primary_format)}</span><span>{_escape(ui_text(locale, '可复用', 'Repurpose'))}: {_escape(secondary)}</span></div>
+                <div class="canon-actions"><button type="button" data-canon-select="{story.story_id}" data-canon-format="video">{_escape(ui_text(locale, '选择做视频', 'Select for video'))}</button><button class="secondary-button" type="button" data-canon-select="{story.story_id}" data-canon-format="blog">{_escape(ui_text(locale, '选择写博客', 'Select for blog'))}</button></div></div></details>'''
+            )
+            story_payload[story.story_id] = {
+                "title": story.title_cn if locale == "zh-CN" else story.working_title_en,
+                "thesis": story.one_sentence_thesis,
+            }
+        week_sections.append(
+            f'''<section class="canon-week" id="canon-week-{week}"><div class="canon-week-title"><span>WEEK {week}</span><h3>{_escape(week_labels[week])}</h3></div><div class="canon-stories">{''.join(cards)}</div></section>'''
+        )
+    options = "".join(
+        f'<option value="{status.value}">{_escape(status_labels[status])}</option>'
+        for status in StoryReadiness
+    )
+    payload_json = json.dumps(story_payload, ensure_ascii=False).replace("</", "<\\/")
+    html_section = f'''<section class="month-one-canon" aria-labelledby="month-one-title"><div class="result-head"><div><span class="kicker">Month 1 · Engineering Story Library</span><h2 id="month-one-title">{_escape(ui_text(locale, '第一个月：从自动化幻想到可用结果', 'Month 1: From automation ambition to useful outcomes'))}</h2><p>{_escape(ui_text(locale, '24 个真实工程故事，按四周组织。先选故事，再补证、做视频或写博客；这里不会调用模型或发布。', 'Twenty-four real engineering stories across four weeks. Select one, then add evidence and produce a video or blog later; nothing here calls a model or publishes.'))}</p></div><label class="canon-filter">{_escape(ui_text(locale, '按就绪状态筛选', 'Filter by readiness'))}<select id="canon-status-filter"><option value="ALL">{_escape(ui_text(locale, '全部 24 个故事', 'All 24 stories'))}</option>{options}</select></label></div><nav class="canon-week-nav" aria-label="Month 1 weeks">{''.join(f'<a href="#canon-week-{week}">Week {week}</a>' for week in range(1, 5))}</nav>{''.join(week_sections)}</section>'''
+    script = f'''
+const monthOneStories = {payload_json};
+const canonFilter = document.getElementById('canon-status-filter');
+canonFilter?.addEventListener('change', () => {{
+  document.querySelectorAll('.canon-story').forEach(story => {{
+    story.hidden = canonFilter.value !== 'ALL' && story.dataset.canonStatus !== canonFilter.value;
+  }});
+  document.querySelectorAll('.canon-week').forEach(week => {{
+    week.hidden = !week.querySelector('.canon-story:not([hidden])');
+  }});
+}});
+document.querySelectorAll('[data-canon-select]').forEach(button => {{
+  button.addEventListener('click', () => {{
+    const story = monthOneStories[button.dataset.canonSelect];
+    if (!story) return;
+    const form = document.getElementById('content-form');
+    form.elements.topic.value = story.title;
+    form.elements.audience.value = {json.dumps(ui_text(locale, '正在用 AI 构建真实产品的工程师和独立开发者', 'AI engineers and solo builders shipping real products'))};
+    form.elements.source_label.value = 'month-one-canon:' + button.dataset.canonSelect;
+    form.elements.hypotheses.value = story.thesis;
+    form.elements.planned.value = button.dataset.canonFormat === 'video'
+      ? {json.dumps(ui_text(locale, '补齐证据后制作 60–90 秒技术视频。', 'Produce a 60–90 second technical video after evidence review.'))}
+      : {json.dumps(ui_text(locale, '补齐证据后写成技术博客。', 'Write a technical blog after evidence review.'))};
+    form.elements.call_to_action.value = {json.dumps(ui_text(locale, '分享你遇到过的类似工程取舍。', 'Share a similar engineering trade-off you have faced.'))};
+    document.getElementById('content-topic').scrollIntoView({{behavior: 'smooth', block: 'center'}});
+  }});
+}});
+'''
+    return html_section, script
+
+
 def content_page(
     *,
     data_root: Path,
@@ -780,7 +881,8 @@ def content_page(
     scan_section = _scan_html(
         scan, selected_candidate_id=candidate_id, locale=locale
     )
-    body = f"""{work_summary}{scan_section}<div class="grid">
+    canon_section, canon_script = _month_one_canon_html(locale)
+    body = f"""{work_summary}{canon_section}{scan_section}<div class="grid">
 <section class="form-card">
 <span class="kicker">{_escape(ui_text(locale, '输入', 'Input'))}</span><h2>{_escape(ui_text(locale, '证据 + 受众 + CTA', 'Evidence + audience + CTA'))}</h2>
 <p class="hint">{_escape(ui_text(locale, '第一条已验证事实会成为开头。数字、结果和结论都应附证据。', 'The first verified fact becomes the opening. Numbers, outcomes, and conclusions should include evidence.'))}</p>
@@ -876,6 +978,7 @@ def content_page(
 {result_html}
 </div>"""
     script = f"""
+{canon_script}
 document.querySelectorAll('.tab').forEach(button => button.addEventListener('click', () => {{
   document.querySelectorAll('.tab,.tab-panel').forEach(item => {{
     item.classList.remove('active');
@@ -914,6 +1017,7 @@ document.querySelectorAll('.copy').forEach(button => {{
 .channel-pills{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin:18px 0 4px}.channel-pills span{padding:5px 10px;border-radius:999px;background:var(--brand-soft);color:var(--brand);font-size:12px;font-weight:800}.empty .secondary-button{align-self:center}.result-head{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.downloads{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}.downloads a,.text-link{font-size:12px;font-weight:750;text-decoration:none;padding:8px 10px;border:1px solid var(--border);border-radius:9px}.tabs{display:flex;flex-wrap:wrap;gap:7px;margin:22px 0 14px;padding:5px;background:var(--surface-subtle);border-radius:12px}.tab{flex:1 1 110px;background:transparent;color:var(--text-muted)}.tab.active{background:white;color:var(--brand);box-shadow:0 1px 4px #17203314}.tab-panel{display:none}.tab-panel.active{display:block}.panel-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}.panel-title h3{margin:0}.copy{background:var(--brand-soft);color:var(--brand)}
 .result-panel pre{max-height:650px;overflow:auto;font:13px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace}.x-thread,.storyboard{display:grid;gap:10px}.x-post,.scene{border:1px solid var(--border);border-radius:14px;padding:14px}.x-post span,.scene span{color:var(--brand);font-size:10px;font-weight:850;letter-spacing:.1em}.x-post p,.scene p{white-space:pre-wrap;line-height:1.5;margin:8px 0}.scene{display:grid;gap:6px}.scene small{color:var(--text-muted)}.review-note{margin:18px 0 0;background:var(--warning-soft);color:var(--warning)}.editorial-trace{margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:12px;color:var(--text-muted);font-size:12px}.editorial-trace summary{color:var(--text);font-weight:800;cursor:pointer}.recent{margin-top:18px;display:flex;gap:9px;flex-wrap:wrap;color:var(--text-muted);font-size:12px}.recent a{text-decoration:none}
 .unified-review{margin-top:24px;padding:18px;border:1px solid var(--border);border-radius:18px;background:var(--surface-subtle)}.unified-review form{display:grid;gap:14px}.review-editor{padding:13px;border:1px solid var(--border);border-radius:14px;background:white}.review-editor textarea{width:100%;min-height:180px}.review-status{padding:6px 10px;border-radius:999px;background:var(--warning-soft);color:var(--warning);font-size:12px;font-weight:850}.review-actions{display:flex;gap:9px;flex-wrap:wrap}.danger{background:#fff1f2;color:#a11b35;border:1px solid #fecdd3}.buildlog-handoff.locked{opacity:.8}
+.month-one-canon{margin-bottom:22px;padding:22px;border:1px solid var(--border);border-radius:20px;background:linear-gradient(145deg,#fff,#f4f8ff)}.month-one-canon h2{margin:7px 0}.month-one-canon p{color:var(--text-muted)}.canon-filter{min-width:220px}.canon-week-nav{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}.canon-week-nav a{padding:7px 11px;border-radius:999px;background:var(--brand-soft);font-size:12px;font-weight:800;text-decoration:none}.canon-week{margin-top:22px}.canon-week-title{display:flex;align-items:baseline;gap:10px}.canon-week-title span{color:var(--brand);font-size:11px;font-weight:900;letter-spacing:.1em}.canon-week-title h3{margin:0}.canon-stories{display:grid;gap:10px;margin-top:11px}.canon-story{border:1px solid var(--border);border-radius:14px;background:#fff}.canon-story>summary{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;padding:14px;cursor:pointer;list-style:none}.canon-story>summary::-webkit-details-marker{display:none}.canon-story summary strong,.canon-story summary small{display:block}.canon-story summary small{margin-top:3px;color:var(--text-muted);font-size:11px}.canon-sequence{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--brand-soft);color:var(--brand);font-weight:900}.canon-status{padding:5px 8px;border-radius:999px;background:var(--surface-subtle);font-size:10px;font-style:normal;font-weight:850}.canon-status.ready_for_production{background:var(--success-soft);color:var(--success)}.canon-status.needs_evidence,.canon-status.needs_user_input{background:var(--warning-soft);color:var(--warning)}.canon-story-body{padding:0 16px 16px}.canon-thesis{font-weight:700;color:var(--text)!important}.six-layers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.six-layers>div,.canon-meta>div{padding:11px;border:1px solid var(--border);border-radius:11px;background:var(--surface-subtle)}.six-layers span{color:var(--brand);font-size:11px;font-weight:900}.six-layers p{margin:5px 0 0;font-size:12px}.canon-meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:9px}.canon-meta h4{margin:0 0 6px}.canon-meta ul{margin:0;padding-left:18px;color:var(--text-muted);font-size:12px}.canon-production{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;color:var(--text-muted);font-size:12px}.canon-actions{display:flex;gap:8px;margin-top:12px}.canon-actions button{width:auto}.canon-actions .secondary-button{background:var(--surface-subtle);color:var(--brand)}
 @media(max-width:900px){.use-my-work,.grid{grid-template-columns:1fr}.scan-work{align-items:flex-start;flex-direction:column}.result-head{display:block}.downloads{justify-content:flex-start;margin-top:12px}}@media(max-width:580px){.two,.reference-pattern-grid{grid-template-columns:1fr}}
 """,
     )
