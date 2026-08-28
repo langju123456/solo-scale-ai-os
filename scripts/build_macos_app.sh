@@ -39,10 +39,17 @@ cp "$desktop_root/Info.plist.template" "$app_root/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_identifier" "$app_root/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app_root/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $build_number" "$app_root/Contents/Info.plist"
+if [[ -n "${SOLOSCALE_GITHUB_APP_CLIENT_ID:-}" ]]; then
+  /usr/libexec/PlistBuddy -c "Set :SoloScaleGitHubAppClientID $SOLOSCALE_GITHUB_APP_CLIENT_ID" "$app_root/Contents/Info.plist"
+fi
 [[ -x "$app_root/Contents/Resources/SoloScaleBackend/SoloScaleBackend" ]] || fail "sidecar copy failed"
 if [[ -n "$codesign_identity" ]]; then
   /usr/bin/codesign --force --options runtime --timestamp --sign "$codesign_identity" "$app_root/Contents/MacOS/SoloScaleDesktop"
   /usr/bin/codesign --force --options runtime --timestamp --sign "$codesign_identity" "$app_root"
-  /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_root"
+else
+  # Swift linker-signs the executable before the sidecar resources are copied.
+  # Seal the completed local bundle so LaunchServices sees one valid app.
+  /usr/bin/codesign --force --deep --sign - "$app_root"
 fi
+/usr/bin/codesign --verify --deep --strict --verbose=2 "$app_root"
 echo "$app_root"

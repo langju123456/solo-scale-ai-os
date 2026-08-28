@@ -40,6 +40,27 @@ public enum DesktopOpenAIKeychain {
     }
 }
 
+public enum DesktopGitHubKeychain {
+    public static let service = "local.soloscale.desktop.github"
+    public static let account = "default"
+
+    public static func save(_ accessToken: String) throws {
+        try DesktopSecretKeychain.save(
+            try desktopAIKeyPayload(accessToken),
+            service: service,
+            account: account
+        )
+    }
+
+    public static func delete() throws {
+        try DesktopSecretKeychain.delete(service: service, account: account)
+    }
+
+    public static func read() throws -> Data? {
+        try DesktopSecretKeychain.read(service: service, account: account)
+    }
+}
+
 public enum DesktopHeyGenKeychain {
     public static let service = "local.soloscale.desktop.media.heygen"
     public static let account = "default"
@@ -163,6 +184,7 @@ public func desktopCredentialFrame(_ payload: Data?) throws -> Data {
 /// environment variables, settings files, pages, and logs.
 public func desktopCredentialEnvelopeFrame(
     openAIKey: Data?,
+    githubAccessToken: Data?,
     heygenAPIKey: Data?
 ) throws -> Data {
     var envelope: [String: Any] = ["schema_version": "1.0"]
@@ -171,6 +193,12 @@ public func desktopCredentialEnvelopeFrame(
             throw DesktopAICredentialError.invalidKey
         }
         envelope["openai_api_key"] = value
+    }
+    if let githubAccessToken {
+        guard let value = String(data: githubAccessToken, encoding: .utf8) else {
+            throw DesktopAICredentialError.invalidKey
+        }
+        envelope["github_access_token"] = value
     }
     if let heygenAPIKey {
         guard let value = String(data: heygenAPIKey, encoding: .utf8) else {

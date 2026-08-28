@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
+from soloscale.evidence_hub import EvidenceHub
 from soloscale.ui_shell import SourceState, render_source_state
 from soloscale.work_ui import (
     import_chatgpt_export,
@@ -148,7 +150,25 @@ def test_codex_import_and_selected_git_project_reuse_existing_intake(
     session.write_text(_codex_session(private_text), encoding="utf-8")
     before = session.read_bytes()
     project = tmp_path / "project"
-    (project / ".git").mkdir(parents=True)
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    (project / "feature.txt").write_text("verified feature", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "feature.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(project),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "feat: add verified local project evidence",
+        ],
+        check=True,
+    )
 
     result = import_codex_history(data_root, codex_home=codex_home)
     snapshot = load_work_context(
@@ -160,6 +180,7 @@ def test_codex_import_and_selected_git_project_reuse_existing_intake(
     assert result.imported == 1
     assert snapshot.codex_sessions == 1
     assert snapshot.project_connected is True
+    assert snapshot.project_state == "STALE"
     assert snapshot.codex_folder_available is True
     assert session.read_bytes() == before
 
@@ -170,16 +191,22 @@ def test_codex_import_and_selected_git_project_reuse_existing_intake(
         notice="本地 Git 项目已连接。",
     )
     assert "本地 Git 项目已连接" in page
-    assert "project · 已选择" in page
+    assert "project · 工程证据已过期" in page
     assert "更换项目" in page
-    assert "准备这个项目" in page
+    assert "刷新工程证据" in page
     assert 'data-processing-source="Local Git"' in page
     assert "正在准备本地项目快照" in page
     assert 'data-processing-source="Codex"' in page
     assert "正在建立本地索引" in page
-    assert "不会上传项目代码" in page
+    assert "不保存或上传项目源码" in page
     assert 'action="/work/refresh"' in page
     assert str(project) not in page
+
+    EvidenceHub(data_root).sync_git_repository(project)
+    ready = load_work_context(data_root, workspace_root=project)
+    assert ready.project_state == "READY"
+    assert ready.project_fact_count == 1
+    assert ready.project_new_commits == 0
 
 
 def test_work_page_english_copy_actions_and_states_are_truthful(tmp_path: Path) -> None:
@@ -206,6 +233,7 @@ def test_work_page_english_copy_actions_and_states_are_truthful(tmp_path: Path) 
 def test_shared_source_states_have_stable_semantics() -> None:
     expected: dict[SourceState, str] = {
         "READY": "✓",
+        "STALE": "!",
         "PROCESSING": "●",
         "AVAILABLE": "＋",
         "NOT_CONNECTED": "○",

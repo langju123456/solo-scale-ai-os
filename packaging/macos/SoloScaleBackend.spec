@@ -38,11 +38,15 @@ datas.append(
         "buildlog/web_static",
     )
 )
+excluded_untracked_web_modules = {"soloscale.app_web", "soloscale.resume_web"}
 a = Analysis(
     [str(ROOT / "src" / "soloscale" / "local_ui.py")],
     pathex=[str(ROOT / "src"), str(ROOT / "packages" / "buildlog" / "src")],
     datas=datas,
-    hiddenimports=collect_submodules("soloscale") + collect_submodules("buildlog"),
+    hiddenimports=collect_submodules(
+        "soloscale", filter=lambda name: name not in excluded_untracked_web_modules
+    )
+    + collect_submodules("buildlog"),
     excludes=["node", "playwright", "selenium"],
 )
 pyz = PYZ(a.pure)

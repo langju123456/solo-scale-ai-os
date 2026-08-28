@@ -6,16 +6,24 @@ from __future__ import annotations
 import html
 import os
 import tempfile
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from soloscale.conversation_intake import (
     ConversationIntakeError,
+    discover_buildlog_runs,
     discover_codex_sources,
+    parse_buildlog_run,
     parse_chatgpt_export,
     parse_codex_session,
 )
-from soloscale.evidence_hub import EvidenceHub, EvidenceHubError
+from soloscale.evidence_hub import (
+    EvidenceHub,
+    EvidenceHubError,
+    inspect_git_repository,
+)
+from soloscale.github_connect import GitHubConnectionState, GitHubConnectionStore
 from soloscale.knowledge_models import ParsedSource, SyncReport
 from soloscale.knowledge_store import KnowledgeStore, KnowledgeStoreError
 from soloscale.ui_shell import (
@@ -45,6 +53,17 @@ class WorkContextSnapshot:
     reusable_items: int = 0
     project_connected: bool = False
     project_name: str | None = None
+    project_state: SourceState = "AVAILABLE"
+    project_head: str | None = None
+    project_branch: str | None = None
+    project_dirty_count: int = 0
+    project_new_commits: int | None = None
+    project_indexed_at: str | None = None
+    project_fact_count: int = 0
+    github_connected: bool = False
+    github_account_login: str | None = None
+    github_selected_repositories: int = 0
+    github_state: SourceState = "NOT_CONNECTED"
     codex_folder_available: bool = False
     last_synced: bool = False
 
@@ -58,6 +77,7 @@ class WorkContextSnapshot:
             self.resume_runs
             or self.knowledge_documents
             or self.project_connected
+            or (self.github_connected and self.github_selected_repositories)
             or self.reusable_items
         )
 
@@ -71,6 +91,71 @@ class WorkImportResult:
     updated: int
     skipped: int
     failed: int
+
+
+def refresh_selected_knowledge_sources(
+    data_root: Path,
+    *,
+    include_codex: bool,
+    codex_home: Path | None = None,
+    chatgpt_exports: Sequence[Path] = (),
+    buildlog_roots: Sequence[Path] = (),
+) -> WorkImportResult:
+    """Refresh only explicitly selected knowledge sources inside the packaged app."""
+
+    parsed: list[ParsedSource] = []
+    discovered = 0
+    parse_failures = 0
+    if include_codex:
+        selected_home = codex_home or Path.home() / ".codex"
+        try:
+            codex_paths = discover_codex_sources(selected_home)
+        except (ConversationIntakeError, OSError, ValueError):
+            codex_paths = []
+            parse_failures += 1
+        discovered += len(codex_paths)
+        for path in codex_paths:
+            try:
+                parsed.append(parse_codex_session(path))
+            except (ConversationIntakeError, OSError, ValueError):
+                parse_failures += 1
+    for export_path in chatgpt_exports:
+        try:
+            export_sources = parse_chatgpt_export(export_path)
+        except (ConversationIntakeError, OSError, ValueError):
+            parse_failures += 1
+            continue
+        discovered += len(export_sources)
+        parsed.extend(export_sources)
+    for root in buildlog_roots:
+        try:
+            run_paths = discover_buildlog_runs(root)
+        except (ConversationIntakeError, OSError, ValueError):
+            parse_failures += 1
+            continue
+        discovered += len(run_paths)
+        for run_path in run_paths:
+            try:
+                parsed.append(parse_buildlog_run(run_path))
+            except (ConversationIntakeError, OSError, ValueError):
+                parse_failures += 1
+    if not parsed:
+        return WorkImportResult(
+            discovered=discovered,
+            imported=0,
+            updated=0,
+            skipped=0,
+            failed=parse_failures,
+        )
+    try:
+        report = KnowledgeStore(Path(data_root)).sync(parsed)
+    except (KnowledgeStoreError, OSError, ValueError) as exc:
+        raise WorkContextError("Selected work sources could not be refreshed.") from exc
+    return _import_result(
+        report,
+        discovered=discovered,
+        parse_failures=parse_failures,
+    )
 
 
 def _count_private_runs(root: Path, directory_name: str, prefix: str) -> int:
@@ -91,6 +176,7 @@ def load_work_context(
     data_root: Path,
     *,
     workspace_root: Path | None = None,
+    github_connected: bool = False,
     home: Path | None = None,
 ) -> WorkContextSnapshot:
     """Load safe product counts without creating a catalog or reading source bodies."""
@@ -135,6 +221,74 @@ def load_work_context(
         and not (workspace_root / ".git").is_symlink()
     )
     project_name = workspace_root.name if project_connected and workspace_root else None
+    project_state: SourceState = "AVAILABLE"
+    project_head: str | None = None
+    project_branch: str | None = None
+    project_dirty_count = 0
+    project_new_commits: int | None = None
+    project_indexed_at: str | None = None
+    project_fact_count = 0
+    if project_connected and workspace_root is not None:
+        try:
+            current_source, current_items = inspect_git_repository(workspace_root)
+            project_head = current_source.native_id[:7]
+            project_branch = current_source.metadata.get("branch")
+            project_dirty_count = int(
+                current_source.metadata.get("dirty_count", "0")
+            )
+            stored_snapshot = (
+                EvidenceHub(root).git_repository_snapshot(workspace_root)
+                if EvidenceHub.catalog_exists(root)
+                else None
+            )
+        except (EvidenceHubError, OSError, ValueError):
+            project_state = "NEEDS_ATTENTION"
+        else:
+            if stored_snapshot is None:
+                project_state = "STALE"
+            else:
+                stored_source, stored_items = stored_snapshot
+                project_state = (
+                    "READY"
+                    if stored_source.content_sha256 == current_source.content_sha256
+                    else "STALE"
+                )
+                project_indexed_at = stored_source.captured_at.isoformat()
+                stored_commits = {
+                    item.native_id
+                    for item in stored_items
+                    if item.evidence_type == "git_commit"
+                }
+                current_commits = [
+                    item.native_id
+                    for item in current_items
+                    if item.evidence_type == "git_commit"
+                ]
+                project_new_commits = sum(
+                    commit not in stored_commits for commit in current_commits
+                )
+                project_fact_count = len(stored_commits)
+    github_account_login: str | None = None
+    github_selected_repositories = 0
+    github_state: SourceState = "NOT_CONNECTED"
+    if github_connected:
+        github_state = "AVAILABLE"
+        try:
+            github_connection = GitHubConnectionStore(root).load()
+        except (OSError, ValueError):
+            github_state = "NEEDS_ATTENTION"
+        else:
+            if github_connection is not None:
+                github_account_login = github_connection.account_login
+                github_selected_repositories = len(
+                    github_connection.selected_repository_ids
+                )
+                if github_connection.last_error_code:
+                    github_state = "NEEDS_ATTENTION"
+                elif github_selected_repositories and github_connection.evidence_refreshed_at:
+                    github_state = "READY"
+                elif github_selected_repositories:
+                    github_state = "STALE"
     return WorkContextSnapshot(
         resume_runs=_count_private_runs(root, "resume-runs", "resume-"),
         codex_sessions=codex_sessions,
@@ -144,6 +298,17 @@ def load_work_context(
         reusable_items=reusable_items,
         project_connected=project_connected,
         project_name=project_name,
+        project_state=project_state,
+        project_head=project_head,
+        project_branch=project_branch,
+        project_dirty_count=project_dirty_count,
+        project_new_commits=project_new_commits,
+        project_indexed_at=project_indexed_at,
+        project_fact_count=project_fact_count,
+        github_connected=github_connected,
+        github_account_login=github_account_login,
+        github_selected_repositories=github_selected_repositories,
+        github_state=github_state,
         codex_folder_available=codex_folder_available,
         last_synced=last_synced,
     )
@@ -251,7 +416,14 @@ def render_work_context_strip(
     """Render the compact shared foundation above the three outcome cards."""
 
     resume = ui_text(locale, "简历 ✓", "Resume ✓") if snapshot.resume_runs else ui_text(locale, "简历待添加", "Add resume")
-    projects = ui_text(locale, "1 个项目", "1 project") if snapshot.project_connected else ui_text(locale, "项目待添加", "Add project")
+    if snapshot.project_connected:
+        projects = (
+            ui_text(locale, "1 个项目 · 需刷新", "1 project · refresh needed")
+            if snapshot.project_state == "STALE"
+            else ui_text(locale, "1 个项目", "1 project")
+        )
+    else:
+        projects = ui_text(locale, "项目待添加", "Add project")
     conversations = ui_text(locale, f"{snapshot.ai_conversations} 个 AI 对话", f"{snapshot.ai_conversations} AI conversations") if snapshot.ai_conversations else ui_text(locale, "AI 对话待添加", "Add AI conversations")
     return f"""<section class="work-context-strip" aria-label="{html.escape(ui_text(locale, '我的工作资料', 'Your work'))}">
   <div><span class="kicker">{html.escape(ui_text(locale, '我的工作资料', 'Your work'))}</span>
@@ -270,11 +442,22 @@ def render_use_my_work(
     """Render a truthful, non-configurable summary for one outcome page."""
 
     if snapshot.has_work:
+        project_status = ""
+        if snapshot.project_connected:
+            project_status = ui_text(
+                locale,
+                " 本地 Git 工程证据需要刷新。"
+                if snapshot.project_state == "STALE"
+                else " 本地 Git 工程证据已更新。",
+                " Local Git evidence needs refresh."
+                if snapshot.project_state == "STALE"
+                else " Local Git evidence is current.",
+            )
         summary = ui_text(
             locale,
             f"已添加 {snapshot.knowledge_documents} 份资料、{snapshot.resume_runs} 份简历记录和 {1 if snapshot.project_connected else 0} 个本地项目。",
             f"Available: {snapshot.knowledge_documents} records, {snapshot.resume_runs} resume runs, and {1 if snapshot.project_connected else 0} local projects.",
-        )
+        ) + project_status
     else:
         summary = ui_text(
             locale,
@@ -315,13 +498,19 @@ def work_page(
     workspace_root: Path | None,
     locale: UILocale = DEFAULT_UI_LOCALE,
     desktop_mode: bool,
+    github_token_configured: bool = False,
+    github_connect_available: bool = False,
     chatgpt_export_selected: bool = False,
     notice: str | None = None,
     error: str | None = None,
 ) -> str:
     """Render the truthful Work Context onboarding and source setup page."""
 
-    snapshot = load_work_context(data_root, workspace_root=workspace_root)
+    snapshot = load_work_context(
+        data_root,
+        workspace_root=workspace_root,
+        github_connected=github_token_configured,
+    )
     notice_html = f'<div class="notice" role="status">{html.escape(notice)}</div>' if notice else ""
     error_html = f'<div class="error" role="alert">{html.escape(error)}</div>' if error else ""
 
@@ -413,16 +602,60 @@ def work_page(
         )
         prepare_project = f'''<form method="post" action="/work/refresh" {processing_form_attributes("Local Git", project_processing)}>
   <input type="hidden" name="ui_locale" value="{locale}" />
-  <button class="source-control" type="submit" data-loading-label="{html.escape(ui_text(locale, '开始准备…', 'Starting…'))}">{html.escape(ui_text(locale, "准备这个项目", "Prepare this project"))}</button>
+  <button class="source-control" type="submit" data-loading-label="{html.escape(ui_text(locale, '正在刷新…', 'Refreshing…'))}">{html.escape(ui_text(locale, "刷新工程证据", "Refresh project evidence"))}</button>
 </form>'''
+        freshness_summary = ui_text(
+            locale,
+            f"{snapshot.project_name or 'Git'} · 工程证据已更新",
+            f"{snapshot.project_name or 'Git'} · evidence current",
+        )
+        if snapshot.project_state == "STALE":
+            freshness_summary = ui_text(
+                locale,
+                f"{snapshot.project_name or 'Git'} · 工程证据已过期",
+                f"{snapshot.project_name or 'Git'} · evidence stale",
+            )
+        elif snapshot.project_state == "NEEDS_ATTENTION":
+            freshness_summary = ui_text(
+                locale,
+                f"{snapshot.project_name or 'Git'} · 无法读取当前状态",
+                f"{snapshot.project_name or 'Git'} · current state unavailable",
+            )
+        state_details = [
+            value
+            for value in (
+                f"HEAD {snapshot.project_head}" if snapshot.project_head else None,
+                snapshot.project_branch,
+                ui_text(
+                    locale,
+                    f"{snapshot.project_dirty_count} 个未提交变更",
+                    f"{snapshot.project_dirty_count} uncommitted changes",
+                ),
+                (
+                    ui_text(
+                        locale,
+                        f"{snapshot.project_new_commits} 个新提交待索引",
+                        f"{snapshot.project_new_commits} new commits to index",
+                    )
+                    if snapshot.project_new_commits
+                    else None
+                ),
+            )
+            if value
+        ]
         connected_rows.append(
             _source_row(
                 key="local-git",
-                state="READY",
+                state=snapshot.project_state,
                 locale=locale,
                 name="Local Git",
-                summary=ui_text(locale, f"{snapshot.project_name or 'Git'} · 已选择", f"{snapshot.project_name or 'Git'} · selected"),
-                detail=ui_text(locale, "只准备分支、提交和变更摘要；不会上传项目代码。", "Prepares branch, commit, and change summaries only; project code is not uploaded."),
+                summary=freshness_summary,
+                detail=" · ".join(state_details)
+                + ui_text(
+                    locale,
+                    "。只保存提交摘要与变更指纹，不保存或上传项目源码。",
+                    ". Only commit summaries and change fingerprints are stored; project source is neither stored nor uploaded.",
+                ),
                 actions=change_project + prepare_project,
             )
         )
@@ -505,16 +738,64 @@ def work_page(
             )
         )
 
-    add_more_rows.append(
-        _source_row(
-            key="github",
-            state="NOT_CONNECTED",
-            locale=locale,
-            name="GitHub",
-            summary=ui_text(locale, "尚未连接 GitHub", "GitHub is not connected"),
-            detail=ui_text(locale, "当前版本尚未提供 GitHub OAuth；请先使用本地 Git 项目。", "GitHub OAuth is not available in this version; use a local Git project for now."),
+    if snapshot.github_connected:
+        github_actions = (
+            f'<a class="source-control" href="{ui_url("/work/github", locale)}">{html.escape(ui_text(locale, "管理仓库", "Manage repositories"))}</a>'
         )
-    )
+        if snapshot.github_selected_repositories:
+            github_actions += f'''<form method="post" action="/work/github/refresh" {processing_form_attributes("GitHub", ui_text(locale, "正在读取已选仓库的只读元数据", "Reading read-only metadata for selected repositories"))}>
+  <input type="hidden" name="ui_locale" value="{locale}" />
+  <button class="source-control" type="submit" data-loading-label="{html.escape(ui_text(locale, '正在刷新…', 'Refreshing…'))}">{html.escape(ui_text(locale, "刷新", "Refresh"))}</button>
+</form>'''
+        github_actions += f'<a class="source-control danger-control" href="soloscale://disconnect-github">{html.escape(ui_text(locale, "断开连接", "Disconnect"))}</a>'
+        if snapshot.github_account_login:
+            github_summary = ui_text(
+                locale,
+                f"{snapshot.github_account_login} · 已选择 {snapshot.github_selected_repositories} 个仓库",
+                f"{snapshot.github_account_login} · {snapshot.github_selected_repositories} repositories selected",
+            )
+        else:
+            github_summary = ui_text(locale, "已连接；请选择仓库", "Connected; choose repositories")
+        connected_rows.append(
+            _source_row(
+                key="github",
+                state=snapshot.github_state,
+                locale=locale,
+                name="GitHub",
+                summary=github_summary,
+                detail=ui_text(
+                    locale,
+                    "只读取你授权并在 SoloScale 中明确选择的仓库元数据；不会修改 GitHub。",
+                    "Reads metadata only from repositories authorized on GitHub and explicitly selected in SoloScale; GitHub is never modified.",
+                ),
+                actions=github_actions,
+            )
+        )
+    else:
+        github_action = ""
+        github_detail = ui_text(
+            locale,
+            "这个 App 包尚未配置 GitHub App Client ID。",
+            "This app build does not yet include a GitHub App client ID.",
+        )
+        if desktop_mode and github_connect_available:
+            github_action = f'<a class="source-control" href="soloscale://connect-github">{html.escape(ui_text(locale, "连接 GitHub", "Connect GitHub"))}</a>'
+            github_detail = ui_text(
+                locale,
+                "通过细粒度只读 GitHub App 授权；访问令牌只保存在 macOS Keychain。",
+                "Uses a fine-grained read-only GitHub App; the access token is stored only in macOS Keychain.",
+            )
+        add_more_rows.append(
+            _source_row(
+                key="github",
+                state="NOT_CONNECTED",
+                locale=locale,
+                name="GitHub",
+                summary=ui_text(locale, "尚未连接 GitHub", "GitHub is not connected"),
+                detail=github_detail,
+                actions=github_action,
+            )
+        )
 
     connected_html = "".join(connected_rows) or f'<p class="section-empty">{html.escape(ui_text(locale, "还没有已连接的工作资料。你可以从下方添加。", "No work sources are connected yet. Add one below when you are ready."))}</p>'
     add_more_html = "".join(add_more_rows)
@@ -592,5 +873,60 @@ def work_page(
     form.closest(".source-row")?.classList.add("is-processing");
   }, true);
 })();
+""",
+    )
+
+
+def github_repositories_page(
+    state: GitHubConnectionState,
+    *,
+    locale: UILocale = DEFAULT_UI_LOCALE,
+    notice: str | None = None,
+) -> str:
+    """Render a searchable explicit selection over the GitHub App inventory."""
+
+    selected = set(state.selected_repository_ids)
+    repository_rows = "".join(
+        f'''<label class="github-repository" data-repository-name="{html.escape(repository.full_name.casefold())}">
+  <input type="checkbox" name="repository" value="{repository.repository_id}" {"checked" if repository.repository_id in selected else ""} />
+  <span><strong>{html.escape(repository.full_name)}</strong><small>{html.escape(ui_text(locale, "私有" if repository.private else "公开", "Private" if repository.private else "Public"))} · {html.escape(repository.default_branch)}</small></span>
+</label>'''
+        for repository in state.repositories
+    )
+    if not repository_rows:
+        repository_rows = f'<p class="section-empty">{html.escape(ui_text(locale, "GitHub App 当前没有可访问的仓库。请先在 GitHub 安装页面授权仓库，然后重新加载。", "The GitHub App cannot access any repositories yet. Grant repository access on GitHub, then reload this page."))}</p>'
+    notice_html = (
+        f'<div class="notice" role="status">{html.escape(notice)}</div>'
+        if notice
+        else ""
+    )
+    body = f"""{notice_html}
+<section class="privacy-note"><strong>{html.escape(ui_text(locale, '只读连接', 'Read-only connection'))}</strong><p>{html.escape(ui_text(locale, 'SoloScale 只调用 GitHub GET API，不创建或修改仓库、Issue、PR、Actions 或代码。', 'SoloScale calls GitHub GET APIs only. It does not create or modify repositories, issues, pull requests, Actions, or code.'))}</p></section>
+<section class="github-selection">
+  <div class="section-heading"><div><span class="kicker">GitHub</span><h2>{html.escape(state.account_login)}</h2></div><span>{len(state.repositories)}</span></div>
+  <label class="search-field">{html.escape(ui_text(locale, '搜索仓库', 'Search repositories'))}<input id="github-repository-search" type="search" autocomplete="off" placeholder="owner/repository" /></label>
+  <form method="post" action="/work/github/select">
+    <input type="hidden" name="ui_locale" value="{locale}" />
+    <div id="github-repository-list" class="github-repository-list">{repository_rows}</div>
+    <p class="source-help">{html.escape(ui_text(locale, '最多选择 20 个仓库。保存后再手动刷新 Evidence。', 'Select up to 20 repositories. Save the selection, then refresh Evidence manually.'))}</p>
+    <div class="form-actions"><button class="primary" type="submit">{html.escape(ui_text(locale, '保存选择', 'Save selection'))}</button><a class="quiet-action" href="{ui_url('/work', locale)}">{html.escape(ui_text(locale, '返回工作资料', 'Back to Work Context'))}</a></div>
+  </form>
+</section>"""
+    return render_app_shell(
+        active="work",
+        locale=locale,
+        current_url="/work/github",
+        title=f"SoloScale · {ui_text(locale, '选择 GitHub 仓库', 'Choose GitHub repositories')}",
+        eyebrow="GitHub",
+        heading=ui_text(locale, "选择允许 SoloScale 使用的仓库", "Choose repositories SoloScale may use"),
+        description=ui_text(locale, "GitHub 授权范围和 SoloScale 内部选择必须同时允许。", "Both GitHub access and the SoloScale selection must allow a repository."),
+        body=body,
+        compact_hero=True,
+        extra_css="""
+.privacy-note{padding:14px 16px;border:1px solid #cfe3da;border-radius:14px;background:#f2faf6}.privacy-note p{margin:4px 0 0;color:var(--text-muted)}.github-selection{display:grid;gap:16px}.section-heading{display:flex;align-items:end;justify-content:space-between;border-bottom:1px solid var(--border);padding-bottom:10px}.section-heading h2{margin:3px 0 0}.search-field{display:grid;gap:6px;font-weight:800}.search-field input{max-width:520px}.github-repository-list{display:grid;gap:8px;max-height:480px;overflow:auto}.github-repository{display:flex;gap:12px;align-items:center;padding:12px 14px;border:1px solid var(--border);border-radius:13px;background:#fff}.github-repository span{display:grid;gap:2px}.github-repository small{color:var(--text-muted)}.form-actions{display:flex;gap:12px;align-items:center}
+""",
+        script="""
+const search=document.getElementById('github-repository-search');
+if(search) search.addEventListener('input',()=>{const value=search.value.trim().toLowerCase();document.querySelectorAll('.github-repository').forEach(row=>{row.hidden=value!==''&&!row.dataset.repositoryName.includes(value);});});
 """,
     )

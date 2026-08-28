@@ -1444,6 +1444,7 @@ def tailor_resume_docx_with_gateway(
     template_metadata: ResumeTemplateMetadata | None = None,
     support_upload: ExtractedResumeUpload | None = None,
     candidate_recorder: Callable[[dict[str, object]], None] | None = None,
+    candidate_evidence_pack: CandidateEvidencePack | None = None,
 ) -> TailoredDocx:
     """Use one explicit provider to rank and ground rewrites against approved bullets."""
     if not job_description.strip():
@@ -1453,7 +1454,9 @@ def tailor_resume_docx_with_gateway(
     skills = _profile_skills(profile)
     entry_ids = list(entries)
     skill_ids = list(skills)
-    candidate_evidence_pack = build_candidate_evidence_pack(profile)
+    candidate_evidence_pack = candidate_evidence_pack or build_candidate_evidence_pack(
+        profile
+    )
     atomic_facts = candidate_evidence_pack.atomic_facts
     fact_ids = [item.fact_id for item in atomic_facts]
     summary_paragraphs = [

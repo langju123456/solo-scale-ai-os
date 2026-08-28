@@ -16,13 +16,16 @@ private enum StartupDestination {
     case home
     case workProjectConnected
     case workChatGPTSelected
+    case workGitHubConnected
+    case workGitHubDisconnected
     case aiSettings(String?)
     case heyGenSettings(String?)
 
     var path: String {
         switch self {
         case .home: "/"
-        case .workProjectConnected, .workChatGPTSelected: "/work"
+        case .workProjectConnected, .workChatGPTSelected, .workGitHubDisconnected: "/work"
+        case .workGitHubConnected: "/work/github"
         case .aiSettings: "/settings/ai/openai"
         case .heyGenSettings: "/settings/media/heygen"
         }
@@ -33,6 +36,8 @@ private enum StartupDestination {
         case .home: nil
         case .workProjectConnected: "project-connected"
         case .workChatGPTSelected: "chatgpt-selected"
+        case .workGitHubDisconnected: "github-disconnected"
+        case .workGitHubConnected: nil
         case .aiSettings, .heyGenSettings: nil
         }
     }
@@ -110,6 +115,9 @@ private final class BackendController: NSObject, ObservableObject {
             if let selectedExport = pendingChatGPTExport {
                 desktopEnvironment["SOLOSCALE_PENDING_CHATGPT_EXPORT"] = selectedExport.path
             }
+            if githubAppClientID() != nil {
+                desktopEnvironment["SOLOSCALE_GITHUB_CONNECT_AVAILABLE"] = "1"
+            }
             process.environment = ProcessInfo.processInfo.environment.merging(
                 desktopEnvironment
             ) { _, new in new }
@@ -126,6 +134,7 @@ private final class BackendController: NSObject, ObservableObject {
                 try credentialWriter.write(
                     desktopCredentialEnvelopeFrame(
                         openAIKey: try DesktopOpenAIKeychain.read(),
+                        githubAccessToken: try DesktopGitHubKeychain.read(),
                         heygenAPIKey: try DesktopHeyGenKeychain.read()
                     )
                 )
@@ -162,6 +171,78 @@ private final class BackendController: NSObject, ObservableObject {
     func deleteHeyGenKey(returnPath: String?) throws {
         try DesktopHeyGenKeychain.delete()
         restart(destination: .heyGenSettings(whitelistedHeyGenSettingsReturnPath(returnPath)))
+    }
+    func connectGitHub() {
+        guard let clientID = githubAppClientID() else {
+            showGitHubAlert(
+                title: "GitHub Connect is not configured",
+                detail: "This build does not include a GitHub App client ID."
+            )
+            return
+        }
+        let flow = GitHubDeviceFlowClient()
+        flow.requestAuthorization(clientID: clientID) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .failure(let error):
+                    self.showGitHubAlert(
+                        title: "SoloScale could not connect GitHub",
+                        detail: error.localizedDescription
+                    )
+                case .success(let authorization):
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(
+                        authorization.userCode,
+                        forType: .string
+                    )
+                    NSWorkspace.shared.open(authorization.verificationURL)
+                    let alert = NSAlert()
+                    alert.alertStyle = .informational
+                    alert.messageText = "Authorize SoloScale on GitHub"
+                    alert.informativeText = "Code \(authorization.userCode) was copied. Complete GitHub authorization in your browser, then return here."
+                    alert.addButton(withTitle: "I authorized SoloScale")
+                    alert.addButton(withTitle: "Cancel")
+                    guard alert.runModal() == .alertFirstButtonReturn else { return }
+                    flow.pollForToken(
+                        clientID: clientID,
+                        authorization: authorization
+                    ) { [weak self] tokenResult in
+                        DispatchQueue.main.async {
+                            guard let self else { return }
+                            do {
+                                let token = try tokenResult.get()
+                                try DesktopGitHubKeychain.save(token)
+                                self.restart(destination: .workGitHubConnected)
+                            } catch {
+                                self.showGitHubAlert(
+                                    title: "SoloScale could not connect GitHub",
+                                    detail: error.localizedDescription
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    func disconnectGitHub() {
+        do {
+            try DesktopGitHubKeychain.delete()
+            let support = try applicationSupportDirectory()
+            let state = support
+                .appendingPathComponent("github", isDirectory: true)
+                .appendingPathComponent("connection.json", isDirectory: false)
+            if FileManager.default.fileExists(atPath: state.path) {
+                try FileManager.default.removeItem(at: state)
+            }
+            restart(destination: .workGitHubDisconnected)
+        } catch {
+            showGitHubAlert(
+                title: "SoloScale could not disconnect GitHub",
+                detail: error.localizedDescription
+            )
+        }
     }
     func failWebSession(_ message: String) { failStart(message) }
     func chooseRepository() {
@@ -430,6 +511,19 @@ private final class BackendController: NSObject, ObservableObject {
               isRegularLocalGitRepository(URL(fileURLWithPath: stored)) else { return nil }
         return stored
     }
+    private func githubAppClientID() -> String? {
+        guard let raw = Bundle.main.object(
+            forInfoDictionaryKey: "SoloScaleGitHubAppClientID"
+        ) as? String else { return nil }
+        return validatedGitHubAppClientID(raw)
+    }
+    private func showGitHubAlert(title: String, detail: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.runModal()
+    }
     private func isSupportedRepository(_ root: URL) -> Bool {
         let manager = FileManager.default
         return manager.fileExists(atPath: root.appendingPathComponent(".git").path)
@@ -606,6 +700,10 @@ private struct LocalWebView: NSViewRepresentable {
                         self?.backend.chooseWorkRepository()
                     case "choose-chatgpt-export":
                         self?.backend.chooseChatGPTExport()
+                    case "connect-github":
+                        self?.backend.connectGitHub()
+                    case "disconnect-github":
+                        self?.backend.disconnectGitHub()
                     default:
                         break
                     }

@@ -39,6 +39,7 @@ _MAX_APPLICATION_RUNS = 500
 _MAX_APPLICATION_FILES = 10_000
 _MAX_APPLICATION_FILE_BYTES = 64 * 1024 * 1024
 _GIT_TIMEOUT_SECONDS = 10
+_MAX_GIT_COMMIT_EVIDENCE = 12
 _GIT_SEARCH_PATH = os.pathsep.join(
     (
         "/opt/homebrew/bin",
@@ -710,6 +711,45 @@ class EvidenceHub:
             list[OutcomeReceipt], self._records("outcomes", "rowid DESC", OutcomeReceipt, limit)
         )
 
+    def sync_git_repository(self, git_root: Path) -> SyncReceipt:
+        """Incrementally replace evidence for one explicitly selected Git repository."""
+
+        source, items = inspect_git_repository(git_root)
+        return self.sync_source(source, items=items)
+
+    def git_repository_snapshot(
+        self, git_root: Path
+    ) -> tuple[SourceRecord, list[EvidenceItem]] | None:
+        """Return the stored snapshot for one exact local repository without source text."""
+
+        repository_key = _repository_key(git_root)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT source_id, payload_json FROM snapshot_sources"
+            ).fetchall()
+            sources = [
+                SourceRecord.model_validate_json(str(row["payload_json"]))
+                for row in rows
+            ]
+            source = next(
+                (
+                    candidate
+                    for candidate in sources
+                    if candidate.metadata.get("repository_key") == repository_key
+                ),
+                None,
+            )
+            if source is None:
+                return None
+            item_rows = connection.execute(
+                "SELECT payload_json FROM snapshot_items WHERE source_id = ?",
+                (source.source_id,),
+            ).fetchall()
+        return source, [
+            EvidenceItem.model_validate_json(str(row["payload_json"]))
+            for row in item_rows
+        ]
+
     def _collect_snapshot(
         self,
         *,
@@ -825,17 +865,9 @@ class EvidenceHub:
         sources.extend(application_sources)
         items.extend(application_items)
         if git_root is not None:
-            source = _git_record(git_root)
+            source, git_items = inspect_git_repository(git_root)
             sources.append(source)
-            items.append(
-                _item(
-                    source,
-                    source.native_id,
-                    source.source_at,
-                    "Git snapshot metadata",
-                    source.content_sha256,
-                )
-            )
+            items.extend(git_items)
         return sorted(sources, key=lambda source: source.source_id), sorted(
             items, key=lambda item: item.evidence_id
         )
@@ -1223,16 +1255,38 @@ def _item(
     )
 
 
-def _git_record(root: Path) -> SourceRecord:
-    root_path = Path(root)
+def _repository_key(root: Path) -> str:
+    return _digest(str(Path(root).expanduser().absolute()))
+
+
+def inspect_git_repository(root: Path) -> tuple[SourceRecord, list[EvidenceItem]]:
+    """Capture bounded metadata and recent committed facts from one selected repo."""
+
+    root_path = Path(root).expanduser().absolute()
+    git_marker = root_path / ".git"
+    if (
+        not root_path.is_dir()
+        or root_path.is_symlink()
+        or not git_marker.exists()
+        or git_marker.is_symlink()
+    ):
+        raise EvidenceHubError("choose one regular local Git repository")
     head_one = _git(root_path, "rev-parse", "--verify", "HEAD")
     branch_one = _git(root_path, "branch", "--show-current", optional=True) or "DETACHED"
-    status_one = _git(root_path, "status", "--porcelain=v1")
+    status_one = _git(root_path, "status", "--porcelain=v1", "--untracked-files=all")
+    tracked_diff = _git(root_path, "diff", "--no-ext-diff", "--binary")
+    staged_diff = _git(root_path, "diff", "--cached", "--no-ext-diff", "--binary")
     commit_at = _git(root_path, "show", "-s", "--format=%cI", "HEAD")
     remote = _git(root_path, "config", "--get", "remote.origin.url", optional=True)
+    log_output = _git(
+        root_path,
+        "log",
+        f"-{_MAX_GIT_COMMIT_EVIDENCE}",
+        "--pretty=format:%H%x1f%cI%x1f%s%x1e",
+    )
     head_two = _git(root_path, "rev-parse", "--verify", "HEAD")
     branch_two = _git(root_path, "branch", "--show-current", optional=True) or "DETACHED"
-    status_two = _git(root_path, "status", "--porcelain=v1")
+    status_two = _git(root_path, "status", "--porcelain=v1", "--untracked-files=all")
     if (
         head_one != head_two
         or branch_one != branch_two
@@ -1241,21 +1295,26 @@ def _git_record(root: Path) -> SourceRecord:
     ):
         raise EvidenceHubError("git snapshot changed during capture")
     remote_fingerprint = _digest(remote) if remote else "none"
+    repository_key = _repository_key(root_path)
+    status_sha256 = _digest(status_one)
+    tracked_diff_sha256 = _digest(
+        {"unstaged": tracked_diff, "staged": staged_diff}
+    )
     status_lines = status_one.splitlines()
     dirty_count = len(status_lines)
     staged_count = sum(line[:1] not in {" ", "?"} for line in status_lines)
     unstaged_count = sum(len(line) > 1 and line[1] not in {" ", "?"} for line in status_lines)
     untracked_count = sum(line.startswith("??") for line in status_lines)
-    digest = _digest(
+    fingerprint = _digest(
         {
             "head": head_one,
             "branch": branch_one,
-            "dirty_count": dirty_count,
-            "remote_fingerprint": remote_fingerprint,
+            "status_sha256": status_sha256,
+            "tracked_diff_sha256": tracked_diff_sha256,
         }
     )
-    return SourceRecord(
-        source_id=_stable_id("source", "git", root_path.name, remote_fingerprint),
+    source = SourceRecord(
+        source_id=_stable_id("source", "git", repository_key, remote_fingerprint),
         native_id=head_one,
         source_system="git",
         source_type="repository_snapshot",
@@ -1263,7 +1322,7 @@ def _git_record(root: Path) -> SourceRecord:
         original_locator=str(root_path),
         captured_at=_now(),
         source_at=datetime.fromisoformat(commit_at),
-        content_sha256=digest,
+        content_sha256=fingerprint,
         sensitivity="private",
         truth_class=TruthClass.PERSONAL_ARTIFACT,
         raw_available=False,
@@ -1275,8 +1334,75 @@ def _git_record(root: Path) -> SourceRecord:
             "unstaged_count": str(unstaged_count),
             "untracked_count": str(untracked_count),
             "remote_fingerprint": remote_fingerprint,
+            "repository_key": repository_key,
+            "status_sha256": status_sha256,
+            "tracked_diff_sha256": tracked_diff_sha256,
+            "fingerprint": fingerprint,
         },
     )
+    items = [
+        _item(
+            source,
+            source.native_id,
+            source.source_at,
+            "Git snapshot metadata",
+            source.content_sha256,
+            verification={
+                "repository_key": repository_key,
+                "fingerprint": fingerprint,
+            },
+        )
+    ]
+    for raw_record in log_output.split("\x1e"):
+        record = raw_record.strip()
+        if not record:
+            continue
+        parts = record.split("\x1f", 2)
+        if len(parts) != 3:
+            raise EvidenceHubError("git history metadata is unavailable")
+        commit_sha, committed_at, raw_subject = parts
+        subject = " ".join(raw_subject.split())[:300]
+        if len(commit_sha) != 40 or not subject:
+            raise EvidenceHubError("git history metadata is unavailable")
+        subject_sha256 = _digest(subject)
+        observed_at = datetime.fromisoformat(committed_at)
+        items.append(
+            EvidenceItem(
+                evidence_id=_stable_id(
+                    "evidence", source.source_id, "git_commit", commit_sha
+                ),
+                source_id=source.source_id,
+                native_id=commit_sha,
+                evidence_type="git_commit",
+                project=source.project,
+                captured_at=_now(),
+                source_at=observed_at,
+                time_start=observed_at,
+                time_end=observed_at,
+                provenance_locator=f"git:{commit_sha}",
+                truth_class=TruthClass.PERSONAL_ARTIFACT,
+                trust_state="verified_repository_commit",
+                public_safe_summary=f"Repository commit: {subject}",
+                relationships=[
+                    f"repository:{repository_key}",
+                    f"commit:{commit_sha}",
+                ],
+                verification={
+                    "repository_key": repository_key,
+                    "commit_sha": commit_sha,
+                    "subject_sha256": subject_sha256,
+                },
+                verification_status="git_object_verified",
+                content_sha256=_digest(
+                    {
+                        "commit_sha": commit_sha,
+                        "committed_at": committed_at,
+                        "subject_sha256": subject_sha256,
+                    }
+                ),
+            )
+        )
+    return source, items
 
 
 def _application_records(data_root: Path) -> tuple[list[SourceRecord], list[EvidenceItem]]:

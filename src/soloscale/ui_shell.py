@@ -11,6 +11,7 @@ UILocale = Literal["zh-CN", "en"]
 DEFAULT_UI_LOCALE: UILocale = "zh-CN"
 SourceState = Literal[
     "READY",
+    "STALE",
     "PROCESSING",
     "AVAILABLE",
     "NOT_CONNECTED",
@@ -20,6 +21,7 @@ SourceState = Literal[
 
 _SOURCE_STATE_PRESENTATION: dict[SourceState, tuple[str, str, str]] = {
     "READY": ("✓", "已就绪", "Ready"),
+    "STALE": ("!", "需刷新", "Stale"),
     "PROCESSING": ("●", "处理中", "Processing"),
     "AVAILABLE": ("＋", "可添加", "Available"),
     "NOT_CONNECTED": ("○", "未连接", "Not connected"),
@@ -227,7 +229,7 @@ button:hover,.primary:hover,.primary-button:hover,.button-link:hover { backgroun
 .source-state-symbol { min-width:12px; text-align:center; font-size:13px; line-height:1; }
 .source-state-ready { background:var(--success-soft); color:var(--success); }
 .source-state-processing,.source-state-available { background:var(--brand-soft); color:var(--brand); }
-.source-state-needs-attention { background:var(--warning-soft); color:var(--warning); }
+.source-state-stale,.source-state-needs-attention { background:var(--warning-soft); color:var(--warning); }
 pre,code { overflow-wrap:anywhere; }
 pre { white-space:pre-wrap; padding:16px; border:1px solid var(--border); border-radius:14px;
   background:#fafbfc; color:#2c3548; }

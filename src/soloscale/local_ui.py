@@ -59,6 +59,8 @@ from soloscale.content_workspace import (
 from soloscale.desktop_credentials import (
     DesktopCredentialError,
     configure_desktop_credentials_from_stdin,
+    github_access_token,
+    github_access_token_is_configured,
     heygen_api_key_is_configured,
     openai_api_key,
     openai_api_key_is_configured,
@@ -70,8 +72,18 @@ from soloscale.editorial_publishing_handoff import (
     preview_editorial_day,
     publish_editorial_preview,
 )
-from soloscale.evidence_hub import EvidenceHubError
-from soloscale.evidence_ui import evidence_page, refresh_evidence_catalog
+from soloscale.evidence_hub import EvidenceHub, EvidenceHubError
+from soloscale.evidence_ui import (
+    evidence_page,
+    refresh_evidence_catalog,
+    refresh_local_project_evidence,
+)
+from soloscale.github_connect import (
+    GitHubConnectError,
+    GitHubConnectionState,
+    GitHubConnectionStore,
+    GitHubReadOnlyClient,
+)
 from soloscale.integration_status import connected_service_statuses
 from soloscale.knowledge_models import RetrievalHit
 from soloscale.knowledge_store import (
@@ -136,6 +148,7 @@ from soloscale.resume_docx import (
     tailor_resume_docx,
     tailor_resume_docx_with_gateway,
 )
+from soloscale.resume_evidence_pack import build_candidate_evidence_pack
 from soloscale.resume_gateway_boundary import (
     ExtractedResumeUpload,
     ResumeFunnelEventType,
@@ -199,10 +212,12 @@ from soloscale.video_story import (
 )
 from soloscale.work_ui import (
     WorkContextError,
+    github_repositories_page,
     import_chatgpt_export,
     import_chatgpt_export_bytes,
     import_codex_history,
     load_work_context,
+    refresh_selected_knowledge_sources,
     render_use_my_work,
     render_work_context_strip,
     work_page,
@@ -290,6 +305,7 @@ class ResumeJobManager:
         files: dict[str, UploadedFile],
         data_root: Path,
         repo_root: Path,
+        evidence_repository_root: Path | None = None,
         gateway: ModelGateway | None,
         expert_gateway: ModelGateway | None = None,
         allow_persistent_storage: bool = False,
@@ -313,6 +329,7 @@ class ResumeJobManager:
             dict(files),
             data_root,
             repo_root,
+            evidence_repository_root,
             gateway,
             expert_gateway,
             allow_persistent_storage,
@@ -355,6 +372,7 @@ class ResumeJobManager:
         files: dict[str, UploadedFile],
         data_root: Path,
         repo_root: Path,
+        evidence_repository_root: Path | None,
         gateway: ModelGateway | None,
         expert_gateway: ModelGateway | None,
         allow_persistent_storage: bool,
@@ -371,6 +389,7 @@ class ResumeJobManager:
                 files,
                 data_root,
                 repo_root,
+                evidence_repository_root=evidence_repository_root,
                 gateway=gateway,
                 expert_gateway=expert_gateway,
                 allow_persistent_storage=allow_persistent_storage,
@@ -1932,6 +1951,7 @@ def _run_user_resume(
     data_root: Path,
     repo_root: Path,
     *,
+    evidence_repository_root: Path | None = None,
     gateway: ModelGateway | None = None,
     expert_gateway: ModelGateway | None = None,
     allow_persistent_storage: bool = False,
@@ -2079,6 +2099,21 @@ def _run_user_resume(
                 "profile_extract_ms",
                 int((time.perf_counter() - profile_started) * 1000),
             )
+        candidate_evidence_pack = None
+        if generation_mode != "template":
+            if progress is not None:
+                progress("RETRIEVING")
+            if evidence_repository_root is not None:
+                refresh_receipt = EvidenceHub(data_root).sync_git_repository(
+                    evidence_repository_root
+                )
+                if refresh_receipt.status.value != "succeeded":
+                    raise EvidenceHubError("local project evidence refresh failed")
+            candidate_evidence_pack = build_candidate_evidence_pack(
+                profile,
+                data_root=data_root,
+                repository_root=evidence_repository_root,
+            )
         if progress is not None:
             progress("GENERATING")
         support_upload: ExtractedResumeUpload | None = extracted.get(ResumeUploadRole.SUPPORT)
@@ -2112,6 +2147,7 @@ def _run_user_resume(
                 template_metadata=resume_upload.template_metadata,
                 support_upload=support_upload,
                 candidate_recorder=candidate_recorder,
+                candidate_evidence_pack=candidate_evidence_pack,
             )
         if timing is not None:
             timing(
@@ -2479,6 +2515,7 @@ def _run_user_resume(
         )
     except (
         KnowledgeStoreError,
+        EvidenceHubError,
         OSError,
         ResumeUploadError,
         ValueError,
@@ -2771,19 +2808,44 @@ def _run_action(form: dict[str, str], data_root: Path, repo_root: Path) -> UIAct
     if action == "knowledge-sync":
         include_codex = form.get("include_codex") == "on"
         codex_home = form.get("codex_home", "").strip()
-        chatgpt_exports = _split_path_list(form.get("chatgpt_exports", ""))
-        buildlog_roots = _split_path_list(form.get("buildlog_roots", ""))
-
-        command = ["knowledge-sync", "--data-root", str(data_root)]
-        if not include_codex:
-            command.append("--no-codex")
-        if codex_home:
-            command += ["--codex-home", codex_home]
-        for export_path in chatgpt_exports:
-            command += ["--chatgpt-export", export_path]
-        for buildlog_root in buildlog_roots:
-            command += ["--buildlog-root", buildlog_root]
-        return _run_command(command, repo_root)
+        chatgpt_exports = [
+            Path(value).expanduser()
+            for value in _split_path_list(form.get("chatgpt_exports", ""))
+        ]
+        buildlog_roots = [
+            Path(value).expanduser()
+            for value in _split_path_list(form.get("buildlog_roots", ""))
+        ]
+        started = time.perf_counter()
+        try:
+            refreshed = refresh_selected_knowledge_sources(
+                data_root,
+                include_codex=include_codex,
+                codex_home=Path(codex_home).expanduser() if codex_home else None,
+                chatgpt_exports=chatgpt_exports,
+                buildlog_roots=buildlog_roots,
+            )
+        except (OSError, ValueError, WorkContextError) as exc:
+            return UIActionResult(
+                name="knowledge-sync",
+                command="in-process knowledge refresh",
+                return_code=1,
+                stdout="",
+                stderr=str(exc),
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+            )
+        return UIActionResult(
+            name="knowledge-sync",
+            command="in-process knowledge refresh",
+            return_code=0 if refreshed.failed == 0 or refreshed.imported + refreshed.updated + refreshed.skipped else 1,
+            stdout=(
+                f"Discovered {refreshed.discovered}; imported {refreshed.imported}; "
+                f"updated {refreshed.updated}; unchanged {refreshed.skipped}; "
+                f"failed {refreshed.failed}."
+            ),
+            stderr="",
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+        )
     if action == "evidence-agent":
         question = form.get("question", "").strip()
         if not question:
@@ -3771,6 +3833,7 @@ def _user_page(
     locale: UILocale = DEFAULT_UI_LOCALE,
     *,
     desktop_mode: bool = False,
+    workspace_root: Path | None = None,
     resume_job: ResumeJobSnapshot | None = None,
 ) -> str:
     job_description = _escape(form.get("job_description", ""))
@@ -3814,7 +3877,7 @@ def _user_page(
         else "workspace"
     )
     work_summary = render_use_my_work(
-        load_work_context(data_root),
+        load_work_context(data_root, workspace_root=workspace_root),
         locale,
         boundary=ui_text(
             locale,
@@ -5580,6 +5643,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.latest_user_form,
             self.ui_locale,
             desktop_mode=self.desktop_session_token is not None,
+            workspace_root=self.workspace_root,
             resume_job=resume_job,
         )
         body = page.encode("utf-8")
@@ -5706,6 +5770,21 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 "已更新你明确选择的工作资料。",
                 "Your explicitly selected work has been refreshed.",
             ),
+            "github-disconnected": ui_text(
+                self.ui_locale,
+                "GitHub 已断开；Keychain 中的访问令牌和本地仓库选择已移除。",
+                "GitHub is disconnected. Its Keychain token and local repository selection were removed.",
+            ),
+            "github-selection-saved": ui_text(
+                self.ui_locale,
+                "GitHub 仓库选择已保存。现在可以手动刷新只读证据。",
+                "Your GitHub repository selection is saved. You can now refresh read-only Evidence.",
+            ),
+            "github-refreshed": ui_text(
+                self.ui_locale,
+                "已从所选 GitHub 仓库更新只读元数据。",
+                "Read-only metadata was refreshed from the selected GitHub repositories.",
+            ),
         }
         errors = {
             "approval-required": ui_text(
@@ -5738,15 +5817,100 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 "选择的导出文件超过 256 MB 限制。",
                 "The selected export exceeds the 256 MB limit.",
             ),
+            "github-not-connected": ui_text(
+                self.ui_locale,
+                "请先通过 Desktop App 连接 GitHub。",
+                "Connect GitHub through the Desktop App first.",
+            ),
+            "github-read-failed": ui_text(
+                self.ui_locale,
+                "GitHub 只读数据未能加载；现有本地证据保持不变。",
+                "GitHub read-only data could not be loaded; existing local Evidence is unchanged.",
+            ),
+            "github-selection-invalid": ui_text(
+                self.ui_locale,
+                "仓库选择无效或超过 20 个，未保存更改。",
+                "The repository selection is invalid or exceeds 20; no change was saved.",
+            ),
         }
         body = work_page(
             data_root=self.ui_data_root.absolute(),
             workspace_root=self.workspace_root,
             locale=self.ui_locale,
             desktop_mode=self.desktop_session_token is not None,
+            github_token_configured=github_access_token_is_configured(),
+            github_connect_available=(
+                self.desktop_session_token is not None
+                and os.environ.get("SOLOSCALE_GITHUB_CONNECT_AVAILABLE") == "1"
+            ),
             chatgpt_export_selected=self.pending_chatgpt_export is not None,
             notice=notices.get(notice_code),
             error=errors.get(error_code),
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_github_repositories_page(
+        self, query: dict[str, list[str]] | None = None
+    ) -> None:
+        token = github_access_token()
+        if token is None or self.desktop_session_token is None:
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url("/work", self.ui_locale, error="github-not-connected"),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        store = GitHubConnectionStore(self.ui_data_root.absolute())
+        saved_notice: str | None = None
+        state: GitHubConnectionState | None = None
+        try:
+            account_id, account_login, repositories = GitHubReadOnlyClient(
+                token
+            ).discover()
+            state = store.save_inventory(
+                account_id=account_id,
+                account_login=account_login,
+                repositories=repositories,
+            )
+        except (GitHubConnectError, OSError, ValueError):
+            try:
+                state = store.load()
+            except (GitHubConnectError, OSError, ValueError):
+                state = None
+            if state is None:
+                self.send_response(303)
+                self.send_header(
+                    "Location",
+                    ui_url("/work", self.ui_locale, error="github-read-failed"),
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            saved_notice = ui_text(
+                self.ui_locale,
+                "GitHub 当前无法刷新；正在显示上次保存的仓库列表。",
+                "GitHub could not refresh now; showing the last saved repository list.",
+            )
+        if (query or {}).get("notice", [""])[0] == "selection-saved":
+            saved_notice = ui_text(
+                self.ui_locale,
+                "仓库选择已保存。",
+                "Repository selection saved.",
+            )
+        if state is None:
+            raise RuntimeError("GitHub repository state is unavailable")
+        body = github_repositories_page(
+            state,
+            locale=self.ui_locale,
+            notice=saved_notice,
         ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -5836,6 +6000,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             return
         if path == "/work":
             self._send_work_page(query)
+            return
+        if path == "/work/github":
+            self._send_github_repositories_page(query)
             return
         resume_job_match = re.fullmatch(
             r"/resume/jobs/(resume-job-[a-f0-9]{12})", path
@@ -6127,7 +6294,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "Credentials are not accepted by this endpoint")
                 return
             outcome = "invalid"
-            if form.get("action") == "save_profile":
+            action = form.get("action")
+            if action == "save_profile":
                 values = {
                     "heygen_avatar_group_id": form.get("avatar_group_id", "").strip(),
                     "heygen_avatar_look_id": form.get("avatar_look_id", "").strip(),
@@ -6493,7 +6661,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             form = _parse_form(self.rfile.read(length)) if length else {}
             self._adopt_ui_locale(form)
             try:
-                receipt = refresh_evidence_catalog(
+                if self.workspace_root is None:
+                    raise ValueError("select one local Git repository first")
+                receipt = refresh_local_project_evidence(
                     self.ui_data_root.absolute(),
                     repository_root=self.workspace_root,
                 )
@@ -6510,6 +6680,89 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                         if receipt.status.value == "succeeded"
                         else {"error": "refresh-failed"}
                     ),
+                )
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/work/github/select":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 64 * 1024:
+                self.send_error(413, "GitHub selection request is too large")
+                return
+            try:
+                values = urllib.parse.parse_qs(
+                    self.rfile.read(length).decode("utf-8"),
+                    keep_blank_values=False,
+                    strict_parsing=False,
+                )
+                self._adopt_ui_locale(
+                    {key: items[0] for key, items in values.items() if items}
+                )
+                repository_ids = [
+                    int(value) for value in values.get("repository", [])
+                ]
+                if any(repository_id <= 0 for repository_id in repository_ids):
+                    raise ValueError("GitHub repository selection is invalid")
+                GitHubConnectionStore(
+                    self.ui_data_root.absolute()
+                ).save_selection(repository_ids)
+            except (GitHubConnectError, UnicodeError, ValueError):
+                location = ui_url(
+                    "/work", self.ui_locale, error="github-selection-invalid"
+                )
+            else:
+                location = ui_url(
+                    "/work/github", self.ui_locale, notice="selection-saved"
+                )
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/work/github/refresh":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "GitHub refresh request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            token = github_access_token()
+            store = GitHubConnectionStore(self.ui_data_root.absolute())
+            try:
+                if token is None or self.desktop_session_token is None:
+                    raise GitHubConnectError("GitHub is not connected")
+                state = store.load()
+                if state is None or not state.selected_repositories:
+                    raise GitHubConnectError("Select at least one GitHub repository")
+                source, items = GitHubReadOnlyClient(token).evidence_snapshot(
+                    account_id=state.account_id,
+                    account_login=state.account_login,
+                    repositories=state.selected_repositories,
+                )
+                receipt = EvidenceHub(
+                    self.ui_data_root.absolute()
+                ).sync_source(source, items=items)
+                if receipt.status.value != "succeeded":
+                    raise EvidenceHubError("GitHub Evidence refresh failed")
+                store.mark_evidence_refresh(receipt_id=receipt.receipt_id)
+            except (EvidenceHubError, GitHubConnectError, OSError, ValueError):
+                try:
+                    store.mark_evidence_refresh(
+                        receipt_id=None, error_code="github_read_failed"
+                    )
+                except (GitHubConnectError, OSError, ValueError):
+                    pass
+                location = ui_url(
+                    "/work", self.ui_locale, error="github-read-failed"
+                )
+            else:
+                location = ui_url(
+                    "/work", self.ui_locale, notice="github-refreshed"
                 )
             self.send_response(303)
             self.send_header("Location", location)
@@ -7254,6 +7507,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     files=submission.files,
                     data_root=data_root,
                     repo_root=self.repo_root,
+                    evidence_repository_root=self.workspace_root,
                     gateway=resume_gateway,
                     expert_gateway=expert_gateway,
                     initial_timings_ms={"post_response_ms": post_response_ms},

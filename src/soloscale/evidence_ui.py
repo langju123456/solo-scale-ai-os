@@ -7,8 +7,8 @@ import html
 from collections.abc import Sequence
 from pathlib import Path
 
-from soloscale.evidence_hub import EvidenceHub
-from soloscale.evidence_hub_models import EvidenceHubStatus, SyncReceipt
+from soloscale.evidence_hub import EvidenceHub, EvidenceHubError, inspect_git_repository
+from soloscale.evidence_hub_models import EvidenceHubStatus, ReceiptStatus, SyncReceipt
 from soloscale.knowledge_store import KnowledgeStore
 from soloscale.ui_shell import DEFAULT_UI_LOCALE, UILocale, render_app_shell, ui_text
 
@@ -33,6 +33,38 @@ def refresh_evidence_catalog(
         buildlog_roots=selected_buildlog_roots,
         git_root=repository_root,
     )
+
+
+def refresh_local_project_evidence(
+    data_root: Path,
+    *,
+    repository_root: Path,
+) -> SyncReceipt:
+    """Incrementally refresh only the Git project explicitly selected by the user."""
+
+    return EvidenceHub(Path(data_root)).sync_git_repository(repository_root)
+
+
+def ensure_local_project_evidence(
+    data_root: Path,
+    *,
+    repository_root: Path,
+) -> bool:
+    """Refresh a selected project only when its deterministic fingerprint changed."""
+
+    root = Path(data_root)
+    current_source, _ = inspect_git_repository(repository_root)
+    if EvidenceHub.catalog_exists(root):
+        stored = EvidenceHub(root).git_repository_snapshot(repository_root)
+        if stored is not None and stored[0].content_sha256 == current_source.content_sha256:
+            return False
+    receipt = refresh_local_project_evidence(
+        root,
+        repository_root=repository_root,
+    )
+    if receipt.status is not ReceiptStatus.SUCCEEDED:
+        raise EvidenceHubError("local project evidence refresh failed")
+    return True
 
 
 def evidence_page(

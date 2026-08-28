@@ -89,6 +89,14 @@ for invalidKey in [" leading", "trailing ", "\nline-break"] {
         // Expected: Swift and Python reject the same unsafe input before startup.
     }
 }
+guard validatedGitHubAppClientID("Iv1.0123456789abcdef") != nil else {
+    fatalError("valid GitHub App client ID was rejected")
+}
+for invalidClientID in [" Iv1.0123456789abcdef", "Iv1.0123456789abcdef ", ".Iv10123456789"] {
+    guard validatedGitHubAppClientID(invalidClientID) == nil else {
+        fatalError("invalid GitHub App client ID was accepted")
+    }
+}
 print("authenticated readiness and bootstrap checks passed")
 
 private extension Data {

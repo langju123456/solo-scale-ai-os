@@ -524,6 +524,26 @@ def test_advanced_page_is_bilingual_and_hides_command_language(tmp_path: Path) -
     assert "Run knowledge-status" not in english
 
 
+def test_packaged_knowledge_refresh_runs_in_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fail_subprocess(*_args: object, **_kwargs: object) -> UIActionResult:
+        raise AssertionError("packaged knowledge refresh must not launch the backend as Python")
+
+    monkeypatch.setattr("soloscale.local_ui._run_command", fail_subprocess)
+
+    result = _run_action(
+        {"action": "knowledge-sync"},
+        tmp_path / "data",
+        tmp_path,
+    )
+
+    assert result is not None
+    assert result.return_code == 0
+    assert result.command == "in-process knowledge refresh"
+    assert "Discovered 0" in result.stdout
+
+
 def test_ai_provider_preference_is_shared_and_persists_privately(tmp_path: Path) -> None:
     data_root = tmp_path / ".soloscale"
     preference = _save_ai_provider_preference(

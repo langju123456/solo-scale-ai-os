@@ -1,12 +1,15 @@
 import hashlib
 import io
 import json
+import subprocess
 import zipfile
+from pathlib import Path
 from xml.etree import ElementTree
 
 import pytest
 from pydantic import ValidationError
 
+from soloscale.evidence_hub import EvidenceHub, EvidenceHubError
 from soloscale.resume_docx import (
     ResumeTemplateError,
     ResumeValidationRuleCode,
@@ -255,17 +258,51 @@ Requirements:
     assert all(signal in job_description for signal in signals)
 
 
-def test_candidate_evidence_pack_adds_compact_verified_soloscale_facts() -> None:
+def test_candidate_evidence_pack_adds_fresh_committed_project_facts(
+    tmp_path: Path,
+) -> None:
     profile = CandidateProfile(
         skills=["Python, RAG"],
         project_bullets=["Built SoloScale AI OS with evidence-grounded workflows."],
     )
+    repository = tmp_path / "solo-scale-ai-os"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    (repository / "feature.txt").write_text("background job", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "feature.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "feat: add non-blocking resume jobs",
+        ],
+        check=True,
+    )
+    data_root = tmp_path / "data"
+    EvidenceHub(data_root).sync_git_repository(repository)
+    assert b"background job" not in EvidenceHub(data_root).database_path.read_bytes()
 
-    first = build_candidate_evidence_pack(profile)
-    second = build_candidate_evidence_pack(profile)
+    first = build_candidate_evidence_pack(
+        profile,
+        data_root=data_root,
+        repository_root=repository,
+    )
+    second = build_candidate_evidence_pack(
+        profile,
+        data_root=data_root,
+        repository_root=repository,
+    )
 
     assert first.pack_sha256 == second.pack_sha256
     assert {source.evidence_id for source in first.sources} == {
+        "EVIDENCE-LOCAL-GIT",
         "EVIDENCE-M1-13",
         "EVIDENCE-M1-14",
         "EVIDENCE-M1-15",
@@ -275,6 +312,10 @@ def test_candidate_evidence_pack_adds_compact_verified_soloscale_facts() -> None
     ]
     assert len(candidate_facts) >= 15
     assert {fact.profile_entry_id for fact in candidate_facts} == {"PROFILE-01"}
+    assert any(
+        fact.text == "Verified repository commit: feat: add non-blocking resume jobs"
+        for fact in candidate_facts
+    )
 
     brief = build_jd_positioning_brief(
         "AI Engineer\nBuild Python RAG pipelines and reliable background jobs.",
@@ -287,6 +328,14 @@ def test_candidate_evidence_pack_adds_compact_verified_soloscale_facts() -> None
     assert set(brief.priority_fact_ids) <= {
         fact.fact_id for fact in first.atomic_facts
     }
+
+    (repository / "feature.txt").write_text("changed but not refreshed", encoding="utf-8")
+    with pytest.raises(EvidenceHubError, match="stale"):
+        build_candidate_evidence_pack(
+            profile,
+            data_root=data_root,
+            repository_root=repository,
+        )
 
 
 def test_selective_rewrite_keeps_supported_claim_and_restores_rejected_claim() -> None:
