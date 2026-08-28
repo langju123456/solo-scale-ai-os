@@ -852,7 +852,7 @@ private struct LocalWebView: NSViewRepresentable {
             panel.prompt = "Choose"
             panel.allowsMultipleSelection = parameters.allowsMultipleSelection
             panel.canChooseDirectories = parameters.allowsDirectories
-            panel.canChooseFiles = !parameters.allowsDirectories
+            panel.canChooseFiles = true
             if panel.canChooseFiles {
                 panel.allowedContentTypes = [
                     UTType(filenameExtension: "docx"),
