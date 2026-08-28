@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
+from soloscale.casebook_store import CasebookStore
 from soloscale.content_canon import load_month_one_canon
 from soloscale.content_distribution import (
     ContentDistributionError,
@@ -99,6 +100,20 @@ from soloscale.knowledge_models import RetrievalHit
 from soloscale.knowledge_store import (
     KnowledgeStore,
     KnowledgeStoreError,
+)
+from soloscale.learning_practice import (
+    ExerciseStatus,
+    ExerciseType,
+    LearningExercise,
+    PracticeLanguage,
+    create_practice_workspace,
+    generate_practice_exercise,
+    ingest_practice_completion,
+    list_exercises,
+    load_exercise,
+    open_practice_workspace,
+    practice_workspace_root,
+    save_exercise,
 )
 from soloscale.learning_traceability import (
     DEFAULT_TARGET_REQUIREMENT,
@@ -5283,6 +5298,209 @@ def _anchor_pack_html(pack: dict[str, object], locale: UILocale) -> str:
 """
 
 
+def _practice_panel_html(data_root: Path, form: dict[str, str], locale: UILocale) -> str:
+    try:
+        cases = CasebookStore(data_root).list_cases()
+    except (OSError, ValueError):
+        cases = []
+    if not cases:
+        return f"""<section class="panel practice-panel" id="practice">
+  <h2>{_escape(ui_text(locale, '编码练习（VS Code）', 'Coding practice (VS Code)'))}</h2>
+  <p class="muted">{_escape(ui_text(locale, '先创建一个学习案例（CLI：soloscale case-create …），这里会把案例缺口变成可练习的编码任务。', 'Create a Learning case first (CLI: soloscale case-create …) to turn the case gap into a bounded coding task.'))}</p>
+</section>"""
+    latest = max(cases, key=lambda case: case.created_at)
+    exercises = [
+        item for item in list_exercises(data_root) if item.case_id == latest.id
+    ]
+    target_requirement = _escape(
+        form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT)
+    )
+    type_options = "".join(
+        f'<option value="{item.value}" {"selected" if item is ExerciseType.IMPLEMENT else ""}>{item.value}</option>'
+        for item in ExerciseType
+    )
+    language_options = "".join(
+        f'<option value="{item.value}" {"selected" if item is PracticeLanguage.PYTHON else ""}>{item.value}</option>'
+        for item in PracticeLanguage
+    )
+    exercise_rows = "".join(
+        _render_practice_exercise_row(item, locale) for item in exercises
+    )
+    return f"""<section class="panel practice-panel" id="practice">
+  <h2>{_escape(ui_text(locale, '编码练习（VS Code）', 'Coding practice (VS Code)'))}</h2>
+  <p class="muted">{_escape(ui_text(locale, '把案例缺口变成有边界、可测试、可回填掌握度的练习任务。', 'Turn the case gap into a bounded, testable task that feeds back into mastery.'))}</p>
+  <form class="practice-create" method="post" action="/learning/practice/create">
+    <input type="hidden" name="ui_locale" value="{locale}" />
+    <input type="hidden" name="case_id" value="{_escape(latest.id)}" />
+    <label>{_escape(ui_text(locale, 'JD 要求', 'JD requirement'))}
+      <input name="target_requirement" value="{target_requirement}" required />
+    </label>
+    <label>{_escape(ui_text(locale, '类型', 'Type'))}<select name="exercise_type">{type_options}</select></label>
+    <label>{_escape(ui_text(locale, '语言', 'Language'))}<select name="practice_language">{language_options}</select></label>
+    <label>{_escape(ui_text(locale, '难度', 'Difficulty'))}<select name="difficulty">
+      <option value="1">1</option><option value="2" selected>2</option><option value="3">3</option>
+      <option value="4">4</option><option value="5">5</option>
+    </select></label>
+    <button type="submit">{_escape(ui_text(locale, '生成练习工作区', 'Create practice workspace'))}</button>
+  </form>
+  <div class="practice-list">{exercise_rows}</div>
+</section>"""
+
+
+def _render_practice_exercise_row(item: LearningExercise, locale: UILocale) -> str:
+    actions: list[str] = []
+    if item.status is not ExerciseStatus.COMPLETED:
+        actions.append(
+            f"""<form method="post" action="/learning/practice/open">
+  <input type="hidden" name="exercise_id" value="{_escape(item.id)}" />
+  <button type="submit">{_escape(ui_text(locale, '在 VS Code 中打开', 'Open in VS Code'))}</button>
+</form>"""
+        )
+        actions.append(
+            f"""<form class="practice-complete" method="post" action="/learning/practice/complete" enctype="multipart/form-data">
+  <input type="hidden" name="exercise_id" value="{_escape(item.id)}" />
+  <label>{_escape(ui_text(locale, '证据文件（通过需要非空文件）', 'Evidence file (required for pass)'))}
+    <input type="file" name="evidence" accept=".py,.md,.txt,.ts,.sql,.sh,.json,.log" />
+  </label>
+  <label>{_escape(ui_text(locale, '通过', 'Passed'))}<input type="number" name="tests_passed" value="0" min="0" /></label>
+  <label>{_escape(ui_text(locale, '失败', 'Failed'))}<input type="number" name="tests_failed" value="0" min="0" /></label>
+  <label>{_escape(ui_text(locale, '说明（未完成时必填）', 'Note (required when not passing)'))}
+    <textarea name="note" rows="2"></textarea>
+  </label>
+  <button type="submit">{_escape(ui_text(locale, '提交练习结果', 'Submit practice result'))}</button>
+</form>"""
+        )
+    return f"""<article class="practice-item">
+  <h3>{_escape(item.exercise_type.value)} · <code>{_escape(item.id)}</code></h3>
+  <p class="muted">{_escape(ui_text(locale, '状态', 'Status'))} <strong>{_escape(item.status.value)}</strong>
+    · {_escape(ui_text(locale, '语言', 'Language'))} {_escape(item.practice_language.value)}
+    · {_escape(ui_text(locale, '难度', 'Difficulty'))} {item.difficulty}/5</p>
+  <p class="muted"><code>{_escape(item.workspace_path or '')}</code></p>
+  <div class="practice-actions">{"".join(actions)}</div>
+</article>"""
+
+
+def _create_practice_exercise_ui(fields: dict[str, str], data_root: Path) -> UIActionResult:
+    case_id = fields.get("case_id", "").strip()
+    requirement = fields.get("target_requirement", "").strip()
+    if not case_id or not requirement:
+        return UIActionResult(
+            "learning-practice",
+            "create practice workspace",
+            1,
+            "",
+            "请选择学习案例并填写 JD 要求。",
+            0,
+        )
+    try:
+        store = CasebookStore(data_root)
+        case = store.load_case(case_id)
+        exercise = generate_practice_exercise(
+            case=case,
+            jd_requirement=requirement,
+            exercise_type=ExerciseType(fields.get("exercise_type", "IMPLEMENT")),
+            difficulty=int(fields.get("difficulty", "2") or "2"),
+            practice_language=PracticeLanguage(fields.get("practice_language", "python")),
+        )
+        workspace = create_practice_workspace(exercise, data_root)
+    except (ValueError, OSError, KeyError) as exc:
+        return UIActionResult("learning-practice", "create practice workspace", 1, "", str(exc), 0)
+    return UIActionResult(
+        "learning-practice",
+        "create practice workspace",
+        0,
+        f"练习工作区已创建（USER_PRACTICE_REQUIRED）：{workspace}",
+        "",
+        0,
+    )
+
+
+def _open_practice_exercise_ui(fields: dict[str, str], data_root: Path) -> UIActionResult:
+    exercise_id = fields.get("exercise_id", "").strip()
+    if not exercise_id:
+        return UIActionResult("learning-practice", "open practice workspace", 1, "", "缺少练习 ID。", 0)
+    try:
+        exercise = load_exercise(exercise_id, data_root)
+        if not exercise.workspace_path:
+            raise ValueError("exercise has no practice workspace yet")
+        workspace = Path(exercise.workspace_path)
+        opened = open_practice_workspace(workspace)
+        if opened:
+            save_exercise(
+                exercise.model_copy(update={"status": ExerciseStatus.OPENED}),
+                data_root,
+            )
+    except (ValueError, OSError) as exc:
+        return UIActionResult("learning-practice", "open practice workspace", 1, "", str(exc), 0)
+    message = (
+        f"已在 VS Code 打开：{workspace}"
+        if opened
+        else f"未检测到 code CLI，请手动打开：{workspace}"
+    )
+    return UIActionResult(
+        "learning-practice",
+        "open practice workspace",
+        0 if opened else 1,
+        message,
+        "",
+        0,
+    )
+
+
+def _complete_practice_exercise_ui(
+    fields: dict[str, str],
+    files: dict[str, UploadedFile],
+    data_root: Path,
+) -> UIActionResult:
+    exercise_id = fields.get("exercise_id", "").strip()
+    if not exercise_id:
+        return UIActionResult("learning-practice", "complete practice", 1, "", "缺少练习 ID。", 0)
+    evidence = files.get("evidence")
+    try:
+        exercise = load_exercise(exercise_id, data_root)
+        store = CasebookStore(data_root)
+        temporary: Path | None = None
+        evidence_path: Path | None = None
+        if evidence is not None and evidence.content:
+            uploads = practice_workspace_root(data_root)
+            uploads.mkdir(mode=0o700, parents=True, exist_ok=True)
+            suffix = Path(evidence.filename).suffix or ".bin"
+            temporary = uploads / f".upload-{uuid4().hex}{suffix}"
+            temporary.write_bytes(evidence.content)
+            temporary.chmod(0o600)
+            evidence_path = temporary
+        try:
+            receipt, result = ingest_practice_completion(
+                store=store,
+                exercise=exercise,
+                evidence_path=evidence_path,
+                tests_passed=int(fields.get("tests_passed", "0") or "0"),
+                tests_failed=int(fields.get("tests_failed", "0") or "0"),
+                note=fields.get("note", "") or None,
+            )
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    except (ValueError, OSError) as exc:
+        return UIActionResult("learning-practice", "complete practice", 1, "", str(exc), 0)
+    outcome = "PASS" if receipt.completed else "NEEDS_WORK"
+    before = receipt.mastery_before.value if receipt.mastery_before else "L0 Seen"
+    after = receipt.mastery_after.value if receipt.mastery_after else "L0 Seen"
+    next_action = result.mastery.next_stage.value if result.mastery.next_stage else "COMPLETE"
+    ready = "是" if receipt.interview_ready else "否"
+    return UIActionResult(
+        "learning-practice",
+        "complete practice",
+        0 if receipt.completed else 1,
+        (
+            f"已记录 {outcome}。掌握：{before} → {after}；"
+            f"面试就绪：{ready}；下一步：{next_action}"
+        ),
+        "",
+        0,
+    )
+
+
 def _learning_page(
     data_root: Path,
     repo_root: Path | None,
@@ -5599,6 +5817,7 @@ def _learning_page(
   <article data-learning-capability="trace" data-state="{trace_state}"><span>TRACE</span><strong>{_escape(capability_state_labels[trace_state])}</strong></article>
   <article data-learning-capability="debug" data-state="{debug_state}"><span>DEBUG</span><strong>{_escape(capability_state_labels[debug_state])}</strong></article>
 </section>"""
+    practice_panel = _practice_panel_html(data_root, form, locale)
     body = f"""
     {work_summary}
     {repository_notice}
@@ -5612,6 +5831,7 @@ def _learning_page(
     </form>
     {result_html}
     {dashboard}
+    {practice_panel}
     """
     learning_current_url = ui_url(
         "/learning",
@@ -9055,6 +9275,51 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header("Location", ui_url("/creator/publish", self.ui_locale))
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if path == "/learning/practice/create":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            practice_form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(practice_form)
+            self.latest_learning_form = dict(practice_form)
+            self._send_learning_page(
+                _create_practice_exercise_ui(
+                    practice_form, self.ui_data_root.absolute()
+                )
+            )
+            return
+        if path == "/learning/practice/open":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            practice_form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(practice_form)
+            self.latest_learning_form = dict(practice_form)
+            self._send_learning_page(
+                _open_practice_exercise_ui(
+                    practice_form, self.ui_data_root.absolute()
+                )
+            )
+            return
+        if path == "/learning/practice/complete":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            body = self.rfile.read(length)
+            try:
+                practice_submission = _parse_submission(
+                    body, self.headers.get("Content-Type", "")
+                )
+            except (UnicodeError, ValueError) as exc:
+                result = UIActionResult(
+                    "learning-practice", "complete practice", 1, "", str(exc), 0
+                )
+                self._send_learning_page(result)
+                return
+            self._adopt_ui_locale(practice_submission.fields)
+            self.latest_learning_form = dict(practice_submission.fields)
+            self._send_learning_page(
+                _complete_practice_exercise_ui(
+                    practice_submission.fields,
+                    practice_submission.files,
+                    self.ui_data_root.absolute(),
+                )
+            )
             return
         if path == "/learning/run":
             length = int(self.headers.get("Content-Length", "0") or 0)

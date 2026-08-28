@@ -38,6 +38,15 @@ from soloscale.evidence_ui import refresh_evidence_catalog
 from soloscale.handoff import packet_from_task, render_packet_markdown
 from soloscale.knowledge_models import ParsedSource, SourceFailure, SourceKind, SyncReport
 from soloscale.knowledge_store import KnowledgeStore, KnowledgeStoreError
+from soloscale.learning_practice import (
+    ExerciseType,
+    PracticeLanguage,
+    create_practice_workspace,
+    generate_practice_exercise,
+    ingest_practice_completion,
+    load_exercise,
+    open_practice_workspace,
+)
 from soloscale.models import (
     LatencyTolerance,
     ReasoningDepth,
@@ -623,6 +632,152 @@ def case_status(
         label = "NOT STARTED" if result is None else result.value.replace("-", " ").upper()
         stages.add_row(practice_stage.value.upper(), label)
     console.print(stages)
+
+
+@app.command("learning-exercise-create")
+def learning_exercise_create(
+    case: Annotated[str, typer.Argument(help="Case ID or path to case.json")],
+    requirement: Annotated[str, typer.Option("--requirement", help="JD requirement to practice")],
+    exercise_type: Annotated[
+        ExerciseType,
+        typer.Option("--type", help="Exercise type"),
+    ] = ExerciseType.IMPLEMENT,
+    difficulty: Annotated[
+        int,
+        typer.Option("--difficulty", min=1, max=5, help="Difficulty 1-5"),
+    ] = 2,
+    language: Annotated[
+        PracticeLanguage,
+        typer.Option("--language", help="Practice language"),
+    ] = PracticeLanguage.PYTHON,
+    claim: Annotated[
+        str | None,
+        typer.Option(help="Optional Resume claim this exercise trains"),
+    ] = None,
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private SoloScale data root"),
+    ] = Path(".soloscale"),
+) -> None:
+    case_id, resolved_root = _resolve_case_target(case, data_root)
+    _validate_private_data_root(resolved_root)
+    try:
+        store = CasebookStore(resolved_root)
+        learning_case = store.load_case(case_id)
+        exercise = generate_practice_exercise(
+            case=learning_case,
+            jd_requirement=requirement,
+            resume_claim=claim,
+            exercise_type=exercise_type,
+            difficulty=difficulty,
+            practice_language=language,
+        )
+        workspace = create_practice_workspace(exercise, resolved_root)
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(f"[green]Created exercise[/green] {exercise.id}")
+    console.print(
+        f"Type: {exercise.exercise_type.value} | Language: {exercise.practice_language.value}"
+    )
+    console.print(f"Mastery capability: {exercise.mastery_capability.value}")
+    console.print(f"Practice workspace: {workspace}")
+    console.print("Status: USER_PRACTICE_REQUIRED — open it in VS Code and complete the task.")
+
+
+@app.command("learning-exercise-open")
+def learning_exercise_open(
+    exercise: Annotated[str, typer.Argument(help="Exercise ID")],
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private SoloScale data root"),
+    ] = Path(".soloscale"),
+) -> None:
+    _validate_private_data_root(data_root)
+    try:
+        stored = load_exercise(exercise, data_root)
+        if not stored.workspace_path:
+            raise ValueError("exercise has no practice workspace yet")
+        workspace = Path(stored.workspace_path)
+        opened = open_practice_workspace(workspace)
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if opened:
+        console.print(f"[green]Opened[/green] {workspace} in VS Code.")
+    else:
+        console.print("[yellow]code CLI not found[/yellow]; open the folder manually:")
+        console.print(workspace)
+
+
+@app.command("learning-exercise-complete")
+def learning_exercise_complete(
+    exercise: Annotated[str, typer.Argument(help="Exercise ID")],
+    evidence: Annotated[
+        Path | None,
+        typer.Option(help="Practice artifact (required for a pass)"),
+    ] = None,
+    tests_passed: Annotated[
+        int,
+        typer.Option("--tests-passed", min=0, help="Tests that passed"),
+    ] = 0,
+    tests_failed: Annotated[
+        int,
+        typer.Option("--tests-failed", min=0, help="Tests that failed"),
+    ] = 0,
+    attempts: Annotated[
+        int,
+        typer.Option("--attempts", min=1, help="Practice attempts used"),
+    ] = 1,
+    note: Annotated[
+        str | None,
+        typer.Option(help="Attempt note (required for needs-work)"),
+    ] = None,
+    changed_file: Annotated[
+        list[str] | None,
+        typer.Option("--changed-file", help="Changed file; repeat as needed"),
+    ] = None,
+    hint: Annotated[
+        list[str] | None,
+        typer.Option("--hint", help="Tutor escalation step used; repeat as needed"),
+    ] = None,
+    git_commit: Annotated[
+        str | None,
+        typer.Option("--git-commit", help="Optional git commit of the practice work"),
+    ] = None,
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private SoloScale data root"),
+    ] = Path(".soloscale"),
+) -> None:
+    _validate_private_data_root(data_root)
+    try:
+        store = CasebookStore(data_root)
+        stored = load_exercise(exercise, data_root)
+        receipt, result = ingest_practice_completion(
+            store=store,
+            exercise=stored,
+            evidence_path=evidence,
+            files_changed=changed_file or (),
+            tests_passed=tests_passed,
+            tests_failed=tests_failed,
+            attempts=attempts,
+            hints_used=hint or (),
+            note=note,
+            git_commit=git_commit,
+        )
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    outcome = "PASS" if receipt.completed else "NEEDS_WORK"
+    snapshot = result.mastery
+    next_action = snapshot.next_stage.value.upper() if snapshot.next_stage else "COMPLETE"
+    console.print(f"[green]Recorded[/green] {outcome} for {exercise}")
+    console.print(
+        f"Mastery: {receipt.mastery_before.value if receipt.mastery_before else 'L0 Seen'} -> "
+        f"{receipt.mastery_after.value if receipt.mastery_after else 'L0 Seen'}"
+    )
+    console.print(
+        f"Interview ready: {'yes' if receipt.interview_ready else 'no'} | "
+        f"Next mastery action: {next_action}"
+    )
 
 
 @app.command("control-tower-build")
