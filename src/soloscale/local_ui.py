@@ -62,6 +62,7 @@ from soloscale.creator_accounts import (
     normalize_account,
     save_creator_account,
 )
+from soloscale.creator_workspace import creator_history_page, creator_overview_page
 from soloscale.desktop_credentials import (
     DesktopCredentialError,
     configure_desktop_credentials_from_stdin,
@@ -3746,14 +3747,14 @@ def _home_activity_html(
                 f'''<article class="activity-card"><span class="activity-state">{_escape(state_copy)}</span>
                 <strong>{_escape(ui_text(locale, '最近内容包', 'Recent content bundle'))}</strong>
                 <p>{_escape(ui_text(locale, '统一内容包已私有保存；发布仍需要你的最终确认。', 'The unified bundle is saved privately; publication still requires your final confirmation.'))}</p>
-                <a href="{_escape(ui_url('/content', locale, run_id=content_dir.name))}">{_escape(action_copy)} →</a></article>'''
+                <a href="{_escape(ui_url('/creator/create', locale, run_id=content_dir.name))}">{_escape(action_copy)} →</a></article>'''
             )
 
     cards.append(
         f'''<article class="activity-card"><span class="activity-state">{_escape(ui_text(locale, '本地', 'Local'))}</span>
         <strong>{_escape(ui_text(locale, '扫描我最近做的事', 'Scan my recent work'))}</strong>
         <p>{_escape(ui_text(locale, '只读取已有本地回执和元数据，不调用模型。', 'Uses existing local receipts and metadata without a model call.'))}</p>
-        <a href="{_escape(ui_url('/content', locale, scan_range='today'))}">{_escape(ui_text(locale, '扫描今天', 'Scan today'))} →</a></article>'''
+        <a href="{_escape(ui_url('/creator/create', locale, scan_range='today'))}">{_escape(ui_text(locale, '扫描今天', 'Scan today'))} →</a></article>'''
     )
     return f'''<section class="today-activity" aria-label="{_escape(ui_text(locale, '最近工作', 'Recent work'))}">
     <span class="kicker">{_escape(ui_text(locale, '继续上次工作', 'Continue where you left off'))}</span>
@@ -3796,7 +3797,7 @@ def _home_page(
     <span class="outcome-action">{_escape(ui_text(locale, '开始面试准备', 'Prepare for an interview'))}<span aria-hidden="true">→</span></span>
   </article>
   <article class="outcome-card visibility-card">
-    <a class="outcome-hitbox" href="{ui_url('/content', locale)}" aria-label="{_escape(ui_text(locale, '把工作变成内容', 'Turn my work into content'))}"></a>
+    <a class="outcome-hitbox" href="{ui_url('/creator', locale)}" aria-label="{_escape(ui_text(locale, '把工作变成内容', 'Turn my work into content'))}"></a>
     <span class="outcome-number">03</span>
     <span class="kicker">{_escape(ui_text(locale, '建立影响力', 'Build visibility'))}</span>
     <h2>{_escape(ui_text(locale, '把真实工作变成可信的公开内容', 'Turn real work into credible public content'))}</h2>
@@ -5708,6 +5709,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         notice: str | None = None,
         scan_range: str | None = None,
         candidate_id: str | None = None,
+        workspace_view: Literal["all", "stories", "create"] = "all",
+        canon_story_id: str | None = None,
+        canon_format: str | None = None,
     ) -> None:
         video_snapshot = (
             self.creator_video_job_manager.get(run_id)
@@ -5734,6 +5738,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             candidate_id=candidate_id,
             creator_video_phase=(video_snapshot.phase if video_snapshot else None),
             creator_video_error=(video_snapshot.error if video_snapshot else None),
+            workspace_view=workspace_view,
+            canon_story_id=canon_story_id,
+            canon_format=canon_format,
         )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -6083,6 +6090,60 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 None, saved_stage if saved_stage in {"explain", "trace"} else None
             )
             return
+        if path == "/creator":
+            body = creator_overview_page(
+                self.ui_data_root.absolute(), locale=self.ui_locale
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/creator/stories":
+            self._send_content_page(workspace_view="stories")
+            return
+        if path == "/creator/create":
+            _apply_ai_provider_preference(
+                self.latest_content_form, self.ui_data_root.absolute()
+            )
+            self._send_content_page(
+                run_id=query.get("run_id", [""])[0] or None,
+                scan_range=query.get("scan_range", [None])[0],
+                candidate_id=query.get("candidate_id", [None])[0],
+                workspace_view="create",
+                canon_story_id=query.get("canon_story_id", [None])[0],
+                canon_format=query.get("canon_format", [None])[0],
+            )
+            return
+        if path == "/creator/publish":
+            body = editorial_publishing_page(
+                data_root=self.ui_data_root.absolute(),
+                locale=self.ui_locale,
+                creator_mode=True,
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/creator/history":
+            body = creator_history_page(
+                self.ui_data_root.absolute(), locale=self.ui_locale
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/content":
             _apply_ai_provider_preference(
                 self.latest_content_form, self.ui_data_root.absolute()
@@ -6121,6 +6182,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 notice=review_notice or reference_notice,
                 scan_range=query.get("scan_range", [None])[0],
                 candidate_id=query.get("candidate_id", [None])[0],
+                workspace_view="create",
             )
             return
         if path == "/creator/accounts":
@@ -7010,6 +7072,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 return
             self.latest_content_form = _parse_form(self.rfile.read(length))
             self._adopt_ui_locale(self.latest_content_form)
+            creator_view = self.latest_content_form.get("creator_view") == "create"
             content_gateway: ModelGateway | None = None
             if self.latest_content_form.get("generation_mode") != "template":
                 _apply_ai_provider_preference(
@@ -7024,13 +7087,16 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 gateway=content_gateway,
             )
             if content_result.run_id is None:
-                self._send_content_page(result=content_result)
+                self._send_content_page(
+                    result=content_result,
+                    workspace_view="create" if creator_view else "all",
+                )
                 return
             self.send_response(303)
             self.send_header(
                 "Location",
                 ui_url(
-                    "/content#results",
+                    "/creator/create#results" if creator_view else "/content#results",
                     self.ui_locale,
                     run_id=content_result.run_id,
                 ),

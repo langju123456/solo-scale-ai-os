@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from soloscale.ui_shell import UILocale, render_app_shell, ui_text
+from soloscale.ui_shell import UILocale, render_app_shell, render_creator_nav, ui_text
 
 CreatorPlatform = Literal[
     "douyin", "xiaohongshu", "youtube", "x", "linkedin", "github", "independent_site"
@@ -177,9 +177,9 @@ def creator_accounts_page(
 <label>{ui_text(locale, "状态", "Status")}<select name="status">{options}</select></label><button type="submit">{ui_text(locale, "保存", "Save")}</button></form>
 </details></div></article>''')
     notice_html = f'<p class="notice">{html.escape(notice)}</p>' if notice else ""
-    body = f'''{notice_html}<section class="boundary"><strong>{ui_text(locale, "这里只保存入口信息", "This stores entry links only")}</strong><p>{ui_text(locale, "不连接 OAuth，不自动发布，也不读取 Analytics 或 Inbox。", "No OAuth, automatic publishing, Analytics, or Inbox access.")}</p></section><section class="account-grid">{"".join(cards)}</section>'''
+    body = f'''{render_creator_nav(active="accounts", locale=locale)}{notice_html}<section class="boundary"><strong>{ui_text(locale, "这里只保存入口信息", "This stores entry links only")}</strong><p>{ui_text(locale, "不连接 OAuth，不自动发布，也不读取 Analytics 或 Inbox。", "No OAuth, automatic publishing, Analytics, or Inbox access.")}</p></section><section class="account-grid">{"".join(cards)}</section>'''
     return render_app_shell(
-        active="accounts", locale=locale, current_url="/creator/accounts",
+        active="content", locale=locale, current_url="/creator/accounts",
         title=f"SoloScale · {ui_text(locale, '账号中心', 'Account Center')}",
         eyebrow=ui_text(locale, "建立影响力", "Build visibility"),
         heading=ui_text(locale, "所有账号入口，一个地方管理。", "Manage every account entry in one place."),

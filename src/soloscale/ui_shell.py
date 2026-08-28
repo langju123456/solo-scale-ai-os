@@ -33,14 +33,22 @@ _NAV_ITEMS: tuple[tuple[str, str, str, str], ...] = (
     ("home", "/", "首页", "Home"),
     ("resume", "/resume", "找到机会", "Get the job"),
     ("learning", "/learning", "面试准备", "Defend the job"),
-    ("content", "/content", "建立影响力", "Build visibility"),
+    ("content", "/creator", "建立影响力", "Build visibility"),
 )
 _MORE_ITEMS: tuple[tuple[str, str, str, str], ...] = (
-    ("accounts", "/creator/accounts", "账号中心", "Account Center"),
     ("work", "/work", "我的工作资料", "Your work"),
     ("video", "/video", "创建视频", "Create video"),
     ("publishing", "/publishing", "发布内容", "Publish content"),
     ("advanced", "/advanced", "设置与高级工具", "Settings & advanced"),
+)
+
+_CREATOR_ITEMS: tuple[tuple[str, str, str, str], ...] = (
+    ("overview", "/creator", "总览", "Overview"),
+    ("accounts", "/creator/accounts", "账号", "Accounts"),
+    ("stories", "/creator/stories", "故事库", "Story Bank"),
+    ("create", "/creator/create", "创作", "Create"),
+    ("publish", "/creator/publish", "发布队列", "Publish Queue"),
+    ("history", "/creator/history", "历史与成本", "History / Cost"),
 )
 
 
@@ -77,6 +85,25 @@ def render_source_state(state: SourceState, locale: UILocale) -> str:
         f'aria-label="{html.escape(label)}">'
         f'<span class="source-state-symbol" aria-hidden="true">{symbol}</span>'
         f"<span>{html.escape(label)}</span></span>"
+    )
+
+
+def render_creator_nav(*, active: str, locale: UILocale) -> str:
+    """Render the stable Creator workspace information architecture."""
+    links = []
+    for key, path, chinese, english in _CREATOR_ITEMS:
+        current = key == active
+        aria_current = ' aria-current="page"' if current else ""
+        links.append(
+            f'<a class="creator-link{" active" if current else ""}" '
+            f'href="{ui_url(path, locale)}"'
+            f"{aria_current}>"
+            f'{html.escape(ui_text(locale, chinese, english))}</a>'
+        )
+    return (
+        f'<nav class="creator-nav" aria-label="{html.escape(ui_text(locale, "创作者工作区", "Creator workspace"))}">'
+        + "".join(links)
+        + "</nav>"
     )
 
 
@@ -181,6 +208,12 @@ a { color:var(--brand); }
   box-shadow:var(--shadow-card); }
 .more-link { width:100%; }
 .locale-switch { border:1px solid var(--border); min-width:48px; justify-content:center; }
+.creator-nav { display:flex; gap:6px; margin:-18px 0 28px; padding:6px; overflow-x:auto;
+  border:1px solid var(--border); border-radius:15px; background:var(--surface-subtle); }
+.creator-link { min-height:40px; display:flex; align-items:center; flex:0 0 auto; padding:0 12px;
+  border-radius:10px; color:var(--text-muted); text-decoration:none; font-size:13px; font-weight:800; }
+.creator-link:hover,.creator-link.active { color:var(--brand); background:var(--surface);
+  box-shadow:0 1px 4px rgb(34 44 75 / 9%); }
 .app-hero { max-width:800px; margin:0 auto 34px; text-align:center; }
 .app-hero.compact { max-width:none; margin:0 0 24px; text-align:left; }
 .eyebrow,.kicker,.result-kicker { color:var(--brand); font-size:12px; font-weight:850;

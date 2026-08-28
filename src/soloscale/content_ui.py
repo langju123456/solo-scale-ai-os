@@ -76,6 +76,7 @@ from soloscale.ui_shell import (
     DEFAULT_UI_LOCALE,
     UILocale,
     render_app_shell,
+    render_creator_nav,
     ui_text,
     ui_url,
 )
@@ -935,6 +936,7 @@ def editorial_publishing_page(
     data_root: Path,
     error: str | None = None,
     locale: UILocale = DEFAULT_UI_LOCALE,
+    creator_mode: bool = False,
 ) -> str:
     """Render the separate, sealed-editorial-package publishing flow."""
 
@@ -948,11 +950,12 @@ def editorial_publishing_page(
         f'''<article class="package-history-card"><span class="status-badge">{_escape(ui_text(locale, '预览就绪', 'Preview ready'))}</span>
         <strong>{_escape(str(package['run_id']))}</strong>
         <p>{_escape(ui_text(locale, 'LinkedIn / X 由 BuildLog 控制；YouTube 为人工上传包。', 'LinkedIn / X remain BuildLog-controlled; YouTube is a manual upload package.'))}</p>
-        <a href="{ui_url('/content', locale, run_id=str(package['run_id']))}">{_escape(ui_text(locale, '打开完整内容包', 'Open full content package'))} →</a></article>'''
+        <a href="{ui_url('/creator/create' if creator_mode else '/content', locale, run_id=str(package['run_id']))}">{_escape(ui_text(locale, '打开完整内容包', 'Open full content package'))} →</a></article>'''
         for package in packages
     ) or f'''<article class="package-history-card empty"><strong>{_escape(ui_text(locale, '还没有统一发布包', 'No unified distribution package yet'))}</strong>
     <p>{_escape(ui_text(locale, '在 Content 中批准文案并生成双尺寸视频后即可准备。', 'Approve copy and render both video sizes in Content to prepare one.'))}</p></article>'''
-    body = f"""<section class="panel package-history"><span class="kicker">{_escape(ui_text(locale, 'SoloScale 内容历史', 'SoloScale content history'))}</span>
+    creator_nav = render_creator_nav(active="publish", locale=locale) if creator_mode else ""
+    body = f"""{creator_nav}<section class="panel package-history"><span class="kicker">{_escape(ui_text(locale, 'SoloScale 内容历史', 'SoloScale content history'))}</span>
 <h2>{_escape(ui_text(locale, '已批准、可继续处理的发布包', 'Approved packages ready for the next action'))}</h2>
 <div class="package-history-grid">{package_cards}</div></section>
 <section class="panel publishing-intake">
@@ -966,9 +969,9 @@ def editorial_publishing_page(
 <button type="submit">{_escape(ui_text(locale, '校验并预览计划', 'Verify and preview plan'))}</button></form></section>
 <div class="publishing-grid">{cards}</div>"""
     return render_app_shell(
-        active="publishing",
+        active="content" if creator_mode else "publishing",
         locale=locale,
-        current_url="/publishing",
+        current_url="/creator/publish" if creator_mode else "/publishing",
         title=f"SoloScale · {ui_text(locale, '发布中心', 'Publishing Center')}",
         eyebrow=ui_text(locale, "发布中心", "Publishing center"),
         heading=ui_text(locale, "把发布前的每一步，放在你手里。", "Keep every pre-publish decision in your hands."),
@@ -1080,7 +1083,9 @@ def _scan_html(
       <div class="candidate-grid">{''.join(cards)}</div></section>'''
 
 
-def _month_one_canon_html(locale: UILocale) -> tuple[str, str]:
+def _month_one_canon_html(
+    locale: UILocale, *, creator_story_bank: bool = False
+) -> tuple[str, str]:
     canon = load_month_one_canon()
     status_labels = {
         StoryReadiness.READY_FOR_PRODUCTION: ui_text(
@@ -1172,6 +1177,13 @@ canonFilter?.addEventListener('change', () => {{
 }});
 document.querySelectorAll('[data-canon-select]').forEach(button => {{
   button.addEventListener('click', () => {{
+    if ({json.dumps(creator_story_bank)}) {{
+      const target = new URL({json.dumps(ui_url('/creator/create', locale))}, window.location.origin);
+      target.searchParams.set('canon_story_id', button.dataset.canonSelect);
+      target.searchParams.set('canon_format', button.dataset.canonFormat);
+      window.location.href = target.toString();
+      return;
+    }}
     const story = monthOneStories[button.dataset.canonSelect];
     if (!story) return;
     const form = document.getElementById('content-form');
@@ -1204,8 +1216,51 @@ def content_page(
     candidate_id: str | None = None,
     creator_video_phase: str | None = None,
     creator_video_error: str | None = None,
+    workspace_view: Literal["all", "stories", "create"] = "all",
+    canon_story_id: str | None = None,
+    canon_format: str | None = None,
 ) -> str:
     values = dict(form or {})
+    if canon_story_id:
+        selected_story = next(
+            (
+                story
+                for story in load_month_one_canon().stories
+                if story.story_id == canon_story_id
+            ),
+            None,
+        )
+        if selected_story is not None:
+            values.update(
+                {
+                    "topic": selected_story.title_cn
+                    if locale == "zh-CN"
+                    else selected_story.working_title_en,
+                    "audience": ui_text(
+                        locale,
+                        "正在用 AI 构建真实产品的工程师和独立开发者",
+                        "AI engineers and solo builders shipping real products",
+                    ),
+                    "source_label": f"month-one-canon:{selected_story.story_id}",
+                    "hypotheses": selected_story.one_sentence_thesis,
+                    "planned": ui_text(
+                        locale,
+                        "补齐证据后制作 60–90 秒技术视频。",
+                        "Produce a 60–90 second technical video after evidence review.",
+                    )
+                    if canon_format == "video"
+                    else ui_text(
+                        locale,
+                        "补齐证据后写成技术博客。",
+                        "Write a technical blog after evidence review.",
+                    ),
+                    "call_to_action": ui_text(
+                        locale,
+                        "分享你遇到过的类似工程取舍。",
+                        "Share a similar engineering trade-off you have faced.",
+                    ),
+                }
+            )
     scan: RecentWorkScan | None = None
     if scan_range in {ScanRange.TODAY.value, ScanRange.LAST_7_DAYS.value}:
         scan = scan_recent_work(
@@ -1323,7 +1378,9 @@ def content_page(
     scan_section = _scan_html(
         scan, selected_candidate_id=candidate_id, locale=locale
     )
-    canon_section, canon_script = _month_one_canon_html(locale)
+    canon_section, canon_script = _month_one_canon_html(
+        locale, creator_story_bank=workspace_view == "stories"
+    )
     reference_videos = recent_reference_videos(data_root)
     selected_reference_id = values.get("reference_id", "")
     reference_options = "".join(
@@ -1348,6 +1405,7 @@ def content_page(
 {notice_html}
 <form id="content-form" method="post" action="/content/generate">
 <input type="hidden" name="ui_locale" value="{locale}" />
+{f'<input type="hidden" name="creator_view" value="{workspace_view}" />' if workspace_view != 'all' else ''}
 <input type="hidden" name="provider_model" value="{_escape(provider_model)}" />
 <label>{_escape(ui_text(locale, '主题', 'Topic'))}
   <input id="content-topic" name="topic" maxlength="180" required
@@ -1438,6 +1496,30 @@ def content_page(
 </section>
 {result_html}
 </div>"""
+    view_css = ""
+    current_url = "/content"
+    heading = ui_text(
+        locale,
+        "把已验证的工作，整理成可以安心发布的内容。",
+        "Turn verified work into content you can publish with confidence.",
+    )
+    description = ui_text(
+        locale,
+        "一次输入得到 LinkedIn、X 和短视频草稿；先私有保存、先预览，再由你决定是否发布。",
+        "Create LinkedIn, X, and short-video drafts from one input. Save and preview privately before you decide whether to publish.",
+    )
+    if workspace_view == "stories":
+        current_url = "/creator/stories"
+        heading = ui_text(locale, "从真实工程故事里，选择下一条内容。", "Choose the next story from real engineering work.")
+        description = ui_text(locale, "24 条 Month 1 Engineering Stories 现在有自己的故事库。", "The 24 Month 1 Engineering Stories now live in their own Story Bank.")
+        view_css = ".use-my-work,.scan-work,.scan-results,.reference-video-upload,.grid{display:none!important}"
+    elif workspace_view == "create":
+        current_url = "/creator/create"
+        heading = ui_text(locale, "把一个真实故事，做成完整内容包。", "Turn one real story into a complete content package.")
+        description = ui_text(locale, "生成、审核、视频与发布准备继续使用现有流程。", "Generation, review, video, and publishing preparation keep using the existing workflow.")
+        view_css = ".month-one-canon{display:none!important}"
+    if workspace_view != "all":
+        body = render_creator_nav(active=workspace_view, locale=locale) + body
     script = f"""
 {canon_script}
 document.querySelectorAll('.tab').forEach(button => button.addEventListener('click', () => {{
@@ -1466,14 +1548,15 @@ if(document.querySelector('[data-video-job-active="true"]')){{
     return render_app_shell(
         active="content",
         locale=locale,
-        current_url="/content",
+        current_url=current_url,
         title=f"SoloScale · {ui_text(locale, '建立专业影响力', 'Build visibility')}",
         eyebrow=ui_text(locale, "建立影响力", "Build visibility"),
-        heading=ui_text(locale, "把已验证的工作，整理成可以安心发布的内容。", "Turn verified work into content you can publish with confidence."),
-        description=ui_text(locale, "一次输入得到 LinkedIn、X 和短视频草稿；先私有保存、先预览，再由你决定是否发布。", "Create LinkedIn, X, and short-video drafts from one input. Save and preview privately before you decide whether to publish."),
+        heading=heading,
+        description=description,
         body=body,
         script=script,
-        extra_css="""
+        extra_css=view_css
+        + """
 .use-my-work{display:grid;grid-template-columns:minmax(260px,.75fr) 1fr auto;gap:16px;align-items:center;margin-bottom:18px;padding:15px 18px;border:1px solid #d9e2dc;border-radius:15px;background:linear-gradient(110deg,#fff,#f1f8f5)}.use-my-work>div{display:grid;gap:3px}.use-my-work strong{font-size:13px}.use-my-work p{margin:0;color:var(--text-muted);font-size:13px}.use-my-work a{font-weight:800;text-decoration:none;white-space:nowrap}
 .scan-work,.scan-results{margin-bottom:22px;padding:22px;border:1px solid var(--border);border-radius:20px;background:linear-gradient(135deg,#fff,var(--brand-soft))}.scan-work{display:flex;justify-content:space-between;align-items:center;gap:20px}.scan-work h2,.scan-results h2{margin:7px 0}.scan-work p,.scan-results p{color:var(--text-muted)}.scan-actions{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.scan-actions a{text-decoration:none;font-weight:800}.candidate-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:13px;margin-top:16px}.candidate-card{display:grid;gap:10px;padding:17px;border:1px solid var(--border);border-radius:16px;background:#fff}.candidate-card.selected{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}.candidate-card h3,.candidate-card p{margin:0}.candidate-card details{font-size:12px}.candidate-head{display:flex;justify-content:space-between;color:var(--brand);font-size:11px;font-weight:850;letter-spacing:.06em}.candidate-card .secondary-button{justify-self:start}.selected-candidate{justify-self:start;padding:7px 10px;border-radius:999px;background:var(--success-soft);color:var(--success);font-size:12px;font-weight:850}.audience-value{font-size:12px}
 .grid{display:grid;grid-template-columns:minmax(340px,.8fr) minmax(0,1.2fr);gap:22px;align-items:start}.form-card h2,.result-panel h2,.empty h2{margin:7px 0 8px;letter-spacing:-.025em}.form-card form{gap:16px;margin-top:22px}.form-card textarea{min-height:92px}.form-card textarea.large{min-height:140px}.two{display:grid;grid-template-columns:1fr 1fr;gap:10px}.primary:disabled{opacity:.65}.boundary{font-size:12px}.provider-summary{border:1px solid var(--border);background:linear-gradient(135deg,var(--brand-soft),var(--success-soft));border-radius:15px;padding:15px;display:grid;gap:5px}.provider-summary strong{font-size:16px}.provider-summary p{margin:0}.provider-summary a{font-size:12px;font-weight:800;justify-self:start}.generate-actions{display:grid;gap:9px}.generate-actions .secondary{background:var(--surface-subtle);color:var(--brand);border:1px solid var(--border)}.engine-badge{display:inline-flex;margin-left:8px;padding:4px 9px;border-radius:999px;background:var(--success-soft);color:var(--success);font-size:12px;font-weight:800}

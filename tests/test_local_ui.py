@@ -425,7 +425,7 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
     assert "建立影响力" in home
     assert 'href="/resume?lang=zh-CN"' in home
     assert 'href="/learning?lang=zh-CN"' in home
-    assert 'href="/content?lang=zh-CN"' in home
+    assert 'href="/creator?lang=zh-CN"' in home
     assert 'href="/video?lang=zh-CN"' in home
     assert 'href="/publishing?lang=zh-CN"' in home
     assert 'href="/work?lang=zh-CN"' in home
@@ -476,7 +476,7 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
     assert 'href="/?lang=zh-CN"' in page
     assert 'href="/resume?lang=zh-CN"' in page
     assert 'href="/advanced?lang=zh-CN"' in page
-    assert 'href="/content?lang=zh-CN"' in page
+    assert 'href="/creator?lang=zh-CN"' in page
     assert 'href="/learning?lang=zh-CN"' in page
     assert 'href="/publishing?lang=zh-CN"' in page
     assert 'href="/work?lang=zh-CN"' in page
@@ -488,7 +488,7 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
     english = _user_page(None, tmp_path / ".soloscale", {}, "en")
     assert '<html lang="en">' in english
     assert "Turn your real experience into a resume for this role." in english
-    assert 'href="/content?lang=en"' in english
+    assert 'href="/creator?lang=en"' in english
     assert 'name="ui_locale" value="en"' in english
     english_home = _home_page("en", data_root=tmp_path / ".soloscale")
     assert "What do you want to accomplish today?" in english_home
