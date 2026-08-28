@@ -7,7 +7,7 @@ Canonical worktree: `/Users/ju.l/Documents/AI TEAM/AI TEAM WORKTREES/solo-scale-
 ## CURRENT BRANCH / HEAD
 
 - branch: `codex/macos-desktop-app`
-- HEAD: `6ffd005` (pushed to `origin/codex/macos-desktop-app`)
+- HEAD: `b55fcc7` (pushed to `origin/codex/macos-desktop-app`)
 
 ## COMPLETED CHECKPOINTS
 
@@ -22,6 +22,11 @@ Canonical worktree: `/Users/ju.l/Documents/AI TEAM/AI TEAM WORKTREES/solo-scale-
 - `6ffd005` — Learning decoupled from the SoloScale repo binding: removed the dead
   `_is_supported_learning_repository` helper and the desktop Choose SoloScale Source
   Checkout binding.
+- `b55fcc7` — Release checkpoint 0.4.1 (6): PyInstaller spec sys.path fix so
+  `content_data` is packaged when soloscale is not pip-installed; version
+  normalized to `0.4.1` / build `6` in build script defaults, Info.plist
+  template, pyproject, and `soloscale.__version__`. Fresh 0.4.1 (6) build
+  verified (bundle version, codesign, month_one.json, pypdf).
 
 ## CURRENT DIRTY WORK (ownership by future slice)
 
@@ -38,16 +43,26 @@ Canonical worktree: `/Users/ju.l/Documents/AI TEAM/AI TEAM WORKTREES/solo-scale-
   in the `buildlog` package and Creator/YouTube job-manager hunks in `local_ui.py`.
 - Desktop toolchain: `check_macos_toolchain.sh` passes with full Xcode 26.6
   (Swift 6.3.3, macOS SDK 26.5).
-- The installed `/Applications/SoloScale AI OS.app` may be behind source; verify
-  bundle identity before claiming installed behavior.
+- Release candidate `0.4.1 (6)` is **ad-hoc signed only**; no Developer ID
+  certificate is available (`security find-identity -p codesigning` = 0
+  identities), so the public distribution boundary is a GitHub
+  prerelease/developer preview with SHA-256 + Gatekeeper instructions, not a
+  notarized production release.
+- GitHub App Client ID is not configured; UI truthfully shows "not configured"
+  (not a release blocker).
+- Creator Story → heavy video render was NOT_DOGFOODED in the RC run; release
+  notes must not claim it was verified.
 
 ## NEXT CANDIDATE SLICES
 
-1. Web/Vercel disposition decision (keep as a separate branch/PR vs defer per the
+1. **Final Release thread** from `b55fcc7`: fresh 0.4.1 (6) build → critical
+   packaged smoke → DMG → codesign state → SHA-256 → release notes → Git tag →
+   GitHub prerelease (Developer ID signing/notarization deferred; no cert
+   available).
+2. Web/Vercel disposition decision (keep as a separate branch/PR vs defer per the
    Local-MVP policy).
-2. YouTube OAuth stale `WAITING` + GitHub Client ID follow-ups.
-3. BuildLog directory-layout migration (after the workspace stabilizes).
-4. Fresh RC build → installed-app dogfood → blocker-only repair → release.
+3. YouTube OAuth stale `WAITING` + GitHub Client ID follow-ups.
+4. BuildLog directory-layout migration (after the workspace stabilizes).
 
 ## RELEASE / PRODUCT GATES
 
