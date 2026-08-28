@@ -20,7 +20,8 @@ SOLOSCALE_TOOLCHAIN_CONFIG="$toolchain_config" "$project_root/scripts/check_maco
 # shellcheck disable=SC1090
 source "$toolchain_config"
 export DEVELOPER_DIR="$SOLOSCALE_DEVELOPER_DIR"
-export SDKROOT="$SOLOSCALE_SDKROOT"
+unset SDKROOT
+export SDKROOT="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)"
 swift_executable="$(/usr/bin/xcrun --find swift)"
 [[ -f "$desktop_root/Package.swift" && -f "$desktop_root/Info.plist.template" ]] || fail "Swift app inputs are missing"
 [[ -x "$sidecar_root/SoloScaleBackend" ]] || fail "backend sidecar is missing; run packaging/macos/build_backend_onedir.sh first"

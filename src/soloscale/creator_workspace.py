@@ -28,6 +28,7 @@ from soloscale.ui_shell import (
     ui_text,
     ui_url,
 )
+from soloscale.youtube_publishing import YouTubePublishingError, load_youtube_accounts
 
 
 @dataclass(frozen=True)
@@ -103,6 +104,15 @@ def creator_overview_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str
     """Render one status-driven entry point for existing Creator capabilities."""
     accounts = load_creator_accounts(data_root)
     active_accounts = sum(account.status == "ACTIVE" for account in accounts)
+    try:
+        youtube_connected = bool(load_youtube_accounts(data_root))
+    except YouTubePublishingError:
+        youtube_connected = False
+    if youtube_connected and not any(
+        account.platform == "youtube" and account.status == "ACTIVE"
+        for account in accounts
+    ):
+        active_accounts += 1
     account_attention = sum(account.status == "NEEDS_ATTENTION" for account in accounts)
     runs = _recent_runs(data_root)
     latest = runs[0] if runs else None

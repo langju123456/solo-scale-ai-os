@@ -39,6 +39,17 @@ datas.append(
     )
 )
 excluded_untracked_web_modules = {"soloscale.app_web", "soloscale.resume_web"}
+youtube_hidden_imports = [
+    "google.auth.exceptions",
+    "google.auth.transport.requests",
+    "google.oauth2.credentials",
+    "google_auth_httplib2",
+    "google_auth_oauthlib.flow",
+    "googleapiclient.discovery",
+    "googleapiclient.errors",
+    "googleapiclient.http",
+    "httplib2",
+]
 a = Analysis(
     [str(ROOT / "src" / "soloscale" / "local_ui.py")],
     pathex=[str(ROOT / "src"), str(ROOT / "packages" / "buildlog" / "src")],
@@ -46,7 +57,8 @@ a = Analysis(
     hiddenimports=collect_submodules(
         "soloscale", filter=lambda name: name not in excluded_untracked_web_modules
     )
-    + collect_submodules("buildlog"),
+    + collect_submodules("buildlog")
+    + youtube_hidden_imports,
     excludes=["node", "playwright", "selenium"],
 )
 pyz = PYZ(a.pure)

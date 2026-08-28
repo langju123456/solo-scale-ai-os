@@ -13,6 +13,12 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from soloscale.ui_shell import UILocale, render_app_shell, render_creator_nav, ui_text
+from soloscale.youtube_publishing import (
+    YouTubeJobSnapshot,
+    YouTubePublishingError,
+    load_youtube_accounts,
+    youtube_configuration_state,
+)
 
 CreatorPlatform = Literal[
     "douyin", "xiaohongshu", "youtube", "x", "linkedin", "github", "independent_site"
@@ -141,9 +147,13 @@ def save_creator_account(data_root: Path, account: CreatorAccount) -> Path:
 
 
 def creator_accounts_page(
-    data_root: Path, *, locale: UILocale = "zh-CN", notice: str | None = None
+    data_root: Path,
+    *,
+    locale: UILocale = "zh-CN",
+    notice: str | None = None,
+    youtube_job: YouTubeJobSnapshot | None = None,
 ) -> str:
-    """Render profile/admin shortcuts and inline editing; no platform integration."""
+    """Render account shortcuts plus the bounded YouTube connection surface."""
     status_copy = {
         "NOT_CONFIGURED": ui_text(locale, "未配置", "Not configured"),
         "ACTIVE": ui_text(locale, "可用", "Active"),
@@ -177,7 +187,36 @@ def creator_accounts_page(
 <label>{ui_text(locale, "状态", "Status")}<select name="status">{options}</select></label><button type="submit">{ui_text(locale, "保存", "Save")}</button></form>
 </details></div></article>''')
     notice_html = f'<p class="notice">{html.escape(notice)}</p>' if notice else ""
-    body = f'''{render_creator_nav(active="accounts", locale=locale)}{notice_html}<section class="boundary"><strong>{ui_text(locale, "这里只保存入口信息", "This stores entry links only")}</strong><p>{ui_text(locale, "不连接 OAuth，不自动发布，也不读取 Analytics 或 Inbox。", "No OAuth, automatic publishing, Analytics, or Inbox access.")}</p></section><section class="account-grid">{"".join(cards)}</section>'''
+    try:
+        youtube_accounts = load_youtube_accounts(data_root)
+    except YouTubePublishingError:
+        youtube_accounts = ()
+    youtube_state = youtube_configuration_state(data_root)
+    channel_rows = "".join(
+        f'''<article class="youtube-channel"><div><strong>{html.escape(item.channel_title)}</strong><small>{html.escape(item.channel_id)}</small></div><div><a href="https://www.youtube.com/channel/{html.escape(item.channel_id, quote=True)}" target="_blank" rel="noopener noreferrer">{ui_text(locale, "打开频道", "Open channel")}</a><a href="https://studio.youtube.com/channel/{html.escape(item.channel_id, quote=True)}" target="_blank" rel="noopener noreferrer">YouTube Studio</a></div></article>'''
+        for item in youtube_accounts
+    ) or f'<p>{ui_text(locale, "尚未连接 YouTube 频道。", "No YouTube channel connected yet.")}</p>'
+    job_html = ""
+    refresh_script = ""
+    if youtube_job is not None:
+        state_copy = {
+            "WAITING": ui_text(locale, "等待开始", "Waiting"),
+            "AUTHENTICATING": ui_text(locale, "请在浏览器完成 Google 授权", "Complete Google authorization in your browser"),
+            "SUCCESS": ui_text(locale, "频道已连接", "Channel connected"),
+            "FAILED": youtube_job.error_message or ui_text(locale, "连接失败", "Connection failed"),
+        }.get(youtube_job.phase, youtube_job.phase)
+        job_html = f'<p class="youtube-job" data-phase="{youtube_job.phase}">{html.escape(state_copy)}</p>'
+        if youtube_job.phase in {"WAITING", "AUTHENTICATING"}:
+            refresh_script = "<script>setTimeout(()=>location.reload(),1500)</script>"
+    connect_disabled = "" if youtube_state == "CONFIGURED" else " disabled"
+    state_message = {
+        "CONFIGURED": ui_text(locale, "OAuth Client 已就绪", "OAuth Client ready"),
+        "DEPENDENCY_MISSING": ui_text(locale, "当前 App 包尚未包含 YouTube 官方组件", "This App build does not include the YouTube client yet"),
+        "CREDENTIAL_JSON_MISSING": ui_text(locale, "缺少 Google OAuth Desktop 凭证", "Google OAuth Desktop credential is missing"),
+        "INVALID_CREDENTIAL_JSON": ui_text(locale, "Google OAuth Desktop 凭证无效", "Google OAuth Desktop credential is invalid"),
+    }.get(youtube_state, youtube_state)
+    youtube_panel = f'''<section class="youtube-connect"><div><span>YouTube OAuth</span><h2>{ui_text(locale, "已连接频道", "Connected channels")}</h2><p>{html.escape(state_message)} · {ui_text(locale, "只请求上传和读取当前频道身份。", "Requests upload plus read-only current-channel identity only.")}</p></div>{channel_rows}{job_html}<form method="post" action="/creator/accounts/youtube/connect"><input type="hidden" name="ui_locale" value="{locale}" /><button type="submit"{connect_disabled}>{ui_text(locale, "连接另一个 YouTube 频道", "Connect another YouTube channel")}</button></form></section>{refresh_script}'''
+    body = f'''{render_creator_nav(active="accounts", locale=locale)}{notice_html}<section class="boundary"><strong>{ui_text(locale, "账号入口与受控连接", "Account links and controlled connections")}</strong><p>{ui_text(locale, "普通账号仍只保存入口；不会自动发布。YouTube 仅在你点击连接或输入 UPLOAD 后调用 Google。", "Regular accounts remain links only; nothing publishes automatically. YouTube calls Google only after you click Connect or type UPLOAD.")}</p></section>{youtube_panel}<section class="account-grid">{"".join(cards)}</section>'''
     return render_app_shell(
         active="content", locale=locale, current_url="/creator/accounts",
         title=f"SoloScale · {ui_text(locale, '账号中心', 'Account Center')}",
@@ -186,6 +225,6 @@ def creator_accounts_page(
         description=ui_text(locale, "保存主页与后台地址，需要时一键打开。", "Save profile and admin links, then open them in one click."),
         body=body, compact_hero=True,
         extra_css="""
-.boundary{margin-bottom:18px;padding:16px 18px;border:1px solid var(--border);border-radius:16px;background:var(--brand-soft)}.boundary p{margin:5px 0 0;color:var(--text-muted)}.account-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px}.account-card{padding:19px;border:1px solid var(--border);border-radius:18px;background:#fff}.account-head{display:flex;justify-content:space-between;gap:16px}.account-head span{font-size:11px;font-weight:850;color:var(--brand)}.account-head h2{margin:5px 0}.account-head p{min-height:20px;margin:0;color:var(--text-muted)}.account-head>strong{align-self:flex-start;padding:6px 9px;border-radius:999px;background:var(--surface-subtle);font-size:11px}.account-head>strong[data-status="ACTIVE"]{background:var(--success-soft);color:var(--success)}.account-head>strong[data-status="NEEDS_ATTENTION"]{background:var(--warning-soft);color:var(--warning)}.account-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:17px}.account-actions details{width:100%;margin-top:4px}.account-actions summary{cursor:pointer;font-weight:800;color:var(--brand)}.account-actions form{display:grid;gap:10px;margin-top:12px}.account-actions label{display:grid;gap:5px}.account-actions button{justify-self:start}.notice{padding:12px 14px;border-radius:12px;background:var(--success-soft);color:var(--success);font-weight:750}
+.boundary{margin-bottom:18px;padding:16px 18px;border:1px solid var(--border);border-radius:16px;background:var(--brand-soft)}.boundary p{margin:5px 0 0;color:var(--text-muted)}.youtube-connect{display:grid;gap:12px;margin-bottom:18px;padding:19px;border:1px solid var(--border);border-radius:18px;background:#fff}.youtube-connect span{font-size:11px;font-weight:900;color:var(--brand)}.youtube-connect h2{margin:4px 0}.youtube-connect p{margin:0;color:var(--text-muted)}.youtube-channel{display:flex;justify-content:space-between;gap:16px;padding:12px;border-radius:12px;background:var(--surface-subtle)}.youtube-channel div{display:grid;gap:4px}.youtube-channel div:last-child{display:flex;gap:12px;align-items:center}.youtube-channel small{color:var(--text-muted)}.youtube-job{padding:10px 12px!important;border-radius:10px;background:var(--brand-soft);color:var(--brand)!important;font-weight:800}.account-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:14px}.account-card{padding:19px;border:1px solid var(--border);border-radius:18px;background:#fff}.account-head{display:flex;justify-content:space-between;gap:16px}.account-head span{font-size:11px;font-weight:850;color:var(--brand)}.account-head h2{margin:5px 0}.account-head p{min-height:20px;margin:0;color:var(--text-muted)}.account-head>strong{align-self:flex-start;padding:6px 9px;border-radius:999px;background:var(--surface-subtle);font-size:11px}.account-head>strong[data-status="ACTIVE"]{background:var(--success-soft);color:var(--success)}.account-head>strong[data-status="NEEDS_ATTENTION"]{background:var(--warning-soft);color:var(--warning)}.account-actions{display:flex;align-items:center;flex-wrap:wrap;gap:8px;margin-top:17px}.account-actions details{width:100%;margin-top:4px}.account-actions summary{cursor:pointer;font-weight:800;color:var(--brand)}.account-actions form{display:grid;gap:10px;margin-top:12px}.account-actions label{display:grid;gap:5px}.account-actions button{justify-self:start}.notice{padding:12px 14px;border-radius:12px;background:var(--success-soft);color:var(--success);font-weight:750}
 """,
     )

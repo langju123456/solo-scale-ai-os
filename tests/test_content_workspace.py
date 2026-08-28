@@ -661,7 +661,8 @@ def test_distribution_package_requires_approval_and_seals_exact_media(
     assert package["variant_group_id"].startswith("fact-contract:")
     assert package["review_revision"] == review.revision
     assert package["media_quality_review"]["revision"] == quality.revision  # type: ignore[index]
-    assert package["channels"]["youtube"]["direct_upload_enabled"] is False  # type: ignore[index]
+    assert package["channels"]["youtube"]["direct_upload_enabled"] is True  # type: ignore[index]
+    assert package["channels"]["youtube"]["adapter"] == "youtube-data-api-v3"  # type: ignore[index]
     artifacts = package["artifacts"]
     assert artifacts["video"]["filename"] == "21_creator_video_youtube.mp4"  # type: ignore[index]
     assert artifacts["video"]["download_path"].endswith("/youtube-video.mp4")  # type: ignore[index]

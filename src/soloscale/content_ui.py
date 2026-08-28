@@ -82,6 +82,13 @@ from soloscale.ui_shell import (
 )
 from soloscale.video_factory import creator_video_ready
 from soloscale.work_ui import load_work_context, render_use_my_work
+from soloscale.youtube_publishing import (
+    YouTubeJobSnapshot,
+    YouTubePublishingError,
+    load_upload_defaults,
+    load_youtube_accounts,
+    load_youtube_receipt,
+)
 
 
 class ContentFormStatus(StrEnum):
@@ -937,6 +944,7 @@ def editorial_publishing_page(
     error: str | None = None,
     locale: UILocale = DEFAULT_UI_LOCALE,
     creator_mode: bool = False,
+    youtube_job: YouTubeJobSnapshot | None = None,
 ) -> str:
     """Render the separate, sealed-editorial-package publishing flow."""
 
@@ -949,15 +957,18 @@ def editorial_publishing_page(
     package_cards = "".join(
         f'''<article class="package-history-card"><span class="status-badge">{_escape(ui_text(locale, '预览就绪', 'Preview ready'))}</span>
         <strong>{_escape(str(package['run_id']))}</strong>
-        <p>{_escape(ui_text(locale, 'LinkedIn / X 由 BuildLog 控制；YouTube 为人工上传包。', 'LinkedIn / X remain BuildLog-controlled; YouTube is a manual upload package.'))}</p>
+        <p>{_escape(ui_text(locale, 'LinkedIn / X 由 BuildLog 控制；YouTube 可选择已授权频道上传。', 'LinkedIn / X remain BuildLog-controlled; YouTube can upload to a selected authorized channel.'))}</p>
         <a href="{ui_url('/creator/create' if creator_mode else '/content', locale, run_id=str(package['run_id']))}">{_escape(ui_text(locale, '打开完整内容包', 'Open full content package'))} →</a></article>'''
         for package in packages
     ) or f'''<article class="package-history-card empty"><strong>{_escape(ui_text(locale, '还没有统一发布包', 'No unified distribution package yet'))}</strong>
     <p>{_escape(ui_text(locale, '在 Content 中批准文案并生成双尺寸视频后即可准备。', 'Approve copy and render both video sizes in Content to prepare one.'))}</p></article>'''
+    youtube_panel = _youtube_publishing_html(
+        data_root, packages=packages, locale=locale, job=youtube_job
+    )
     creator_nav = render_creator_nav(active="publish", locale=locale) if creator_mode else ""
     body = f"""{creator_nav}<section class="panel package-history"><span class="kicker">{_escape(ui_text(locale, 'SoloScale 内容历史', 'SoloScale content history'))}</span>
 <h2>{_escape(ui_text(locale, '已批准、可继续处理的发布包', 'Approved packages ready for the next action'))}</h2>
-<div class="package-history-grid">{package_cards}</div></section>
+<div class="package-history-grid">{package_cards}</div></section>{youtube_panel}
 <section class="panel publishing-intake">
 <span class="status-badge">{_escape(ui_text(locale, '需要你确认', 'Needs your review'))}</span>
 <h2>{_escape(ui_text(locale, '已完成内容 → BuildLog 发布计划', 'Finalized content → BuildLog publishing plan'))}</h2>
@@ -979,9 +990,70 @@ def editorial_publishing_page(
         body=body,
         extra_css="""
 .package-history{margin-bottom:22px}.package-history h2{margin:10px 0 16px}.package-history-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.package-history-card{display:grid;gap:8px;padding:16px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.package-history-card p{margin:0;color:var(--text-muted)}.package-history-card a{font-weight:800;text-decoration:none}.publishing-intake{max-width:900px;margin:0 auto 22px}.publishing-intake h2{margin:12px 0 8px}.publishing-intake form{grid-template-columns:minmax(0,1fr) 180px auto;align-items:end}.publishing-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:22px}.channel{min-width:0}.channel h2{margin-top:0}.channel p,.channel small{color:var(--text-muted)}.channel pre{max-height:380px;overflow:auto}.channel img{border-color:var(--border)!important}.meta{font-size:.9rem}.channel code{color:var(--brand)}
+.youtube-publish{margin-bottom:22px}.youtube-publish-head{display:flex;justify-content:space-between;gap:16px;align-items:start}.youtube-publish-head h2{margin:8px 0}.youtube-upload-list{display:grid;gap:14px;margin-top:16px}.youtube-upload-card{padding:17px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.youtube-upload-card form{display:grid;grid-template-columns:1fr 1fr;gap:10px}.youtube-upload-card label{display:grid;gap:5px}.youtube-upload-card .wide{grid-column:1/-1}.youtube-upload-card textarea{min-height:110px}.youtube-upload-card button{justify-self:start}.youtube-job{padding:12px 14px;border-radius:12px;background:var(--brand-soft);color:var(--brand);font-weight:800}.youtube-receipt{padding:10px 12px;border-radius:10px;background:var(--success-soft);color:var(--success)}
 @media(max-width:900px){.publishing-intake form,.publishing-grid,.package-history-grid{grid-template-columns:1fr}}
 """,
     )
+
+
+def _youtube_publishing_html(
+    data_root: Path,
+    *,
+    packages: list[dict[str, object]],
+    locale: UILocale,
+    job: YouTubeJobSnapshot | None,
+) -> str:
+    try:
+        accounts = load_youtube_accounts(data_root)
+    except YouTubePublishingError:
+        accounts = ()
+    job_html = ""
+    refresh_script = ""
+    if job is not None:
+        label = {
+            "WAITING": ui_text(locale, "等待后台任务", "Waiting for background worker"),
+            "AUTHENTICATING": ui_text(locale, "请在浏览器完成 Google 授权", "Complete Google authorization in your browser"),
+            "UPLOADING": ui_text(locale, "正在上传", "Uploading"),
+            "SUCCESS": ui_text(locale, "YouTube 上传成功", "YouTube upload succeeded"),
+            "FAILED": job.error_message or ui_text(locale, "YouTube 操作失败", "YouTube operation failed"),
+        }.get(job.phase, job.phase)
+        progress = f" · {job.progress_percent}%" if job.progress_percent is not None else ""
+        link = (
+            f' · <a href="{_escape(job.video_url or "")}" target="_blank" rel="noopener noreferrer">{_escape(job.video_id or "YouTube")}</a>'
+            if job.phase == "SUCCESS" and job.video_url
+            else ""
+        )
+        job_html = f'<p class="youtube-job" data-phase="{job.phase}">{_escape(label)}{progress}{link}</p>'
+        if job.phase in {"WAITING", "AUTHENTICATING", "UPLOADING"}:
+            refresh_script = "<script>setTimeout(()=>location.reload(),1500)</script>"
+    if not accounts:
+        return f'''<section class="panel youtube-publish"><div class="youtube-publish-head"><div><span class="status-badge">YouTube</span><h2>{_escape(ui_text(locale, '先连接发布频道', 'Connect a publishing channel'))}</h2><p>{_escape(ui_text(locale, '一个 OAuth Client 可以保存多个频道授权；每次上传只选择一个目标频道。', 'One OAuth Client can store multiple channel authorizations; each upload targets one selected channel.'))}</p></div><a class="secondary-button" href="{ui_url('/creator/accounts', locale)}">{_escape(ui_text(locale, '打开账号中心', 'Open Account Center'))}</a></div>{job_html}</section>{refresh_script}'''
+    account_options = "".join(
+        f'<option value="{_escape(item.channel_id)}">{_escape(item.channel_title)} · {_escape(item.channel_id)}</option>'
+        for item in accounts
+    )
+    cards: list[str] = []
+    for package in packages:
+        run_id = str(package.get("run_id", ""))
+        try:
+            defaults = load_upload_defaults(data_root, run_id)
+        except YouTubePublishingError:
+            continue
+        receipts: list[str] = []
+        for account in accounts:
+            try:
+                receipt = load_youtube_receipt(data_root, run_id, account.channel_id)
+            except YouTubePublishingError:
+                receipt = None
+            if receipt is not None:
+                receipts.append(
+                    f'<p class="youtube-receipt">{_escape(account.channel_title)} · <a href="{_escape(str(receipt.get("video_url", "")))}" target="_blank" rel="noopener noreferrer">{_escape(str(receipt.get("video_id", "")))}</a> · {_escape(str(receipt.get("privacy_status", "")))}</p>'
+                )
+        title = _escape(str(defaults.get("title", "")))
+        description = _escape(str(defaults.get("description", "")))
+        cards.append(f'''<article class="youtube-upload-card"><strong>{_escape(run_id)}</strong>{"".join(receipts)}<form method="post" action="/publishing/youtube/upload"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="run_id" value="{_escape(run_id)}" /><label>{_escape(ui_text(locale, '目标频道', 'Target channel'))}<select name="channel_id">{account_options}</select></label><label>{_escape(ui_text(locale, '可见性', 'Privacy'))}<select name="privacy_status"><option value="private">Private</option><option value="unlisted">Unlisted</option><option value="public">Public</option></select></label><label class="wide">{_escape(ui_text(locale, '标题', 'Title'))}<input name="title" maxlength="100" value="{title}" required /></label><label class="wide">{_escape(ui_text(locale, '描述', 'Description'))}<textarea name="description" maxlength="5000">{description}</textarea></label><label class="wide">{_escape(ui_text(locale, '标签（逗号分隔）', 'Tags (comma-separated)'))}<input name="tags" maxlength="2000" /></label><label class="wide">{_escape(ui_text(locale, '输入 UPLOAD 才会真正上传', 'Type UPLOAD to perform the real upload'))}<input name="confirmation" autocomplete="off" required /></label><button type="submit">{_escape(ui_text(locale, '上传到所选频道', 'Upload to selected channel'))}</button></form></article>''')
+    empty = f'<p>{_escape(ui_text(locale, "还没有可上传的 Distribution Package。", "No Distribution Package is ready for upload."))}</p>'
+    return f'''<section class="panel youtube-publish"><div class="youtube-publish-head"><div><span class="status-badge">YouTube</span><h2>{_escape(ui_text(locale, '选择频道并上传', 'Select a channel and upload'))}</h2><p>{_escape(ui_text(locale, '上传在独立后台任务中执行；不会自动重试。', 'Upload runs in a bounded background job with no automatic retry.'))}</p></div><a class="secondary-button" href="{ui_url('/creator/accounts', locale)}">{_escape(ui_text(locale, '管理频道', 'Manage channels'))}</a></div>{job_html}<div class="youtube-upload-list">{"".join(cards) or empty}</div></section>{refresh_script}'''
 
 
 def _editorial_channel_html(

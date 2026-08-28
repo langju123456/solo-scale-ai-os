@@ -45,7 +45,7 @@ def test_account_center_exposes_all_platforms_and_only_configured_links(
     assert "打开主页" in page
     assert "打开后台" in page
     assert 'target="_blank" rel="noopener noreferrer"' in page
-    assert "OAuth" in page
+    assert "YouTube OAuth" in page
     assert "自动发布" in page
     assert 'href="/creator/accounts?lang=zh-CN"' in page
 
@@ -102,4 +102,5 @@ def test_account_center_renders_english_copy(tmp_path: Path) -> None:
     assert "Open profile" not in page
     assert "Open admin" not in page
     assert "Edit" in page
-    assert "No OAuth, automatic publishing, Analytics, or Inbox access." in page
+    assert "Account links and controlled connections" in page
+    assert "Google OAuth Desktop credential is missing" in page

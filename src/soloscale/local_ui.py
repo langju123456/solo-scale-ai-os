@@ -241,6 +241,11 @@ from soloscale.work_ui import (
     render_work_context_strip,
     work_page,
 )
+from soloscale.youtube_publishing import (
+    YouTubePublishingError,
+    YouTubePublishingJobManager,
+    normalize_upload_request,
+)
 
 COMMAND_TIMEOUT_SECONDS = 120
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
@@ -6062,6 +6067,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     video_story_job_manager: LocalVideoJobManager | None = None
     creator_video_job_manager: CreatorVideoJobManager | None = None
     codex_import_job_manager: CodexImportJobManager | None = None
+    youtube_job_manager: YouTubePublishingJobManager | None = None
 
     def log_message(self, format: str, *args: object) -> None:
         if self.desktop_session_token is not None:
@@ -6301,9 +6307,25 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_creator_accounts_page(self, notice: str | None = None) -> None:
+    def _send_creator_accounts_page(
+        self,
+        notice: str | None = None,
+        *,
+        youtube_job_id: str | None = None,
+    ) -> None:
+        manager = self.youtube_job_manager
+        youtube_job = (
+            manager.get(self.ui_data_root.absolute(), youtube_job_id)
+            if manager is not None and youtube_job_id
+            else manager.latest(self.ui_data_root.absolute(), kind="connect")
+            if manager is not None
+            else None
+        )
         body = creator_accounts_page(
-            self.ui_data_root.absolute(), locale=self.ui_locale, notice=notice
+            self.ui_data_root.absolute(),
+            locale=self.ui_locale,
+            notice=notice,
+            youtube_job=youtube_job,
         ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -6853,10 +6875,24 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/creator/publish":
+            youtube_manager = self.youtube_job_manager
+            requested_youtube_job = query.get("youtube_job", [""])[0]
+            youtube_job = (
+                youtube_manager.get(
+                    self.ui_data_root.absolute(), requested_youtube_job
+                )
+                if youtube_manager is not None and requested_youtube_job
+                else youtube_manager.latest(
+                    self.ui_data_root.absolute(), kind="upload"
+                )
+                if youtube_manager is not None
+                else None
+            )
             body = editorial_publishing_page(
                 data_root=self.ui_data_root.absolute(),
                 locale=self.ui_locale,
                 creator_mode=True,
+                youtube_job=youtube_job,
             ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -6930,7 +6966,50 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     "Could not save. Check the URLs and status.",
                 ),
             }.get(query.get("account", [""])[0])
-            self._send_creator_accounts_page(account_notice)
+            self._send_creator_accounts_page(
+                account_notice,
+                youtube_job_id=query.get("youtube_job", [""])[0] or None,
+            )
+            return
+        youtube_job_match = re.fullmatch(
+            r"/creator/youtube/jobs/(youtube-(?:auth|upload)-[a-f0-9]{12})",
+            path,
+        )
+        if youtube_job_match is not None:
+            manager = self.youtube_job_manager
+            snapshot = (
+                manager.get(
+                    self.ui_data_root.absolute(), youtube_job_match.group(1)
+                )
+                if manager is not None
+                else None
+            )
+            if snapshot is None:
+                self.send_error(404, "YouTube job not found")
+                return
+            body = json.dumps(
+                {
+                    "job_id": snapshot.job_id,
+                    "kind": snapshot.kind,
+                    "phase": snapshot.phase,
+                    "progress_percent": snapshot.progress_percent,
+                    "channel_id": snapshot.channel_id,
+                    "run_id": snapshot.run_id,
+                    "video_id": snapshot.video_id,
+                    "video_url": snapshot.video_url,
+                    "error_code": snapshot.error_code,
+                    "error_message": snapshot.error_message,
+                    "updated_at": snapshot.updated_at,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
             return
         if path == "/evidence":
             self._send_evidence_page()
@@ -7086,6 +7165,39 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         if not self._desktop_session_allowed():
             return
         resume_post_started = time.perf_counter() if path == "/generate" else None
+        if path == "/creator/accounts/youtube/connect":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "YouTube connection request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            manager = self.youtube_job_manager
+            try:
+                if manager is None:
+                    raise YouTubePublishingError(
+                        "YouTube background worker is unavailable",
+                        code="WORKER_UNAVAILABLE",
+                    )
+                job = manager.start_connect(data_root=self.ui_data_root.absolute())
+            except (OSError, YouTubePublishingError) as exc:
+                self._send_creator_accounts_page(str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/accounts",
+                    self.ui_locale,
+                    youtube_job=job.job_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path == "/creator/accounts/save":
             try:
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -8180,6 +8292,64 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if path == "/publishing/youtube/upload":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 16 * 1024:
+                self.send_error(413, "YouTube upload request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            manager = self.youtube_job_manager
+            try:
+                if form.get("confirmation") != "UPLOAD":
+                    raise YouTubePublishingError(
+                        "Type UPLOAD to authorize this exact external upload",
+                        code="UPLOAD_CONFIRMATION_REQUIRED",
+                    )
+                if manager is None:
+                    raise YouTubePublishingError(
+                        "YouTube background worker is unavailable",
+                        code="WORKER_UNAVAILABLE",
+                    )
+                request = normalize_upload_request(
+                    run_id=form.get("run_id", ""),
+                    channel_id=form.get("channel_id", ""),
+                    title=form.get("title", ""),
+                    description=form.get("description", ""),
+                    tags=form.get("tags", ""),
+                    privacy_status=form.get("privacy_status", "private"),
+                )
+                job = manager.start_upload(
+                    data_root=self.ui_data_root.absolute(), request=request
+                )
+            except (OSError, YouTubePublishingError) as exc:
+                body = editorial_publishing_page(
+                    data_root=self.ui_data_root.absolute(),
+                    error=str(exc),
+                    locale=self.ui_locale,
+                    creator_mode=True,
+                ).encode("utf-8")
+                self.send_response(422)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "private, no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/publish", self.ui_locale, youtube_job=job.job_id
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         editorial_publish_match = re.fullmatch(r"/publishing/editorial/(linkedin|x)/publish", path)
         if editorial_publish_match is not None:
             length = int(self.headers.get("Content-Length", "0") or 0)
@@ -8520,6 +8690,8 @@ def main() -> None:
     handler.creator_video_job_manager = creator_video_job_manager
     codex_import_job_manager = CodexImportJobManager()
     handler.codex_import_job_manager = codex_import_job_manager
+    youtube_job_manager = YouTubePublishingJobManager()
+    handler.youtube_job_manager = youtube_job_manager
 
     server = HTTPServer((args.host, args.port), handler)
     raw_host, port = server.server_address[:2]
@@ -8567,6 +8739,8 @@ def main() -> None:
         handler.creator_video_job_manager = None
         codex_import_job_manager.shutdown()
         handler.codex_import_job_manager = None
+        youtube_job_manager.shutdown()
+        handler.youtube_job_manager = None
         if readiness_path is not None:
             try:
                 readiness_path.unlink()
