@@ -36,6 +36,7 @@ _NAV_ITEMS: tuple[tuple[str, str, str, str], ...] = (
     ("content", "/content", "建立影响力", "Build visibility"),
 )
 _MORE_ITEMS: tuple[tuple[str, str, str, str], ...] = (
+    ("accounts", "/creator/accounts", "账号中心", "Account Center"),
     ("work", "/work", "我的工作资料", "Your work"),
     ("video", "/video", "创建视频", "Create video"),
     ("publishing", "/publishing", "发布内容", "Publish content"),

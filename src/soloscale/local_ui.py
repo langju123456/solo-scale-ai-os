@@ -56,6 +56,12 @@ from soloscale.content_workspace import (
     load_content_run,
     save_content_review,
 )
+from soloscale.creator_accounts import (
+    CreatorAccountError,
+    creator_accounts_page,
+    normalize_account,
+    save_creator_account,
+)
 from soloscale.desktop_credentials import (
     DesktopCredentialError,
     configure_desktop_credentials_from_stdin,
@@ -5630,6 +5636,18 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_creator_accounts_page(self, notice: str | None = None) -> None:
+        body = creator_accounts_page(
+            self.ui_data_root.absolute(), locale=self.ui_locale, notice=notice
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_user_page(
         self,
         result: UIActionResult | None,
@@ -6105,6 +6123,19 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 candidate_id=query.get("candidate_id", [None])[0],
             )
             return
+        if path == "/creator/accounts":
+            account_notice = {
+                "saved": ui_text(
+                    self.ui_locale, "账号入口已保存。", "Account entry saved."
+                ),
+                "invalid": ui_text(
+                    self.ui_locale,
+                    "无法保存；请检查网址和状态。",
+                    "Could not save. Check the URLs and status.",
+                ),
+            }.get(query.get("account", [""])[0])
+            self._send_creator_accounts_page(account_notice)
+            return
         if path == "/evidence":
             self._send_evidence_page()
             return
@@ -6259,6 +6290,40 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         if not self._desktop_session_allowed():
             return
         resume_post_started = time.perf_counter() if path == "/generate" else None
+        if path == "/creator/accounts/save":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 16 * 1024:
+                self.send_error(413, "Account settings request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            forbidden = {"token", "secret", "password", "api_key", "oauth"}
+            outcome = "invalid"
+            if not forbidden.intersection(form):
+                try:
+                    account = normalize_account(
+                        platform=form.get("platform", ""),
+                        display_name=form.get("display_name", ""),
+                        handle=form.get("handle", ""),
+                        profile_url=form.get("profile_url", ""),
+                        admin_url=form.get("admin_url", ""),
+                        status=form.get("status", "NOT_CONFIGURED"),
+                    )
+                    save_creator_account(self.ui_data_root.absolute(), account)
+                    outcome = "saved"
+                except (CreatorAccountError, OSError):
+                    outcome = "invalid"
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url("/creator/accounts", self.ui_locale, account=outcome),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path == "/settings/ai-provider":
             try:
                 length = int(self.headers.get("Content-Length", "0") or 0)
