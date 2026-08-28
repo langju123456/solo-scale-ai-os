@@ -10,6 +10,10 @@ import re
 import stat
 import tempfile
 import threading
+import time
+import webbrowser
+import wsgiref.simple_server
+import wsgiref.util
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
@@ -29,8 +33,18 @@ YOUTUBE_CLIENT_SECRET_ENV = "SOLOSCALE_YOUTUBE_CLIENT_SECRET_FILE"
 YouTubePrivacy = Literal["private", "unlisted", "public"]
 YouTubeJobKind = Literal["connect", "upload"]
 YouTubeJobPhase = Literal[
-    "WAITING", "AUTHENTICATING", "UPLOADING", "SUCCESS", "FAILED"
+    "WAITING",
+    "AUTHENTICATING",
+    "STARTING",
+    "WAITING_FOR_AUTHORIZATION",
+    "COMPLETING",
+    "UPLOADING",
+    "SUCCESS",
+    "CANCELLED",
+    "TIMED_OUT",
+    "FAILED",
 ]
+OAuthStatusCallback = Callable[[Literal["waiting", "completing"], str | None], None]
 
 _CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{8,96}$")
 _RUN_ID_RE = re.compile(r"^content-[A-Za-z0-9._+-]{3,160}$")
@@ -39,6 +53,13 @@ _CLIENT_SECRET_NAME = "client_secret.json"
 _ACCOUNTS_NAME = "accounts.json"
 _UPLOAD_METADATA_NAME = "27_youtube_upload.json"
 _VIDEO_NAME = "21_creator_video_youtube.mp4"
+_DEFAULT_OAUTH_TIMEOUT_SECONDS = 300.0
+_ACTIVE_OAUTH_PHASES = {
+    "STARTING",
+    "AUTHENTICATING",
+    "WAITING_FOR_AUTHORIZATION",
+    "COMPLETING",
+}
 
 
 class YouTubePublishingError(ValueError):
@@ -86,12 +107,21 @@ class YouTubeJobSnapshot:
     progress_percent: int | None = None
     video_id: str | None = None
     video_url: str | None = None
+    authorization_url: str | None = None
+    channel_title: str | None = None
     error_code: str | None = None
     error_message: str | None = None
 
 
 class YouTubeProvider(Protocol):
-    def authorize(self, client_secret_path: Path) -> tuple[str, str, str]: ...
+    def authorize(
+        self,
+        client_secret_path: Path,
+        *,
+        status: OAuthStatusCallback,
+        cancel_event: threading.Event,
+        timeout_seconds: float,
+    ) -> tuple[str, str, str]: ...
 
     def upload(
         self,
@@ -331,28 +361,103 @@ def load_channel_credentials(data_root: Path, channel_id: str) -> object:
     return credentials
 
 
+class _OAuthCallbackApp:
+    """Capture one localhost OAuth response without exposing its query to the UI."""
+
+    def __init__(self) -> None:
+        self.last_request_uri: str | None = None
+
+    def __call__(self, environ: dict[str, Any], start_response: Any) -> list[bytes]:
+        self.last_request_uri = wsgiref.util.request_uri(environ)
+        body = (
+            b"YouTube authorization response received. "
+            b"You can return to SoloScale."
+        )
+        start_response(
+            "200 OK",
+            [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                ("Content-Length", str(len(body))),
+                ("Cache-Control", "no-store"),
+            ],
+        )
+        return [body]
+
+
+class _QuietOAuthRequestHandler(wsgiref.simple_server.WSGIRequestHandler):
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        return
+
+
+def _oauth_authorization_url(flow: Any) -> str:
+    authorization_url, _ = flow.authorization_url(
+        access_type="offline",
+        prompt="select_account",
+    )
+    return str(authorization_url)
+
+
 class GoogleYouTubeProvider:
     """Official Google client implementation; instantiated only by a user action."""
 
-    def authorize(self, client_secret_path: Path) -> tuple[str, str, str]:
+    def authorize(
+        self,
+        client_secret_path: Path,
+        *,
+        status: OAuthStatusCallback,
+        cancel_event: threading.Event,
+        timeout_seconds: float,
+    ) -> tuple[str, str, str]:
         selected = validate_client_secret(client_secret_path)
         flow_type, _, _, client_tools, _, _ = _google_modules()
         build_client, _ = client_tools
+        callback = _OAuthCallbackApp()
+        local_server = wsgiref.simple_server.make_server(
+            "127.0.0.1",
+            0,
+            callback,
+            handler_class=_QuietOAuthRequestHandler,
+        )
         try:
             flow = flow_type.from_client_secrets_file(str(selected), scopes=list(YOUTUBE_SCOPES))
-            credentials = flow.run_local_server(
-                host="127.0.0.1",
-                port=0,
-                open_browser=True,
-                authorization_prompt_message="Opening Google authorization in your browser…",
-                success_message="YouTube channel connected. You can return to SoloScale.",
-            )
+            flow.redirect_uri = f"http://127.0.0.1:{local_server.server_port}/"
+            authorization_url = _oauth_authorization_url(flow)
+            status("waiting", authorization_url)
+            if not cancel_event.is_set():
+                try:
+                    webbrowser.open(authorization_url, new=1, autoraise=True)
+                except webbrowser.Error:
+                    pass
+            deadline = time.monotonic() + timeout_seconds
+            while callback.last_request_uri is None:
+                if cancel_event.is_set():
+                    raise YouTubePublishingError(
+                        "Google authorization was cancelled",
+                        code="OAUTH_CANCELLED",
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise YouTubePublishingError(
+                        "Google authorization timed out",
+                        code="OAUTH_TIMEOUT",
+                    )
+                local_server.timeout = min(0.5, remaining)
+                local_server.handle_request()
+            status("completing", None)
+            assert callback.last_request_uri is not None
+            authorization_response = callback.last_request_uri.replace("http", "https", 1)
+            flow.fetch_token(authorization_response=authorization_response)
+            credentials = flow.credentials
             service = build_client(
                 "youtube", "v3", credentials=credentials, cache_discovery=False
             )
             response = service.channels().list(part="snippet", mine=True).execute()
+        except YouTubePublishingError:
+            raise
         except Exception as exc:
             raise _classify_google_error(exc, action="authorization") from exc
+        finally:
+            local_server.server_close()
         items = response.get("items", []) if isinstance(response, dict) else []
         first = items[0] if isinstance(items, list) and items else None
         snippet = first.get("snippet") if isinstance(first, dict) else None
@@ -576,24 +681,71 @@ def load_youtube_receipt(
 class YouTubePublishingJobManager:
     """Bounded worker for OAuth and upload so the local HTTP server stays responsive."""
 
-    def __init__(self, provider: YouTubeProvider | None = None) -> None:
+    def __init__(
+        self,
+        provider: YouTubeProvider | None = None,
+        *,
+        oauth_timeout_seconds: float = _DEFAULT_OAUTH_TIMEOUT_SECONDS,
+    ) -> None:
+        if oauth_timeout_seconds <= 0:
+            raise ValueError("OAuth timeout must be positive")
         self._provider = provider or GoogleYouTubeProvider()
+        self._oauth_timeout_seconds = oauth_timeout_seconds
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="soloscale-youtube")
         self._lock = threading.Lock()
         self._jobs: dict[str, YouTubeJobSnapshot] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
 
     def start_connect(self, *, data_root: Path) -> YouTubeJobSnapshot:
         validate_client_secret(youtube_client_secret_path(data_root))
+        with self._lock:
+            active = next(
+                (
+                    item
+                    for item in self._jobs.values()
+                    if item.kind == "connect" and item.phase in _ACTIVE_OAUTH_PHASES
+                ),
+                None,
+            )
+        if active is not None:
+            raise YouTubePublishingError(
+                "Cancel the current YouTube connection before starting another",
+                code="OAUTH_IN_PROGRESS",
+            )
         job = YouTubeJobSnapshot(
             job_id=f"youtube-auth-{uuid4().hex[:12]}",
             kind="connect",
-            phase="WAITING",
+            phase="STARTING",
             created_at=_utc_now(),
             updated_at=_utc_now(),
         )
+        cancel_event = threading.Event()
+        with self._lock:
+            self._cancel_events[job.job_id] = cancel_event
         self._put(data_root, job)
         self._executor.submit(self._connect, data_root, job.job_id)
         return job
+
+    def cancel_connect(self, *, data_root: Path, job_id: str) -> YouTubeJobSnapshot:
+        current = self.get(data_root, job_id)
+        if current is None or current.kind != "connect":
+            raise YouTubePublishingError(
+                "YouTube connection attempt was not found", code="JOB_INVALID"
+            )
+        if current.phase not in _ACTIVE_OAUTH_PHASES:
+            return current
+        with self._lock:
+            cancel_event = self._cancel_events.get(job_id)
+        if cancel_event is not None:
+            cancel_event.set()
+        return self._transition(
+            data_root,
+            job_id,
+            "CANCELLED",
+            authorization_url=None,
+            error_code="OAUTH_CANCELLED",
+            error_message="Google authorization was cancelled",
+        )
 
     def start_upload(
         self, *, data_root: Path, request: YouTubeUploadRequest
@@ -624,7 +776,10 @@ class YouTubePublishingJobManager:
             return None
         with self._lock:
             current = self._jobs.get(job_id)
-        return current if current is not None else _load_job(data_root, job_id)
+        if current is not None:
+            return current
+        loaded = _load_job(data_root, job_id)
+        return self._recover_interrupted_connect(data_root, loaded)
 
     def latest(
         self, data_root: Path, *, kind: YouTubeJobKind | None = None
@@ -634,10 +789,37 @@ class YouTubePublishingJobManager:
             by_id = {item.job_id: item for item in jobs}
             by_id.update(self._jobs)
         selected = [item for item in by_id.values() if kind is None or item.kind == kind]
-        return max(selected, key=lambda item: item.created_at) if selected else None
+        latest = max(selected, key=lambda item: item.created_at) if selected else None
+        return self._recover_interrupted_connect(data_root, latest)
 
     def shutdown(self) -> None:
+        with self._lock:
+            cancel_events = tuple(self._cancel_events.values())
+        for cancel_event in cancel_events:
+            cancel_event.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _recover_interrupted_connect(
+        self,
+        data_root: Path,
+        job: YouTubeJobSnapshot | None,
+    ) -> YouTubeJobSnapshot | None:
+        if job is None or job.kind != "connect" or job.phase not in _ACTIVE_OAUTH_PHASES:
+            return job
+        with self._lock:
+            still_running = job.job_id in self._jobs
+        if still_running:
+            return job
+        recovered = replace(
+            job,
+            phase="FAILED",
+            updated_at=_utc_now(),
+            authorization_url=None,
+            error_code="OAUTH_INTERRUPTED",
+            error_message="Google authorization was interrupted; connect again",
+        )
+        self._put(data_root, recovered)
+        return recovered
 
     def _put(self, data_root: Path, job: YouTubeJobSnapshot) -> None:
         with self._lock:
@@ -658,11 +840,38 @@ class YouTubePublishingJobManager:
         return updated
 
     def _connect(self, data_root: Path, job_id: str) -> None:
-        self._transition(data_root, job_id, "AUTHENTICATING")
+        with self._lock:
+            cancel_event = self._cancel_events[job_id]
+
+        def status(phase: Literal["waiting", "completing"], url: str | None) -> None:
+            if cancel_event.is_set():
+                return
+            if phase == "waiting":
+                self._transition(
+                    data_root,
+                    job_id,
+                    "WAITING_FOR_AUTHORIZATION",
+                    authorization_url=url,
+                )
+            else:
+                self._transition(
+                    data_root,
+                    job_id,
+                    "COMPLETING",
+                    authorization_url=None,
+                )
+
         try:
             channel_id, channel_title, credential_json = self._provider.authorize(
-                youtube_client_secret_path(data_root)
+                youtube_client_secret_path(data_root),
+                status=status,
+                cancel_event=cancel_event,
+                timeout_seconds=self._oauth_timeout_seconds,
             )
+            if cancel_event.is_set():
+                raise YouTubePublishingError(
+                    "Google authorization was cancelled", code="OAUTH_CANCELLED"
+                )
             account = save_authorized_channel(
                 data_root,
                 channel_id=channel_id,
@@ -673,15 +882,33 @@ class YouTubePublishingJobManager:
             error = exc if isinstance(exc, YouTubePublishingError) else YouTubePublishingError(
                 "YouTube channel could not be saved", code="TOKEN_STORAGE_FAILED"
             )
+            phase: YouTubeJobPhase
+            if cancel_event.is_set() or error.code == "OAUTH_CANCELLED":
+                phase = "CANCELLED"
+            elif error.code == "OAUTH_TIMEOUT":
+                phase = "TIMED_OUT"
+            else:
+                phase = "FAILED"
             self._transition(
                 data_root,
                 job_id,
-                "FAILED",
+                phase,
+                authorization_url=None,
                 error_code=error.code,
                 error_message=str(error),
             )
-            return
-        self._transition(data_root, job_id, "SUCCESS", channel_id=account.channel_id)
+        else:
+            self._transition(
+                data_root,
+                job_id,
+                "SUCCESS",
+                channel_id=account.channel_id,
+                channel_title=account.channel_title,
+                authorization_url=None,
+            )
+        finally:
+            with self._lock:
+                self._cancel_events.pop(job_id, None)
 
     def _upload(
         self, data_root: Path, job_id: str, request: YouTubeUploadRequest

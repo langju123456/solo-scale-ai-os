@@ -59,6 +59,7 @@ from soloscale.model_gateway import (
     ModelProviderId,
     model_gateway_for,
 )
+from soloscale.platform_accounts import ConnectedIdentity, eligible_publish_identities
 from soloscale.presenter_assets import (
     PresenterAssetError,
     PresenterMode,
@@ -86,7 +87,6 @@ from soloscale.youtube_publishing import (
     YouTubeJobSnapshot,
     YouTubePublishingError,
     load_upload_defaults,
-    load_youtube_accounts,
     load_youtube_receipt,
 )
 
@@ -949,8 +949,15 @@ def editorial_publishing_page(
     """Render the separate, sealed-editorial-package publishing flow."""
 
     channels: tuple[Literal["linkedin", "x"], Literal["linkedin", "x"]] = ("linkedin", "x")
+    publish_identities = eligible_publish_identities(data_root)
     cards = "".join(
-        _editorial_channel_html(data_root, channel, locale=locale) for channel in channels
+        _editorial_channel_html(
+            data_root,
+            channel,
+            locale=locale,
+            identities=publish_identities.get(channel, ()),
+        )
+        for channel in channels
     )
     error_html = f'<p class="error" role="alert">{_escape(error)}</p>' if error else ""
     packages = recent_distribution_packages(data_root)
@@ -963,7 +970,11 @@ def editorial_publishing_page(
     ) or f'''<article class="package-history-card empty"><strong>{_escape(ui_text(locale, '还没有统一发布包', 'No unified distribution package yet'))}</strong>
     <p>{_escape(ui_text(locale, '在 Content 中批准文案并生成双尺寸视频后即可准备。', 'Approve copy and render both video sizes in Content to prepare one.'))}</p></article>'''
     youtube_panel = _youtube_publishing_html(
-        data_root, packages=packages, locale=locale, job=youtube_job
+        data_root,
+        packages=packages,
+        locale=locale,
+        job=youtube_job,
+        accounts=publish_identities.get("youtube", ()),
     )
     creator_nav = render_creator_nav(active="publish", locale=locale) if creator_mode else ""
     body = f"""{creator_nav}<section class="panel package-history"><span class="kicker">{_escape(ui_text(locale, 'SoloScale 内容历史', 'SoloScale content history'))}</span>
@@ -1002,11 +1013,8 @@ def _youtube_publishing_html(
     packages: list[dict[str, object]],
     locale: UILocale,
     job: YouTubeJobSnapshot | None,
+    accounts: tuple[ConnectedIdentity, ...],
 ) -> str:
-    try:
-        accounts = load_youtube_accounts(data_root)
-    except YouTubePublishingError:
-        accounts = ()
     job_html = ""
     refresh_script = ""
     if job is not None:
@@ -1029,7 +1037,7 @@ def _youtube_publishing_html(
     if not accounts:
         return f'''<section class="panel youtube-publish"><div class="youtube-publish-head"><div><span class="status-badge">YouTube</span><h2>{_escape(ui_text(locale, '先连接发布频道', 'Connect a publishing channel'))}</h2><p>{_escape(ui_text(locale, '一个 OAuth Client 可以保存多个频道授权；每次上传只选择一个目标频道。', 'One OAuth Client can store multiple channel authorizations; each upload targets one selected channel.'))}</p></div><a class="secondary-button" href="{ui_url('/creator/accounts', locale)}">{_escape(ui_text(locale, '打开账号中心', 'Open Account Center'))}</a></div>{job_html}</section>{refresh_script}'''
     account_options = "".join(
-        f'<option value="{_escape(item.channel_id)}">{_escape(item.channel_title)} · {_escape(item.channel_id)}</option>'
+        f'<option value="{_escape(item.external_account_id)}">{_escape(item.display_name)} · {_escape(item.external_account_id)}</option>'
         for item in accounts
     )
     cards: list[str] = []
@@ -1042,12 +1050,14 @@ def _youtube_publishing_html(
         receipts: list[str] = []
         for account in accounts:
             try:
-                receipt = load_youtube_receipt(data_root, run_id, account.channel_id)
+                receipt = load_youtube_receipt(
+                    data_root, run_id, account.external_account_id
+                )
             except YouTubePublishingError:
                 receipt = None
             if receipt is not None:
                 receipts.append(
-                    f'<p class="youtube-receipt">{_escape(account.channel_title)} · <a href="{_escape(str(receipt.get("video_url", "")))}" target="_blank" rel="noopener noreferrer">{_escape(str(receipt.get("video_id", "")))}</a> · {_escape(str(receipt.get("privacy_status", "")))}</p>'
+                    f'<p class="youtube-receipt">{_escape(account.display_name)} · <a href="{_escape(str(receipt.get("video_url", "")))}" target="_blank" rel="noopener noreferrer">{_escape(str(receipt.get("video_id", "")))}</a> · {_escape(str(receipt.get("privacy_status", "")))}</p>'
                 )
         title = _escape(str(defaults.get("title", "")))
         description = _escape(str(defaults.get("description", "")))
@@ -1061,8 +1071,14 @@ def _editorial_channel_html(
     channel: Literal["linkedin", "x"],
     *,
     locale: UILocale = DEFAULT_UI_LOCALE,
+    identities: tuple[ConnectedIdentity, ...] = (),
 ) -> str:
     label = "LinkedIn" if channel == "linkedin" else "X"
+    if not identities:
+        return f'''<section class="channel empty-state" data-platform="{channel}"><span class="kicker">{label}</span>
+<h2>{_escape(ui_text(locale, '没有具备发布权限的账号', 'No publish-capable account'))}</h2>
+<p>{_escape(ui_text(locale, '账号中心必须先验证真实身份与发布 scope；手动 ACTIVE 状态不会解锁发布。', 'Account Center must verify a real identity and publishing scope first; a manual ACTIVE state cannot unlock publishing.'))}</p>
+<a class="secondary-button" href="{ui_url('/creator/accounts', locale)}">{_escape(ui_text(locale, '打开账号中心', 'Open Account Center'))}</a></section>'''
     try:
         preview, receipt = editorial_publishing_status(data_root, channel)
     except ValueError:

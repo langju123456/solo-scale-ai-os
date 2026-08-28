@@ -117,6 +117,7 @@ private final class BackendController: NSObject, ObservableObject {
             }
             if githubAppClientID() != nil {
                 desktopEnvironment["SOLOSCALE_GITHUB_CONNECT_AVAILABLE"] = "1"
+                desktopEnvironment["SOLOSCALE_GITHUB_NATIVE_AVAILABLE"] = "1"
             }
             process.environment = ProcessInfo.processInfo.environment.merging(
                 desktopEnvironment

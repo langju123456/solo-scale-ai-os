@@ -28,7 +28,7 @@ from email.parser import BytesParser
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from soloscale.buildlog_handoff import (
@@ -130,6 +130,18 @@ from soloscale.model_gateway import (
     ModelGatewayTransportError,
     ModelProviderId,
     model_gateway_for,
+)
+from soloscale.platform_accounts import (
+    PROVIDERS,
+    PlatformAccountError,
+    cancel_authorization_attempt,
+    complete_authorization_response,
+    disconnect_identity,
+    load_authorization_attempt,
+    load_developer_config,
+    require_publish_identity,
+    save_developer_config,
+    start_authorization_attempt,
 )
 from soloscale.presenter_assets import (
     MAX_PRESENTER_ASSET_BYTES,
@@ -6312,20 +6324,34 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         notice: str | None = None,
         *,
         youtube_job_id: str | None = None,
+        auth_platform: str | None = None,
+        auth_attempt_id: str | None = None,
     ) -> None:
         manager = self.youtube_job_manager
         youtube_job = (
             manager.get(self.ui_data_root.absolute(), youtube_job_id)
             if manager is not None and youtube_job_id
-            else manager.latest(self.ui_data_root.absolute(), kind="connect")
-            if manager is not None
             else None
         )
+        auth_attempt = None
+        if (
+            auth_platform in {"x", "linkedin", "douyin"}
+            and auth_attempt_id
+        ):
+            try:
+                auth_attempt = load_authorization_attempt(
+                    self.ui_data_root.absolute(),
+                    cast(Any, auth_platform),
+                    auth_attempt_id,
+                )
+            except PlatformAccountError:
+                auth_attempt = None
         body = creator_accounts_page(
             self.ui_data_root.absolute(),
             locale=self.ui_locale,
             notice=notice,
             youtube_job=youtube_job,
+            auth_attempt=auth_attempt,
         ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -6965,10 +6991,32 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     "无法保存；请检查网址和状态。",
                     "Could not save. Check the URLs and status.",
                 ),
+                "configured": ui_text(
+                    self.ui_locale,
+                    "开发者应用配置已保存在本机；密钥不会回显。",
+                    "Developer integration saved locally; secrets are not displayed.",
+                ),
+                "config-invalid": ui_text(
+                    self.ui_locale,
+                    "开发者应用配置无效或不完整。",
+                    "Developer integration configuration is invalid or incomplete.",
+                ),
+                "disconnected": ui_text(
+                    self.ui_locale,
+                    "账号连接已从本机移除。",
+                    "The local account connection was removed.",
+                ),
+                "connected": ui_text(
+                    self.ui_locale,
+                    "账号身份已验证并安全保存在本机。",
+                    "The account identity was verified and saved locally.",
+                ),
             }.get(query.get("account", [""])[0])
             self._send_creator_accounts_page(
                 account_notice,
                 youtube_job_id=query.get("youtube_job", [""])[0] or None,
+                auth_platform=query.get("auth_platform", [""])[0] or None,
+                auth_attempt_id=query.get("auth_attempt", [""])[0] or None,
             )
             return
         youtube_job_match = re.fullmatch(
@@ -7198,6 +7246,216 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if path == "/creator/accounts/youtube/cancel":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "YouTube cancellation request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            manager = self.youtube_job_manager
+            try:
+                if manager is None:
+                    raise YouTubePublishingError(
+                        "YouTube background worker is unavailable",
+                        code="WORKER_UNAVAILABLE",
+                    )
+                job_id = form.get("job_id", "")
+                job = manager.cancel_connect(
+                    data_root=self.ui_data_root.absolute(),
+                    job_id=job_id,
+                )
+            except (OSError, YouTubePublishingError) as exc:
+                self._send_creator_accounts_page(str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/accounts",
+                    self.ui_locale,
+                    youtube_job=job.job_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/accounts/configure":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 16 * 1024:
+                self.send_error(413, "Developer configuration request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            platform = form.get("platform", "")
+            outcome = "config-invalid"
+            try:
+                if platform not in {"x", "linkedin", "douyin", "xiaohongshu"}:
+                    raise PlatformAccountError("Unsupported platform")
+                selected_platform = cast(Any, platform)
+                existing = load_developer_config(
+                    self.ui_data_root.absolute(), selected_platform
+                )
+                values: dict[str, str] = {}
+                for field in PROVIDERS[selected_platform].required_fields:
+                    submitted = form.get(field, "").strip()
+                    if submitted:
+                        values[field] = submitted
+                    elif existing.source == "local" and existing.values.get(field):
+                        values[field] = existing.values[field]
+                save_developer_config(
+                    self.ui_data_root.absolute(), selected_platform, values
+                )
+                outcome = "configured"
+            except (OSError, PlatformAccountError):
+                outcome = "config-invalid"
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url("/creator/accounts", self.ui_locale, account=outcome),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        provider_connect = re.fullmatch(
+            r"/creator/accounts/(x|linkedin|douyin)/connect", path
+        )
+        if provider_connect is not None:
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "Connection request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            platform = cast(Any, provider_connect.group(1))
+            try:
+                attempt = start_authorization_attempt(
+                    self.ui_data_root.absolute(), platform
+                )
+            except PlatformAccountError as exc:
+                self._send_creator_accounts_page(str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/accounts",
+                    self.ui_locale,
+                    auth_platform=attempt.platform,
+                    auth_attempt=attempt.attempt_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/accounts/auth/cancel":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "Cancellation request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            platform = form.get("platform", "")
+            attempt_id = form.get("attempt_id", "")
+            try:
+                if platform not in {"x", "linkedin", "douyin"}:
+                    raise PlatformAccountError("Unsupported platform")
+                attempt = cancel_authorization_attempt(
+                    self.ui_data_root.absolute(), cast(Any, platform), attempt_id
+                )
+            except PlatformAccountError as exc:
+                self._send_creator_accounts_page(str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/accounts",
+                    self.ui_locale,
+                    auth_platform=attempt.platform,
+                    auth_attempt=attempt.attempt_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/accounts/auth/complete":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 16 * 1024:
+                self.send_error(413, "Authorization response is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            platform = form.get("platform", "")
+            attempt_id = form.get("attempt_id", "")
+            try:
+                if platform not in {"x", "linkedin", "douyin"}:
+                    raise PlatformAccountError("Unsupported platform")
+                complete_authorization_response(
+                    self.ui_data_root.absolute(),
+                    cast(Any, platform),
+                    attempt_id,
+                    form.get("authorization_response", ""),
+                )
+            except PlatformAccountError as exc:
+                self._send_creator_accounts_page(
+                    str(exc),
+                    auth_platform=platform,
+                    auth_attempt_id=attempt_id,
+                )
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url("/creator/accounts", self.ui_locale, account="connected"),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/accounts/disconnect":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "Disconnect request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            platform = form.get("platform", "")
+            try:
+                if platform not in {"x", "linkedin", "douyin", "xiaohongshu"}:
+                    raise PlatformAccountError("Unsupported platform")
+                disconnect_identity(
+                    self.ui_data_root.absolute(),
+                    cast(Any, platform),
+                    form.get("external_account_id", ""),
+                )
+            except PlatformAccountError as exc:
+                self._send_creator_accounts_page(str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location", ui_url("/creator/accounts", self.ui_locale, account="disconnected")
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path == "/creator/accounts/save":
             try:
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -7210,7 +7468,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self._adopt_ui_locale(form)
             forbidden = {"token", "secret", "password", "api_key", "oauth"}
             outcome = "invalid"
-            if not forbidden.intersection(form):
+            if not forbidden.intersection(form) and form.get("platform") == "independent_site":
                 try:
                     account = normalize_account(
                         platform=form.get("platform", ""),
@@ -8383,6 +8641,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     length = int(self.headers.get("Content-Length", "0") or 0)
                     publish_form = _parse_form(self.rfile.read(length))
                     self._adopt_ui_locale(publish_form)
+                    require_publish_identity(
+                        self.ui_data_root.absolute(), cast(Any, channel)
+                    )
                     publish_via_buildlog(
                         data_root=self.ui_data_root.absolute(),
                         run_id=run_id,

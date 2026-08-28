@@ -1,6 +1,7 @@
 import hashlib
 import json
 import stat
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -80,15 +81,45 @@ def _wait(
     while time.monotonic() < deadline:
         snapshot = manager.get(data_root, job_id)
         assert snapshot is not None
-        if snapshot.phase in {"SUCCESS", "FAILED"}:
+        if snapshot.phase in {"SUCCESS", "CANCELLED", "TIMED_OUT", "FAILED"}:
             return snapshot
         time.sleep(0.01)
     raise AssertionError("YouTube job did not finish")
 
 
+def _wait_phase(
+    manager: YouTubePublishingJobManager,
+    data_root: Path,
+    job_id: str,
+    phase: youtube.YouTubeJobPhase,
+) -> youtube.YouTubeJobSnapshot:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        snapshot = manager.get(data_root, job_id)
+        assert snapshot is not None
+        if snapshot.phase == phase:
+            return snapshot
+        time.sleep(0.01)
+    raise AssertionError(f"YouTube job did not reach {phase}")
+
+
 class FakeProvider:
-    def authorize(self, client_secret_path: Path) -> tuple[str, str, str]:
+    def authorize(
+        self,
+        client_secret_path: Path,
+        *,
+        status: youtube.OAuthStatusCallback,
+        cancel_event: threading.Event,
+        timeout_seconds: float,
+    ) -> tuple[str, str, str]:
         assert validate_client_secret(client_secret_path)
+        assert not cancel_event.is_set()
+        assert timeout_seconds > 0
+        status(
+            "waiting",
+            "https://accounts.google.com/o/oauth2/auth?prompt=select_account",
+        )
+        status("completing", None)
         return (
             CHANNEL_ID,
             "SoloScale",
@@ -111,6 +142,64 @@ class FakeProvider:
             video_id="video-123",
             video_url="https://youtu.be/video-123",
             uploaded_at="2026-08-28T12:00:00+00:00",
+        )
+
+
+class CancelThenSucceedProvider(FakeProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def authorize(
+        self,
+        client_secret_path: Path,
+        *,
+        status: youtube.OAuthStatusCallback,
+        cancel_event: threading.Event,
+        timeout_seconds: float,
+    ) -> tuple[str, str, str]:
+        self.calls += 1
+        if self.calls == 1:
+            status(
+                "waiting",
+                "https://accounts.google.com/o/oauth2/auth?prompt=select_account",
+            )
+            cancel_event.wait(timeout_seconds)
+            raise youtube.YouTubePublishingError(
+                "Google authorization was cancelled", code="OAUTH_CANCELLED"
+            )
+        return super().authorize(
+            client_secret_path,
+            status=status,
+            cancel_event=cancel_event,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+class FailThenSucceedProvider(FakeProvider):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        self.calls = 0
+
+    def authorize(
+        self,
+        client_secret_path: Path,
+        *,
+        status: youtube.OAuthStatusCallback,
+        cancel_event: threading.Event,
+        timeout_seconds: float,
+    ) -> tuple[str, str, str]:
+        self.calls += 1
+        if self.calls == 1:
+            status(
+                "waiting",
+                "https://accounts.google.com/o/oauth2/auth?prompt=select_account",
+            )
+            raise youtube.YouTubePublishingError("synthetic failure", code=self.code)
+        return super().authorize(
+            client_secret_path,
+            status=status,
+            cancel_event=cancel_event,
+            timeout_seconds=timeout_seconds,
         )
 
 
@@ -183,6 +272,84 @@ def test_background_connect_and_upload_create_receipt_without_blocking(
         assert receipt["privacy_status"] == "private"
         assert receipt["automatic_retry_count"] == 0
         assert "token" not in json.dumps(receipt)
+    finally:
+        manager.shutdown()
+
+
+def test_oauth_authorization_url_forces_account_selection() -> None:
+    captured: dict[str, object] = {}
+
+    class Flow:
+        def authorization_url(self, **kwargs: object) -> tuple[str, str]:
+            captured.update(kwargs)
+            return "https://accounts.google.com/o/oauth2/auth?prompt=select_account", "state"
+
+    assert "prompt=select_account" in youtube._oauth_authorization_url(Flow())
+    assert captured == {"access_type": "offline", "prompt": "select_account"}
+
+
+def test_cancelled_oauth_saves_no_account_and_can_retry(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    _client_secret(data_root / "integrations/youtube/client_secret.json")
+    provider = CancelThenSucceedProvider()
+    manager = YouTubePublishingJobManager(provider=provider, oauth_timeout_seconds=1)
+    try:
+        first = manager.start_connect(data_root=data_root)
+        waiting = _wait_phase(
+            manager, data_root, first.job_id, "WAITING_FOR_AUTHORIZATION"
+        )
+        assert waiting.authorization_url is not None
+        cancelled = manager.cancel_connect(data_root=data_root, job_id=first.job_id)
+        assert cancelled.phase == "CANCELLED"
+        assert _wait(manager, data_root, first.job_id).phase == "CANCELLED"
+        assert load_youtube_accounts(data_root) == ()
+        assert not (data_root / "integrations/youtube/tokens").exists()
+
+        second = manager.start_connect(data_root=data_root)
+        assert _wait(manager, data_root, second.job_id).phase == "SUCCESS"
+        assert len(load_youtube_accounts(data_root)) == 1
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("failure_code", "expected_phase"),
+    (("OAUTH_TIMEOUT", "TIMED_OUT"), ("NETWORK_UNAVAILABLE", "FAILED")),
+)
+def test_timeout_or_failure_returns_to_retry_ready(
+    tmp_path: Path,
+    failure_code: str,
+    expected_phase: youtube.YouTubeJobPhase,
+) -> None:
+    data_root = tmp_path / failure_code.lower()
+    _client_secret(data_root / "integrations/youtube/client_secret.json")
+    manager = YouTubePublishingJobManager(provider=FailThenSucceedProvider(failure_code))
+    try:
+        first = manager.start_connect(data_root=data_root)
+        failed = _wait(manager, data_root, first.job_id)
+        assert failed.phase == expected_phase
+        assert failed.authorization_url is None
+        assert load_youtube_accounts(data_root) == ()
+
+        second = manager.start_connect(data_root=data_root)
+        complete = _wait(manager, data_root, second.job_id)
+        assert complete.phase == "SUCCESS"
+        assert complete.channel_title == "SoloScale"
+    finally:
+        manager.shutdown()
+
+
+def test_reconnecting_same_channel_updates_without_duplicate(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    _client_secret(data_root / "integrations/youtube/client_secret.json")
+    manager = YouTubePublishingJobManager(provider=FakeProvider())
+    try:
+        for _ in range(2):
+            job = manager.start_connect(data_root=data_root)
+            assert _wait(manager, data_root, job.job_id).phase == "SUCCESS"
+        accounts = load_youtube_accounts(data_root)
+        assert len(accounts) == 1
+        assert accounts[0].channel_id == CHANNEL_ID
     finally:
         manager.shutdown()
 
