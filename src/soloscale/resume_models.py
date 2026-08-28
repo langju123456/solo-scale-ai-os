@@ -7,7 +7,7 @@ import re
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from soloscale.models import ContractModel, utc_now
 
@@ -78,6 +78,47 @@ class CandidateProfile(ContractModel):
 _ATOMIC_FACT_SPLIT_RE = re.compile(r"(?:[.;；]\s+|\s+[—–]\s+)")
 
 
+class ResumeAtomicFactQuarantineReason(StrEnum):
+    LOW_INFORMATION = "LOW_INFORMATION"
+    STRUCTURAL_FRAGMENT = "STRUCTURAL_FRAGMENT"
+    INVALID_TEXT = "INVALID_TEXT"
+    INVALID_PROVENANCE = "INVALID_PROVENANCE"
+    OTHER = "OTHER"
+
+
+class ResumeAtomicFactAdmissionTrace(ContractModel):
+    """Body-free counts for request-local candidate fact admission."""
+
+    candidate_facts_total: int = Field(ge=0)
+    candidate_facts_admitted: int = Field(ge=0)
+    candidate_facts_quarantined: int = Field(ge=0)
+    quarantine_reason_counts: dict[ResumeAtomicFactQuarantineReason, int] = Field(
+        default_factory=dict
+    )
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> ResumeAtomicFactAdmissionTrace:
+        if any(count < 0 for count in self.quarantine_reason_counts.values()):
+            raise ValueError("atomic fact quarantine counts must be non-negative")
+        if self.candidate_facts_total != (
+            self.candidate_facts_admitted + self.candidate_facts_quarantined
+        ):
+            raise ValueError("atomic fact admission counts must balance")
+        if self.candidate_facts_quarantined != sum(
+            self.quarantine_reason_counts.values()
+        ):
+            raise ValueError("atomic fact quarantine reasons must match the total")
+        return self
+
+
+class ResumeAtomicFactAdmissionError(ValueError):
+    """No truth-safe candidate facts survived individual admission."""
+
+    def __init__(self, trace: ResumeAtomicFactAdmissionTrace) -> None:
+        super().__init__("Candidate Evidence Pack contains no usable approved atomic facts")
+        self.trace = trace
+
+
 class ResumeAtomicFact(ContractModel):
     """One immutable fact identity derived from an approved profile entry."""
 
@@ -112,11 +153,49 @@ class ResumeAtomicFact(ContractModel):
         return values
 
 
-def build_resume_atomic_facts(profile: CandidateProfile) -> list[ResumeAtomicFact]:
-    """Derive deterministic request-local fact IDs from approved resume bullets."""
+def _candidate_fact_prevalidation_reason(
+    text: str,
+) -> ResumeAtomicFactQuarantineReason | None:
+    if "\ufffd" in text or any(
+        ord(character) < 0x20 and character not in {"\t", "\n", "\r"}
+        for character in text
+    ):
+        return ResumeAtomicFactQuarantineReason.INVALID_TEXT
+    if not any(character.isalnum() for character in text):
+        return ResumeAtomicFactQuarantineReason.STRUCTURAL_FRAGMENT
+    if len(text) < 3:
+        return ResumeAtomicFactQuarantineReason.LOW_INFORMATION
+    return None
+
+
+def _candidate_fact_validation_reason(
+    error: ValidationError,
+) -> ResumeAtomicFactQuarantineReason:
+    provenance_fields = {
+        "fact_id",
+        "profile_entry_id",
+        "evidence_id",
+        "source_sha256",
+        "fact_sha256",
+    }
+    if any(
+        validation_error.get("loc")
+        and validation_error["loc"][0] in provenance_fields
+        for validation_error in error.errors()
+    ):
+        return ResumeAtomicFactQuarantineReason.INVALID_PROVENANCE
+    return ResumeAtomicFactQuarantineReason.OTHER
+
+
+def admit_resume_atomic_facts(
+    profile: CandidateProfile,
+) -> tuple[list[ResumeAtomicFact], ResumeAtomicFactAdmissionTrace]:
+    """Admit approved facts independently and quarantine only invalid fragments."""
 
     entries = profile.experience_bullets + profile.project_bullets
     facts: list[ResumeAtomicFact] = []
+    total = 0
+    quarantine_reason_counts: dict[ResumeAtomicFactQuarantineReason, int] = {}
     for entry_index, source_text in enumerate(entries, start=1):
         profile_entry_id = f"PROFILE-{entry_index:02d}"
         source_sha256 = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
@@ -126,9 +205,16 @@ def build_resume_atomic_facts(profile: CandidateProfile) -> list[ResumeAtomicFac
             if fragment.strip(" \t\n,.;；")
         ] or [source_text]
         for fact_index, fragment in enumerate(fragments[:12], start=1):
+            total += 1
+            prevalidation_reason = _candidate_fact_prevalidation_reason(fragment)
+            if prevalidation_reason is not None:
+                quarantine_reason_counts[prevalidation_reason] = (
+                    quarantine_reason_counts.get(prevalidation_reason, 0) + 1
+                )
+                continue
             fact_id = f"FACT-{profile_entry_id}-{fact_index:02d}"
-            facts.append(
-                ResumeAtomicFact(
+            try:
+                fact = ResumeAtomicFact(
                     fact_id=fact_id,
                     profile_entry_id=profile_entry_id,
                     evidence_id=profile_entry_id,
@@ -139,7 +225,28 @@ def build_resume_atomic_facts(profile: CandidateProfile) -> list[ResumeAtomicFac
                         f"{fact_id}\0{profile_entry_id}\0{fragment}".encode()
                     ).hexdigest(),
                 )
-            )
+            except ValidationError as exc:
+                reason = _candidate_fact_validation_reason(exc)
+                quarantine_reason_counts[reason] = (
+                    quarantine_reason_counts.get(reason, 0) + 1
+                )
+                continue
+            facts.append(fact)
+    trace = ResumeAtomicFactAdmissionTrace(
+        candidate_facts_total=total,
+        candidate_facts_admitted=len(facts),
+        candidate_facts_quarantined=total - len(facts),
+        quarantine_reason_counts=quarantine_reason_counts,
+    )
+    if not facts:
+        raise ResumeAtomicFactAdmissionError(trace)
+    return facts, trace
+
+
+def build_resume_atomic_facts(profile: CandidateProfile) -> list[ResumeAtomicFact]:
+    """Derive deterministic request-local fact IDs from approved resume bullets."""
+
+    facts, _trace = admit_resume_atomic_facts(profile)
     return facts
 
 
@@ -399,6 +506,7 @@ class CandidateEvidencePack(ContractModel):
     schema_version: Literal["1.0"] = "1.0"  # type: ignore[assignment]
     sources: list[CandidateEvidenceSource] = Field(default_factory=list, max_length=32)
     atomic_facts: list[ResumeAtomicFact] = Field(min_length=1, max_length=960)
+    fact_admission: ResumeAtomicFactAdmissionTrace | None = None
     composition_plan: CompositionEvidencePlan | None = None
     pack_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
@@ -417,6 +525,12 @@ class CandidateEvidencePack(ContractModel):
         }
         if any(fact.evidence_id not in allowed_evidence_ids for fact in self.atomic_facts):
             raise ValueError("candidate evidence fact references an unknown source")
+        if self.fact_admission is not None:
+            profile_fact_count = sum(
+                fact.source_kind == "PROFILE_ENTRY" for fact in self.atomic_facts
+            )
+            if self.fact_admission.candidate_facts_admitted != profile_fact_count:
+                raise ValueError("atomic fact admission trace must match profile facts")
         if self.composition_plan is not None and not set(
             self.composition_plan.prioritized_fact_ids
         ) <= set(fact_ids):

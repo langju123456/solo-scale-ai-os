@@ -864,6 +864,104 @@ def test_chinese_editorial_synthesis_keeps_fact_boundary_and_rejects_inflation()
     }
 
 
+def test_cross_locale_fact_match_accepts_chinese_facts_in_english() -> None:
+    profile = CandidateProfile(
+        skills=["RAG", "FastAPI"],
+        project_bullets=[
+            "构建 RAG 检索工作流。",
+            "通过 FastAPI 完成服务编排。",
+        ],
+    )
+    fact_ids = _fact_ids(profile, "PROFILE-01", "PROFILE-02")
+    strategy = RoleStrategy(
+        role_summary="RAG and FastAPI role",
+        top_hiring_signals=["Required: RAG retrieval and FastAPI orchestration."],
+        evidence_priority=["PROFILE-01", "PROFILE-02"],
+        skill_priority=["RAG", "FastAPI"],
+        bullet_rewrites=[
+            GroundedResumeBulletRewrite(
+                profile_entry_id="PROFILE-01",
+                kind="SYNTHESIS",
+                text="Built a RAG retrieval workflow with FastAPI orchestration.",
+                source_profile_entry_ids=["PROFILE-01", "PROFILE-02"],
+                source_fact_ids=fact_ids,
+            ),
+            GroundedResumeBulletRewrite(
+                profile_entry_id="PROFILE-02",
+                text="Implemented FastAPI orchestration.",
+                source_fact_ids=_fact_ids(profile, "PROFILE-02"),
+            ),
+        ],
+        rewrite_guidance="Use natural English without adding facts.",
+    )
+
+    selected, _entries, diagnostics = _select_safe_rewrites(
+        strategy,
+        profile=profile,
+        job_description="Required: RAG retrieval and FastAPI orchestration.",
+        output_locale="en-US",
+    )
+
+    assert diagnostics.validator_status == "accepted"
+    assert selected.bullet_rewrites[0].kind == "SYNTHESIS"
+
+
+def test_cross_locale_fact_match_still_rejects_new_facts() -> None:
+    profile = CandidateProfile(
+        skills=["RAG"],
+        project_bullets=["构建 RAG 检索工作流。"],
+    )
+    fact_ids = _fact_ids(profile, "PROFILE-01")
+    unsafe_cases = (
+        (
+            "Built a RAG retrieval workflow with 40% improvement.",
+            ResumeValidationRuleCode.CLAIM_NEW_NUMBER,
+        ),
+        ("Led a RAG retrieval workflow.", ResumeValidationRuleCode.CLAIM_ROLE_INFLATION),
+        (
+            "Built a RAG retrieval workflow for Acme customers.",
+            ResumeValidationRuleCode.CLAIM_CLIENT_INFLATION,
+        ),
+        (
+            "Built an enterprise production RAG retrieval workflow.",
+            ResumeValidationRuleCode.CLAIM_SCALE_INFLATION,
+        ),
+        (
+            "Built a LangGraph RAG retrieval workflow.",
+            ResumeValidationRuleCode.CLAIM_TECHNOLOGY_INFLATION,
+        ),
+        (
+            "Reduced latency through a RAG retrieval workflow.",
+            ResumeValidationRuleCode.CLAIM_OUTCOME_INFLATION,
+        ),
+    )
+    for text, expected_rule in unsafe_cases:
+        strategy = RoleStrategy(
+            role_summary="RAG role",
+            top_hiring_signals=["Required: RAG retrieval."],
+            evidence_priority=["PROFILE-01"],
+            skill_priority=["RAG"],
+            bullet_rewrites=[
+                GroundedResumeBulletRewrite(
+                    profile_entry_id="PROFILE-01",
+                    text=text,
+                    source_fact_ids=fact_ids,
+                )
+            ],
+            rewrite_guidance="Use natural English without adding facts.",
+        )
+        selected, _entries, diagnostics = _select_safe_rewrites(
+            strategy,
+            profile=profile,
+            job_description="Required: RAG retrieval.",
+            output_locale="en-US",
+        )
+        assert selected.bullet_rewrites[0].text == "构建 RAG 检索工作流。"
+        assert expected_rule in {
+            failure.rule_code for failure in diagnostics.failures
+        }
+
+
 def test_synthesis_provenance_rejects_misaligned_target_source_hash() -> None:
     final_text = "Built RAG retrieval with FastAPI orchestration."
     first_source_hash = hashlib.sha256(b"Built RAG retrieval.").hexdigest()

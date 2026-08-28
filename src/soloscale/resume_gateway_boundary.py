@@ -19,10 +19,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import ClassVar, Literal
 from xml.etree import ElementTree
 
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
 
 from soloscale.models import ContractModel, utc_now
 from soloscale.resume_evidence_pack import (
@@ -136,6 +137,35 @@ class ResumeUploadError(ValueError):
     """A selected file is outside the explicitly authorized upload boundary."""
 
 
+class PDFExtractionTrace(ContractModel):
+    """Body-free observability for the canonical PDF extraction policy."""
+
+    primary_extractor: Literal["bounded_stream"] = "bounded_stream"
+    primary_quality: Literal["USABLE", "UNRELIABLE"]
+    fallback_used: bool
+    fallback_extractor: Literal["pypdf"] | None = None
+    fallback_quality: Literal["NOT_USED", "USABLE", "UNRELIABLE"]
+    extracted_chars: int = Field(ge=0, le=_MAX_EXTRACTED_TEXT)
+    replacement_chars: int = Field(ge=0, le=_MAX_EXTRACTED_TEXT)
+    meaningful_line_ratio: float = Field(ge=0.0, le=1.0)
+    source_parse_status: Literal["USABLE", "SOURCE_PARSE_UNRELIABLE_TEXT"]
+
+
+class ResumeSourceParseError(ResumeUploadError):
+    """The selected source cannot produce trustworthy natural-language text."""
+
+    code: ClassVar[str] = "SOURCE_PARSE_UNRELIABLE_TEXT"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        trace: PDFExtractionTrace | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.trace = trace
+
+
 class ResumeUploadRole(StrEnum):
     RESUME = "resume"
     JOB_DESCRIPTION = "job_description"
@@ -244,6 +274,7 @@ class ExtractedResumeUpload(ContractModel):
     content_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     text: str = Field(min_length=1, max_length=_MAX_EXTRACTED_TEXT)
     template_metadata: ResumeTemplateMetadata
+    source_parse_trace: PDFExtractionTrace | None = None
 
 
 class GatewayResumeEntry(ContractModel):
@@ -553,7 +584,19 @@ def _pdf_stream_dictionary(content: bytes, match: re.Match[bytes]) -> bytes:
     return content[object_start:stream_start]
 
 
-def _pdf_text(content: bytes) -> tuple[str, int | None]:
+@dataclass(frozen=True)
+class _PDFTextQuality:
+    usable: bool
+    extracted_chars: int
+    replacement_chars: int
+    meaningful_line_ratio: float
+
+
+class _PDFFallbackExtractionError(Exception):
+    """The bounded fallback could not recover a complete text result."""
+
+
+def _primary_pdf_text(content: bytes) -> tuple[str, int | None]:
     if b"/Encrypt" in content:
         raise ResumeUploadError("Password-protected PDF files are not accepted")
     page_count = len(re.findall(rb"/Type\s*/Page\b", content)) or None
@@ -611,7 +654,190 @@ def _pdf_text(content: bytes) -> tuple[str, int | None]:
         raise ResumeUploadError(
             "The PDF has no extractable text; image-only PDFs and OCR are not supported"
         )
+    if len(text) > _MAX_EXTRACTED_TEXT:
+        raise ResumeUploadError("Extracted text exceeds the bounded processing limit")
     return text, page_count
+
+
+def _pdf_text_quality(text: str) -> _PDFTextQuality:
+    """Evaluate every PDF extractor with the same canonical quality contract."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    characters = [character for character in text if not character.isspace()]
+    if not lines or not characters:
+        return _PDFTextQuality(
+            usable=False,
+            extracted_chars=len(text),
+            replacement_chars=text.count("\ufffd"),
+            meaningful_line_ratio=0.0,
+        )
+
+    replacement_chars = text.count("\ufffd")
+    replacement_ratio = replacement_chars / len(characters)
+    printable_ratio = sum(character.isprintable() for character in characters) / len(
+        characters
+    )
+    textual_ratio = sum(character.isalnum() for character in characters) / len(
+        characters
+    )
+    meaningful_lines = sum(
+        len(line) >= 3 and sum(character.isalnum() for character in line) >= 2
+        for line in lines
+    )
+    short_line_ratio = sum(len(line) <= 2 for line in lines) / len(lines)
+    wordlike_sequences = re.findall(r"[^\W_]{3,}", text, flags=re.UNICODE)
+
+    fragmented = (
+        len(lines) >= 4
+        and short_line_ratio >= 0.90
+        and meaningful_lines == 0
+    )
+    replacement_corruption = replacement_ratio >= 0.08
+    nontextual = printable_ratio < 0.90 or textual_ratio < 0.35
+    no_natural_language = meaningful_lines == 0 and not wordlike_sequences
+
+    usable = not (
+        (fragmented and (replacement_corruption or no_natural_language))
+        or (replacement_corruption and nontextual)
+        or (len(lines) >= 4 and nontextual and no_natural_language)
+    )
+    return _PDFTextQuality(
+        usable=usable,
+        extracted_chars=len(text),
+        replacement_chars=replacement_chars,
+        meaningful_line_ratio=meaningful_lines / len(lines),
+    )
+
+
+def _pdf_extracted_text_is_usable(text: str) -> bool:
+    """Reject clear glyph-fragment output before it becomes Resume structure."""
+
+    return _pdf_text_quality(text).usable
+
+
+def _pypdf_text(content: bytes) -> tuple[str, int]:
+    """Recover one bounded complete extraction with pypdf; never merge outputs."""
+
+    try:
+        reader = PdfReader(
+            io.BytesIO(content),
+            strict=True,
+            root_object_recovery_limit=1_000,
+        )
+        if reader.is_encrypted:
+            raise ResumeUploadError("Password-protected PDF files are not accepted")
+        page_count = len(reader.pages)
+        if page_count == 0:
+            raise _PDFFallbackExtractionError("PDF contains no pages")
+        if page_count > 100:
+            raise ResumeUploadError("PDF page count exceeds the bounded processing limit")
+
+        values: list[str] = []
+        decoded_bytes = 0
+        extracted_chars = 0
+        for page in reader.pages:
+            contents = page.get_contents()
+            if contents is not None:
+                decoded_bytes += len(contents.get_data())
+                if decoded_bytes > _MAX_PDF_DECOMPRESSED_BYTES:
+                    raise ResumeUploadError(
+                        "PDF content expands beyond the safety limit"
+                    )
+            page_text = page.extract_text() or ""
+            extracted_chars += len(page_text)
+            if extracted_chars > _MAX_EXTRACTED_TEXT:
+                raise ResumeUploadError(
+                    "Extracted text exceeds the bounded processing limit"
+                )
+            if page_text.strip():
+                values.append(page_text.strip())
+    except ResumeUploadError:
+        raise
+    except Exception as exc:
+        raise _PDFFallbackExtractionError from exc
+
+    text = "\n".join(values).strip()
+    if not text:
+        raise _PDFFallbackExtractionError("PDF contains no extractable text")
+    return text, page_count
+
+
+def _pdf_extraction_trace(
+    *,
+    primary_quality: _PDFTextQuality,
+    fallback_used: bool,
+    fallback_quality: _PDFTextQuality | None,
+    source_parse_status: Literal["USABLE", "SOURCE_PARSE_UNRELIABLE_TEXT"],
+) -> PDFExtractionTrace:
+    selected_quality = fallback_quality or primary_quality
+    return PDFExtractionTrace(
+        primary_quality="USABLE" if primary_quality.usable else "UNRELIABLE",
+        fallback_used=fallback_used,
+        fallback_extractor="pypdf" if fallback_used else None,
+        fallback_quality=(
+            "USABLE"
+            if fallback_quality is not None and fallback_quality.usable
+            else "UNRELIABLE"
+            if fallback_used
+            else "NOT_USED"
+        ),
+        extracted_chars=selected_quality.extracted_chars,
+        replacement_chars=selected_quality.replacement_chars,
+        meaningful_line_ratio=selected_quality.meaningful_line_ratio,
+        source_parse_status=source_parse_status,
+    )
+
+
+def _pdf_text(content: bytes) -> tuple[str, int | None, PDFExtractionTrace]:
+    primary_text, primary_page_count = _primary_pdf_text(content)
+    primary_quality = _pdf_text_quality(primary_text)
+    if primary_quality.usable:
+        return (
+            primary_text,
+            primary_page_count,
+            _pdf_extraction_trace(
+                primary_quality=primary_quality,
+                fallback_used=False,
+                fallback_quality=None,
+                source_parse_status="USABLE",
+            ),
+        )
+
+    fallback_text: str | None = None
+    fallback_page_count: int | None = None
+    fallback_quality: _PDFTextQuality | None = None
+    try:
+        fallback_text, fallback_page_count = _pypdf_text(content)
+        fallback_quality = _pdf_text_quality(fallback_text)
+    except _PDFFallbackExtractionError:
+        pass
+
+    if (
+        fallback_text is not None
+        and fallback_page_count is not None
+        and fallback_quality is not None
+        and fallback_quality.usable
+    ):
+        return (
+            fallback_text,
+            fallback_page_count,
+            _pdf_extraction_trace(
+                primary_quality=primary_quality,
+                fallback_used=True,
+                fallback_quality=fallback_quality,
+                source_parse_status="USABLE",
+            ),
+        )
+
+    trace = _pdf_extraction_trace(
+        primary_quality=primary_quality,
+        fallback_used=True,
+        fallback_quality=fallback_quality,
+        source_parse_status="SOURCE_PARSE_UNRELIABLE_TEXT",
+    )
+    raise ResumeSourceParseError(
+        "无法可靠读取此 PDF 中的文字。请改用 DOCX，或使用可复制文本的 PDF。",
+        trace=trace,
+    )
 
 
 def extract_selected_resume_file(item: SelectedResumeFile) -> ExtractedResumeUpload:
@@ -620,11 +846,12 @@ def extract_selected_resume_file(item: SelectedResumeFile) -> ExtractedResumeUpl
     _reject_disguised_file(item.content, suffix)
     if len(item.content) > MAX_RESUME_FILE_BYTES:
         raise ResumeUploadError("Each selected file must be 5 MB or smaller")
+    source_parse_trace: PDFExtractionTrace | None = None
     if suffix == ".docx":
         text, metadata = _docx_text_and_metadata(item.content)
         source_format: Literal["docx", "pdf", "txt", "md", "html"] = "docx"
     elif suffix == ".pdf":
-        text, page_count = _pdf_text(item.content)
+        text, page_count, source_parse_trace = _pdf_text(item.content)
         source_format = "pdf"
         metadata = ResumeTemplateMetadata(source_format="pdf", page_count=page_count)
     else:
@@ -662,6 +889,7 @@ def extract_selected_resume_file(item: SelectedResumeFile) -> ExtractedResumeUpl
         content_sha256=hashlib.sha256(item.content).hexdigest(),
         text=text,
         template_metadata=metadata,
+        source_parse_trace=source_parse_trace,
     )
 
 

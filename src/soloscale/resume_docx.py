@@ -988,6 +988,8 @@ _ZH_INFLATION_TERMS: tuple[
 )
 _ZH_FACT_ANCHOR_ALIASES: dict[str, tuple[str, ...]] = {
     "architecture": ("架构",),
+    "client": ("客户",),
+    "customer": ("客户",),
     "customer-facing": ("面向客户", "客户场景"),
     "delivery": ("交付",),
     "development": ("开发",),
@@ -995,6 +997,7 @@ _ZH_FACT_ANCHOR_ALIASES: dict[str, tuple[str, ...]] = {
     "evaluation": ("评估",),
     "evidence-grounded": ("证据驱动", "证据支撑"),
     "orchestration": ("编排",),
+    "improved": ("改进", "提升"),
     "reliability": ("可靠性",),
     "requirements": ("需求",),
     "retrieval": ("检索",),
@@ -1016,6 +1019,47 @@ def _fact_anchor_terms(text: str) -> set[str]:
     terms = _terms(text)
     anchors = terms - _FACT_ACTION_TERMS - _GENERIC_JD_TERMS
     return anchors or terms
+
+
+def _cross_locale_fact_match(
+    *,
+    source_fact: str,
+    candidate_claim: str,
+    target_locale: Literal["en-US", "zh-CN"],
+    source_anchors: set[str],
+    candidate_terms: set[str],
+) -> bool:
+    """Match only curated semantic anchors when source and target languages differ."""
+
+    source_has_chinese = any(
+        "\u4e00" <= character <= "\u9fff" for character in source_fact
+    )
+    if target_locale == "zh-CN" and not source_has_chinese:
+        return any(
+            alias in candidate_claim
+            for anchor in source_anchors
+            for alias in _ZH_FACT_ANCHOR_ALIASES.get(anchor, ())
+        )
+    if target_locale == "en-US" and source_has_chinese:
+        return any(
+            anchor in candidate_terms
+            and any(alias in source_fact for alias in chinese_aliases)
+            for anchor, chinese_aliases in _ZH_FACT_ANCHOR_ALIASES.items()
+        )
+    return False
+
+
+def _source_terms_for_target_locale(
+    source_text: str, target_locale: Literal["en-US", "zh-CN"]
+) -> set[str]:
+    terms = _normalized_words(source_text) | _terms(source_text)
+    if target_locale == "en-US":
+        terms.update(
+            anchor
+            for anchor, chinese_aliases in _ZH_FACT_ANCHOR_ALIASES.items()
+            if any(alias in source_text for alias in chinese_aliases)
+        )
+    return terms
 
 
 def _protected_facts(text: str) -> set[str]:
@@ -1197,12 +1241,17 @@ def _validate_role_strategy(
                     or any(character.isdigit() for character in value)
                     or len(value) >= 4
                 }
-            translated_anchor_present = output_locale == "zh-CN" and any(
-                alias in text
-                for anchor in fact_anchors
-                for alias in _ZH_FACT_ANCHOR_ALIASES.get(anchor, ())
+            cross_locale_anchor_present = _cross_locale_fact_match(
+                source_fact=fact.text,
+                candidate_claim=text,
+                target_locale=output_locale,
+                source_anchors=fact_anchors,
+                candidate_terms=output_terms,
             )
-            if not (fact_anchors & output_terms) and not translated_anchor_present:
+            if (
+                not (fact_anchors & output_terms)
+                and not cross_locale_anchor_present
+            ):
                 reject(
                     ResumeValidationRuleCode.CLAIM_NO_EVIDENCE,
                     f"{json_path}.text",
@@ -1214,7 +1263,7 @@ def _validate_role_strategy(
         allowed_numbers = {
             value.casefold() for fact in resolved_facts for value in fact.allowed_numbers
         }
-        source_words = _normalized_words(source_union) | _terms(source_union)
+        source_words = _source_terms_for_target_locale(source_union, output_locale)
         localized_protected_allowlist: set[str] = set()
         if output_locale == "zh-CN" and any(
             value == "ai" or value.startswith("ai-") or value.endswith("ai")
@@ -1247,7 +1296,7 @@ def _validate_role_strategy(
                 f"{json_path}.text",
                 claim_id=claim_id,
             )
-        if (_terms(text) & jd_terms) - _terms(source_union):
+        if (_terms(text) & jd_terms) - source_words:
             reject(
                 ResumeValidationRuleCode.CLAIM_ROLE_INFLATION,
                 f"{json_path}.text",

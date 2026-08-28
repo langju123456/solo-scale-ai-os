@@ -1640,6 +1640,11 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
     }
     for run_dir in (fde_run, eir_run, unrelated_run):
         metadata = json.loads((run_dir / "09_user_ui.json").read_text())
+        assert metadata["composition_status"] == "CONTENT_READY"
+        assert metadata["truth_status"] == "VERIFIED"
+        assert metadata["docx_status"] == "DOCX_READY"
+        assert metadata["pdf_status"] == "NEEDS_ATTENTION"
+        assert metadata["pdf_failure_reason"] == "LOCAL_PDF_RENDER_UNAVAILABLE_OR_FAILED"
         assert metadata["model_call_performed"] is True
         assert metadata["evidence_requirements"]
         assert len(metadata["evidence_source_summary"]) == 9
@@ -1703,6 +1708,8 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
             for claim in provenance["claims"]
         )
     rendered_fde = _user_page(fde_result, tmp_path / "data-FDE", {})
+    assert "简历已经生成并可下载 DOCX" in rendered_fde
+    assert "PDF 预览未完成" in rendered_fde
     assert "查看本次证据来源" in rendered_fde
     assert "查看 JD 要求覆盖" in rendered_fde
 
@@ -1761,6 +1768,10 @@ def test_resume_ui_generates_bilingual_variants_from_one_evidence_pack(
         for run_dir in run_dirs
     ]
     assert {item["output_locale"] for item in metadata} == {"en-US", "zh-CN"}
+    assert {item["source_resume_locale"] for item in metadata} == {"en-US"}
+    assert {item["target_locale"] for item in metadata} == {"en-US", "zh-CN"}
+    assert {item["docx_status"] for item in metadata} == {"DOCX_READY"}
+    assert {item["pdf_status"] for item in metadata} == {"PDF_READY"}
     assert len({item["resume_project_id"] for item in metadata}) == 1
     assert len({item["candidate_evidence_pack_sha256"] for item in metadata}) == 1
     assert all((run_dir / "08_resume.docx").is_file() for run_dir in run_dirs)

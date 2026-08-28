@@ -27,7 +27,7 @@ from soloscale.resume_models import (
     ResumeEvidenceRetrievalTrace,
     ResumeEvidenceSourceSummary,
     ResumeRequirementCoverage,
-    build_resume_atomic_facts,
+    admit_resume_atomic_facts,
 )
 
 _HEADING_LINES = {
@@ -210,11 +210,19 @@ def _compact_verified_facts(
             & requirement_terms
             & _HIGH_SIGNAL_TERMS
         )
+        fact_authority = authority(fact)
         return (
-            int(lexical >= 3 or tags >= 1 or high_signal_match),
+            int(
+                lexical >= 3
+                or tags >= 1
+                or high_signal_match
+                # Verified evidence (metrics, rich events, and committed repository
+                # summaries) is never silently dropped by JD relevance compaction.
+                or fact_authority > 0
+            ),
             lexical,
             tags,
-            authority(fact),
+            fact_authority,
         )
 
     selected: list[ResumeAtomicFact] = []
@@ -677,7 +685,7 @@ def build_candidate_evidence_pack(
     """Retrieve locally, admit verified sources, and build compact model context."""
 
     admission_started = time.perf_counter()
-    atomic_facts = build_resume_atomic_facts(profile)
+    atomic_facts, fact_admission = admit_resume_atomic_facts(profile)
     sources: list[CandidateEvidenceSource] = []
     if repository_root is not None and data_root is None:
         raise ValueError("data_root is required when repository_root is provided")
@@ -783,6 +791,7 @@ def build_candidate_evidence_pack(
         {
             "sources": [source.model_dump(mode="json") for source in sources],
             "atomic_facts": [fact.model_dump(mode="json") for fact in atomic_facts],
+            "fact_admission": fact_admission.model_dump(mode="json"),
             "composition_plan": composition_plan.model_dump(mode="json"),
         },
         ensure_ascii=False,
@@ -792,6 +801,7 @@ def build_candidate_evidence_pack(
     pack = CandidateEvidencePack(
         sources=sources,
         atomic_facts=atomic_facts,
+        fact_admission=fact_admission,
         composition_plan=composition_plan,
         pack_sha256=hashlib.sha256(canonical.encode()).hexdigest(),
     )

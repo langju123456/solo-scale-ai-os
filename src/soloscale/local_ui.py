@@ -199,6 +199,7 @@ from soloscale.resume_models import (
 )
 from soloscale.resume_template_intake import (
     ResumeTemplateReceipt,
+    detect_resume_language,
     inspect_template_file,
     inspect_template_html,
     inspect_template_url,
@@ -489,7 +490,7 @@ class ResumeJobManager:
                 job_id,
                 "COMPLETE",
                 result=completed,
-                preview_state="ready" if preview_created else "unavailable",
+                preview_state="ready" if preview_created else "needs_attention",
             )
             snapshot = self.get(job_id)
             if snapshot is not None:
@@ -1889,6 +1890,7 @@ def _save_request_scoped_resume_run(
     approved_claims: list[dict[str, str]],
     create_preview: bool = True,
     output_locale: Literal["en-US", "zh-CN"] = "en-US",
+    source_resume_locale: Literal["en-US", "zh-CN", "mixed", "unknown"] = "unknown",
     resume_project_id: str | None = None,
     template_receipt: ResumeTemplateReceipt | None = None,
 ) -> Path:
@@ -1905,7 +1907,9 @@ def _save_request_scoped_resume_run(
     run_dir.mkdir(mode=0o700)
     os.chmod(run_dir, 0o700)
     internal_docx = run_dir / "08_resume.docx"
+    docx_started = time.perf_counter()
     _write_private_bytes(internal_docx, tailored.content)
+    docx_render_ms = int((time.perf_counter() - docx_started) * 1000)
     provenance = _build_resume_provenance_receipt(
         run_id=run_id,
         job_description=job_description,
@@ -1941,6 +1945,11 @@ def _save_request_scoped_resume_run(
                 "candidate_evidence_fact_count": sum(
                     fact.source_kind == "CANDIDATE_EVIDENCE"
                     for fact in pack.atomic_facts
+                ),
+                "fact_admission": (
+                    pack.fact_admission.model_dump(mode="json")
+                    if pack.fact_admission is not None
+                    else None
                 ),
                 "sources": [
                     source.model_dump(mode="json") for source in pack.sources
@@ -1985,15 +1994,52 @@ def _save_request_scoped_resume_run(
         },
     )
     preview_pdf = run_dir / "10_resume_preview.pdf"
+    pdf_started = time.perf_counter()
     preview_created = (
         _create_resume_pdf_preview(internal_docx, preview_pdf)
         if create_preview
         else False
     )
+    pdf_render_ms = (
+        int((time.perf_counter() - pdf_started) * 1000) if create_preview else 0
+    )
+    pdf_status = (
+        "PDF_READY"
+        if preview_created
+        else "NEEDS_ATTENTION"
+        if create_preview
+        else "PENDING"
+    )
     user_metadata: dict[str, object] = {
         "schema_version": "1.0",
         "resume_project_id": resume_project_id,
+        "source_resume_locale": source_resume_locale,
+        "target_locale": output_locale,
         "output_locale": output_locale,
+        "composition_status": "CONTENT_READY",
+        "truth_status": "VERIFIED",
+        "docx_status": "DOCX_READY",
+        "docx_render_ms": docx_render_ms,
+        "pdf_status": pdf_status,
+        "pdf_render_ms": pdf_render_ms,
+        "pdf_layout_attempts": 1 if create_preview else 0,
+        "pdf_failure_reason": (
+            "LOCAL_PDF_RENDER_UNAVAILABLE_OR_FAILED"
+            if create_preview and not preview_created
+            else None
+        ),
+        "failure_classification": (
+            "DEGRADED"
+            if create_preview and not preview_created
+            else "RECOVERABLE"
+            if not create_preview
+            else None
+        ),
+        "fallback_used": bool(
+            tailored.role_strategy_fallback_applied
+            or tailored.rejected_rewrites
+            or tailored.expert_review_skipped_code
+        ),
         "retention": "request_scoped_sources_not_persisted",
         "template_source_format": source_format,
         "template_sha256": tailored.template_sha256,
@@ -2099,6 +2145,8 @@ def _save_request_scoped_resume_run(
             "status": "REQUEST_SCOPED_DRAFT_READY",
             "run_id": run_id,
             "resume_project_id": resume_project_id,
+            "source_resume_locale": source_resume_locale,
+            "target_locale": output_locale,
             "output_locale": output_locale,
             "source_inputs_retained": False,
             "source_input_lifetime": "request_only",
@@ -2154,7 +2202,14 @@ def _save_request_scoped_resume_run(
             "run_id": run_id,
             "status": "DRAFT_REQUIRES_HUMAN_REVIEW",
             "resume_project_id": resume_project_id,
+            "source_resume_locale": source_resume_locale,
+            "target_locale": output_locale,
             "output_locale": output_locale,
+            "composition_status": "CONTENT_READY",
+            "truth_status": "VERIFIED",
+            "docx_status": "DOCX_READY",
+            "docx_render_ms": docx_render_ms,
+            "pdf_status": pdf_status,
             "retention": "request_scoped_sources_not_persisted",
             "artifact_paths": artifacts,
             "job_description_sha256": job_sha256,
@@ -2254,6 +2309,9 @@ def _run_user_resume(
         if output_language == "both"
         else (cast(Literal["en-US", "zh-CN"], output_language),)
     )
+    # Safe offline mode preserves source claim wording by design. Locale-specific
+    # editorial composition is an AI capability; this is not a source/target
+    # language-matching rule.
     if generation_mode == "template" and output_language != "en-US":
         return UIActionResult(
             "tailored-resume",
@@ -2345,6 +2403,7 @@ def _run_user_resume(
             )
         extracted = extract_selected_resume_files(selected_files)
         resume_upload = extracted[ResumeUploadRole.RESUME]
+        source_resume_locale = detect_resume_language([resume_upload.text])
         _record_resume_event(data_root, ResumeFunnelEventType.RESUME_UPLOAD_COMPLETED)
         pasted_jd = form.get("job_description", "").strip()
         uploaded_jd = extracted.get(ResumeUploadRole.JOB_DESCRIPTION)
@@ -2607,6 +2666,7 @@ def _run_user_resume(
                     approved_claims=approved_claims,
                     create_preview=create_preview,
                     output_locale=output_locale,
+                    source_resume_locale=source_resume_locale,
                     resume_project_id=resume_project_id,
                     template_receipt=template_receipt,
                 )
@@ -2673,6 +2733,11 @@ def _run_user_resume(
             application_resume_metadata={
                 "output_locale": tailored.output_locale,
                 "template_source_format": resume_upload.source_format,
+                "source_parse_trace": (
+                    resume_upload.source_parse_trace.model_dump_json()
+                    if resume_upload.source_parse_trace is not None
+                    else ""
+                ),
                 "template_sha256": tailored.template_sha256,
                 "claims_preserved": tailored.claims_preserved,
                 "source_paragraph_count": tailored.source_paragraph_count,
@@ -2756,15 +2821,58 @@ def _run_user_resume(
         preview_pdf = run_dir / "10_resume_preview.pdf"
         if create_preview and progress is not None:
             progress("PREVIEWING")
+        pdf_started = time.perf_counter()
         preview_created = (
             _create_resume_pdf_preview(internal_docx, preview_pdf)
             if create_preview
             else False
         )
+        pdf_render_ms = (
+            int((time.perf_counter() - pdf_started) * 1000) if create_preview else 0
+        )
+        pdf_status = (
+            "PDF_READY"
+            if preview_created
+            else "NEEDS_ATTENTION"
+            if create_preview
+            else "PENDING"
+        )
+        docx_render_ms = int((time.perf_counter() - docx_started) * 1000)
         user_metadata: dict[str, object] = {
             "schema_version": "1.0",
+            "source_resume_locale": source_resume_locale,
+            "target_locale": tailored.output_locale,
             "output_locale": tailored.output_locale,
+            "composition_status": "CONTENT_READY",
+            "truth_status": "VERIFIED",
+            "docx_status": "DOCX_READY",
+            "docx_render_ms": docx_render_ms,
+            "pdf_status": pdf_status,
+            "pdf_render_ms": pdf_render_ms,
+            "pdf_layout_attempts": 1 if create_preview else 0,
+            "pdf_failure_reason": (
+                "LOCAL_PDF_RENDER_UNAVAILABLE_OR_FAILED"
+                if create_preview and not preview_created
+                else None
+            ),
+            "failure_classification": (
+                "DEGRADED"
+                if create_preview and not preview_created
+                else "RECOVERABLE"
+                if not create_preview
+                else None
+            ),
+            "fallback_used": bool(
+                tailored.role_strategy_fallback_applied
+                or tailored.rejected_rewrites
+                or tailored.expert_review_skipped_code
+            ),
             "template_source_format": resume_upload.source_format,
+            "source_parse_trace": (
+                resume_upload.source_parse_trace.model_dump(mode="json")
+                if resume_upload.source_parse_trace is not None
+                else None
+            ),
             "template_sha256": tailored.template_sha256,
             "output_filename": output_name,
             "output_sha256": tailored.output_sha256,
@@ -2926,6 +3034,11 @@ def _run_user_resume(
         route["docx_sha256"] = tailored.output_sha256
         route["resume_provenance_sha256"] = provenance_sha256
         route["preview_generated"] = preview_created
+        route["composition_status"] = "CONTENT_READY"
+        route["truth_status"] = "VERIFIED"
+        route["docx_status"] = "DOCX_READY"
+        route["docx_render_ms"] = docx_render_ms
+        route["pdf_status"] = pdf_status
         route["model_call_profile"] = tailored.model_call_profile
         artifact_paths = run_payload.get("artifact_paths")
         if not isinstance(artifact_paths, list):
@@ -3068,11 +3181,13 @@ def _finalize_resume_preview(data_root: Path, result: UIActionResult) -> bool:
     for run_dir in run_dirs:
         source = _resume_run_artifact(data_root, run_dir.name, "08_resume.docx")
         target = run_dir / "10_resume_preview.pdf"
+        pdf_started = time.perf_counter()
         created = bool(
             source is not None
             and not target.is_symlink()
             and _create_resume_pdf_preview(source, target)
         )
+        pdf_render_ms = int((time.perf_counter() - pdf_started) * 1000)
 
         metadata_path = run_dir / "09_user_ui.json"
         metadata = _load_json_file(metadata_path)
@@ -3081,6 +3196,16 @@ def _finalize_resume_preview(data_root: Path, result: UIActionResult) -> bool:
             metadata["preview_url"] = (
                 f"/previews/{run_dir.name}/resume.pdf" if created else ""
             )
+            metadata["pdf_status"] = "PDF_READY" if created else "NEEDS_ATTENTION"
+            metadata["pdf_render_ms"] = pdf_render_ms
+            previous_attempts = metadata.get("pdf_layout_attempts", 0)
+            metadata["pdf_layout_attempts"] = (
+                previous_attempts + 1 if isinstance(previous_attempts, int) else 1
+            )
+            metadata["pdf_failure_reason"] = (
+                None if created else "LOCAL_PDF_RENDER_UNAVAILABLE_OR_FAILED"
+            )
+            metadata["failure_classification"] = None if created else "DEGRADED"
             _write_private_json(metadata_path, metadata)
 
         run_path = run_dir / "run.json"
@@ -3091,6 +3216,9 @@ def _finalize_resume_preview(data_root: Path, result: UIActionResult) -> bool:
                 route = {}
                 run_payload["route"] = route
             route["preview_generated"] = created
+            route["pdf_status"] = "PDF_READY" if created else "NEEDS_ATTENTION"
+            route["pdf_render_ms"] = pdf_render_ms
+            route["failure_classification"] = None if created else "DEGRADED"
             artifacts = run_payload.get("artifact_paths")
             if not isinstance(artifacts, list):
                 artifacts = []
@@ -3851,9 +3979,17 @@ def _user_result_card(
             "生成失败，请检查输入后重试。",
             "Generation failed. Check the input and try again.",
         )
+        source_unreadable = "PDF content expands beyond the safety limit" in message
+        failure_heading = ui_text(
+            locale,
+            "输入文件无法安全读取" if source_unreadable else "这次没有生成简历",
+            "The input file could not be read safely"
+            if source_unreadable
+            else "No resume was generated this time",
+        )
         return f"""<section class="result-card error-state" role="alert">
   <span class="result-kicker">{_escape(ui_text(locale, '需要处理', 'Needs attention'))}</span>
-  <h2>{_escape(ui_text(locale, '这次没有生成简历', 'No resume was generated this time'))}</h2>
+  <h2>{_escape(failure_heading)}</h2>
   <p>{_escape(message)}</p>
 </section>"""
 
@@ -3882,6 +4018,7 @@ def _user_result_card(
         variant_locale = str(variant_metadata.get("output_locale", ""))
         variant_download = str(variant_metadata.get("download_url", ""))
         variant_preview = str(variant_metadata.get("preview_url", ""))
+        variant_pdf_status = str(variant_metadata.get("pdf_status", "PENDING"))
         variant_name = str(
             variant_metadata.get("output_filename", "Tailored Resume.docx")
         )
@@ -3890,7 +4027,7 @@ def _user_result_card(
         preview_link = (
             f'<a href="{_escape(variant_preview)}" target="_blank" rel="noopener">PDF</a>'
             if variant_preview
-            else ""
+            else f'<span>{_escape(ui_text(locale, "PDF 待处理", "PDF needs attention") if variant_pdf_status == "NEEDS_ATTENTION" else ui_text(locale, "PDF 生成中", "PDF pending"))}</span>'
         )
         variant_cards.append(
             '<article class="resume-variant-card">'
@@ -3934,6 +4071,7 @@ def _user_result_card(
         gap_html = f"<li>{_escape(ui_text(locale, '没有发现明确的未覆盖项。', 'No explicit uncovered requirement was found.'))}</li>"
     download_url = str(user_metadata.get("download_url", ""))
     preview_url = str(user_metadata.get("preview_url", ""))
+    pdf_status = str(user_metadata.get("pdf_status", "PENDING"))
     output_name = str(user_metadata.get("output_filename", "Tailored Resume.docx"))
     output_locale = str(user_metadata.get("output_locale", "en-US"))
     internal_path = str(user_metadata.get("internal_docx", run_dir / "08_resume.docx"))
@@ -4116,10 +4254,18 @@ def _user_result_card(
                 "The DOCX is ready to download. The PDF preview is still rendering, and this page will update automatically.",
             )
         else:
-            preview_note = ui_text(
-                locale,
-                "本机未找到 DOCX 渲染器，当前显示内容预览；最终版式保留上传模板。",
-                "No local DOCX renderer was found, so this is a content preview. The final file keeps the uploaded layout.",
+            preview_note = (
+                ui_text(
+                    locale,
+                    "简历已经生成并可下载 DOCX。PDF 预览未完成；你可以继续使用 DOCX，稍后再处理 PDF 排版。",
+                    "The resume and DOCX are ready. PDF preview did not complete; you can use the DOCX now and address PDF layout later.",
+                )
+                if pdf_status == "NEEDS_ATTENTION"
+                else ui_text(
+                    locale,
+                    "本机未找到 DOCX 渲染器，当前显示内容预览；最终版式保留上传模板。",
+                    "No local DOCX renderer was found, so this is a content preview. The final file keeps the uploaded layout.",
+                )
             )
     saved_locations = (
         f'<p><strong>SoloScale 私有运行：</strong><code>{_escape(internal_path)}</code></p>'

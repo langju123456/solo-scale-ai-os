@@ -148,7 +148,11 @@ def _deduplicated_sections(headings: list[str]) -> list[str]:
     return sections
 
 
-def _detected_language(values: list[str]) -> Literal["en-US", "zh-CN", "mixed", "unknown"]:
+def detect_resume_language(
+    values: list[str],
+) -> Literal["en-US", "zh-CN", "mixed", "unknown"]:
+    """Classify source text for trace/display only, never output eligibility."""
+
     joined = " ".join(values)
     has_zh = any("\u4e00" <= character <= "\u9fff" for character in joined)
     has_en = any(character.isascii() and character.isalpha() for character in joined)
@@ -184,7 +188,7 @@ def _receipt(
         source_url=source_url,
         detected_sections=sections,
         heading_names=headings[:30],
-        detected_language=_detected_language(headings),
+        detected_language=detect_resume_language(headings),
         retrieved_at=datetime.now(UTC).isoformat(),
     )
 
