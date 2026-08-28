@@ -47,6 +47,7 @@ from soloscale.resume_models import (
     GroundedResumeBulletRewrite,
     JDPositioningBrief,
     ResumeAtomicFact,
+    ResumeEvidenceRetrievalTrace,
     ResumeExpertReviewResult,
     RoleStrategy,
     build_resume_atomic_facts,
@@ -215,7 +216,12 @@ class TailoredDocx:
     role_strategy: RoleStrategy | None = None
     candidate_evidence_pack: CandidateEvidencePack | None = None
     positioning_brief: JDPositioningBrief | None = None
+    evidence_retrieval_trace: ResumeEvidenceRetrievalTrace | None = None
+    role_strategy_fallback_applied: bool = False
+    role_strategy_fallback_code: str | None = None
     expert_review: ResumeExpertReviewResult | None = None
+    expert_review_attempted: bool = False
+    expert_review_skipped_code: str | None = None
     expert_rewrites: int = 0
     expert_provider: str | None = None
     expert_model: str | None = None
@@ -1244,7 +1250,6 @@ def _select_safe_rewrites(
             entries,
             replace(diagnostics, validator_status="selective_pass"),
         )
-
     verified_count = sum(
         rewrite.text == entries[rewrite.profile_entry_id]
         for rewrite in strategy.bullet_rewrites
@@ -1267,6 +1272,48 @@ def _select_safe_rewrites(
             validator_status="accepted",
         ),
     )
+
+
+def _deterministic_role_strategy_fallback(
+    *,
+    profile: CandidateProfile,
+    job_description: str,
+) -> RoleStrategy:
+    """Preserve the approved Resume when model positioning is globally unsafe."""
+
+    entries = _profile_entries(profile)
+    fact_ids_by_entry: dict[str, list[str]] = {}
+    for fact in build_resume_atomic_facts(profile):
+        fact_ids_by_entry.setdefault(fact.profile_entry_id, []).append(fact.fact_id)
+    signals = deterministic_hiring_signals(job_description)
+    strategy = RoleStrategy(
+        role_summary=signals[0],
+        top_hiring_signals=signals,
+        evidence_priority=list(entries),
+        skill_priority=list(profile.skills),
+        bullet_rewrites=[
+            GroundedResumeBulletRewrite(
+                profile_entry_id=entry_id,
+                kind="REWRITE",
+                text=text,
+                source_profile_entry_ids=[entry_id],
+                source_fact_ids=fact_ids_by_entry[entry_id],
+            )
+            for entry_id, text in entries.items()
+        ],
+        summary_rewrite=None,
+        unsupported_requirements=[],
+        rewrite_guidance=(
+            "Preserve every operator-approved claim and use exact JD signals only for "
+            "deterministic ordering."
+        ),
+    )
+    _validate_role_strategy(
+        strategy,
+        profile=profile,
+        job_description=job_description,
+    )
+    return strategy
 
 
 def _reorder_project_blocks_by_priority(
@@ -1577,6 +1624,8 @@ def tailor_resume_docx_with_gateway(
                 diagnostics=None,
             )
         )
+    role_strategy_fallback_applied = False
+    role_strategy_fallback_code: str | None = None
     try:
         strategy, validated_entries, validation_diagnostics = _select_safe_rewrites(
             raw_strategy,
@@ -1585,22 +1634,35 @@ def tailor_resume_docx_with_gateway(
             atomic_facts=atomic_facts,
         )
     except ResumeTemplateError as error:
-        if candidate_recorder is not None:
-            candidate_recorder(
-                _structured_candidate_artifact(
-                    raw_strategy,
-                    status="REJECTED",
-                    diagnostics=error.validation_diagnostics,
+        if error.validation_diagnostics is None:
+            if candidate_recorder is not None:
+                candidate_recorder(
+                    _structured_candidate_artifact(
+                        raw_strategy,
+                        status="REJECTED",
+                        diagnostics=None,
+                    )
                 )
-            )
-        raise
+            raise
+        strategy = _deterministic_role_strategy_fallback(
+            profile=profile,
+            job_description=job_description,
+        )
+        validated_entries = entries
+        validation_diagnostics = replace(
+            error.validation_diagnostics,
+            validator_status="fallback_pass",
+        )
+        role_strategy_fallback_applied = True
+        role_strategy_fallback_code = "ROLE_STRATEGY_TRUTH_REJECTED"
     if candidate_recorder is not None:
         candidate_recorder(
             _structured_candidate_artifact(
                 raw_strategy,
                 status=(
                     "REJECTED"
-                    if validation_diagnostics.rejected_count
+                    if role_strategy_fallback_applied
+                    or validation_diagnostics.rejected_count
                     else "VALIDATED"
                 ),
                 diagnostics=validation_diagnostics,
@@ -1679,6 +1741,8 @@ def tailor_resume_docx_with_gateway(
         role_strategy=strategy,
         candidate_evidence_pack=candidate_evidence_pack,
         positioning_brief=positioning_brief,
+        role_strategy_fallback_applied=role_strategy_fallback_applied,
+        role_strategy_fallback_code=role_strategy_fallback_code,
     )
 
 
@@ -1697,7 +1761,12 @@ def request_resume_expert_review(
         )
     approved_entries = _profile_entries(profile)
     atomic_fact_by_id = {
-        item.fact_id: item for item in build_resume_atomic_facts(profile)
+        item.fact_id: item
+        for item in (
+            tailored.candidate_evidence_pack.atomic_facts
+            if tailored.candidate_evidence_pack is not None
+            else build_resume_atomic_facts(profile)
+        )
     }
     rewrite_by_id = {
         rewrite.profile_entry_id: rewrite for rewrite in strategy.bullet_rewrites
@@ -1799,6 +1868,11 @@ def apply_resume_expert_review(
         reviewed_strategy,
         profile=profile,
         job_description=job_description,
+        atomic_facts=(
+            tailored.candidate_evidence_pack.atomic_facts
+            if tailored.candidate_evidence_pack is not None
+            else None
+        ),
     )
 
     members, document = _read_package(tailored.content)
@@ -1834,6 +1908,8 @@ def apply_resume_expert_review(
         grounded_rewrites=len(reviewed_strategy.bullet_rewrites),
         role_strategy=reviewed_strategy,
         expert_review=review,
+        expert_review_attempted=True,
+        expert_review_skipped_code=None,
         expert_rewrites=len(review.patches),
         expert_provider=expert_provider,
         expert_model=expert_model,

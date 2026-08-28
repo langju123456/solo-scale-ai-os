@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from email import policy
@@ -156,7 +156,10 @@ from soloscale.resume_docx import (
     tailor_resume_docx,
     tailor_resume_docx_with_gateway,
 )
-from soloscale.resume_evidence_pack import build_candidate_evidence_pack
+from soloscale.resume_evidence_pack import (
+    build_candidate_evidence_pack,
+    build_resume_evidence_retrieval_trace,
+)
 from soloscale.resume_gateway_boundary import (
     ExtractedResumeUpload,
     ResumeFunnelEventType,
@@ -172,6 +175,7 @@ from soloscale.resume_models import (
     InterviewDefenseRecord,
     ResumeClaimProvenance,
     ResumeClaimVerificationStatus,
+    ResumeExpertReviewResult,
     ResumeHiringSignalReceipt,
     ResumeMode,
     ResumeProvenanceReceipt,
@@ -1274,6 +1278,44 @@ def _new_resume_candidate_recorder(
     return path, record
 
 
+def _expert_review_candidate_artifact(
+    review: ResumeExpertReviewResult | None,
+    *,
+    status: Literal["PENDING_VALIDATION", "VALIDATED", "REJECTED"],
+    failure_code: str | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "candidate_kind": "RESUME_EXPERT_REVIEW_PATCH",
+        "status": status,
+        "submission_status": "NOT_FOR_SUBMISSION",
+        "label": (
+            "REJECTED / NOT FOR SUBMISSION"
+            if status == "REJECTED"
+            else "EXPERT PATCH / NOT FOR SUBMISSION"
+        ),
+        "structured_candidate": (
+            review.model_dump(mode="json") if review is not None else None
+        ),
+        "failure_code": failure_code,
+    }
+
+
+def _expert_review_failure_code(error: Exception) -> str:
+    if isinstance(error, ModelGatewayNotConfigured):
+        return "EXPERT_REVIEW_UNAVAILABLE"
+    if isinstance(error, ModelGatewayTransportError):
+        return "EXPERT_REVIEW_TRANSPORT_FAILED"
+    if isinstance(error, ModelGatewayInvalidResponse):
+        return "EXPERT_REVIEW_INVALID_RESPONSE"
+    message = str(error)
+    if "does not match the approved draft" in message:
+        return "EXPERT_PATCH_SOURCE_MISMATCH"
+    if "unsupported factual claims" in message:
+        return "EXPERT_PATCH_UNSUPPORTED_FACT"
+    return "EXPERT_PATCH_REVALIDATION_FAILED"
+
+
 def _find_soffice() -> str | None:
     candidates = [
         os.environ.get("SOLOSCALE_SOFFICE"),
@@ -1701,20 +1743,58 @@ def _write_resume_expert_review_receipt(
     run_dir: Path,
     tailored: TailoredDocx,
 ) -> str | None:
-    if tailored.expert_review is None:
+    if not tailored.expert_review_attempted and tailored.expert_review is None:
         return None
     path = run_dir / "13_expert_review.json"
+    skipped_status = {
+        "EXPERT_PATCH_SOURCE_MISMATCH": "SKIPPED_DRAFT_MISMATCH",
+        "EXPERT_PATCH_UNSUPPORTED_FACT": "SKIPPED_UNSUPPORTED_FACT",
+        "EXPERT_PATCH_REVALIDATION_FAILED": "SKIPPED_REVALIDATION",
+        "EXPERT_REVIEW_UNAVAILABLE": "SKIPPED_UNAVAILABLE",
+        "EXPERT_REVIEW_TRANSPORT_FAILED": "SKIPPED_TRANSPORT",
+        "EXPERT_REVIEW_INVALID_RESPONSE": "SKIPPED_INVALID_RESPONSE",
+    }
     _write_private_json(
         path,
         {
             "schema_version": "1.0",
-            "status": "PATCHES_REVERIFIED",
+            "status": (
+                "PATCHES_REVERIFIED"
+                if tailored.expert_review is not None
+                else skipped_status.get(
+                    tailored.expert_review_skipped_code or "",
+                    "SKIPPED_REVALIDATION",
+                )
+            ),
             "provider": tailored.expert_provider,
             "model": tailored.expert_model,
             "patch_count": tailored.expert_rewrites,
-            "review": tailored.expert_review.model_dump(mode="json"),
+            "review": (
+                tailored.expert_review.model_dump(mode="json")
+                if tailored.expert_review is not None
+                else None
+            ),
+            "failure_code": tailored.expert_review_skipped_code,
+            "final_resume_sha256": tailored.output_sha256,
             "new_factual_claims_accepted": 0,
             "final_human_review_required": True,
+        },
+    )
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_resume_evidence_trace(run_dir: Path, tailored: TailoredDocx) -> str | None:
+    trace = tailored.evidence_retrieval_trace
+    if trace is None:
+        return None
+    path = run_dir / "14_resume_evidence_trace.json"
+    _write_private_json(
+        path,
+        {
+            "schema_version": "1.0",
+            "trace": trace.model_dump(mode="json"),
+            "raw_discovery_bodies_retained": False,
+            "raw_discovery_bodies_sent_to_model": False,
         },
     )
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1757,6 +1837,7 @@ def _save_request_scoped_resume_run(
     provenance_sha256 = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
     provenance_summary = _resume_provenance_summary(provenance)
     expert_review_sha256 = _write_resume_expert_review_receipt(run_dir, tailored)
+    evidence_trace_sha256 = _write_resume_evidence_trace(run_dir, tailored)
     resume_text = "\n".join(
         paragraph.text
         for paragraph in read_template_paragraphs(tailored.content)
@@ -1766,6 +1847,7 @@ def _save_request_scoped_resume_run(
     coverage, gaps = _request_scoped_coverage(job_description, profile)
     pack = tailored.candidate_evidence_pack
     positioning = tailored.positioning_brief
+    retrieval_trace = tailored.evidence_retrieval_trace
     if pack is not None:
         _write_private_json(
             run_dir / "03_candidate_evidence_pack.json",
@@ -1843,13 +1925,39 @@ def _save_request_scoped_resume_run(
         "synthesized_rewrites": tailored.synthesized_rewrites,
         "summary_rewritten": tailored.summary_rewritten,
         "rejected_rewrites": tailored.rejected_rewrites,
+        "role_strategy_fallback_applied": tailored.role_strategy_fallback_applied,
+        "role_strategy_fallback_code": tailored.role_strategy_fallback_code,
         "generation_mode": tailored.generation_mode,
         "provider": tailored.provider or "template",
         "model": tailored.model,
         "model_call_performed": tailored.role_strategy is not None,
         "model_call_profile": tailored.model_call_profile,
         "candidate_evidence_pack_sha256": pack.pack_sha256 if pack else None,
+        "evidence_retrieval_trace_sha256": evidence_trace_sha256,
         "candidate_evidence_fact_count": len(pack.atomic_facts) if pack else 0,
+        "evidence_retrieved_count": (
+            retrieval_trace.retrieved_count if retrieval_trace is not None else 0
+        ),
+        "evidence_admitted_count": (
+            retrieval_trace.admitted_count
+            if retrieval_trace is not None
+            else len(pack.atomic_facts) if pack else 0
+        ),
+        "evidence_sent_count": (
+            retrieval_trace.sent_count
+            if retrieval_trace is not None
+            else len(pack.atomic_facts) if pack else 0
+        ),
+        "evidence_requirements": (
+            [item.model_dump(mode="json") for item in retrieval_trace.requirements]
+            if retrieval_trace is not None
+            else []
+        ),
+        "evidence_source_summary": (
+            [item.model_dump(mode="json") for item in retrieval_trace.sources]
+            if retrieval_trace is not None
+            else []
+        ),
         "candidate_evidence_projects": (
             list(dict.fromkeys(source.project for source in pack.sources))
             if pack
@@ -1880,6 +1988,8 @@ def _save_request_scoped_resume_run(
         "resume_provenance_sha256": provenance_sha256,
         "claim_provenance": provenance_summary,
         "expert_review_performed": tailored.expert_review is not None,
+        "expert_review_attempted": tailored.expert_review_attempted,
+        "expert_review_skipped_code": tailored.expert_review_skipped_code,
         "expert_review_provider": tailored.expert_provider,
         "expert_review_model": tailored.expert_model,
         "expert_rewrites": tailored.expert_rewrites,
@@ -1904,6 +2014,8 @@ def _save_request_scoped_resume_run(
             "resume_provenance_sha256": provenance_sha256,
             "all_exported_claims_supported": True,
             "expert_review_performed": tailored.expert_review is not None,
+            "expert_review_attempted": tailored.expert_review_attempted,
+            "expert_review_skipped_code": tailored.expert_review_skipped_code,
             "expert_review_provider": tailored.expert_provider,
             "expert_review_model": tailored.expert_model,
             "expert_review_sha256": expert_review_sha256,
@@ -1932,6 +2044,8 @@ def _save_request_scoped_resume_run(
         artifacts.append("10_resume_preview.pdf")
     if expert_review_sha256 is not None:
         artifacts.append("13_expert_review.json")
+    if evidence_trace_sha256 is not None:
+        artifacts.append("14_resume_evidence_trace.json")
     _write_private_json(
         run_dir / "run.json",
         {
@@ -1944,6 +2058,8 @@ def _save_request_scoped_resume_run(
             "candidate_profile_sha256": candidate_sha256,
             "claim_provenance": provenance_summary,
             "expert_review_performed": tailored.expert_review is not None,
+            "expert_review_attempted": tailored.expert_review_attempted,
+            "expert_review_skipped_code": tailored.expert_review_skipped_code,
             "model_call_profile": tailored.model_call_profile,
             "candidate_evidence_pack_sha256": pack.pack_sha256 if pack else None,
             "candidate_evidence_fact_count": len(pack.atomic_facts) if pack else 0,
@@ -1970,6 +2086,7 @@ def _run_user_resume(
     """Run the local upload → evidence → workspace → DOCX flow without a subprocess."""
     started = time.perf_counter()
     candidate_artifact_path: Path | None = None
+    discovery_hits: list[RetrievalHit] = []
     upload = files.get("resume_template")
     if progress is not None:
         progress("PREPARING")
@@ -2111,16 +2228,24 @@ def _run_user_resume(
         if generation_mode != "template":
             if progress is not None:
                 progress("RETRIEVING")
+            retrieval_started = time.perf_counter()
             if evidence_repository_root is not None:
                 ensure_local_project_evidence(
                     data_root,
                     repository_root=evidence_repository_root,
                 )
+            discovery_hits = _search_job_evidence(job_description, data_root)
             candidate_evidence_pack = build_candidate_evidence_pack(
                 profile,
                 data_root=data_root,
                 repository_root=evidence_repository_root,
+                job_description=job_description,
             )
+            if timing is not None:
+                timing(
+                    "retrieval_ms",
+                    int((time.perf_counter() - retrieval_started) * 1000),
+                )
         if progress is not None:
             progress("GENERATING")
         support_upload: ExtractedResumeUpload | None = extracted.get(ResumeUploadRole.SUPPORT)
@@ -2143,6 +2268,7 @@ def _run_user_resume(
                 generation_mode,
                 model=form.get("provider_model", "qwen3:8b"),
             )
+            assert candidate_evidence_pack is not None
             candidate_artifact_path, candidate_recorder = (
                 _new_resume_candidate_recorder(data_root)
             )
@@ -2155,6 +2281,16 @@ def _run_user_resume(
                 support_upload=support_upload,
                 candidate_recorder=candidate_recorder,
                 candidate_evidence_pack=candidate_evidence_pack,
+            )
+            # The gateway call above receives only verified atomic facts. Attach
+            # body-free discovery lineage locally after that boundary completes.
+            tailored = replace(
+                tailored,
+                evidence_retrieval_trace=build_resume_evidence_retrieval_trace(
+                    job_description=job_description,
+                    facts=candidate_evidence_pack.atomic_facts,
+                    knowledge_hits=discovery_hits,
+                ),
             )
         if timing is not None:
             timing(
@@ -2182,31 +2318,69 @@ def _run_user_resume(
                 progress("EXPERT_REVIEW")
             expert_started = time.perf_counter()
             selected_expert_gateway = cast(ModelGateway, expert_gateway)
-            expert_review = request_resume_expert_review(
-                tailored,
-                profile=profile,
-                gateway=selected_expert_gateway,
+            _expert_candidate_artifact_path, expert_candidate_recorder = (
+                _new_resume_candidate_recorder(data_root)
             )
+            expert_review: ResumeExpertReviewResult | None = None
+            try:
+                expert_review = request_resume_expert_review(
+                    tailored,
+                    profile=profile,
+                    gateway=selected_expert_gateway,
+                )
+                expert_candidate_recorder(
+                    _expert_review_candidate_artifact(
+                        expert_review,
+                        status="PENDING_VALIDATION",
+                    )
+                )
+                if progress is not None:
+                    progress("REVERIFYING")
+                reverification_started = time.perf_counter()
+                tailored = apply_resume_expert_review(
+                    tailored,
+                    profile=profile,
+                    job_description=job_description,
+                    review=expert_review,
+                    expert_provider=selected_expert_gateway.descriptor.provider.value,
+                    expert_model=selected_expert_gateway.descriptor.model,
+                )
+                expert_candidate_recorder(
+                    _expert_review_candidate_artifact(
+                        expert_review,
+                        status="VALIDATED",
+                    )
+                )
+                if timing is not None:
+                    timing(
+                        "reverification_ms",
+                        int((time.perf_counter() - reverification_started) * 1000),
+                    )
+            except (
+                ModelGatewayNotConfigured,
+                ModelGatewayTransportError,
+                ModelGatewayInvalidResponse,
+                ResumeTemplateError,
+            ) as error:
+                failure_code = _expert_review_failure_code(error)
+                expert_candidate_recorder(
+                    _expert_review_candidate_artifact(
+                        expert_review,
+                        status="REJECTED",
+                        failure_code=failure_code,
+                    )
+                )
+                tailored = replace(
+                    tailored,
+                    expert_review_attempted=True,
+                    expert_review_skipped_code=failure_code,
+                    expert_provider=selected_expert_gateway.descriptor.provider.value,
+                    expert_model=selected_expert_gateway.descriptor.model,
+                )
             if timing is not None:
                 timing(
                     "expert_review_ms",
                     int((time.perf_counter() - expert_started) * 1000),
-                )
-            if progress is not None:
-                progress("REVERIFYING")
-            reverification_started = time.perf_counter()
-            tailored = apply_resume_expert_review(
-                tailored,
-                profile=profile,
-                job_description=job_description,
-                review=expert_review,
-                expert_provider=selected_expert_gateway.descriptor.provider.value,
-                expert_model=selected_expert_gateway.descriptor.model,
-            )
-            if timing is not None:
-                timing(
-                    "reverification_ms",
-                    int((time.perf_counter() - reverification_started) * 1000),
                 )
         output_name = _user_resume_filename(
             profile,
@@ -2215,7 +2389,7 @@ def _run_user_resume(
             job_description,
         )
         if not allow_persistent_storage:
-            if timing is not None:
+            if timing is not None and generation_mode == "template":
                 timing("retrieval_ms", 0)
             if progress is not None:
                 progress("EXPORTING")
@@ -2255,15 +2429,17 @@ def _run_user_resume(
             .expanduser()
             .absolute()
         )
-        if progress is not None:
-            progress("RETRIEVING")
-        retrieval_started = time.perf_counter()
-        evidence_hits = _search_job_evidence(job_description, data_root)
-        if timing is not None:
-            timing(
-                "retrieval_ms",
-                int((time.perf_counter() - retrieval_started) * 1000),
-            )
+        evidence_hits = discovery_hits
+        if generation_mode == "template":
+            if progress is not None:
+                progress("RETRIEVING")
+            retrieval_started = time.perf_counter()
+            evidence_hits = _search_job_evidence(job_description, data_root)
+            if timing is not None:
+                timing(
+                    "retrieval_ms",
+                    int((time.perf_counter() - retrieval_started) * 1000),
+                )
         if progress is not None:
             progress("EXPORTING")
         docx_started = time.perf_counter()
@@ -2291,6 +2467,12 @@ def _run_user_resume(
                 "synthesized_rewrites": tailored.synthesized_rewrites,
                 "summary_rewritten": tailored.summary_rewritten,
                 "rejected_rewrites": tailored.rejected_rewrites,
+                "role_strategy_fallback_applied": (
+                    tailored.role_strategy_fallback_applied
+                ),
+                "role_strategy_fallback_code": (
+                    tailored.role_strategy_fallback_code or ""
+                ),
                 "generation_mode": tailored.generation_mode,
                 "provider": tailored.provider or "template",
                 "model": tailored.model or "none",
@@ -2328,6 +2510,7 @@ def _run_user_resume(
         provenance_sha256 = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
         provenance_summary = _resume_provenance_summary(provenance)
         expert_review_sha256 = _write_resume_expert_review_receipt(run_dir, tailored)
+        evidence_trace_sha256 = _write_resume_evidence_trace(run_dir, tailored)
         verification_path = run_dir / "07_verification.json"
         verification_payload = _load_json_file(verification_path) or {}
         verification_payload["claim_provenance"] = provenance_summary
@@ -2354,11 +2537,59 @@ def _run_user_resume(
             "synthesized_rewrites": tailored.synthesized_rewrites,
             "summary_rewritten": tailored.summary_rewritten,
             "rejected_rewrites": tailored.rejected_rewrites,
+            "role_strategy_fallback_applied": tailored.role_strategy_fallback_applied,
+            "role_strategy_fallback_code": tailored.role_strategy_fallback_code,
             "generation_mode": tailored.generation_mode,
             "provider": tailored.provider or "template",
             "model": tailored.model,
             "model_call_performed": tailored.role_strategy is not None,
             "model_call_profile": tailored.model_call_profile,
+            "candidate_evidence_pack_sha256": (
+                candidate_evidence_pack.pack_sha256
+                if candidate_evidence_pack is not None
+                else None
+            ),
+            "candidate_evidence_fact_count": (
+                len(candidate_evidence_pack.atomic_facts)
+                if candidate_evidence_pack is not None
+                else 0
+            ),
+            "evidence_retrieval_trace_sha256": evidence_trace_sha256,
+            "evidence_retrieved_count": (
+                tailored.evidence_retrieval_trace.retrieved_count
+                if tailored.evidence_retrieval_trace is not None
+                else 0
+            ),
+            "evidence_admitted_count": (
+                tailored.evidence_retrieval_trace.admitted_count
+                if tailored.evidence_retrieval_trace is not None
+                else len(candidate_evidence_pack.atomic_facts)
+                if candidate_evidence_pack is not None
+                else 0
+            ),
+            "evidence_sent_count": (
+                tailored.evidence_retrieval_trace.sent_count
+                if tailored.evidence_retrieval_trace is not None
+                else len(candidate_evidence_pack.atomic_facts)
+                if candidate_evidence_pack is not None
+                else 0
+            ),
+            "evidence_requirements": (
+                [
+                    item.model_dump(mode="json")
+                    for item in tailored.evidence_retrieval_trace.requirements
+                ]
+                if tailored.evidence_retrieval_trace is not None
+                else []
+            ),
+            "evidence_source_summary": (
+                [
+                    item.model_dump(mode="json")
+                    for item in tailored.evidence_retrieval_trace.sources
+                ]
+                if tailored.evidence_retrieval_trace is not None
+                else []
+            ),
             "model_gap_quotes": (
                 tailored.role_strategy.unsupported_requirements
                 if tailored.role_strategy is not None
@@ -2386,6 +2617,8 @@ def _run_user_resume(
             "resume_provenance_sha256": provenance_sha256,
             "claim_provenance": provenance_summary,
             "expert_review_performed": tailored.expert_review is not None,
+            "expert_review_attempted": tailored.expert_review_attempted,
+            "expert_review_skipped_code": tailored.expert_review_skipped_code,
             "expert_review_provider": tailored.expert_provider,
             "expert_review_model": tailored.expert_model,
             "expert_rewrites": tailored.expert_rewrites,
@@ -2409,6 +2642,8 @@ def _run_user_resume(
             "resume_provenance_sha256": provenance_sha256,
             "all_exported_claims_supported": True,
             "expert_review_performed": tailored.expert_review is not None,
+            "expert_review_attempted": tailored.expert_review_attempted,
+            "expert_review_skipped_code": tailored.expert_review_skipped_code,
             "expert_review_provider": tailored.expert_provider,
             "expert_review_model": tailored.expert_model,
             "expert_review_sha256": expert_review_sha256,
@@ -2453,6 +2688,8 @@ def _run_user_resume(
             output_artifacts.append("11_role_strategy.json")
         if expert_review_sha256 is not None:
             output_artifacts.append("13_expert_review.json")
+        if evidence_trace_sha256 is not None:
+            output_artifacts.append("14_resume_evidence_trace.json")
         if preview_created:
             output_artifacts.append("10_resume_preview.pdf")
         for name in output_artifacts:
@@ -3360,6 +3597,49 @@ def _user_result_card(
     summary_rewritten = user_metadata.get("summary_rewritten") is True
     rejected_count = user_metadata.get("rejected_rewrites", 0)
     evidence_fact_count = user_metadata.get("candidate_evidence_fact_count", 0)
+    retrieved_count = user_metadata.get("evidence_retrieved_count", 0)
+    admitted_count = user_metadata.get("evidence_admitted_count", evidence_fact_count)
+    requirement_rows = user_metadata.get("evidence_requirements", [])
+    if not isinstance(requirement_rows, list):
+        requirement_rows = []
+    requirement_rows = [item for item in requirement_rows if isinstance(item, dict)]
+    if requirement_rows:
+        coverage = {
+            "total": len(requirement_rows),
+            "lexical_candidate_strong": sum(
+                item.get("status") == "STRONG" for item in requirement_rows
+            ),
+            "lexical_candidate_partial": sum(
+                item.get("status") == "MEDIUM" for item in requirement_rows
+            ),
+            "no_lexical_candidate": sum(
+                item.get("status") == "GAP" for item in requirement_rows
+            ),
+        }
+    requirement_coverage_html = "".join(
+        (
+            "<details><summary>"
+            f"{_escape(str(item.get('requirement_id', 'Requirement')))} · "
+            f"{_escape(str(item.get('status', 'GAP')))}</summary>"
+            f"<p>{_escape(', '.join(str(value) for value in item.get('matched_fact_ids', [])) or ui_text(locale, '暂无已验证事实', 'No verified fact yet'))}</p></details>"
+        )
+        for item in requirement_rows
+    )
+    source_rows = user_metadata.get("evidence_source_summary", [])
+    if not isinstance(source_rows, list):
+        source_rows = []
+    source_summary_html = "".join(
+        (
+            "<li><strong>"
+            f"{_escape(str(item.get('source_type', '')).replace('_', ' ').title())}"
+            "</strong> · "
+            f"{_escape(str(item.get('state', 'UNAVAILABLE')))} · "
+            f"{_escape(str(item.get('retrieved_count', 0)))} {_escape(ui_text(locale, '条检索', 'retrieved'))} · "
+            f"{_escape(str(item.get('sent_count', 0)))} {_escape(ui_text(locale, '条发送', 'sent'))}</li>"
+        )
+        for item in source_rows
+        if isinstance(item, dict)
+    )
     evidence_projects = user_metadata.get("candidate_evidence_projects", [])
     if not isinstance(evidence_projects, list):
         evidence_projects = []
@@ -3379,9 +3659,15 @@ def _user_result_card(
         )
         privacy_note = ui_text(
             locale,
-            f"本次使用 {provider}。提交了 JD、已批准简历事实与 {evidence_fact_count} 条紧凑候选证据事实；原始对话、项目文件和未选资料未发送。",
-            f"This run used {provider}. It submitted the JD, approved resume facts, and {evidence_fact_count} compact candidate-evidence facts. Raw conversations, project files, and unselected material were not sent.",
+            f"本次使用 {provider}。本地检索到 {retrieved_count} 条资料线索，最终只准入并提交 {admitted_count} 条已验证事实；原始对话、项目文件和未选资料未发送。",
+            f"This run used {provider}. Local retrieval found {retrieved_count} discovery clues; only {admitted_count} verified facts were admitted and sent. Raw conversations, project files, and unselected material were not sent.",
         )
+        if user_metadata.get("role_strategy_fallback_applied") is True:
+            result_summary += ui_text(
+                locale,
+                " AI 提出的部分岗位定位缺少足够证据，SoloScale 已自动使用安全定位继续生成。",
+                " Some AI positioning lacked sufficient evidence, so SoloScale continued with a deterministic safe strategy.",
+            )
         if user_metadata.get("expert_review_performed") is True:
             expert_rewrites = user_metadata.get("expert_rewrites", 0)
             result_summary += ui_text(
@@ -3393,6 +3679,12 @@ def _user_result_card(
                 locale,
                 " 专家审阅只接收 JD 信号、支持片段和当前草稿。",
                 " Expert review received only JD signals, supporting fragments, and the current draft.",
+            )
+        elif user_metadata.get("expert_review_attempted") is True:
+            result_summary += ui_text(
+                locale,
+                " 基础简历已成功生成；专家优化未通过版本或事实校验，因此没有应用，安全版本已保留。",
+                " The base resume succeeded. Expert optimization did not pass draft or fact validation, so it was skipped and the safe version was preserved.",
             )
     else:
         result_summary = ui_text(
@@ -3504,6 +3796,14 @@ def _user_result_card(
     <div><strong>{_escape(str(coverage.get("lexical_candidate_partial", 0)))}</strong><span>{_escape(ui_text(locale, '部分证据候选', 'Partial candidates'))}</span></div>
     <div><strong>{_escape(str(coverage.get("no_lexical_candidate", 0)))}</strong><span>{_escape(ui_text(locale, '待补证', 'Needs evidence'))}</span></div>
   </div>
+  <details>
+    <summary>{_escape(ui_text(locale, '查看本次证据来源', 'Evidence for this resume'))}</summary>
+    <ul class="gap-list">{source_summary_html}</ul>
+  </details>
+  <details>
+    <summary>{_escape(ui_text(locale, '查看 JD 要求覆盖', 'View JD requirement coverage'))}</summary>
+    {requirement_coverage_html}
+  </details>
   <p class="privacy-note"><strong>{_escape(ui_text(locale, 'JD 定位', 'JD positioning'))}:</strong> {_escape(positioning_role)} · <strong>{_escape(ui_text(locale, '候选证据包', 'Candidate Evidence Pack'))}:</strong> {_escape(str(evidence_fact_count))} {_escape(ui_text(locale, '条事实', 'facts'))}{(' · ' + _escape(', '.join(str(item) for item in evidence_projects))) if evidence_projects else ''}</p>
   <div class="result-grid">
     <div>

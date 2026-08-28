@@ -336,9 +336,15 @@ class RecordingExpertReviewGateway:
         base_url="https://api.openai.com/v1/chat/completions",
     )
 
-    def __init__(self, *, propose_new_fact: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        propose_new_fact: bool = False,
+        stale_patch: bool = False,
+    ) -> None:
         self.requests: list[dict[str, object]] = []
         self.propose_new_fact = propose_new_fact
+        self.stale_patch = stale_patch
 
     def complete(
         self,
@@ -361,9 +367,11 @@ class RecordingExpertReviewGateway:
                 "patches": [
                     {
                         "profile_entry_id": "PROFILE-03",
-                        "before_sha256": hashlib.sha256(
-                            before.encode("utf-8")
-                        ).hexdigest(),
+                        "before_sha256": (
+                            "0" * 64
+                            if self.stale_patch
+                            else hashlib.sha256(before.encode("utf-8")).hexdigest()
+                        ),
                         "after": (
                             "Integrated SoloScale full-stack GenAI workflows with RAG "
                             "and agents and BuildLog architecture for AI-assisted "
@@ -1407,7 +1415,7 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
         ]
         return result, run_dir, paragraphs
 
-    _, fde_run, fde = run(
+    fde_result, fde_run, fde = run(
         "FDE",
         "Forward Deployed Engineer\ncustomer-facing requirements translation "
         "stakeholder reliable agents",
@@ -1432,6 +1440,9 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
     assert unrelated_gaps["gaps"]
     unrelated_metadata = json.loads((unrelated_run / "09_user_ui.json").read_text())
     assert unrelated_metadata["unsupported_requirement_count"] == 1
+    assert {item["status"] for item in unrelated_metadata["evidence_requirements"]} == {
+        "GAP"
+    }
     rendered_unrelated = _user_page(
         unrelated_result, tmp_path / "data-Unrelated", {}
     )
@@ -1448,6 +1459,8 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
     for run_dir in (fde_run, eir_run, unrelated_run):
         metadata = json.loads((run_dir / "09_user_ui.json").read_text())
         assert metadata["model_call_performed"] is True
+        assert metadata["evidence_requirements"]
+        assert len(metadata["evidence_source_summary"]) == 9
         assert metadata["generation_mode"] == "ai"
         assert metadata["provider"] == "ollama"
         assert metadata["model_call_profile"]["model_call_count"] == 1
@@ -1507,6 +1520,9 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
             claim["final_text"] in paragraphs_by_run[run_dir]
             for claim in provenance["claims"]
         )
+    rendered_fde = _user_page(fde_result, tmp_path / "data-FDE", {})
+    assert "查看本次证据来源" in rendered_fde
+    assert "查看 JD 要求覆盖" in rendered_fde
 
 
 def test_resume_ui_rejects_only_unsafe_rewrite_and_keeps_original_bullet(
@@ -1601,7 +1617,7 @@ def test_resume_ui_rejects_only_unsafe_rewrite_and_keeps_original_bullet(
     assert "Summary已重写" in rendered
 
 
-def test_resume_ui_persists_globally_rejected_candidate_before_validation(
+def test_resume_ui_uses_safe_strategy_after_global_truth_rejection(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     class GloballyRejectedGateway(RecordingResumeGateway):
@@ -1654,7 +1670,7 @@ def test_resume_ui_persists_globally_rejected_candidate_before_validation(
         gateway=GloballyRejectedGateway(),
     )
 
-    assert result.return_code == 1
+    assert result.return_code == 0, result.stderr
     assert candidate_statuses == ["PENDING_VALIDATION", "REJECTED"]
     candidate_paths = list((data_root / "resume-candidates").glob("*.json"))
     assert len(candidate_paths) == 1
@@ -1663,17 +1679,18 @@ def test_resume_ui_persists_globally_rejected_candidate_before_validation(
     assert candidate["status"] == "REJECTED"
     assert candidate["submission_status"] == "NOT_FOR_SUBMISSION"
     assert candidate["label"] == "REJECTED / NOT FOR SUBMISSION"
-    assert candidate["validation_diagnostics"]["validator_status"] == "rejected"
+    assert candidate["validation_diagnostics"]["validator_status"] == "fallback_pass"
     assert {
         failure["rule_code"]
         for failure in candidate["validation_diagnostics"]["failures"]
     } == {"GAP_NOT_SOURCE_GROUNDED"}
     assert candidate_path.stat().st_mode & 0o777 == 0o600
-    assert result.diagnostics is not None
-    assert result.diagnostics["structured_candidate_path"] == str(candidate_path)
-    assert str(candidate_path) in result.stderr
-    assert not (data_root / "resume-runs").exists()
-    assert not list(data_root.rglob("*.docx"))
+    run_dir = _workspace_path(result.stdout)
+    assert run_dir is not None
+    metadata = json.loads((run_dir / "09_user_ui.json").read_text())
+    assert metadata["role_strategy_fallback_applied"] is True
+    assert metadata["role_strategy_fallback_code"] == "ROLE_STRATEGY_TRUTH_REJECTED"
+    assert (run_dir / "08_resume.docx").is_file()
 
 
 def test_resume_optional_expert_review_returns_patches_and_reverifies_locally(
@@ -1734,7 +1751,7 @@ def test_resume_optional_expert_review_returns_patches_and_reverifies_locally(
     assert "再次通过事实校验" in rendered
 
 
-def test_resume_expert_review_new_fact_is_rejected_before_any_run_is_saved(
+def test_resume_expert_review_new_fact_is_discarded_and_base_resume_is_saved(
     tmp_path: Path,
 ) -> None:
     result = _run_user_resume(
@@ -1761,9 +1778,62 @@ def test_resume_expert_review_new_fact_is_rejected_before_any_run_is_saved(
         expert_gateway=RecordingExpertReviewGateway(propose_new_fact=True),
     )
 
-    assert result.return_code == 1
-    assert "unsupported factual claims" in result.stderr
-    assert not (tmp_path / "data" / "resume-runs").exists()
+    assert result.return_code == 0, result.stderr
+    run_dir = _workspace_path(result.stdout)
+    assert run_dir is not None
+    receipt = json.loads((run_dir / "13_expert_review.json").read_text())
+    assert receipt["status"] == "SKIPPED_UNSUPPORTED_FACT"
+    assert receipt["failure_code"] == "EXPERT_PATCH_UNSUPPORTED_FACT"
+    metadata = json.loads((run_dir / "09_user_ui.json").read_text())
+    assert metadata["expert_review_attempted"] is True
+    assert metadata["expert_review_performed"] is False
+    assert metadata["expert_review_skipped_code"] == "EXPERT_PATCH_UNSUPPORTED_FACT"
+    assert (run_dir / "08_resume.docx").is_file()
+
+
+def test_resume_expert_review_stale_patch_preserves_base_resume(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    result = _run_user_resume(
+        {
+            "job_description": (
+                "Engineer in Residence\nrapid prototyping full-stack GenAI "
+                "architecture"
+            ),
+            "generation_mode": "ollama",
+            "provider_model": "test-model",
+            "expert_review_mode": "openai_sol",
+            "approve_expert_review": "yes",
+            "approve_resume_processing": "yes",
+        },
+        {
+            "resume_template": UploadedFile(
+                filename="Synthetic.docx",
+                content_type="application/octet-stream",
+                content=_role_resume_docx(),
+            )
+        },
+        data_root,
+        tmp_path / "repo",
+        gateway=RecordingResumeGateway(),
+        expert_gateway=RecordingExpertReviewGateway(stale_patch=True),
+    )
+
+    assert result.return_code == 0, result.stderr
+    run_dir = _workspace_path(result.stdout)
+    assert run_dir is not None
+    receipt = json.loads((run_dir / "13_expert_review.json").read_text())
+    assert receipt["status"] == "SKIPPED_DRAFT_MISMATCH"
+    assert receipt["failure_code"] == "EXPERT_PATCH_SOURCE_MISMATCH"
+    candidates = [
+        json.loads(path.read_text())
+        for path in (data_root / "resume-candidates").glob("*.json")
+    ]
+    assert any(
+        candidate.get("candidate_kind") == "RESUME_EXPERT_REVIEW_PATCH"
+        and candidate["status"] == "REJECTED"
+        for candidate in candidates
+    )
+    assert (run_dir / "08_resume.docx").is_file()
 
 
 def test_resume_hosted_provider_unavailable_never_silently_saves_offline_draft(

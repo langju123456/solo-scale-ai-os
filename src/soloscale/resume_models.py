@@ -206,6 +206,107 @@ class CandidateEvidenceSource(ContractModel):
     source_refs: list[str] = Field(default_factory=list, max_length=12)
 
 
+class ResumeEvidenceRetrievalHit(ContractModel):
+    """Body-free trace for one local-knowledge retrieval result."""
+
+    retrieval_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    source_kind: Literal["codex_session", "chatgpt_export", "buildlog_run"]
+    chunk_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    document_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    score: float = Field(ge=0)
+    disposition: Literal["DISCOVERY_ONLY"] = "DISCOVERY_ONLY"
+    requirement_ids: list[str] = Field(default_factory=list, max_length=8)
+    matched_fact_ids: list[str] = Field(default_factory=list, max_length=12)
+
+    @field_validator("requirement_ids", "matched_fact_ids")
+    @classmethod
+    def validate_unique_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("retrieval identities must be unique")
+        return values
+
+
+class ResumeRequirementCoverage(ContractModel):
+    """Body-safe requirement coverage derived from exact JD spans."""
+
+    requirement_id: str = Field(pattern=r"^REQ-\d{2}$")
+    requirement_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    status: Literal["STRONG", "MEDIUM", "GAP"]
+    matched_fact_ids: list[str] = Field(default_factory=list, max_length=12)
+
+    @field_validator("matched_fact_ids")
+    @classmethod
+    def validate_unique_fact_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("requirement fact identities must be unique")
+        return values
+
+
+class ResumeEvidenceSourceSummary(ContractModel):
+    """Count-only source participation summary for the Resume UI."""
+
+    source_type: Literal[
+        "EXISTING_RESUME",
+        "LOCAL_GIT",
+        "GITHUB",
+        "BUILDLOG",
+        "CODEX",
+        "CHATGPT",
+        "CONTENT_CANON",
+        "LEARNING",
+        "RESUME_HISTORY",
+    ]
+    state: Literal["MATCHED", "NO_MATCH", "UNAVAILABLE"]
+    retrieved_count: int = Field(ge=0)
+    admitted_count: int = Field(ge=0)
+    context_only_count: int = Field(ge=0)
+    sent_count: int = Field(ge=0)
+
+
+class ResumeEvidenceRetrievalTrace(ContractModel):
+    """Explain how local context selected verified facts without authorizing claims."""
+
+    job_description_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    source_counts: dict[str, int] = Field(default_factory=dict)
+    hits: list[ResumeEvidenceRetrievalHit] = Field(default_factory=list, max_length=32)
+    requirements: list[ResumeRequirementCoverage] = Field(
+        default_factory=list, max_length=8
+    )
+    sources: list[ResumeEvidenceSourceSummary] = Field(
+        default_factory=list, max_length=9
+    )
+    retrieved_count: int = Field(ge=0)
+    admitted_count: int = Field(ge=0)
+    sent_count: int = Field(ge=0)
+    admitted_fact_ids: list[str] = Field(default_factory=list, max_length=960)
+    sent_fact_ids: list[str] = Field(default_factory=list, max_length=960)
+
+    @model_validator(mode="after")
+    def validate_trace(self) -> ResumeEvidenceRetrievalTrace:
+        if any(count < 0 for count in self.source_counts.values()):
+            raise ValueError("retrieval source counts must be non-negative")
+        retrieval_ids = [hit.retrieval_id for hit in self.hits]
+        if len(retrieval_ids) != len(set(retrieval_ids)):
+            raise ValueError("retrieval identities must be unique")
+        if len(self.admitted_fact_ids) != len(set(self.admitted_fact_ids)):
+            raise ValueError("admitted fact identities must be unique")
+        if len(self.sent_fact_ids) != len(set(self.sent_fact_ids)):
+            raise ValueError("sent fact identities must be unique")
+        if not set(self.sent_fact_ids) <= set(self.admitted_fact_ids):
+            raise ValueError("sent facts must be admitted first")
+        if self.admitted_count != len(self.admitted_fact_ids):
+            raise ValueError("admitted count must match admitted fact identities")
+        if self.sent_count != len(self.sent_fact_ids):
+            raise ValueError("sent count must match sent fact identities")
+        requirement_ids = [item.requirement_id for item in self.requirements]
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise ValueError("requirement identities must be unique")
+        source_types = [item.source_type for item in self.sources]
+        if len(source_types) != len(set(source_types)):
+            raise ValueError("evidence source summaries must be unique")
+        return self
+
+
 class CandidateEvidencePack(ContractModel):
     """High-density truth context used in addition to the uploaded Resume."""
 

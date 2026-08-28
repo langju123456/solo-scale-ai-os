@@ -3,13 +3,16 @@ import io
 import json
 import subprocess
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 from xml.etree import ElementTree
 
 import pytest
 from pydantic import ValidationError
 
+from soloscale.content_canon import StoryReadiness, load_month_one_canon
 from soloscale.evidence_hub import EvidenceHub, EvidenceHubError
+from soloscale.knowledge_models import ContentRole, RetrievalHit, SourceKind
 from soloscale.resume_docx import (
     ResumeTemplateError,
     ResumeValidationRuleCode,
@@ -22,13 +25,16 @@ from soloscale.resume_docx import (
     tailor_resume_docx,
 )
 from soloscale.resume_evidence_pack import (
+    _compact_verified_facts,
     build_candidate_evidence_pack,
     build_jd_positioning_brief,
+    build_resume_evidence_retrieval_trace,
 )
 from soloscale.resume_models import (
     CandidateProfile,
     GroundedResumeBulletRewrite,
     GroundedResumeSummaryRewrite,
+    ResumeAtomicFact,
     ResumeClaimProvenance,
     ResumeClaimVerificationStatus,
     RoleStrategy,
@@ -44,6 +50,31 @@ def _fact_ids(profile: CandidateProfile, *source_ids: str) -> list[str]:
         for fact in build_resume_atomic_facts(profile)
         if fact.profile_entry_id in source_ids
     ]
+
+
+def _retrieval_hit(
+    source_kind: SourceKind,
+    text: str,
+    *,
+    suffix: str,
+) -> RetrievalHit:
+    text_sha256 = hashlib.sha256(text.encode()).hexdigest()
+    document_sha256 = hashlib.sha256(f"document-{suffix}".encode()).hexdigest()
+    return RetrievalHit(
+        chunk_id=f"chunk-{suffix}",
+        document_id=f"document-{suffix}",
+        source_kind=source_kind,
+        external_id=f"external-{suffix}",
+        locator=f"/private/{suffix}",
+        title="Private local context",
+        role=ContentRole.ASSISTANT,
+        timestamp=datetime(2026, 8, 28, tzinfo=UTC),
+        excerpt=text,
+        chunk_sha256=text_sha256,
+        document_sha256=document_sha256,
+        score=1.0,
+        channels=["fts"],
+    )
 
 
 def test_blank_page_guard_removes_only_body_final_empty_paragraphs() -> None:
@@ -301,12 +332,14 @@ def test_candidate_evidence_pack_adds_fresh_committed_project_facts(
     )
 
     assert first.pack_sha256 == second.pack_sha256
-    assert {source.evidence_id for source in first.sources} == {
-        "EVIDENCE-LOCAL-GIT",
-        "EVIDENCE-M1-13",
-        "EVIDENCE-M1-14",
-        "EVIDENCE-M1-15",
+    source_ids = {source.evidence_id for source in first.sources}
+    assert "EVIDENCE-LOCAL-GIT" in source_ids
+    ready_story_ids = {
+        f"EVIDENCE-{story.story_id}"
+        for story in load_month_one_canon().stories
+        if story.status is StoryReadiness.READY_FOR_PRODUCTION
     }
+    assert ready_story_ids <= source_ids
     candidate_facts = [
         fact for fact in first.atomic_facts if fact.source_kind == "CANDIDATE_EVIDENCE"
     ]
@@ -336,6 +369,169 @@ def test_candidate_evidence_pack_adds_fresh_committed_project_facts(
             data_root=data_root,
             repository_root=repository,
         )
+
+
+def test_resume_retrieval_trace_is_body_free_and_never_promotes_conversations() -> None:
+    profile = CandidateProfile(
+        skills=["Python", "RAG"],
+        project_bullets=["Built SoloScale evidence-grounded RAG workflows."],
+    )
+    job_description = "Build Python RAG workflows with reliable background jobs."
+    pack = build_candidate_evidence_pack(
+        profile,
+        job_description=job_description,
+    )
+    private_claim = "Implemented an unverified production platform for 9 million users."
+    hits = [
+        _retrieval_hit(SourceKind.CODEX_SESSION, private_claim, suffix="codex"),
+        _retrieval_hit(
+            SourceKind.CHATGPT_EXPORT,
+            "Discussed RAG workflow positioning.",
+            suffix="chatgpt",
+        ),
+        _retrieval_hit(
+            SourceKind.BUILDLOG_RUN,
+            "Recorded background job verification context.",
+            suffix="buildlog",
+        ),
+    ]
+    trace = build_resume_evidence_retrieval_trace(
+        job_description=job_description,
+        facts=pack.atomic_facts,
+        knowledge_hits=hits,
+    )
+
+    assert len(pack.atomic_facts) <= 80
+    assert private_claim not in {fact.text for fact in pack.atomic_facts}
+    assert trace.source_counts == {
+        "buildlog_run": 1,
+        "chatgpt_export": 1,
+        "codex_session": 1,
+    }
+    assert trace.retrieved_count == len(pack.atomic_facts) + len(hits)
+    assert trace.admitted_count == trace.sent_count == len(pack.atomic_facts)
+    assert trace.requirements
+    assert {item.status for item in trace.requirements} <= {
+        "STRONG",
+        "MEDIUM",
+        "GAP",
+    }
+    source_summary = {item.source_type: item for item in trace.sources}
+    assert source_summary["CODEX"].context_only_count == 1
+    assert source_summary["CHATGPT"].context_only_count == 1
+    assert source_summary["BUILDLOG"].context_only_count == 1
+    assert source_summary["CODEX"].sent_count == 0
+    assert source_summary["LEARNING"].state == "UNAVAILABLE"
+    assert source_summary["RESUME_HISTORY"].state == "UNAVAILABLE"
+    assert {hit.disposition for hit in trace.hits} == {"DISCOVERY_ONLY"}
+    serialized = trace.model_dump_json()
+    assert private_claim not in serialized
+    assert "/private/" not in serialized
+    assert trace.sent_fact_ids == [fact.fact_id for fact in pack.atomic_facts]
+
+
+def test_compact_evidence_pack_balances_distinct_jd_requirements() -> None:
+    profile = CandidateProfile(project_bullets=["Built a verified AI workflow."])
+    profile_facts = build_resume_atomic_facts(profile)
+
+    def candidate_fact(index: int, text: str, tags: list[str]) -> ResumeAtomicFact:
+        fact_id = f"FACT-EVIDENCE-TEST-{index:02d}"
+        source_sha256 = hashlib.sha256(b"test-source").hexdigest()
+        return ResumeAtomicFact(
+            fact_id=fact_id,
+            profile_entry_id="PROFILE-01",
+            evidence_id="EVIDENCE-TEST",
+            source_kind="CANDIDATE_EVIDENCE",
+            capability_tags=tags,
+            text=text,
+            source_sha256=source_sha256,
+            fact_sha256=hashlib.sha256(
+                f"{fact_id}\0PROFILE-01\0{text}".encode()
+            ).hexdigest(),
+        )
+
+    python_facts = [
+        candidate_fact(index, f"Built Python backend API {index}.", ["python", "backend"])
+        for index in range(1, 77)
+    ]
+    observability_facts = [
+        candidate_fact(
+            index,
+            f"Added observability monitoring and logging {index}.",
+            ["observability", "monitoring"],
+        )
+        for index in range(77, 81)
+    ]
+    unrelated_facts = [
+        candidate_fact(index, f"Designed media asset {index}.", ["media"])
+        for index in range(81, 100)
+    ]
+
+    compact = _compact_verified_facts(
+        job_description=(
+            "Build Python backend applications.\n"
+            "Ship observability, monitoring, and logging."
+        ),
+        atomic_facts=[
+            *profile_facts,
+            *python_facts,
+            *observability_facts,
+            *unrelated_facts,
+        ],
+    )
+
+    selected_ids = {fact.fact_id for fact in compact}
+    assert len(compact) == 80
+    assert {fact.fact_id for fact in profile_facts} <= selected_ids
+    assert {fact.fact_id for fact in observability_facts} <= selected_ids
+    assert not ({fact.fact_id for fact in unrelated_facts} & selected_ids)
+
+
+def test_resume_lexical_retrieval_evaluation_fixture_has_stable_recall() -> None:
+    profile = CandidateProfile(
+        project_bullets=["Built SoloScale evidence-grounded RAG workflows."]
+    )
+    all_facts = build_candidate_evidence_pack(profile).atomic_facts
+    cases = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "resume_retrieval_eval.json"
+        ).read_text(encoding="utf-8")
+    )
+    recall_at_5: list[float] = []
+    recall_at_10: list[float] = []
+    reciprocal_ranks: list[float] = []
+    for case in cases:
+        ranked = _compact_verified_facts(
+            job_description=case["query"],
+            atomic_facts=all_facts,
+        )
+        ranked_evidence_ids = list(
+            dict.fromkeys(
+                fact.evidence_id
+                for fact in ranked
+                if fact.source_kind == "CANDIDATE_EVIDENCE"
+            )
+        )
+        relevant = set(case["relevant_evidence_ids"])
+        recall_at_5.append(len(relevant & set(ranked_evidence_ids[:5])) / len(relevant))
+        recall_at_10.append(
+            len(relevant & set(ranked_evidence_ids[:10])) / len(relevant)
+        )
+        first_rank = next(
+            (
+                index
+                for index, evidence_id in enumerate(ranked_evidence_ids, start=1)
+                if evidence_id in relevant
+            ),
+            None,
+        )
+        reciprocal_ranks.append(0 if first_rank is None else 1 / first_rank)
+
+    assert sum(recall_at_5) / len(recall_at_5) >= 0.75
+    assert sum(recall_at_10) / len(recall_at_10) >= 0.85
+    assert sum(reciprocal_ranks) / len(reciprocal_ranks) >= 0.65
 
 
 def test_selective_rewrite_keeps_supported_claim_and_restores_rejected_claim() -> None:

@@ -5,17 +5,23 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from pathlib import Path
 
-from soloscale.content_canon import StoryReadiness, load_month_one_canon
+from soloscale.content_canon import CanonicalStory, StoryReadiness, load_month_one_canon
 from soloscale.evidence_hub import EvidenceHub, EvidenceHubError, inspect_git_repository
 from soloscale.github_connect import GitHubConnectionStore, is_resume_safe_commit_summary
+from soloscale.knowledge_models import RetrievalHit
 from soloscale.resume_models import (
     CandidateEvidencePack,
     CandidateEvidenceSource,
     CandidateProfile,
     JDPositioningBrief,
     ResumeAtomicFact,
+    ResumeEvidenceRetrievalHit,
+    ResumeEvidenceRetrievalTrace,
+    ResumeEvidenceSourceSummary,
+    ResumeRequirementCoverage,
     build_resume_atomic_facts,
 )
 
@@ -47,8 +53,11 @@ _THEMES = (
     "CI/CD",
     "observability",
 )
-_STORY_IDS = ("M1-13", "M1-14", "M1-15")
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#./-]{2,}")
+_MAX_SENT_FACTS = 80
+_MIN_SENT_FACTS = 30
+_MAX_RETRIEVAL_HITS = 32
+_FACTS_PER_REQUIREMENT = 4
 
 
 def deterministic_hiring_signals(job_description: str) -> list[str]:
@@ -80,6 +89,11 @@ def _entry_terms(value: str) -> set[str]:
     return {token.casefold() for token in _TOKEN_RE.findall(value)}
 
 
+_HIGH_SIGNAL_TERMS = {
+    term for theme in _THEMES for term in _entry_terms(theme)
+}
+
+
 def _soloscale_target(profile: CandidateProfile) -> str | None:
     entries = profile.experience_bullets + profile.project_bullets
     for index, text in enumerate(entries, start=1):
@@ -104,10 +118,7 @@ def _soloscale_target(profile: CandidateProfile) -> str | None:
     return None
 
 
-def _story_fact_texts(story_id: str) -> list[tuple[str, str | None]]:
-    story = next(
-        story for story in load_month_one_canon().stories if story.story_id == story_id
-    )
+def _story_fact_texts(story: CanonicalStory) -> list[tuple[str, str | None]]:
     facts: list[tuple[str, str | None]] = [
         (story.fact, None),
         (story.architecture, None),
@@ -117,6 +128,261 @@ def _story_fact_texts(story_id: str) -> list[tuple[str, str | None]]:
     ]
     facts.extend((metric, metric) for metric in story.verified_metrics)
     return facts[:8]
+
+
+def _compact_verified_facts(
+    *,
+    job_description: str,
+    atomic_facts: list[ResumeAtomicFact],
+) -> list[ResumeAtomicFact]:
+    """Keep a compact, requirement-balanced set of already approved facts."""
+
+    profile_facts = [
+        fact for fact in atomic_facts if fact.source_kind == "PROFILE_ENTRY"
+    ]
+    candidate_facts = [
+        fact for fact in atomic_facts if fact.source_kind == "CANDIDATE_EVIDENCE"
+    ]
+    if not job_description.strip():
+        return atomic_facts
+    candidate_limit = max(0, _MAX_SENT_FACTS - len(profile_facts))
+    if candidate_limit == 0:
+        return profile_facts
+
+    requirements = [
+        terms
+        for signal in deterministic_hiring_signals(job_description)
+        if (terms := _entry_terms(signal))
+    ]
+    if not requirements:
+        requirements = [_entry_terms(job_description)]
+    fact_terms = {fact.fact_id: _entry_terms(fact.text) for fact in candidate_facts}
+    tag_terms = {
+        fact.fact_id: {
+            term
+            for tag in fact.capability_tags
+            for term in _entry_terms(tag)
+        }
+        for fact in candidate_facts
+    }
+    original_order = {fact.fact_id: index for index, fact in enumerate(candidate_facts)}
+
+    def authority(fact: ResumeAtomicFact) -> int:
+        if "verified-commit" in fact.capability_tags:
+            return 3
+        if fact.evidence_id.startswith("EVIDENCE-M1-"):
+            return 2
+        if "committed-summary" in fact.capability_tags:
+            return 1
+        return 0
+
+    def requirement_score(
+        fact: ResumeAtomicFact, requirement_terms: set[str]
+    ) -> tuple[int, int, int, int]:
+        lexical = len(fact_terms[fact.fact_id] & requirement_terms)
+        tags = len(tag_terms[fact.fact_id] & requirement_terms)
+        high_signal_match = bool(
+            (fact_terms[fact.fact_id] | tag_terms[fact.fact_id])
+            & requirement_terms
+            & _HIGH_SIGNAL_TERMS
+        )
+        return (
+            int(lexical >= 3 or tags >= 1 or high_signal_match),
+            lexical,
+            tags,
+            authority(fact),
+        )
+
+    selected: list[ResumeAtomicFact] = []
+    selected_ids: set[str] = set()
+    for requirement_terms in requirements:
+        ranked = sorted(
+            candidate_facts,
+            key=lambda fact: (
+                *(-value for value in requirement_score(fact, requirement_terms)),
+                original_order[fact.fact_id],
+                fact.fact_id,
+            ),
+        )
+        added = 0
+        for fact in ranked:
+            relevant, _lexical, _tags, _authority = requirement_score(
+                fact, requirement_terms
+            )
+            if relevant == 0:
+                break
+            if fact.fact_id in selected_ids:
+                continue
+            selected.append(fact)
+            selected_ids.add(fact.fact_id)
+            added += 1
+            if added == _FACTS_PER_REQUIREMENT or len(selected) == candidate_limit:
+                break
+        if len(selected) == candidate_limit:
+            break
+
+    def global_score(fact: ResumeAtomicFact) -> tuple[int, int, int, int]:
+        scores = [requirement_score(fact, terms) for terms in requirements]
+        return max(scores, default=(0, 0, 0, authority(fact)))
+
+    ranked_remaining = sorted(
+        (fact for fact in candidate_facts if fact.fact_id not in selected_ids),
+        key=lambda fact: (
+            *(-value for value in global_score(fact)),
+            original_order[fact.fact_id],
+            fact.fact_id,
+        ),
+    )
+    minimum_candidate_count = min(
+        candidate_limit,
+        max(0, _MIN_SENT_FACTS - len(profile_facts)),
+    )
+    for fact in ranked_remaining:
+        relevant, _lexical, _tags, _authority = global_score(fact)
+        if relevant == 0 and len(selected) >= minimum_candidate_count:
+            break
+        selected.append(fact)
+        selected_ids.add(fact.fact_id)
+        if len(selected) == candidate_limit:
+            break
+    return [*profile_facts, *selected]
+
+
+def build_resume_evidence_retrieval_trace(
+    *,
+    job_description: str,
+    facts: list[ResumeAtomicFact],
+    knowledge_hits: list[RetrievalHit],
+) -> ResumeEvidenceRetrievalTrace:
+    """Build a local, body-free trace after the model input is frozen."""
+
+    if not job_description.strip():
+        raise ValueError("job description must not be empty")
+    signals = deterministic_hiring_signals(job_description)
+    requirement_terms = {
+        f"REQ-{index:02d}": _entry_terms(signal)
+        for index, signal in enumerate(signals, start=1)
+    }
+    fact_terms = {fact.fact_id: _entry_terms(fact.text) for fact in facts}
+    requirements: list[ResumeRequirementCoverage] = []
+    for index, signal in enumerate(signals, start=1):
+        requirement_id = f"REQ-{index:02d}"
+        terms = requirement_terms[requirement_id]
+        ranked_fact_ids = [
+            fact_id
+            for fact_id, _score in sorted(
+                (
+                    (fact_id, len(terms & terms_for_fact))
+                    for fact_id, terms_for_fact in fact_terms.items()
+                    if len(terms & terms_for_fact) >= 3
+                    or bool(terms & terms_for_fact & _HIGH_SIGNAL_TERMS)
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )[:12]
+        ]
+        requirements.append(
+            ResumeRequirementCoverage(
+                requirement_id=requirement_id,
+                requirement_sha256=hashlib.sha256(signal.encode()).hexdigest(),
+                status=(
+                    "STRONG"
+                    if len(ranked_fact_ids) >= 2
+                    else "MEDIUM"
+                    if ranked_fact_ids
+                    else "GAP"
+                ),
+                matched_fact_ids=ranked_fact_ids,
+            )
+        )
+    trace_hits: list[ResumeEvidenceRetrievalHit] = []
+    for hit in knowledge_hits[:_MAX_RETRIEVAL_HITS]:
+        hit_terms = _entry_terms(hit.excerpt)
+        matching_requirements = [
+            requirement_id
+            for requirement_id, terms in requirement_terms.items()
+            if terms & hit_terms
+        ]
+        matched_fact_ids = [
+            fact_id
+            for fact_id, terms in fact_terms.items()
+            if len(terms & hit_terms) >= 2
+        ][:12]
+        trace_hits.append(
+            ResumeEvidenceRetrievalHit(
+                retrieval_id=hashlib.sha256(
+                    f"{hit.source_kind.value}\0{hit.chunk_id}".encode()
+                ).hexdigest(),
+                source_kind=hit.source_kind.value,
+                chunk_sha256=hit.chunk_sha256,
+                document_sha256=hit.document_sha256,
+                score=hit.score,
+                requirement_ids=matching_requirements,
+                matched_fact_ids=matched_fact_ids,
+            )
+        )
+    fact_ids = [fact.fact_id for fact in facts]
+    source_type_for_evidence: dict[str, str] = {}
+    for fact in facts:
+        if fact.source_kind == "PROFILE_ENTRY":
+            source_type_for_evidence[fact.fact_id] = "EXISTING_RESUME"
+        elif fact.evidence_id == "EVIDENCE-LOCAL-GIT":
+            source_type_for_evidence[fact.fact_id] = "LOCAL_GIT"
+        elif fact.evidence_id == "EVIDENCE-GITHUB-COMMITS":
+            source_type_for_evidence[fact.fact_id] = "GITHUB"
+        elif fact.evidence_id.startswith("EVIDENCE-M1-"):
+            source_type_for_evidence[fact.fact_id] = "CONTENT_CANON"
+    fact_counts = Counter(source_type_for_evidence.values())
+    knowledge_source_map = {
+        "buildlog_run": "BUILDLOG",
+        "codex_session": "CODEX",
+        "chatgpt_export": "CHATGPT",
+    }
+    context_counts = Counter(
+        knowledge_source_map[hit.source_kind.value]
+        for hit in knowledge_hits
+        if hit.source_kind.value in knowledge_source_map
+    )
+    source_summaries = [
+        ResumeEvidenceSourceSummary(
+            source_type=source_type,  # type: ignore[arg-type]
+            state=(
+                "UNAVAILABLE"
+                if source_type in {"LEARNING", "RESUME_HISTORY"}
+                else "MATCHED"
+                if fact_counts[source_type] or context_counts[source_type]
+                else "NO_MATCH"
+            ),
+            retrieved_count=fact_counts[source_type] + context_counts[source_type],
+            admitted_count=fact_counts[source_type],
+            context_only_count=context_counts[source_type],
+            sent_count=fact_counts[source_type],
+        )
+        for source_type in (
+            "EXISTING_RESUME",
+            "LOCAL_GIT",
+            "GITHUB",
+            "BUILDLOG",
+            "CODEX",
+            "CHATGPT",
+            "CONTENT_CANON",
+            "LEARNING",
+            "RESUME_HISTORY",
+        )
+    ]
+    return ResumeEvidenceRetrievalTrace(
+        job_description_sha256=hashlib.sha256(job_description.encode()).hexdigest(),
+        source_counts=dict(
+            sorted(Counter(hit.source_kind.value for hit in knowledge_hits).items())
+        ),
+        hits=trace_hits,
+        requirements=requirements,
+        sources=source_summaries,
+        retrieved_count=len(facts) + len(knowledge_hits),
+        admitted_count=len(fact_ids),
+        sent_count=len(fact_ids),
+        admitted_fact_ids=fact_ids,
+        sent_fact_ids=fact_ids,
+    )
 
 
 def _append_repository_facts(
@@ -297,8 +563,9 @@ def build_candidate_evidence_pack(
     *,
     data_root: Path | None = None,
     repository_root: Path | None = None,
+    job_description: str = "",
 ) -> CandidateEvidencePack:
-    """Combine approved Resume facts with compact tracked READY evidence."""
+    """Retrieve locally, admit verified sources, and build compact model context."""
 
     atomic_facts = build_resume_atomic_facts(profile)
     sources: list[CandidateEvidenceSource] = []
@@ -321,11 +588,10 @@ def build_candidate_evidence_pack(
         )
     target_id = _soloscale_target(profile)
     if target_id is not None:
-        stories = {story.story_id: story for story in load_month_one_canon().stories}
-        for story_id in _STORY_IDS:
-            story = stories[story_id]
+        for story in load_month_one_canon().stories:
             if story.status != StoryReadiness.READY_FOR_PRODUCTION:
                 continue
+            story_id = story.story_id
             evidence_id = f"EVIDENCE-{story_id}"
             source_payload = story.model_dump_json()
             source_sha256 = hashlib.sha256(source_payload.encode()).hexdigest()
@@ -339,7 +605,7 @@ def build_candidate_evidence_pack(
                 )
             )
             for index, (text, metric) in enumerate(
-                _story_fact_texts(story_id), start=1
+                _story_fact_texts(story), start=1
             ):
                 fact_id = f"FACT-{evidence_id}-{index:02d}"
                 atomic_facts.append(
@@ -363,6 +629,18 @@ def build_candidate_evidence_pack(
                         ).hexdigest(),
                     )
                 )
+    atomic_facts = _compact_verified_facts(
+        job_description=job_description,
+        atomic_facts=atomic_facts,
+    )
+    selected_evidence_ids = {
+        fact.evidence_id
+        for fact in atomic_facts
+        if fact.source_kind == "CANDIDATE_EVIDENCE"
+    }
+    sources = [
+        source for source in sources if source.evidence_id in selected_evidence_ids
+    ]
     canonical = json.dumps(
         {
             "sources": [source.model_dump(mode="json") for source in sources],
@@ -421,6 +699,7 @@ def build_jd_positioning_brief(
 
 __all__ = [
     "build_candidate_evidence_pack",
+    "build_resume_evidence_retrieval_trace",
     "build_jd_positioning_brief",
     "deterministic_hiring_signals",
 ]
