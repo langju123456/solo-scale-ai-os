@@ -898,6 +898,10 @@ def _local_video_panel(
   {availability}
   <form method="post" action="/video/local/render">
     <input type="hidden" name="ui_locale" value="{locale}" />
+    <label>{_escape(ui_text(locale, '内容包 run_id（可选）', 'Content run ID (optional)'))}
+      <input name="content_run_id" placeholder="content-2026…" />
+    </label>
+    <p class="muted">{_escape(ui_text(locale, '填写后直接从该内容包渲染视频脚本与分镜，不再重新录入事实；留空则使用本地工程故事。', 'When filled, renders that content package video script and storyboard downstream without re-entering facts; empty keeps the local engineering story.'))}</p>
     <button class="primary"{disabled}>{_escape(ui_text(locale, "生成本地视频", "Render local video"))}</button>
   </form>
 </section>'''
@@ -8474,10 +8478,12 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             if video_story_manager is None:
                 self.send_error(503, "Local video worker is unavailable")
                 return
+            content_run_id = form.get("content_run_id", "").strip() or None
             try:
                 job_id = video_story_manager.submit(
                     data_root=self.ui_data_root.absolute(),
                     repository_root=self.repo_root,
+                    content_run_id=content_run_id,
                 )
             except (OSError, ResumeWorkspaceStorageError, VideoStoryError) as exc:
                 self._send_video_page(error=str(exc))
