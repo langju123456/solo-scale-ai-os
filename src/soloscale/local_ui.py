@@ -81,6 +81,7 @@ from soloscale.editorial_publishing_handoff import (
 )
 from soloscale.evidence_hub import EvidenceHub, EvidenceHubError
 from soloscale.evidence_ui import (
+    ensure_local_project_evidence,
     evidence_page,
     refresh_evidence_catalog,
     refresh_local_project_evidence,
@@ -2111,11 +2112,10 @@ def _run_user_resume(
             if progress is not None:
                 progress("RETRIEVING")
             if evidence_repository_root is not None:
-                refresh_receipt = EvidenceHub(data_root).sync_git_repository(
-                    evidence_repository_root
+                ensure_local_project_evidence(
+                    data_root,
+                    repository_root=evidence_repository_root,
                 )
-                if refresh_receipt.status.value != "succeeded":
-                    raise EvidenceHubError("local project evidence refresh failed")
             candidate_evidence_pack = build_candidate_evidence_pack(
                 profile,
                 data_root=data_root,

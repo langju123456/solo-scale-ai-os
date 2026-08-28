@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from email.message import Message
 from pathlib import Path
 
+from soloscale.evidence_hub import EvidenceHub, inspect_git_repository
+from soloscale.evidence_ui import ensure_local_project_evidence
 from soloscale.knowledge_models import (
     ContentRole,
     NormalizedChunk,
@@ -100,3 +102,49 @@ def test_evidence_refresh_post_redirects_and_renders_metadata_only(tmp_path: Pat
     assert "Sources" in body and "Evidence" in body and "codex_session" in body
     assert "private body" not in body
     assert "/private/thread.jsonl" not in body
+
+
+def test_local_project_evidence_preflight_refreshes_only_when_fingerprint_changes(
+    tmp_path: Path,
+) -> None:
+    repository_root = tmp_path / "repository"
+    repository_root.mkdir()
+    subprocess.run(["git", "init", "-q", str(repository_root)], check=True)
+    tracked = repository_root / "feature.txt"
+    tracked.write_text("first version", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository_root), "add", "feature.txt"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repository_root), "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid", "commit", "-qm",
+            "feat: add current project evidence",
+        ],
+        check=True,
+    )
+    data_root = tmp_path / "data"
+
+    assert ensure_local_project_evidence(
+        data_root,
+        repository_root=repository_root,
+    ) is True
+    assert ensure_local_project_evidence(
+        data_root,
+        repository_root=repository_root,
+    ) is False
+
+    tracked.write_text("second version", encoding="utf-8")
+    assert ensure_local_project_evidence(
+        data_root,
+        repository_root=repository_root,
+    ) is True
+
+    current_source, _ = inspect_git_repository(repository_root)
+    stored_snapshot = EvidenceHub(data_root).git_repository_snapshot(repository_root)
+    assert stored_snapshot is not None
+    stored_source, _ = stored_snapshot
+    assert stored_source.content_sha256 == current_source.content_sha256
+    assert stored_source.metadata["status_sha256"] == current_source.metadata["status_sha256"]
+    assert (
+        stored_source.metadata["tracked_diff_sha256"]
+        == current_source.metadata["tracked_diff_sha256"]
+    )
