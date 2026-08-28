@@ -219,11 +219,11 @@ from soloscale.video_story import (
     local_video_download_names,
 )
 from soloscale.work_ui import (
+    CodexImportJobManager,
     WorkContextError,
     github_repositories_page,
     import_chatgpt_export,
     import_chatgpt_export_bytes,
-    import_codex_history,
     load_work_context,
     refresh_selected_knowledge_sources,
     render_use_my_work,
@@ -5398,6 +5398,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     resume_job_manager: ResumeJobManager | None = None
     video_story_job_manager: LocalVideoJobManager | None = None
     creator_video_job_manager: CreatorVideoJobManager | None = None
+    codex_import_job_manager: CodexImportJobManager | None = None
 
     def log_message(self, format: str, *args: object) -> None:
         if self.desktop_session_token is not None:
@@ -5769,6 +5770,23 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             added = max(0, int(values.get("added", ["0"])[0]))
         except ValueError:
             added = 0
+        codex_job = None
+        manager = self.codex_import_job_manager
+        requested_job_id = values.get("codex_job", [""])[0]
+        if manager is not None:
+            codex_job = (
+                manager.get(self.ui_data_root.absolute(), requested_job_id)
+                if requested_job_id
+                else manager.latest(self.ui_data_root.absolute())
+            )
+        if codex_job is not None and requested_job_id:
+            if codex_job.phase == "READY":
+                notice_code = (
+                    "codex-partial" if codex_job.failed else "codex-added"
+                )
+                added = codex_job.imported + codex_job.updated
+            elif codex_job.phase == "FAILED":
+                error_code = "codex-import-failed"
         notices = {
             "project-connected": ui_text(
                 self.ui_locale,
@@ -5784,6 +5802,11 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.ui_locale,
                 f"Codex 资料已添加：{added} 份新增或更新记录。",
                 f"Codex work added: {added} new or updated records.",
+            ),
+            "codex-partial": ui_text(
+                self.ui_locale,
+                f"Codex 资料已更新：{added} 份新增或更新记录；个别会话需要重试。",
+                f"Codex work updated: {added} new or updated records; some sessions need attention.",
             ),
             "chatgpt-added": ui_text(
                 self.ui_locale,
@@ -5869,6 +5892,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 and os.environ.get("SOLOSCALE_GITHUB_CONNECT_AVAILABLE") == "1"
             ),
             chatgpt_export_selected=self.pending_chatgpt_export is not None,
+            codex_job=codex_job,
             notice=notices.get(notice_code),
             error=errors.get(error_code),
         ).encode("utf-8")
@@ -6022,6 +6046,48 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.ui_locale = normalize_ui_locale(query.get("lang", [""])[0])
         if path in {"/", ""}:
             self._send_home_page()
+            return
+        codex_import_job_match = re.fullmatch(
+            r"/work/import-codex/jobs/(codex-import-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10})",
+            path,
+        )
+        if codex_import_job_match is not None:
+            manager = self.codex_import_job_manager
+            snapshot = (
+                manager.get(
+                    self.ui_data_root.absolute(),
+                    codex_import_job_match.group(1),
+                )
+                if manager is not None
+                else None
+            )
+            if snapshot is None:
+                self.send_error(404, "Codex import job not found")
+                return
+            body = json.dumps(
+                {
+                    "job_id": snapshot.job_id,
+                    "phase": snapshot.phase,
+                    "total": snapshot.total,
+                    "processed": snapshot.processed,
+                    "running": snapshot.running,
+                    "imported": snapshot.imported,
+                    "updated": snapshot.updated,
+                    "skipped": snapshot.skipped,
+                    "failed": snapshot.failed,
+                    "failure_codes": list(snapshot.failure_codes),
+                    "created_at": snapshot.created_at,
+                    "updated_at": snapshot.updated_at,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
             return
         if path == "/work":
             self._send_work_page(query)
@@ -6688,8 +6754,13 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 )
             else:
                 try:
-                    codex_result = import_codex_history(
-                        self.ui_data_root.absolute()
+                    manager = self.codex_import_job_manager
+                    if manager is None:
+                        raise WorkContextError(
+                            "Codex background import is unavailable."
+                        )
+                    job_id = manager.submit(
+                        data_root=self.ui_data_root.absolute(),
                     )
                 except (WorkContextError, OSError, ValueError):
                     location = ui_url(
@@ -6699,8 +6770,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     location = ui_url(
                         "/work",
                         self.ui_locale,
-                        notice="codex-added",
-                        added=str(codex_result.imported + codex_result.updated),
+                        codex_job=job_id,
                     )
             self.send_response(303)
             self.send_header("Location", location)
@@ -7742,6 +7812,8 @@ def main() -> None:
     handler.video_story_job_manager = video_story_job_manager
     creator_video_job_manager = CreatorVideoJobManager()
     handler.creator_video_job_manager = creator_video_job_manager
+    codex_import_job_manager = CodexImportJobManager()
+    handler.codex_import_job_manager = codex_import_job_manager
 
     server = HTTPServer((args.host, args.port), handler)
     raw_host, port = server.server_address[:2]
@@ -7787,6 +7859,8 @@ def main() -> None:
         handler.video_story_job_manager = None
         creator_video_job_manager.shutdown()
         handler.creator_video_job_manager = None
+        codex_import_job_manager.shutdown()
+        handler.codex_import_job_manager = None
         if readiness_path is not None:
             try:
                 readiness_path.unlink()

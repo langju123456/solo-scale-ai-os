@@ -1,11 +1,14 @@
 import hashlib
+import http.client
 import io
 import json
 import os
 import subprocess
 import threading
 import time
+import urllib.parse
 import zipfile
+from http.server import HTTPServer
 from pathlib import Path
 from typing import Literal, TypeVar
 
@@ -15,6 +18,7 @@ from pydantic import BaseModel
 from soloscale.content_models import ContentReviewDecision
 from soloscale.content_ui import run_content_form
 from soloscale.content_workspace import save_content_review
+from soloscale.conversation_intake import parse_codex_session
 from soloscale.knowledge_models import ContentRole, RetrievalHit, SourceKind
 from soloscale.knowledge_store import InvalidKnowledgeQueryError
 from soloscale.learning_traceability import run_learning_traceability
@@ -22,6 +26,7 @@ from soloscale.local_ui import (
     OllamaReadiness,
     ResumeJobManager,
     ResumeJobSnapshot,
+    SoloScaleLocalUIHandler,
     UIActionResult,
     UploadedFile,
     _ai_settings_page,
@@ -59,6 +64,7 @@ from soloscale.resume_workspace import (
     map_interview_defense_bullet,
     run_resume_workspace,
 )
+from soloscale.work_ui import CodexImportJobManager
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -832,6 +838,99 @@ def test_create_resume_pdf_preview_uses_isolated_local_renderer(
     assert _create_resume_pdf_preview(source, target) is True
     assert target.read_bytes().startswith(b"%PDF-")
     assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_codex_import_http_returns_immediately_and_exposes_polling_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    session = home / ".codex" / "sessions" / "2026" / "session.jsonl"
+    session.parent.mkdir(parents=True)
+    session.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-28T08:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "http-background-session"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "timestamp": "2026-08-28T08:01:00Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "http-message",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "private work"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    def slow_parse(path: Path) -> object:
+        time.sleep(0.25)
+        return parse_codex_session(path)
+
+    monkeypatch.setattr("soloscale.work_ui.parse_codex_session", slow_parse)
+    manager = CodexImportJobManager(parse_workers=1)
+    SoloScaleLocalUIHandler.ui_data_root = tmp_path / "data"
+    SoloScaleLocalUIHandler.desktop_session_token = None
+    SoloScaleLocalUIHandler.desktop_expected_host = None
+    SoloScaleLocalUIHandler.codex_import_job_manager = manager
+    server = HTTPServer(("127.0.0.1", 0), SoloScaleLocalUIHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+    try:
+        body = urllib.parse.urlencode({"approve": "yes", "ui_locale": "en"})
+        started = time.monotonic()
+        connection.request(
+            "POST",
+            "/work/import-codex",
+            body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        response = connection.getresponse()
+        response.read()
+        elapsed = time.monotonic() - started
+        assert response.status == 303
+        assert elapsed < 0.5
+        location = response.getheader("Location") or ""
+        job_id = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)[
+            "codex_job"
+        ][0]
+
+        connection.request("GET", "/health")
+        health = connection.getresponse()
+        assert health.status == 200
+        health.read()
+
+        deadline = time.monotonic() + 5
+        payload: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            connection.request("GET", f"/work/import-codex/jobs/{job_id}")
+            status = connection.getresponse()
+            payload = json.loads(status.read())
+            assert status.status == 200
+            if payload["phase"] in {"READY", "FAILED"}:
+                break
+            time.sleep(0.02)
+        assert payload["phase"] == "READY"
+        assert payload["processed"] == 1
+        assert payload["imported"] == 1
+        assert "private work" not in json.dumps(payload)
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        manager.shutdown()
+        SoloScaleLocalUIHandler.codex_import_job_manager = None
 
 
 def _wait_for_resume_job(

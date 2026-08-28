@@ -2,17 +2,35 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 import subprocess
+import time
 from pathlib import Path
 
 from soloscale.evidence_hub import EvidenceHub
 from soloscale.ui_shell import SourceState, render_source_state
 from soloscale.work_ui import (
+    CodexImportJobManager,
+    CodexImportJobSnapshot,
     import_chatgpt_export,
     import_codex_history,
     load_work_context,
     work_page,
 )
+
+
+def _wait_for_codex_job(
+    manager: CodexImportJobManager,
+    data_root: Path,
+    job_id: str,
+) -> CodexImportJobSnapshot:
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        snapshot = manager.get(data_root, job_id)
+        if snapshot is not None and snapshot.phase in {"READY", "FAILED"}:
+            return snapshot
+        time.sleep(0.01)
+    raise AssertionError("Codex import job did not finish")
 
 
 def _chatgpt_export(private_text: str) -> list[object]:
@@ -207,6 +225,128 @@ def test_codex_import_and_selected_git_project_reuse_existing_intake(
     assert ready.project_state == "READY"
     assert ready.project_fact_count == 1
     assert ready.project_new_commits == 0
+
+
+def test_codex_background_import_is_incremental_and_isolates_session_failures(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    codex_home = tmp_path / "home" / ".codex"
+    sessions = codex_home / "sessions" / "2026"
+    sessions.mkdir(parents=True)
+    private_text = "PRIVATE BACKGROUND IMPORT DETAIL"
+    good = sessions / "good.jsonl"
+    good.write_text(_codex_session(private_text), encoding="utf-8")
+    bad = sessions / "bad.jsonl"
+    bad.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-16T01:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "broken-work-session"},
+            }
+        )
+        + "\nnot-json\n",
+        encoding="utf-8",
+    )
+    before = good.read_bytes()
+    manager = CodexImportJobManager(parse_workers=2)
+    try:
+        first_job_id = manager.submit(data_root=data_root, codex_home=codex_home)
+        assert first_job_id.startswith("codex-import-")
+        first = _wait_for_codex_job(manager, data_root, first_job_id)
+
+        assert first.phase == "READY"
+        assert first.total == 2
+        assert first.processed == 2
+        assert first.running == 0
+        assert first.imported == 1
+        assert first.failed == 1
+        assert "SESSION_PARSE_FAILED" in first.failure_codes
+
+        second_job_id = manager.submit(data_root=data_root, codex_home=codex_home)
+        assert second_job_id != first_job_id
+        second = _wait_for_codex_job(manager, data_root, second_job_id)
+
+        assert second.phase == "READY"
+        assert second.total == 2
+        assert second.processed == 2
+        assert second.running == 0
+        assert second.imported == 0
+        assert second.updated == 0
+        assert second.skipped == 1
+        assert second.failed == 1
+        assert "SESSION_PARSE_FAILED" in second.failure_codes
+    finally:
+        manager.shutdown()
+
+    assert good.read_bytes() == before
+    inventory = data_root / "knowledge" / "codex-source-inventory.json"
+    first_receipt = (
+        data_root / "knowledge" / "import-jobs" / f"{first_job_id}.json"
+    )
+    persisted_metadata = inventory.read_text() + first_receipt.read_text()
+    assert private_text not in persisted_metadata
+    assert str(codex_home) not in persisted_metadata
+    assert stat.S_IMODE(inventory.stat().st_mode) == 0o600
+    assert stat.S_IMODE(first_receipt.stat().st_mode) == 0o600
+    restarted_manager = CodexImportJobManager(parse_workers=1)
+    try:
+        recovered = restarted_manager.get(data_root, first_job_id)
+        assert recovered is not None
+        assert recovered.phase == "READY"
+        assert recovered.processed == first.processed
+        assert recovered.failed == first.failed
+    finally:
+        restarted_manager.shutdown()
+
+
+def test_work_page_polls_body_free_codex_background_progress(tmp_path: Path) -> None:
+    job = CodexImportJobSnapshot(
+        job_id="codex-import-20260828T120000Z-0123456789",
+        phase="PROCESSING",
+        total=12,
+        processed=5,
+        running=2,
+        imported=3,
+        updated=1,
+        skipped=1,
+        failed=0,
+        failure_codes=(),
+        created_at="2026-08-28T12:00:00+00:00",
+        updated_at="2026-08-28T12:00:01+00:00",
+    )
+
+    page = work_page(
+        data_root=tmp_path / "data",
+        workspace_root=None,
+        desktop_mode=True,
+        codex_job=job,
+    )
+
+    assert 'data-source="codex"' in page
+    assert 'data-source-state="PROCESSING"' in page
+    assert "已处理 5/12" in page
+    assert 'data-job-id="codex-import-20260828T120000Z-0123456789"' in page
+    assert "/work/import-codex/jobs/${jobId}" in page
+    assert "后台增量处理" in page
+
+    failed_page = work_page(
+        data_root=tmp_path / "data",
+        workspace_root=None,
+        desktop_mode=True,
+        codex_job=CodexImportJobSnapshot(
+            **{
+                **job.__dict__,
+                "phase": "FAILED",
+                "processed": 12,
+                "running": 0,
+                "failed": 2,
+            }
+        ),
+    )
+    assert 'data-source-state="NEEDS_ATTENTION"' in failed_page
+    assert "处理未完成" in failed_page
 
 
 def test_work_page_english_copy_actions_and_states_are_truthful(tmp_path: Path) -> None:

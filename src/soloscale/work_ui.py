@@ -3,12 +3,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
+import json
 import os
+import re
+import stat
 import tempfile
+import threading
 from collections.abc import Sequence
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
+from uuid import uuid4
 
 from soloscale.conversation_intake import (
     ConversationIntakeError,
@@ -39,6 +48,21 @@ from soloscale.ui_shell import (
 
 class WorkContextError(ValueError):
     """Raised when an explicitly approved work source cannot be imported safely."""
+
+
+CodexImportPhase = Literal[
+    "QUEUED",
+    "DISCOVERING",
+    "PROCESSING",
+    "READY",
+    "FAILED",
+]
+
+_CODEX_IMPORT_JOB_ID = re.compile(
+    r"codex-import-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10}"
+)
+_TERMINAL_CODEX_IMPORT_PHASES = {"READY", "FAILED"}
+_SHA256 = re.compile(r"[a-f0-9]{64}")
 
 
 @dataclass(frozen=True)
@@ -91,6 +115,439 @@ class WorkImportResult:
     updated: int
     skipped: int
     failed: int
+
+
+@dataclass(frozen=True)
+class CodexImportJobSnapshot:
+    """Body-free persisted progress for one explicit Codex history import."""
+
+    job_id: str
+    phase: CodexImportPhase
+    total: int
+    processed: int
+    running: int
+    imported: int
+    updated: int
+    skipped: int
+    failed: int
+    failure_codes: tuple[str, ...]
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class _CodexImportJobRecord:
+    job_id: str
+    phase: CodexImportPhase
+    total: int = 0
+    processed: int = 0
+    running: int = 0
+    imported: int = 0
+    updated: int = 0
+    skipped: int = 0
+    failed: int = 0
+    failure_codes: list[str] = field(default_factory=list)
+    created_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    updated_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+
+
+def _codex_import_job_path(data_root: Path, job_id: str) -> Path:
+    if _CODEX_IMPORT_JOB_ID.fullmatch(job_id) is None:
+        raise WorkContextError("Codex import job ID is invalid.")
+    return Path(data_root) / "knowledge" / "import-jobs" / f"{job_id}.json"
+
+
+def _codex_inventory_path(data_root: Path) -> Path:
+    return Path(data_root) / "knowledge" / "codex-source-inventory.json"
+
+
+def _codex_source_fingerprint(path: Path) -> tuple[str, str]:
+    """Return body-free path identity and change fingerprint for one regular source."""
+
+    try:
+        source_stat = path.lstat()
+    except OSError as exc:
+        raise WorkContextError("Codex source metadata is unavailable.") from exc
+    if stat.S_ISLNK(source_stat.st_mode) or not stat.S_ISREG(source_stat.st_mode):
+        raise WorkContextError("Codex source is not a regular file.")
+    path_key = hashlib.sha256(str(path.absolute()).encode("utf-8")).hexdigest()
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "device": source_stat.st_dev,
+                "inode": source_stat.st_ino,
+                "size": source_stat.st_size,
+                "modified_ns": source_stat.st_mtime_ns,
+                "changed_ns": source_stat.st_ctime_ns,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return path_key, fingerprint
+
+
+def _load_codex_inventory(data_root: Path) -> dict[str, str]:
+    path = _codex_inventory_path(data_root)
+    if not path.exists():
+        return {}
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise WorkContextError("Codex source inventory is unavailable.")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise WorkContextError("Codex source inventory is unavailable.") from exc
+    if not isinstance(payload, dict):
+        raise WorkContextError("Codex source inventory is unavailable.")
+    inventory = payload.get("sources")
+    if not isinstance(inventory, dict):
+        raise WorkContextError("Codex source inventory is unavailable.")
+    normalized: dict[str, str] = {}
+    for key, value in inventory.items():
+        if (
+            not isinstance(key, str)
+            or not isinstance(value, str)
+            or _SHA256.fullmatch(key) is None
+            or _SHA256.fullmatch(value) is None
+        ):
+            raise WorkContextError("Codex source inventory is unavailable.")
+        normalized[key] = value
+    return normalized
+
+
+def _persist_codex_inventory(data_root: Path, inventory: dict[str, str]) -> None:
+    path = _codex_inventory_path(data_root)
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if directory.is_symlink():
+        raise WorkContextError("Codex source inventory storage is unsafe.")
+    os.chmod(directory, 0o700)
+    descriptor, raw_temporary = tempfile.mkstemp(
+        prefix=".codex-source-inventory-",
+        suffix=".tmp",
+        dir=directory,
+    )
+    temporary = Path(raw_temporary)
+    try:
+        os.chmod(temporary, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            json.dump(
+                {"schema_version": "1.0", "sources": inventory},
+                stream,
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _persist_codex_import_job(data_root: Path, record: _CodexImportJobRecord) -> None:
+    path = _codex_import_job_path(data_root, record.job_id)
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if directory.is_symlink():
+        raise WorkContextError("Codex import job storage is unsafe.")
+    os.chmod(directory, 0o700)
+    descriptor, raw_temporary = tempfile.mkstemp(
+        prefix=f".{record.job_id}-",
+        suffix=".tmp",
+        dir=directory,
+    )
+    temporary = Path(raw_temporary)
+    try:
+        os.chmod(temporary, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            json.dump(record.__dict__, stream, ensure_ascii=False, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _load_codex_import_job(data_root: Path, job_id: str) -> _CodexImportJobRecord:
+    path = _codex_import_job_path(data_root, job_id)
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise WorkContextError("Codex import job is unavailable.")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        record = _CodexImportJobRecord(**payload)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise WorkContextError("Codex import job is unavailable.") from exc
+    if record.job_id != job_id or record.phase not in {
+        "QUEUED",
+        "DISCOVERING",
+        "PROCESSING",
+        "READY",
+        "FAILED",
+    }:
+        raise WorkContextError("Codex import job is unavailable.")
+    return record
+
+
+class CodexImportJobManager:
+    """Import Codex history off the HTTP thread with bounded parse concurrency."""
+
+    def __init__(self, *, parse_workers: int = 4) -> None:
+        self._parse_workers = max(1, min(4, parse_workers))
+        self._executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="soloscale-codex-import",
+        )
+        self._lock = threading.Lock()
+        self._jobs: dict[str, _CodexImportJobRecord] = {}
+
+    def submit(self, *, data_root: Path, codex_home: Path | None = None) -> str:
+        with self._lock:
+            for existing in self._jobs.values():
+                if existing.phase not in _TERMINAL_CODEX_IMPORT_PHASES:
+                    return existing.job_id
+            now = datetime.now(UTC)
+            job_id = (
+                f"codex-import-{now.strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:10]}"
+            )
+            record = _CodexImportJobRecord(job_id=job_id, phase="QUEUED")
+            self._jobs[job_id] = record
+            _persist_codex_import_job(data_root, record)
+        self._executor.submit(self._execute, Path(data_root), codex_home, job_id)
+        return job_id
+
+    def get(self, data_root: Path, job_id: str) -> CodexImportJobSnapshot | None:
+        if _CODEX_IMPORT_JOB_ID.fullmatch(job_id) is None:
+            return None
+        with self._lock:
+            record = self._jobs.get(job_id)
+            if record is not None:
+                return self._snapshot(record)
+        try:
+            record = _load_codex_import_job(data_root, job_id)
+        except WorkContextError:
+            return None
+        if record.phase not in _TERMINAL_CODEX_IMPORT_PHASES:
+            record.phase = "FAILED"
+            record.running = 0
+            record.failure_codes.append("INTERRUPTED")
+            record.updated_at = datetime.now(UTC).isoformat()
+            _persist_codex_import_job(data_root, record)
+        return self._snapshot(record)
+
+    def latest(self, data_root: Path) -> CodexImportJobSnapshot | None:
+        directory = Path(data_root) / "knowledge" / "import-jobs"
+        try:
+            candidates = sorted(
+                (
+                    path.stem
+                    for path in directory.glob("codex-import-*.json")
+                    if not path.is_symlink()
+                    and _CODEX_IMPORT_JOB_ID.fullmatch(path.stem) is not None
+                ),
+                reverse=True,
+            )
+        except OSError:
+            return None
+        for job_id in candidates:
+            snapshot = self.get(data_root, job_id)
+            if snapshot is not None:
+                return snapshot
+        return None
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _execute(
+        self,
+        data_root: Path,
+        codex_home: Path | None,
+        job_id: str,
+    ) -> None:
+        selected_home = (
+            Path(codex_home) if codex_home is not None else Path.home() / ".codex"
+        )
+        try:
+            self._update(data_root, job_id, phase="DISCOVERING")
+            paths = discover_codex_sources(selected_home)
+            if not paths:
+                self._finish_failed(data_root, job_id, "NO_SUPPORTED_HISTORY")
+                return
+            self._update(data_root, job_id, phase="PROCESSING", total=len(paths))
+            store = KnowledgeStore(data_root)
+            previous_inventory = _load_codex_inventory(data_root)
+            next_inventory: dict[str, str] = {}
+            pending: list[tuple[Path, str, str]] = []
+            for path in paths:
+                try:
+                    path_key, source_fingerprint = _codex_source_fingerprint(path)
+                except WorkContextError:
+                    self._increment(
+                        data_root,
+                        job_id,
+                        processed=1,
+                        failed=1,
+                        failure_code="SOURCE_METADATA_FAILED",
+                    )
+                    continue
+                previous_fingerprint = previous_inventory.get(path_key)
+                if previous_fingerprint == source_fingerprint:
+                    next_inventory[path_key] = source_fingerprint
+                    self._increment(
+                        data_root,
+                        job_id,
+                        processed=1,
+                        skipped=1,
+                    )
+                    continue
+                if previous_fingerprint is not None:
+                    next_inventory[path_key] = previous_fingerprint
+                pending.append((path, path_key, source_fingerprint))
+
+            def parse_one(
+                item: tuple[Path, str, str],
+            ) -> tuple[str, str, ParsedSource]:
+                path, path_key, source_fingerprint = item
+                self._increment(data_root, job_id, running=1)
+                try:
+                    return path_key, source_fingerprint, parse_codex_session(path)
+                finally:
+                    self._increment(data_root, job_id, running=-1)
+
+            with ThreadPoolExecutor(
+                max_workers=self._parse_workers,
+                thread_name_prefix="soloscale-codex-parse",
+            ) as parser:
+                futures = [parser.submit(parse_one, item) for item in pending]
+                for future in as_completed(futures):
+                    try:
+                        path_key, source_fingerprint, parsed = future.result()
+                    except (ConversationIntakeError, OSError, ValueError):
+                        self._increment(
+                            data_root,
+                            job_id,
+                            processed=1,
+                            failed=1,
+                            failure_code="SESSION_PARSE_FAILED",
+                        )
+                        continue
+                    try:
+                        report = store.sync([parsed])
+                    except (KnowledgeStoreError, OSError, ValueError):
+                        self._increment(
+                            data_root,
+                            job_id,
+                            processed=1,
+                            failed=1,
+                            failure_code="SESSION_SYNC_FAILED",
+                        )
+                        continue
+                    if report.failed == 0:
+                        next_inventory[path_key] = source_fingerprint
+                    self._increment(
+                        data_root,
+                        job_id,
+                        processed=1,
+                        imported=report.imported,
+                        updated=report.updated,
+                        skipped=report.skipped,
+                        failed=report.failed,
+                        failure_code=(
+                            "SESSION_SYNC_REJECTED" if report.failed else None
+                        ),
+                    )
+            _persist_codex_inventory(data_root, next_inventory)
+            snapshot = self.get(data_root, job_id)
+            if snapshot is None or not (
+                snapshot.imported + snapshot.updated + snapshot.skipped
+            ):
+                self._finish_failed(data_root, job_id, "NO_SESSIONS_IMPORTED")
+                return
+            self._update(data_root, job_id, phase="READY", running=0)
+        except (ConversationIntakeError, KnowledgeStoreError, OSError, ValueError):
+            self._finish_failed(data_root, job_id, "IMPORT_FAILED")
+
+    def _finish_failed(self, data_root: Path, job_id: str, code: str) -> None:
+        self._increment(data_root, job_id, failure_code=code)
+        self._update(data_root, job_id, phase="FAILED", running=0)
+
+    def _increment(
+        self,
+        data_root: Path,
+        job_id: str,
+        *,
+        processed: int = 0,
+        running: int = 0,
+        imported: int = 0,
+        updated: int = 0,
+        skipped: int = 0,
+        failed: int = 0,
+        failure_code: str | None = None,
+    ) -> None:
+        with self._lock:
+            record = self._jobs[job_id]
+            record.processed += processed
+            record.running = max(0, record.running + running)
+            record.imported += imported
+            record.updated += updated
+            record.skipped += skipped
+            record.failed += failed
+            if failure_code is not None:
+                record.failure_codes.append(failure_code)
+            record.updated_at = datetime.now(UTC).isoformat()
+            _persist_codex_import_job(data_root, record)
+
+    def _update(
+        self,
+        data_root: Path,
+        job_id: str,
+        *,
+        phase: CodexImportPhase | None = None,
+        total: int | None = None,
+        running: int | None = None,
+    ) -> None:
+        with self._lock:
+            record = self._jobs[job_id]
+            if phase is not None:
+                record.phase = phase
+            if total is not None:
+                record.total = total
+            if running is not None:
+                record.running = running
+            record.updated_at = datetime.now(UTC).isoformat()
+            _persist_codex_import_job(data_root, record)
+
+    @staticmethod
+    def _snapshot(record: _CodexImportJobRecord) -> CodexImportJobSnapshot:
+        return CodexImportJobSnapshot(
+            job_id=record.job_id,
+            phase=record.phase,
+            total=record.total,
+            processed=record.processed,
+            running=record.running,
+            imported=record.imported,
+            updated=record.updated,
+            skipped=record.skipped,
+            failed=record.failed,
+            failure_codes=tuple(record.failure_codes),
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
 
 
 def refresh_selected_knowledge_sources(
@@ -501,6 +958,7 @@ def work_page(
     github_token_configured: bool = False,
     github_connect_available: bool = False,
     chatgpt_export_selected: bool = False,
+    codex_job: CodexImportJobSnapshot | None = None,
     notice: str | None = None,
     error: str | None = None,
 ) -> str:
@@ -513,6 +971,26 @@ def work_page(
     )
     notice_html = f'<div class="notice" role="status">{html.escape(notice)}</div>' if notice else ""
     error_html = f'<div class="error" role="alert">{html.escape(error)}</div>' if error else ""
+    codex_job_active = bool(
+        codex_job is not None
+        and codex_job.phase not in _TERMINAL_CODEX_IMPORT_PHASES
+    )
+    codex_job_needs_attention = bool(
+        codex_job is not None
+        and (codex_job.phase == "FAILED" or codex_job.failed > 0)
+    )
+    codex_progress = ""
+    codex_job_marker = ""
+    if codex_job_active and codex_job is not None:
+        codex_progress = ui_text(
+            locale,
+            f"已处理 {codex_job.processed}/{codex_job.total} · 正在处理 {codex_job.running} · 失败 {codex_job.failed} · 跳过 {codex_job.skipped}",
+            f"Processed {codex_job.processed}/{codex_job.total} · running {codex_job.running} · failed {codex_job.failed} · skipped {codex_job.skipped}",
+        )
+        codex_job_marker = (
+            '<div id="codex-import-monitor" hidden '
+            f'data-job-id="{html.escape(codex_job.job_id)}"></div>'
+        )
 
     def processing_form_attributes(source: str, copy: str) -> str:
         return (
@@ -528,7 +1006,7 @@ def work_page(
         "Building the local index · this page will update when complete",
     )
     codex_action = ""
-    if snapshot.codex_folder_available:
+    if snapshot.codex_folder_available and not codex_job_active:
         codex_action = f'''<form method="post" action="/work/import-codex" {processing_form_attributes(codex_name, codex_processing)}>
   <input type="hidden" name="ui_locale" value="{locale}" />
   <label class="consent"><input type="checkbox" name="approve" value="yes" required />{html.escape(ui_text(locale, "我批准这次读取标准 Codex 历史目录。", "I approve reading the standard Codex history folder for this import."))}</label>
@@ -677,7 +1155,52 @@ def work_page(
             )
         )
 
-    if snapshot.codex_sessions:
+    if codex_job_active:
+        connected_rows.append(
+            _source_row(
+                key="codex",
+                state="PROCESSING",
+                locale=locale,
+                name=codex_name,
+                summary=codex_progress,
+                detail=ui_text(
+                    locale,
+                    "后台增量处理；你可以继续使用其他页面。单个会话失败不会停止其余会话。",
+                    "Incremental processing continues in the background. You can keep using other pages, and one failed session does not stop the rest.",
+                ),
+            )
+        )
+    elif codex_job_needs_attention and codex_job is not None:
+        failed_target = connected_rows if snapshot.codex_sessions else add_more_rows
+        incomplete = codex_job.phase == "FAILED"
+        failed_target.append(
+            _source_row(
+                key="codex",
+                state="NEEDS_ATTENTION",
+                locale=locale,
+                name=codex_name,
+                summary=ui_text(
+                    locale,
+                    (
+                        f"处理未完成 · 已处理 {codex_job.processed}/{codex_job.total} · 失败 {codex_job.failed}"
+                        if incomplete
+                        else f"更新完成，但 {codex_job.failed} 个会话需要处理"
+                    ),
+                    (
+                        f"Import incomplete · processed {codex_job.processed}/{codex_job.total} · failed {codex_job.failed}"
+                        if incomplete
+                        else f"Update completed with {codex_job.failed} sessions needing attention"
+                    ),
+                ),
+                detail=ui_text(
+                    locale,
+                    "已存在的资料保持不变；可以重新更新。",
+                    "Existing work remains unchanged; you can run the update again.",
+                ),
+                actions=codex_action,
+            )
+        )
+    elif snapshot.codex_sessions:
         connected_rows.append(
             _source_row(
                 key="codex",
@@ -808,7 +1331,7 @@ def work_page(
         detail=ui_text(locale, "当前不扫描任意文件夹，也不显示无法执行的操作。", "SoloScale does not scan arbitrary folders or show actions that cannot run."),
     )
 
-    body = f"""{notice_html}{error_html}
+    body = f"""{notice_html}{error_html}{codex_job_marker}
 <section class="privacy-note" aria-labelledby="privacy-heading">
   <div><strong id="privacy-heading">{html.escape(ui_text(locale, '只读取你明确选择的资料。本地优先，不扫描整台 Mac。', 'Only work you explicitly choose is read. Local first; no whole-Mac scanning.'))}</strong>
   <details><summary>{html.escape(ui_text(locale, '了解数据边界', 'Understand the data boundary'))}</summary>
@@ -872,6 +1395,40 @@ def work_page(
     section.hidden = false;
     form.closest(".source-row")?.classList.add("is-processing");
   }, true);
+  const monitor = document.getElementById("codex-import-monitor");
+  if (!monitor) return;
+  const jobId = monitor.dataset.jobId;
+  const summary = document.querySelector('[data-source="codex"] .source-copy strong');
+  const isZh = document.documentElement.lang.toLowerCase().startsWith("zh");
+  const poll = async () => {
+    try {
+      const response = await fetch(`/work/import-codex/jobs/${jobId}`, {
+        cache: "no-store",
+        headers: {"Accept": "application/json"},
+      });
+      if (!response.ok) throw new Error("job unavailable");
+      const job = await response.json();
+      if (summary) {
+        summary.textContent = isZh
+          ? `已处理 ${job.processed}/${job.total} · 正在处理 ${job.running} · 失败 ${job.failed} · 跳过 ${job.skipped}`
+          : `Processed ${job.processed}/${job.total} · running ${job.running} · failed ${job.failed} · skipped ${job.skipped}`;
+      }
+      if (job.phase === "READY") {
+        const added = Number(job.imported || 0) + Number(job.updated || 0);
+        const notice = Number(job.failed || 0) > 0 ? "codex-partial" : "codex-added";
+        window.location.replace(`/work?notice=${notice}&added=${added}&codex_job=${jobId}&lang=${encodeURIComponent(document.documentElement.lang)}`);
+        return;
+      }
+      if (job.phase === "FAILED") {
+        window.location.replace(`/work?error=codex-import-failed&lang=${encodeURIComponent(document.documentElement.lang)}`);
+        return;
+      }
+    } catch (_) {
+      // A transient local fetch failure should not cancel the persisted background job.
+    }
+    window.setTimeout(poll, 750);
+  };
+  window.setTimeout(poll, 250);
 })();
 """,
     )
