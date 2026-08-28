@@ -824,6 +824,21 @@ def _result_html(
         writer.provider.kind.value if writer is not None else "template",
         ui_text(locale, "生成方式未知", "Generation method unknown"),
     )
+    if run.execution_state == "AI_EXECUTED":
+        usage_suffix = ""
+        if run.token_usage:
+            usage_suffix = (
+                f" · {run.token_usage.get('prompt_eval_tokens', '?')}/"
+                f"{run.token_usage.get('output_tokens', '?')} tok"
+            )
+        latency_suffix = f" · {run.latency_ms}ms" if run.latency_ms is not None else ""
+        cost_suffix = f" · ${run.cost_usd:.4f}" if run.cost_usd is not None else ""
+        execution_truth = (
+            f"AI_EXECUTED · {run.model_calls} call"
+            f"{'s' if run.model_calls != 1 else ''}{usage_suffix}{latency_suffix}{cost_suffix}"
+        )
+    else:
+        execution_truth = "AI_NOT_EXECUTED · 0 model calls"
     reference_card = ""
     if run.brief.reference_asset is not None and run.brief.content_pattern is not None:
         asset = run.brief.reference_asset
@@ -893,7 +908,7 @@ def _result_html(
         distribution_section = ""
     return f"""<section id="results" class="result-panel">
       <div class="result-head">
-        <div><span class="kicker">{_escape(ui_text(locale, '已生成', 'Generated'))}</span><span class="engine-badge">{_escape(engine_label)}</span><span class="engine-badge">{_escape('zh-CN' if run.brief.language == '中文' else 'en-US')}</span><h2>{_escape(ui_text(locale, '一个主故事，五种渠道适配', 'One canonical story, five adaptations'))}</h2>
+        <div><span class="kicker">{_escape(ui_text(locale, '已生成', 'Generated'))}</span><span class="engine-badge">{_escape(engine_label)}</span><span class="engine-badge">{_escape(execution_truth)}</span><span class="engine-badge">{_escape('zh-CN' if run.brief.language == '中文' else 'en-US')}</span><h2>{_escape(ui_text(locale, '一个主故事，五种渠道适配', 'One canonical story, five adaptations'))}</h2>
           <p>{_escape(ui_text(locale, '内容已私有保存；复制或下载后，人工检查再发布。', 'Drafts are saved privately. Review them after copying or downloading and before publishing.'))}</p></div>
         <div class="downloads">{download_links}</div>
       </div>

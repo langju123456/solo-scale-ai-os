@@ -254,15 +254,21 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
         "evidence_bundle_used": False,
         "evidence_gap_count": 0,
         "evidence_item_count": 0,
+        "execution_state": "AI_NOT_EXECUTED",
         "fact_contract_sha256": run.locale_variant.fact_contract_sha256,
+        "fallback_used": False,
+        "latency_ms": None,
         "locale": "en-US",
+        "model_calls": 0,
         "model_used": False,
         "network_used": False,
         "private_path_scan_passed": True,
         "publication_performed": False,
         "status": "PASS",
+        "token_usage": None,
         "verified_and_observed_have_receipts": True,
         "variant_group_id": run.locale_variant.variant_group_id,
+        "cost_usd": None,
     }
 
     loaded = load_content_run(data_root, run.run_id)
