@@ -62,8 +62,9 @@ def test_content_workspace_exposes_month_one_library_without_generation(
     assert 'data-canon-select="M1-01"' in page
     assert "补充证据 / 确认" in page
     assert "打开并编辑输入" in page
-    assert "生成中文版" in page
-    assert "生成英文版" in page
+    assert "生成文章" in page
+    assert "生成视频" in page
+    assert "生成并加入队列" in page
     assert "month-one-canon:" in page
     assert "Fact" in page
     assert "Architecture" in page
@@ -81,5 +82,6 @@ def test_content_workspace_exposes_month_one_library_without_generation(
     assert "Month 1: From automation ambition to useful outcomes" in english
     assert "Add evidence / confirm" in english
     assert "Open and edit input" in english
-    assert "Generate Chinese" in english
-    assert "Generate English" in english
+    assert "Generate article" in english
+    assert "Generate video" in english
+    assert "Generate and queue" in english

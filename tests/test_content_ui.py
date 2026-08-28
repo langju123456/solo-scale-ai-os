@@ -97,7 +97,7 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     assert "可复用人物素材 · 0" in page
     assert "新 Avatar 3" in page
     assert f'action="/content/review/{result.run_id}"' in page
-    assert "先批准这个统一内容包" in page
+    assert "/content/buildlog/" not in page
 
     rendering = content_page(
         data_root=data_root,
@@ -114,8 +114,7 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
         decision=ContentReviewDecision.APPROVED,
     )
     approved = content_page(data_root=data_root, run_id=result.run_id)
-    assert "已批准内容包，可以进入精确发布预览" in approved
-    assert f'action="/content/buildlog/{result.run_id}/linkedin"' in approved
+    assert f'action="/content/buildlog/{result.run_id}/linkedin"' not in approved
     assert "先生成 YouTube 与 Short 成片" in approved
 
     english = content_page(
@@ -152,6 +151,14 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     legacy_package.write_text("{}", encoding="utf-8")
     legacy_page = content_page(data_root=data_root, run_id=result.run_id)
     assert "media-quality-review.json" not in legacy_page
+    assert (
+        f'href="/creator/publish?run_id={result.run_id}&lang=zh-CN"'
+        in legacy_page
+    )
+    assert f'data-approved-artifact="{result.run_id}"' in legacy_page
+    assert "将发布已审核版本" in legacy_page
+    assert "/content/buildlog/" not in legacy_page
+    assert 'name="verified_claims" required' in legacy_page
     legacy_package.unlink()
 
     save_media_quality_review(

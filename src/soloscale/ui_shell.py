@@ -90,7 +90,7 @@ _NAV_ITEMS: tuple[tuple[str, str, str, str], ...] = (
 _MORE_ITEMS: tuple[tuple[str, str, str, str], ...] = (
     ("work", "/work", "我的工作资料", "Your work"),
     ("video", "/video", "创建视频", "Create video"),
-    ("publishing", "/publishing", "发布内容", "Publish content"),
+    ("publishing", "/creator/publish", "发布内容", "Publish content"),
     ("advanced", "/advanced", "设置与高级工具", "Settings & advanced"),
 )
 

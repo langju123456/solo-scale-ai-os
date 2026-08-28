@@ -174,8 +174,8 @@ def test_ready_month_one_story_produces_grounded_multiformat_bundle(
     run = run_content_workspace(data_root=tmp_path / ".soloscale", brief=brief)
     run_dir = tmp_path / ".soloscale" / "content-runs" / run.run_id
     assert (run_dir / "20_youtube_script.md").is_file()
-    assert "CLAIM-01" in run.drafts.youtube_script
-    assert "CLAIM-08" in run.drafts.youtube_script
+    assert "CLAIM-" not in run.drafts.youtube_script
+    assert "VERIFIED · CLAIM" not in run.drafts.youtube_script
 
     with pytest.raises(ContentCanonError, match="needs evidence or owner input"):
         content_brief_from_month_one_story("M1-23", language="中文")
@@ -237,14 +237,14 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
     x_thread = (run_dir / "03_x_thread.md").read_text(encoding="utf-8")
     video = (run_dir / "04_video_script.md").read_text(encoding="utf-8")
     verification = json.loads((run_dir / "08_verification.json").read_text())
-    assert "CLAIM-01" in linkedin
+    assert "CLAIM-" not in linkedin
     assert (run_dir / "15_canonical_story.md").is_file()
     assert (run_dir / "16_blog.md").is_file()
     assert run.drafts.x_post.strip() == (run_dir / "03_x_post.md").read_text().strip()
     assert 60 <= run.drafts.storyboard[-1].end_second <= 120
     assert "This does not prove production readiness" in linkedin
     assert "1/5" in x_thread
-    assert "Claim anchors: CLAIM-01" in video
+    assert "Claim anchors" not in video
     assert run.locale_variant is not None
     assert verification == {
         "claim_count": 3,
@@ -333,9 +333,9 @@ def test_content_workspace_uses_local_ollama_and_rejects_unanchored_output(
     )
     for claim in brief.claims:
         marker = f"{claim.status.value} · {claim.id}"
-        assert marker in repaired.drafts.linkedin
-        assert marker in "\n".join(repaired.drafts.x_thread)
-        assert marker in repaired.drafts.video_script
+        assert marker not in repaired.drafts.linkedin
+        assert marker not in "\n".join(repaired.drafts.x_thread)
+        assert marker not in repaired.drafts.video_script
     assert all(
         post.startswith(f"{index}/{len(repaired.drafts.x_thread)} ")
         for index, post in enumerate(repaired.drafts.x_thread, start=1)

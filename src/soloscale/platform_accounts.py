@@ -565,7 +565,10 @@ def _token_requires_reauthorization(
         return True
     if expiry.tzinfo is None:
         return True
-    return datetime.now(UTC) >= expiry.astimezone(UTC)
+    if datetime.now(UTC) < expiry.astimezone(UTC):
+        return False
+    refresh_token = token.get("refresh_token")
+    return not isinstance(refresh_token, str) or not refresh_token.strip()
 
 
 def platform_snapshot(

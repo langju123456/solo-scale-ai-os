@@ -57,6 +57,17 @@ _SECRET = re.compile(
     r"Bearer\s+[A-Za-z0-9._~+/=-]{12,})"
 )
 _CLAIM_ID = re.compile(r"CLAIM-[0-9]{2}")
+_CLAIM_STATUS_NAME = r"(?:VERIFIED|OBSERVED|HYPOTHESIS|PLANNED)"
+_CLAIM_MARKER_TOKEN = re.compile(
+    rf"\[?{_CLAIM_STATUS_NAME} · CLAIM-[0-9]{{2}}\]?|\[CLAIM-[0-9]{{2}}\]"
+)
+_CLAIM_MARKER_LINE_PREFIX = re.compile(
+    rf"(?m)^[ \t]*{_CLAIM_STATUS_NAME} · CLAIM-[0-9]{{2}} — ?"
+)
+_INTERNAL_LABEL_LINE = re.compile(
+    r"(?m)^[ \t]*(?:- |\* )?(?:Claim anchors|Facts source|Reference pattern applied):[^\n]*[ \t]*$"
+)
+_CLAIM_MAP_LINE = re.compile(r"(?m)^[ \t]*(?:- |\* )?CLAIM-[0-9]{2}: [^\n]*$")
 _OLLAMA_PROMPT_VERSION = "content-ollama-writer-v1"
 _OLLAMA_SYSTEM_PROMPT = """You are the SoloScale evidence-bound content writer.
 Return only JSON matching the supplied schema. Write one canonical story and derive a
@@ -623,7 +634,53 @@ def build_content_drafts(brief: ContentBrief) -> ContentDrafts:
         storyboard=storyboard,
     )
     _validate_generated_drafts(brief, drafts)
-    return drafts
+    return _strip_public_claim_markers(drafts)
+
+
+def _strip_claim_markers(value: str) -> str:
+    """Remove internal claim truth markers from public-facing text (A8 boundary)."""
+
+    stripped = _INTERNAL_LABEL_LINE.sub("", value)
+    stripped = _CLAIM_MAP_LINE.sub("", stripped)
+    stripped = _CLAIM_MARKER_LINE_PREFIX.sub("", stripped)
+    stripped = _CLAIM_MARKER_TOKEN.sub("", stripped)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    trailing_newline = "\n" if value.endswith(("\n", "\r\n")) else ""
+    return stripped.strip() + trailing_newline
+
+
+def _strip_public_claim_markers(drafts: ContentDrafts) -> ContentDrafts:
+    """Return a public copy of the drafts without internal provenance markers.
+
+    Validation has already proven every claim is present; the storyboard keeps its
+    claim_ids so lineage stays internal while the rendered text becomes publish-safe.
+    """
+
+    def stripped_scene(scene: StoryboardScene) -> StoryboardScene:
+        voiceover = _strip_claim_markers(scene.voiceover) or scene.voiceover
+        on_screen_text = _strip_claim_markers(scene.on_screen_text) or voiceover
+        purpose = _strip_claim_markers(scene.purpose) or "Evidence anchor"
+        return scene.model_copy(
+            update={
+                "purpose": purpose,
+                "visual": _strip_claim_markers(scene.visual) or scene.visual,
+                "voiceover": voiceover,
+                "on_screen_text": on_screen_text,
+            }
+        )
+
+    return drafts.model_copy(
+        update={
+            "canonical_story": _strip_claim_markers(drafts.canonical_story),
+            "linkedin": _strip_claim_markers(drafts.linkedin),
+            "x_thread": [_strip_claim_markers(post) for post in drafts.x_thread],
+            "x_post": _strip_claim_markers(drafts.x_post),
+            "blog": _strip_claim_markers(drafts.blog),
+            "youtube_script": _strip_claim_markers(drafts.youtube_script),
+            "video_script": _strip_claim_markers(drafts.video_script),
+            "storyboard": [stripped_scene(scene) for scene in drafts.storyboard],
+        }
+    )
 
 
 def _ground_ollama_drafts(
@@ -847,7 +904,7 @@ def generate_content_drafts_with_gateway(
         ) from exc
     drafts = _ground_ollama_drafts(brief, transport_drafts)
     _validate_generated_drafts(brief, drafts)
-    return drafts
+    return _strip_public_claim_markers(drafts)
 
 
 def generate_content_drafts_with_ollama(
@@ -1014,6 +1071,43 @@ def _validate_generated_drafts(brief: ContentBrief, drafts: ContentDrafts) -> No
         raise ContentWorkspaceError("Storyboard must preserve the supplied CTA")
 
 
+def _validate_reviewed_drafts(brief: ContentBrief, drafts: ContentDrafts) -> None:
+    """Review-time contract for human-edited drafts.
+
+    Generated drafts are marker-free by A8, so review validation preserves the
+    invariants that still matter: no unknown claim IDs, no private output, the
+    supplied CTA stays intact, and X thread numbering remains exact.
+    """
+
+    allowed_ids = {claim.id for claim in brief.claims}
+    text_artifacts = {
+        "canonical story": drafts.canonical_story,
+        "LinkedIn draft": drafts.linkedin,
+        "X thread": "\n\n".join(drafts.x_thread),
+        "blog draft": drafts.blog,
+        "YouTube script": drafts.youtube_script,
+        "video script": drafts.video_script,
+    }
+    for field, value in text_artifacts.items():
+        _reject_private_output(value, field=field)
+        referenced = set(_CLAIM_ID.findall(value))
+        if referenced - allowed_ids:
+            raise ContentWorkspaceError(
+                f"{field} must not introduce unknown claim IDs"
+            )
+        if brief.call_to_action not in value:
+            raise ContentWorkspaceError(f"{field} must preserve the supplied CTA")
+
+    _reject_private_output(drafts.x_post, field="standalone X post")
+    if set(_CLAIM_ID.findall(drafts.x_post)) - allowed_ids:
+        raise ContentWorkspaceError("Standalone X post contains an unknown claim ID")
+
+    total = len(drafts.x_thread)
+    for index, post in enumerate(drafts.x_thread, start=1):
+        if not post.startswith(f"{index}/{total} "):
+            raise ContentWorkspaceError("X thread numbering must be consecutive and exact")
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
@@ -1173,7 +1267,7 @@ def run_content_workspace(
             raise ContentWorkspaceError(
                 "Generated content drafts require a non-template provider identity"
             )
-        _validate_generated_drafts(brief, drafts)
+        _validate_reviewed_drafts(brief, drafts)
         selected_provider = provider
         selected_prompt_version = prompt_version or _OLLAMA_PROMPT_VERSION
         model_used = True
@@ -1589,8 +1683,9 @@ def save_content_review(
         )
     except ValidationError as exc:
         raise ContentWorkspaceError("Content review does not satisfy the output contract") from exc
-    _validate_generated_drafts(run.brief, reviewed_drafts)
-    values = _draft_review_values(reviewed_drafts)
+    _validate_reviewed_drafts(run.brief, reviewed_drafts)
+    values = _draft_review_values(_strip_public_claim_markers(reviewed_drafts))
+    values = {key: _normalize_review_text(value) for key, value in values.items()}
     selected_decision = ContentReviewDecision(decision)
     previous_revision = previous[0].revision if previous is not None else 0
     revision = previous_revision + 1

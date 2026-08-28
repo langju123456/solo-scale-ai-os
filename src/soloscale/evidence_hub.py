@@ -701,6 +701,15 @@ class EvidenceHub:
             list[SyncReceipt], self._records("sync_receipts", "sequence DESC", SyncReceipt, limit)
         )
 
+    def recent_evidence(self, *, limit: int = 50) -> list[EvidenceItem]:
+        """Return the most recently captured metadata-only evidence items."""
+
+        _validate_limit(limit)
+        return cast(
+            list[EvidenceItem],
+            self._records("snapshot_items", "rowid DESC", EvidenceItem, limit),
+        )
+
     def recent_assets(self, *, limit: int = 10) -> list[AssetRecord]:
         _validate_limit(limit)
         return cast(list[AssetRecord], self._records("assets", "rowid DESC", AssetRecord, limit))
@@ -1095,15 +1104,19 @@ class EvidenceHub:
         self,
         table: str,
         order: str,
-        model: type[SyncReceipt] | type[AssetRecord] | type[OutcomeReceipt],
+        model: (
+            type[SyncReceipt] | type[AssetRecord] | type[OutcomeReceipt] | type[EvidenceItem]
+        ),
         limit: int,
-    ) -> list[SyncReceipt] | list[AssetRecord] | list[OutcomeReceipt]:
+    ) -> (
+        list[SyncReceipt] | list[AssetRecord] | list[OutcomeReceipt] | list[EvidenceItem]
+    ):
         with self._connect() as connection:
             rows = connection.execute(
                 f"SELECT payload_json FROM {table} ORDER BY {order} LIMIT ?", (limit,)
             ).fetchall()
         return cast(
-            list[SyncReceipt] | list[AssetRecord] | list[OutcomeReceipt],
+            list[SyncReceipt] | list[AssetRecord] | list[OutcomeReceipt] | list[EvidenceItem],
             [model.model_validate_json(str(row["payload_json"])) for row in rows],
         )
 

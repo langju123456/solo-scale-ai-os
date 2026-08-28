@@ -31,12 +31,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
-from soloscale.buildlog_handoff import (
-    BuildLogHandoffError,
-    Channel,
-    preview_for_buildlog,
-    publish_via_buildlog,
-)
+from soloscale.content_canon import load_month_one_canon
 from soloscale.content_distribution import (
     ContentDistributionError,
     prepare_distribution_package,
@@ -48,6 +43,7 @@ from soloscale.content_ui import (
     editorial_publishing_page,
     run_content_form,
     run_month_one_story,
+    run_story_candidate,
 )
 from soloscale.content_workspace import (
     ContentWorkspaceError,
@@ -61,6 +57,13 @@ from soloscale.creator_accounts import (
     creator_accounts_page,
     normalize_account,
     save_creator_account,
+)
+from soloscale.creator_production import (
+    CreatorProductionError,
+    CreatorProductionJob,
+    CreatorProductionJobManager,
+    CreatorProductionRequest,
+    assign_artifact_to_account,
 )
 from soloscale.creator_workspace import creator_history_page, creator_overview_page
 from soloscale.desktop_credentials import (
@@ -139,7 +142,6 @@ from soloscale.platform_accounts import (
     disconnect_identity,
     load_authorization_attempt,
     load_developer_config,
-    require_publish_identity,
     save_developer_config,
     start_authorization_attempt,
 )
@@ -210,6 +212,12 @@ from soloscale.resume_workspace import (
 )
 from soloscale.resume_workspace import run_resume_workspace as execute_resume_workspace
 from soloscale.runtime_paths import resolve_runtime_paths, source_data_root
+from soloscale.story_mining import (
+    StoryCandidate,
+    StoryMiningError,
+    load_story_candidates,
+    mine_story_candidates,
+)
 from soloscale.ui_shell import (
     DEFAULT_UI_LOCALE,
     UILocale,
@@ -226,6 +234,7 @@ from soloscale.video_factory import (
     creator_video_runtime_available,
     import_avatar_segment,
     prepare_heygen_handoff,
+    render_creator_video,
 )
 from soloscale.video_generation import (
     GoogleVeoClient,
@@ -4480,7 +4489,7 @@ def _home_page(
     <span class="outcome-action">{_escape(ui_text(locale, '把工作变成内容', 'Turn my work into content'))}<span aria-hidden="true">→</span></span>
     <div class="secondary-actions">
       <a href="{ui_url('/video', locale)}">{_escape(ui_text(locale, '创建视频', 'Create video'))}</a>
-      <a href="{ui_url('/publishing', locale)}">{_escape(ui_text(locale, '发布已审核内容', 'Publish approved content'))}</a>
+      <a href="{ui_url('/creator/publish', locale)}">{_escape(ui_text(locale, '发布已审核内容', 'Publish approved content'))}</a>
     </div>
   </article>
 </section>
@@ -6134,6 +6143,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     creator_video_job_manager: CreatorVideoJobManager | None = None
     codex_import_job_manager: CodexImportJobManager | None = None
     youtube_job_manager: YouTubePublishingJobManager | None = None
+    creator_production_job_manager: CreatorProductionJobManager | None = None
 
     def log_message(self, format: str, *args: object) -> None:
         if self.desktop_session_token is not None:
@@ -6479,6 +6489,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         workspace_view: Literal["all", "stories", "create"] = "all",
         canon_story_id: str | None = None,
         canon_format: str | None = None,
+        creator_job: CreatorProductionJob | None = None,
     ) -> None:
         video_snapshot = (
             self.creator_video_job_manager.get(run_id)
@@ -6508,6 +6519,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             workspace_view=workspace_view,
             canon_story_id=canon_story_id,
             canon_format=canon_format,
+            creator_job=creator_job,
         )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -6939,11 +6951,34 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == "/creator/stories":
-            self._send_content_page(workspace_view="stories")
+            mining_notice = query.get("mining_notice", [""])[0]
+            notice = None
+            if mining_notice == "ok":
+                notice = ui_text(
+                    self.ui_locale,
+                    "已从最新工作生成候选故事（确定性草稿，未调用模型）。",
+                    "Generated candidate stories from recent work (deterministic drafts; no model call).",
+                )
+            elif mining_notice == "empty":
+                notice = ui_text(
+                    self.ui_locale,
+                    "没有新的已批准证据；先刷新工作资料。",
+                    "No new approved evidence yet; refresh work sources first.",
+                )
+            self._send_content_page(workspace_view="stories", notice=notice)
             return
         if path == "/creator/create":
             _apply_ai_provider_preference(
                 self.latest_content_form, self.ui_data_root.absolute()
+            )
+            creator_job_id = query.get("creator_job", [""])[0]
+            production_manager = self.creator_production_job_manager
+            creator_job = (
+                production_manager.get(
+                    self.ui_data_root.absolute(), creator_job_id
+                )
+                if production_manager is not None and creator_job_id
+                else None
             )
             self._send_content_page(
                 run_id=query.get("run_id", [""])[0] or None,
@@ -6952,6 +6987,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 workspace_view="create",
                 canon_story_id=query.get("canon_story_id", [None])[0],
                 canon_format=query.get("canon_format", [None])[0],
+                creator_job=creator_job,
             )
             return
         if path == "/creator/publish":
@@ -6973,6 +7009,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 locale=self.ui_locale,
                 creator_mode=True,
                 youtube_job=youtube_job,
+                selected_run_id=query.get("run_id", [""])[0] or None,
             ).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -7123,15 +7160,17 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/publishing":
-            body = editorial_publishing_page(
-                data_root=self.ui_data_root.absolute(), locale=self.ui_locale
-            ).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/publish",
+                    self.ui_locale,
+                    run_id=query.get("run_id", [""])[0],
+                ),
+            )
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(body)
             return
         editorial_image_match = re.fullmatch(
             r"/publishing/editorial/(linkedin|x)/image", path
@@ -8149,6 +8188,182 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         canon_generate_match = re.fullmatch(r"/content/canon/(M1-[0-9]{2})", path)
+        if path == "/creator/stories/mine":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if length < 0 or length > MAX_UPLOAD_BYTES:
+                self.send_error(413, "Story mining request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            data_root = self.ui_data_root.absolute()
+            try:
+                hub = EvidenceHub(data_root)
+                recent = hub.recent_evidence(limit=50)
+            except (EvidenceHubError, OSError, ValueError):
+                recent = []
+            approved = [
+                item
+                for item in recent
+                if item.verification_status in {"verified", "approved"}
+                or item.trust_state in {"verified", "approved"}
+            ]
+            existing_ids = [
+                story.story_id for story in load_month_one_canon().stories
+            ] + [candidate.candidate_id for candidate in load_story_candidates(data_root)]
+            mined: tuple[StoryCandidate, ...] = ()
+            try:
+                mined = mine_story_candidates(
+                    data_root,
+                    evidence=approved,
+                    existing_story_ids=existing_ids,
+                    limit=5,
+                )
+            except StoryMiningError:
+                mined = ()
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/stories",
+                    self.ui_locale,
+                    mining_notice="ok" if mined else "empty",
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/production/start":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if length < 0 or length > MAX_UPLOAD_BYTES:
+                self.send_error(413, "Creator production request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            manager = self.creator_production_job_manager
+            if manager is None:
+                self.send_error(503, "Creator production is unavailable")
+                return
+            action = form.get("production_action", "article")
+            outputs: list[Literal["ARTICLE", "VIDEO"]]
+            add_to_queue = action == "queue"
+            if action == "article":
+                outputs = ["ARTICLE"]
+            elif action == "video":
+                outputs = ["VIDEO"]
+            elif action == "queue":
+                outputs = ["ARTICLE", "VIDEO"]
+            else:
+                self.send_error(400, "Creator production action is invalid")
+                return
+            source_kind = form.get("source_kind", "")
+            language: Literal["English", "中文"] = (
+                "中文" if form.get("language") == "中文" else "English"
+            )
+            preference = _load_ai_provider_preference(self.ui_data_root.absolute())
+            generation_mode = form.get("generation_mode", preference.provider_id.value)
+            ai_editorial = generation_mode != "template"
+            gateway = _gateway_from_preference(preference) if ai_editorial else None
+            data_root = self.ui_data_root.absolute()
+            if source_kind == "STORY":
+                story_id = form.get("source_story_id", "")
+                if re.fullmatch(
+                    r"(?:M1-[0-9]{2}|story-candidate-[a-f0-9]{12})", story_id
+                ) is None:
+                    self.send_error(400, "Creator story is invalid")
+                    return
+                if story_id.startswith("story-candidate-"):
+
+                    def runner() -> str:
+                        result = run_story_candidate(
+                            story_id,
+                            data_root,
+                            language=language,
+                            gateway=gateway,
+                        )
+                        if result.run_id is None:
+                            if ai_editorial:
+                                raise CreatorProductionError("AI_NOT_EXECUTED")
+                            raise CreatorProductionError(
+                                result.error or "Content generation failed"
+                            )
+                        return result.run_id
+                else:
+
+                    def runner() -> str:
+                        result = run_month_one_story(
+                            story_id,
+                            data_root,
+                            language=language,
+                            gateway=gateway,
+                        )
+                        if result.run_id is None:
+                            if ai_editorial:
+                                raise CreatorProductionError("AI_NOT_EXECUTED")
+                            raise CreatorProductionError(
+                                result.error or "Content generation failed"
+                            )
+                        return result.run_id
+
+                source_story_id: str | None = story_id
+            elif source_kind == "CREATE":
+                self.latest_content_form = dict(form)
+                if ai_editorial:
+                    _apply_ai_provider_preference(form, data_root)
+
+                def runner() -> str:
+                    result = run_content_form(form, data_root, gateway=gateway)
+                    if result.run_id is None:
+                        if ai_editorial:
+                            raise CreatorProductionError("AI_NOT_EXECUTED")
+                        raise CreatorProductionError(result.error or "Content generation failed")
+                    return result.run_id
+
+                source_story_id = None
+            else:
+                self.send_error(400, "Creator production source is invalid")
+                return
+            request = CreatorProductionRequest(
+                source_kind=cast(Literal["STORY", "CREATE"], source_kind),
+                source_story_id=source_story_id,
+                outputs=outputs,
+                language=language,
+                ai_editorial=ai_editorial,
+                add_to_queue=add_to_queue,
+            )
+            job = manager.submit(
+                data_root=data_root,
+                request=request,
+                runner=runner,
+                renderer=(
+                    lambda run_id: render_creator_video(
+                        data_root=data_root,
+                        run_id=run_id,
+                        repository_root=self.creator_video_root,
+                    )
+                )
+                if "VIDEO" in outputs
+                else None,
+            )
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/create",
+                    self.ui_locale,
+                    creator_job=job.job_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path == "/content/reference-video":
             try:
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -8588,6 +8803,48 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if path == "/creator/publish/queue":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 16 * 1024:
+                self.send_error(413, "Publish Queue request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            try:
+                item = assign_artifact_to_account(
+                    data_root=self.ui_data_root.absolute(),
+                    artifact_id=form.get("artifact_id", ""),
+                    channel_account_id=form.get("channel_account_id", ""),
+                )
+            except (CreatorProductionError, OSError) as exc:
+                body = editorial_publishing_page(
+                    data_root=self.ui_data_root.absolute(),
+                    error=str(exc),
+                    locale=self.ui_locale,
+                    creator_mode=True,
+                ).encode("utf-8")
+                self.send_response(422)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/publish",
+                    self.ui_locale,
+                    queue_item=item.queue_item_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path == "/publishing/editorial/preview":
             length = int(self.headers.get("Content-Length", "0") or 0)
             form = _parse_form(self.rfile.read(length))
@@ -8605,7 +8862,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.send_error(422, "Editorial package preview failed")
                 return
             self.send_response(303)
-            self.send_header("Location", ui_url("/publishing", self.ui_locale))
+            self.send_header("Location", ui_url("/creator/publish", self.ui_locale))
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -8682,53 +8939,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.send_error(422, "Editorial publication failed")
                 return
             self.send_response(303)
-            self.send_header("Location", ui_url("/publishing", self.ui_locale))
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        buildlog_match = re.fullmatch(
-            r"/content/buildlog/(content-[^/]+)/(linkedin|x)(/publish)?", path
-        )
-        if buildlog_match is not None:
-            run_id, channel, publish_path = buildlog_match.groups()
-            if channel not in {"linkedin", "x"}:
-                self.send_error(404)
-                return
-            channel = cast(Channel, channel)
-            try:
-                if publish_path:
-                    length = int(self.headers.get("Content-Length", "0") or 0)
-                    publish_form = _parse_form(self.rfile.read(length))
-                    self._adopt_ui_locale(publish_form)
-                    require_publish_identity(
-                        self.ui_data_root.absolute(), cast(Any, channel)
-                    )
-                    publish_via_buildlog(
-                        data_root=self.ui_data_root.absolute(),
-                        run_id=run_id,
-                        channel=channel,
-                        confirmation=publish_form.get("confirmation", ""),
-                    )
-                    query = {"run_id": run_id, "buildlog": "published"}
-                else:
-                    preview_for_buildlog(
-                        data_root=self.ui_data_root.absolute(),
-                        run_id=run_id,
-                        channel=channel,
-                    )
-                    query = {"run_id": run_id, "buildlog": "previewed"}
-            except (
-                BuildLogHandoffError,
-                ContentWorkspaceError,
-                OSError,
-                subprocess.TimeoutExpired,
-            ):
-                self.send_error(422, "BuildLog handoff failed")
-                return
-            self.send_response(303)
-            self.send_header(
-                "Location", ui_url("/content#results", self.ui_locale, **query)
-            )
+            self.send_header("Location", ui_url("/creator/publish", self.ui_locale))
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -9012,6 +9223,8 @@ def main() -> None:
     handler.codex_import_job_manager = codex_import_job_manager
     youtube_job_manager = YouTubePublishingJobManager()
     handler.youtube_job_manager = youtube_job_manager
+    creator_production_job_manager = CreatorProductionJobManager()
+    handler.creator_production_job_manager = creator_production_job_manager
 
     server = HTTPServer((args.host, args.port), handler)
     raw_host, port = server.server_address[:2]
@@ -9061,6 +9274,8 @@ def main() -> None:
         handler.codex_import_job_manager = None
         youtube_job_manager.shutdown()
         handler.youtube_job_manager = None
+        creator_production_job_manager.shutdown()
+        handler.creator_production_job_manager = None
         if readiness_path is not None:
             try:
                 readiness_path.unlink()

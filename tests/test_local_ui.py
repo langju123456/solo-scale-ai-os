@@ -474,7 +474,7 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
     assert 'href="/learning?lang=zh-CN"' in home
     assert 'href="/creator?lang=zh-CN"' in home
     assert 'href="/video?lang=zh-CN"' in home
-    assert 'href="/publishing?lang=zh-CN"' in home
+    assert 'href="/creator/publish?lang=zh-CN"' in home
     assert 'href="/work?lang=zh-CN"' in home
     assert home.count('class="outcome-hitbox"') == 3
     assert 'id="page-progress"' in home
@@ -531,7 +531,7 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
     assert 'href="/advanced?lang=zh-CN"' in page
     assert 'href="/creator?lang=zh-CN"' in page
     assert 'href="/learning?lang=zh-CN"' in page
-    assert 'href="/publishing?lang=zh-CN"' in page
+    assert 'href="/creator/publish?lang=zh-CN"' in page
     assert 'href="/work?lang=zh-CN"' in page
     assert "使用我的工作资料" in page
     assert "knowledge-sync" not in page
@@ -1021,6 +1021,40 @@ def test_codex_import_http_returns_immediately_and_exposes_polling_status(
         thread.join(timeout=2)
         manager.shutdown()
         SoloScaleLocalUIHandler.codex_import_job_manager = None
+
+
+def test_legacy_publishing_page_redirects_to_creator_publish_queue(
+    tmp_path: Path,
+) -> None:
+    previous_data_root = SoloScaleLocalUIHandler.ui_data_root
+    previous_token = SoloScaleLocalUIHandler.desktop_session_token
+    previous_host = SoloScaleLocalUIHandler.desktop_expected_host
+    SoloScaleLocalUIHandler.ui_data_root = tmp_path / "data"
+    SoloScaleLocalUIHandler.desktop_session_token = None
+    SoloScaleLocalUIHandler.desktop_expected_host = None
+    server = HTTPServer(("127.0.0.1", 0), SoloScaleLocalUIHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+    try:
+        connection.request(
+            "GET",
+            "/publishing?run_id=content-20260828T120000Z-aaaaaaaaaa&lang=en",
+        )
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 303
+        assert response.getheader("Location") == (
+            "/creator/publish?run_id=content-20260828T120000Z-aaaaaaaaaa&lang=en"
+        )
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        SoloScaleLocalUIHandler.ui_data_root = previous_data_root
+        SoloScaleLocalUIHandler.desktop_session_token = previous_token
+        SoloScaleLocalUIHandler.desktop_expected_host = previous_host
 
 
 def _wait_for_resume_job(

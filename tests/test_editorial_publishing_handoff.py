@@ -185,7 +185,7 @@ def test_editorial_handoff_rejects_tampered_receipt_and_nonconsecutive_thread(tm
         )
 
 
-def test_failed_publish_is_terminal_and_old_receipt_does_not_hide_new_plan(
+def test_failed_publish_is_terminal_and_legacy_buildlog_retry_is_removed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -212,7 +212,7 @@ def test_failed_publish_is_terminal_and_old_receipt_does_not_hide_new_plan(
 
     receipt["plan_id"] = "plan-from-an-older-preview"
     (data_root / "editorial-publishing" / "x-receipt.json").write_text(json.dumps(receipt))
-    assert "PUBLISH X" in editorial_publishing_page(data_root=data_root)
+    assert "PUBLISH X" not in editorial_publishing_page(data_root=data_root)
 
 
 def test_publish_rejects_preview_bound_to_a_different_connected_account(

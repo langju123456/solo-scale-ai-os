@@ -172,6 +172,27 @@ def test_expired_identity_cannot_unlock_publishing(tmp_path: Path) -> None:
     assert "x" not in eligible_publish_identities(data_root)
 
 
+def test_expired_access_token_with_refresh_token_remains_connected(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    identity = _identity(
+        "x", ("tweet.read", "users.read", "tweet.write", "offline.access")
+    )
+    save_connected_identity(
+        data_root,
+        identity,
+        token_payload={
+            "access_token": "expired",
+            "refresh_token": "synthetic-refresh",
+            "expires_at": "2026-08-27T00:00:00+00:00",
+        },
+    )
+
+    assert platform_snapshot(data_root, "x").connection_state == "CONNECTED"
+    assert eligible_publish_identities(data_root)["x"][0].handle == "synthetic"
+
+
 def test_douyin_authorization_requests_identity_and_video_capabilities(
     tmp_path: Path,
 ) -> None:
