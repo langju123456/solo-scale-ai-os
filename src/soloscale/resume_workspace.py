@@ -688,7 +688,9 @@ def _application_bundle(
             "jd_filename": "JD.md",
             "resume_filename": resume_filename,
             "soloscale_run_id": run_id,
-            "status": "DRAFT_REQUIRES_HUMAN_REVIEW",
+            "status": "DRAFT",
+            "updated_at": date,
+            "next_action": "Review the tailored resume before applying.",
         }
         if resume_docx_metadata:
             metadata.update(resume_docx_metadata)

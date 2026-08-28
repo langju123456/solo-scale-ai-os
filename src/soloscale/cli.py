@@ -12,6 +12,13 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from soloscale.application_record import (
+    ApplicationStatus,
+    applications_root,
+    link_learning_case,
+    list_application_records,
+    update_application_status,
+)
 from soloscale.buildlog_adapter import export_buildlog_iteration
 from soloscale.casebook_models import (
     AttemptOutcome,
@@ -777,6 +784,104 @@ def learning_exercise_complete(
     console.print(
         f"Interview ready: {'yes' if receipt.interview_ready else 'no'} | "
         f"Next mastery action: {next_action}"
+    )
+
+
+@app.command("application-list")
+def application_list(
+    library_root: Annotated[
+        Path,
+        typer.Option("--library-root", help="Private Resume application library root"),
+    ],
+) -> None:
+    records = list_application_records(library_root)
+    table = Table(title="Career applications")
+    table.add_column("Role")
+    table.add_column("Company")
+    table.add_column("Status")
+    table.add_column("Run")
+    for record in records:
+        table.add_row(
+            record.role or "-",
+            record.company or "-",
+            record.status.value,
+            record.soloscale_run_id,
+        )
+    console.print(table)
+    console.print(f"Total: {len(records)}")
+
+
+@app.command("application-status")
+def application_status_update(
+    application: Annotated[
+        str,
+        typer.Argument(help="Application directory name under <library-root>/applications"),
+    ],
+    status: Annotated[ApplicationStatus, typer.Option("--status")],
+    library_root: Annotated[
+        Path,
+        typer.Option("--library-root", help="Private Resume application library root"),
+    ],
+    note: Annotated[
+        str | None,
+        typer.Option("--note", help="Optional operator note"),
+    ] = None,
+    next_action: Annotated[
+        str | None,
+        typer.Option("--next-action", help="Optional next action"),
+    ] = None,
+) -> None:
+    application_dir = applications_root(library_root) / application
+    if not application_dir.is_dir() or application_dir.is_symlink():
+        raise typer.BadParameter("application directory not found", param_hint="application")
+    try:
+        record = update_application_status(
+            application_dir=application_dir,
+            status=status,
+            note=note,
+            next_action=next_action,
+        )
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(
+        f"[green]Updated[/green] {record.role or application} -> {record.status.value}"
+    )
+    if record.next_action:
+        console.print(f"Next action: {record.next_action}")
+
+
+@app.command("application-link-learning")
+def application_link_learning(
+    application: Annotated[
+        str,
+        typer.Argument(help="Application directory name under <library-root>/applications"),
+    ],
+    case: Annotated[str, typer.Argument(help="Learning case ID")],
+    library_root: Annotated[
+        Path,
+        typer.Option("--library-root", help="Private Resume application library root"),
+    ],
+    data_root: Annotated[
+        Path,
+        typer.Option("--data-root", help="Private SoloScale data root"),
+    ] = Path(".soloscale"),
+) -> None:
+    application_dir = applications_root(library_root) / application
+    if not application_dir.is_dir() or application_dir.is_symlink():
+        raise typer.BadParameter("application directory not found", param_hint="application")
+    try:
+        record = link_learning_case(
+            application_dir=application_dir,
+            learning_case_id=case,
+            data_root=data_root,
+        )
+    except (OSError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print(
+        f"[green]Linked[/green] {record.role or application} -> learning case {case}"
+    )
+    console.print(
+        f"Interview ready: {'yes' if record.interview_ready else 'no'}"
     )
 
 
