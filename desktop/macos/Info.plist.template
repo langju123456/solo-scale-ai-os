@@ -9,8 +9,8 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>SoloScale AI OS</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>0.4.1</string>
+  <key>CFBundleVersion</key><string>6</string>
   <key>SoloScaleGitHubAppClientID</key><string></string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSAppTransportSecurity</key>

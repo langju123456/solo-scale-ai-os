@@ -2,11 +2,14 @@
 # This template packages only tracked application resources. It never discovers user data.
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = Path(SPECPATH).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "packages" / "buildlog" / "src"))
 
 
 def tracked_files(*prefixes):

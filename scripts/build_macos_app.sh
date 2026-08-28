@@ -9,8 +9,8 @@ app_root="$output_root/SoloScale AI OS.app"
 sidecar_root="${SOLOSCALE_SIDECAR_ROOT:-$project_root/packaging/macos/dist/SoloScaleBackend}"
 swift_scratch="${SOLOSCALE_SWIFT_SCRATCH:-$desktop_root/.build}"
 bundle_identifier="${SOLOSCALE_BUNDLE_IDENTIFIER:-local.soloscale.desktop}"
-version="${SOLOSCALE_VERSION:-0.2.0}"
-build_number="${SOLOSCALE_BUILD_NUMBER:-1}"
+version="${SOLOSCALE_VERSION:-0.4.1}"
+build_number="${SOLOSCALE_BUILD_NUMBER:-6}"
 codesign_identity="${SOLOSCALE_CODESIGN_IDENTITY:-}"
 fail() { echo "macOS app build: $*" >&2; exit 1; }
 
