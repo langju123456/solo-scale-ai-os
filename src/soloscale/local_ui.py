@@ -95,7 +95,6 @@ from soloscale.github_connect import (
 from soloscale.integration_status import connected_service_statuses
 from soloscale.knowledge_models import RetrievalHit
 from soloscale.knowledge_store import (
-    InvalidKnowledgeQueryError,
     KnowledgeStore,
     KnowledgeStoreError,
 )
@@ -1402,41 +1401,63 @@ def _user_resume_filename(
     )
 
 
-def _bisect_evidence_query(query: str) -> tuple[str, ...]:
-    """Split an invalid store query without dropping any JD content."""
-    words = query.split()
-    if len(words) > 1:
-        midpoint = len(words) // 2
-        return (" ".join(words[:midpoint]), " ".join(words[midpoint:]))
-    if len(query) > 1:
-        midpoint = len(query) // 2
-        return (query[:midpoint], query[midpoint:])
-    return ()
+_JOB_EVIDENCE_PRIORITY_TERMS = (
+    "python",
+    "rag",
+    "retrieval",
+    "reranking",
+    "embeddings",
+    "agentic",
+    "structured",
+    "evaluation",
+    "fastapi",
+    "flask",
+    "django",
+    "vertex",
+    "gcp",
+    "aws",
+    "postgresql",
+    "observability",
+    "monitoring",
+    "cicd",
+)
+_JOB_EVIDENCE_STOPWORDS = {
+    "and",
+    "the",
+    "with",
+    "using",
+    "experience",
+    "knowledge",
+    "understanding",
+    "applications",
+    "development",
+    "related",
+    "quality",
+}
 
 
-def _search_evidence_query(store: KnowledgeStore, query: str) -> list[RetrievalHit]:
-    """Search a complete JD fragment, automatically batching store-safe queries."""
-    normalized = " ".join(query.split())
-    if not normalized:
-        return []
-    try:
-        return store.search(normalized, limit=3)
-    except InvalidKnowledgeQueryError:
-        parts = _bisect_evidence_query(normalized)
-        if not parts:
-            return []
-        hits: list[RetrievalHit] = []
-        for part in parts:
-            hits.extend(_search_evidence_query(store, part))
-        return hits
+def _job_evidence_query(job_description: str) -> str:
+    """Build one bounded discovery query instead of scanning once per JD line."""
+
+    observed = list(
+        dict.fromkeys(
+            token.casefold()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9+#./-]{2,}", job_description)
+        )
+    )
+    selected = [term for term in _JOB_EVIDENCE_PRIORITY_TERMS if term in observed]
+    selected.extend(
+        token
+        for token in observed
+        if token not in selected and token not in _JOB_EVIDENCE_STOPWORDS
+    )
+    return " ".join(selected[:8])
 
 
 def _search_job_evidence(job_description: str, data_root: Path) -> list[RetrievalHit]:
     store = KnowledgeStore(data_root)
-    hits: list[RetrievalHit] = []
-    for requirement in job_description.splitlines():
-        hits.extend(_search_evidence_query(store, requirement))
-    return list({hit.chunk_id: hit for hit in hits}.values())
+    query = _job_evidence_query(job_description)
+    return store.search(query, limit=8) if query else []
 
 
 def _record_resume_event(
@@ -1958,6 +1979,11 @@ def _save_request_scoped_resume_run(
             if retrieval_trace is not None
             else []
         ),
+        "evidence_adoption": (
+            [item.model_dump(mode="json") for item in retrieval_trace.adoption]
+            if retrieval_trace is not None
+            else []
+        ),
         "candidate_evidence_projects": (
             list(dict.fromkeys(source.project for source in pack.sources))
             if pack
@@ -2233,13 +2259,27 @@ def _run_user_resume(
                 ensure_local_project_evidence(
                     data_root,
                     repository_root=evidence_repository_root,
+                    timing=timing,
                 )
+            elif timing is not None:
+                timing("freshness_check_ms", 0)
+                timing("local_git_refresh_ms", 0)
+            if timing is not None:
+                timing("knowledge_sync_ms", 0)
+            lexical_started = time.perf_counter()
             discovery_hits = _search_job_evidence(job_description, data_root)
+            if timing is not None:
+                timing(
+                    "lexical_search_ms",
+                    int((time.perf_counter() - lexical_started) * 1000),
+                )
             candidate_evidence_pack = build_candidate_evidence_pack(
                 profile,
                 data_root=data_root,
                 repository_root=evidence_repository_root,
                 job_description=job_description,
+                repository_snapshot_is_current=evidence_repository_root is not None,
+                timing=timing,
             )
             if timing is not None:
                 timing(
@@ -2290,6 +2330,7 @@ def _run_user_resume(
                     job_description=job_description,
                     facts=candidate_evidence_pack.atomic_facts,
                     knowledge_hits=discovery_hits,
+                    adoption=list(tailored.evidence_adoption),
                 ),
             )
         if timing is not None:
@@ -2586,6 +2627,14 @@ def _run_user_resume(
                 [
                     item.model_dump(mode="json")
                     for item in tailored.evidence_retrieval_trace.sources
+                ]
+                if tailored.evidence_retrieval_trace is not None
+                else []
+            ),
+            "evidence_adoption": (
+                [
+                    item.model_dump(mode="json")
+                    for item in tailored.evidence_retrieval_trace.adoption
                 ]
                 if tailored.evidence_retrieval_trace is not None
                 else []
@@ -3455,6 +3504,14 @@ def _resume_job_panel(
         ("post_response_ms", "提交后返回", "POST response"),
         ("profile_extract_ms", "解析简历", "Profile extract"),
         ("retrieval_ms", "本地检索", "Evidence retrieval"),
+        ("freshness_check_ms", "证据新鲜度检查", "Freshness check"),
+        ("local_git_refresh_ms", "本地 Git 刷新", "Local Git refresh"),
+        ("knowledge_sync_ms", "资料同步", "Knowledge sync"),
+        ("requirement_extraction_ms", "提取 JD 要求", "Requirement extraction"),
+        ("lexical_search_ms", "关键词检索", "Lexical search"),
+        ("fusion_ms", "证据融合排序", "Evidence fusion"),
+        ("evidence_admission_ms", "事实准入", "Evidence admission"),
+        ("candidate_pack_build_ms", "构建证据包", "Candidate pack build"),
         ("model_generation_ms", "模型生成", "Model generation"),
         ("verification_ms", "本地验证", "Local verification"),
         ("expert_review_ms", "专家审阅", "Expert review"),
@@ -3640,6 +3697,37 @@ def _user_result_card(
         for item in source_rows
         if isinstance(item, dict)
     )
+    adoption_rows = user_metadata.get("evidence_adoption", [])
+    if not isinstance(adoption_rows, list):
+        adoption_rows = []
+    adoption_html = "".join(
+        "<li><code>"
+        f"{_escape(str(item.get('fact_id', 'FACT')))}</code> · "
+        + " → ".join(
+            stage
+            for stage, active in (
+                ("RETRIEVED", item.get("retrieved") is True),
+                ("ADMITTED", item.get("admitted") is True),
+                ("SENT", item.get("sent_to_model") is True),
+                ("PROPOSED", item.get("proposed") is True),
+                ("ACCEPTED", item.get("accepted") is True),
+                ("RENDERED", item.get("rendered") is True),
+            )
+            if active
+        )
+        + (
+            " · REJECTED: "
+            + _escape(
+                ", ".join(str(code) for code in item.get("rejection_rule_codes", []))
+            )
+            if item.get("rejection_rule_codes")
+            else ""
+        )
+        + "</li>"
+        for item in adoption_rows
+        if isinstance(item, dict)
+        and (item.get("proposed") is True or item.get("rejection_rule_codes"))
+    )
     evidence_projects = user_metadata.get("candidate_evidence_projects", [])
     if not isinstance(evidence_projects, list):
         evidence_projects = []
@@ -3803,6 +3891,10 @@ def _user_result_card(
   <details>
     <summary>{_escape(ui_text(locale, '查看 JD 要求覆盖', 'View JD requirement coverage'))}</summary>
     {requirement_coverage_html}
+  </details>
+  <details>
+    <summary>{_escape(ui_text(locale, '查看证据采用轨迹', 'View evidence adoption trace'))}</summary>
+    <ul class="gap-list">{adoption_html or f'<li>{_escape(ui_text(locale, "本次没有模型采用轨迹。", "No model adoption trace is available for this run."))}</li>'}</ul>
   </details>
   <p class="privacy-note"><strong>{_escape(ui_text(locale, 'JD 定位', 'JD positioning'))}:</strong> {_escape(positioning_role)} · <strong>{_escape(ui_text(locale, '候选证据包', 'Candidate Evidence Pack'))}:</strong> {_escape(str(evidence_fact_count))} {_escape(ui_text(locale, '条事实', 'facts'))}{(' · ' + _escape(', '.join(str(item) for item in evidence_projects))) if evidence_projects else ''}</p>
   <div class="result-grid">
@@ -5559,6 +5651,10 @@ def _serve_resume_download(
     *,
     desktop_mode: bool = False,
 ) -> None:
+    # WKWebView owns the user download destination in Desktop mode. Returning a
+    # second HTML confirmation body from a link marked `download` made WebKit save
+    # that HTML as an additional fake DOCX download.
+    del desktop_mode
     target = _resume_run_artifact(data_root, run_id, "08_resume.docx")
     if target is None:
         handler.send_error(404, "Resume not found")
@@ -5568,51 +5664,6 @@ def _serve_resume_download(
     filename = str(metadata.get("output_filename", "Tailored_Resume.docx"))
     safe_ascii = _safe_filename_component(Path(filename).stem, "Tailored_Resume") + ".docx"
     content = target.read_bytes()
-    if desktop_mode:
-        downloads = Path.home() / "Downloads"
-        _reject_symlink_ancestry(downloads)
-        if downloads.is_symlink() or not downloads.is_dir():
-            handler.send_error(500, "Downloads folder is unavailable")
-            return
-        destination = downloads / safe_ascii
-        if destination.exists():
-            destination = downloads / (
-                f"{Path(safe_ascii).stem}-{uuid4().hex[:12]}.docx"
-            )
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            file_descriptor = os.open(destination, flags, 0o600)
-            with os.fdopen(file_descriptor, "wb") as output:
-                output.write(content)
-                output.flush()
-                os.fsync(output.fileno())
-        except OSError:
-            destination.unlink(missing_ok=True)
-            handler.send_error(500, "Resume could not be saved to Downloads")
-            return
-        metadata["external_docx"] = str(destination)
-        _write_private_json(run_dir / "09_user_ui.json", metadata)
-        _record_resume_event(
-            data_root,
-            ResumeFunnelEventType.RESUME_EXPORTED,
-            run_id=run_id,
-        )
-        locale = getattr(handler, "ui_locale", DEFAULT_UI_LOCALE)
-        body = f"""<!doctype html><html lang="{_escape(locale)}"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{_escape(ui_text(locale, '简历已保存', 'Resume saved'))}</title></head><body>
-<main><h1>{_escape(ui_text(locale, '简历已保存到 Downloads', 'Resume saved to Downloads'))}</h1>
-<p>{_escape(str(destination))}</p>
-<p><a href="{_escape(ui_url('/', locale))}">{_escape(ui_text(locale, '返回首页', 'Return home'))}</a></p>
-</main></body></html>""".encode()
-        handler.send_response(200)
-        handler.send_header("Content-Type", "text/html; charset=utf-8")
-        handler.send_header("Content-Length", str(len(body)))
-        handler.send_header("Cache-Control", "private, no-store")
-        handler.send_header("X-Content-Type-Options", "nosniff")
-        handler.end_headers()
-        handler.wfile.write(body)
-        return
     _record_resume_event(data_root, ResumeFunnelEventType.RESUME_EXPORTED, run_id=run_id)
     handler.send_response(200)
     handler.send_header("Content-Type", _DOCX_CONTENT_TYPE)

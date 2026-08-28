@@ -853,15 +853,7 @@ private struct LocalWebView: NSViewRepresentable {
             panel.allowsMultipleSelection = parameters.allowsMultipleSelection
             panel.canChooseDirectories = parameters.allowsDirectories
             panel.canChooseFiles = true
-            if panel.canChooseFiles {
-                panel.allowedContentTypes = [
-                    UTType(filenameExtension: "docx"),
-                    UTType.pdf,
-                    UTType.plainText,
-                    UTType(filenameExtension: "md"),
-                    UTType.mpeg4Movie,
-                ].compactMap { $0 }
-            }
+            panel.allowsOtherFileTypes = true
             completionHandler(panel.runModal() == .OK ? panel.urls : nil)
         }
     }

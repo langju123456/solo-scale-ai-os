@@ -27,6 +27,7 @@ from soloscale.resume_docx import (
 from soloscale.resume_evidence_pack import (
     _compact_verified_facts,
     build_candidate_evidence_pack,
+    build_composition_evidence_plan,
     build_jd_positioning_brief,
     build_resume_evidence_retrieval_trace,
 )
@@ -485,6 +486,112 @@ def test_compact_evidence_pack_balances_distinct_jd_requirements() -> None:
     assert {fact.fact_id for fact in profile_facts} <= selected_ids
     assert {fact.fact_id for fact in observability_facts} <= selected_ids
     assert not ({fact.fact_id for fact in unrelated_facts} & selected_ids)
+
+
+def test_composition_plan_prefers_rich_verified_event_over_thin_commit() -> None:
+    source_sha256 = hashlib.sha256(b"verified-sources").hexdigest()
+
+    def fact(
+        fact_id: str,
+        evidence_id: str,
+        text: str,
+        tags: list[str],
+    ) -> ResumeAtomicFact:
+        return ResumeAtomicFact(
+            fact_id=fact_id,
+            profile_entry_id="PROFILE-01",
+            evidence_id=evidence_id,
+            source_kind="CANDIDATE_EVIDENCE",
+            capability_tags=tags,
+            text=text,
+            source_sha256=source_sha256,
+            fact_sha256=hashlib.sha256(
+                f"{fact_id}\0PROFILE-01\0{text}".encode()
+            ).hexdigest(),
+        )
+
+    rich = fact(
+        "FACT-EVIDENCE-M1-14-01",
+        "EVIDENCE-M1-14",
+        "Redesigned blocking resume generation into a reliable background job with polling.",
+        ["background-jobs", "reliability"],
+    )
+    thin = fact(
+        "FACT-EVIDENCE-LOCAL-GIT-01",
+        "EVIDENCE-LOCAL-GIT",
+        "Verified repository commit: feat add background jobs for resume delivery.",
+        ["repository", "verified-commit"],
+    )
+
+    plan = build_composition_evidence_plan(
+        "Build reliable Python background jobs for AI workflows.", [thin, rich]
+    )
+
+    assert plan.requirements[0].primary_fact_ids[0] == rich.fact_id
+    assert thin.fact_id in plan.prioritized_fact_ids
+
+
+def test_allowed_fact_number_passes_but_another_number_still_fails() -> None:
+    profile = CandidateProfile(
+        project_bullets=["Built SoloScale evidence workflows."]
+    )
+    profile_fact = build_resume_atomic_facts(profile)[0]
+    metric_text = "Measured POST response latency during Desktop E2E."
+    metric_fact = ResumeAtomicFact(
+        fact_id="FACT-EVIDENCE-M1-14-01",
+        profile_entry_id="PROFILE-01",
+        evidence_id="EVIDENCE-M1-14",
+        source_kind="CANDIDATE_EVIDENCE",
+        capability_tags=["performance"],
+        metric="POST response 19 ms",
+        allowed_numbers=["19"],
+        text=metric_text,
+        source_sha256=hashlib.sha256(b"metric-source").hexdigest(),
+        fact_sha256=hashlib.sha256(
+            f"FACT-EVIDENCE-M1-14-01\0PROFILE-01\0{metric_text}".encode()
+        ).hexdigest(),
+    )
+
+    def strategy(number: int) -> RoleStrategy:
+        return RoleStrategy(
+            role_summary="Build evidence workflows.",
+            top_hiring_signals=["Build evidence workflows."],
+            evidence_priority=["PROFILE-01"],
+            skill_priority=[],
+            bullet_rewrites=[
+                GroundedResumeBulletRewrite(
+                    profile_entry_id="PROFILE-01",
+                    kind="SYNTHESIS",
+                    text=(
+                        "Built SoloScale evidence workflows with a measured "
+                        f"POST response of {number} ms."
+                    ),
+                    source_profile_entry_ids=["PROFILE-01"],
+                    source_fact_ids=[profile_fact.fact_id, metric_fact.fact_id],
+                )
+            ],
+            unsupported_requirements=[],
+            rewrite_guidance="Use verified evidence.",
+        )
+
+    _validate_role_strategy(
+        strategy(19),
+        profile=profile,
+        job_description="Build evidence workflows.",
+        atomic_facts=[profile_fact, metric_fact],
+    )
+    with pytest.raises(ResumeTemplateError) as rejected:
+        _validate_role_strategy(
+            strategy(20),
+            profile=profile,
+            job_description="Build evidence workflows.",
+            atomic_facts=[profile_fact, metric_fact],
+        )
+    assert rejected.value.validation_diagnostics is not None
+    assert ResumeValidationRuleCode.CLAIM_NEW_NUMBER in {
+        failure.rule_code
+        for failure in rejected.value.validation_diagnostics.failures
+    }
 
 
 def test_resume_lexical_retrieval_evaluation_fixture_has_stable_recall() -> None:

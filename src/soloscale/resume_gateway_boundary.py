@@ -24,10 +24,14 @@ from xml.etree import ElementTree
 from pydantic import BaseModel, Field
 
 from soloscale.models import ContractModel, utc_now
-from soloscale.resume_evidence_pack import build_jd_positioning_brief
+from soloscale.resume_evidence_pack import (
+    build_composition_evidence_plan,
+    build_jd_positioning_brief,
+)
 from soloscale.resume_models import (
     CandidateEvidencePack,
     CandidateProfile,
+    CompositionEvidencePlan,
     JDPositioningBrief,
     ResumeAtomicFact,
     RoleStrategy,
@@ -194,6 +198,7 @@ class GatewayPayload(ContractModel):
     job_description: str = Field(min_length=1, max_length=_MAX_EXTRACTED_TEXT)
     tailoring_instructions: str = Field(default="", max_length=1_200)
     positioning_brief: JDPositioningBrief
+    composition_evidence_plan: CompositionEvidencePlan
     candidate_profile: GatewayCandidateProfile
     support_context: list[GatewaySupportSummary] = Field(default_factory=list, max_length=1)
     template_metadata: ResumeTemplateMetadata
@@ -836,6 +841,8 @@ def prepare_resume_gateway_payload(
                     if fact.metric
                     else None
                 ),
+                allowed_numbers=fact.allowed_numbers,
+                source_refs=fact.source_refs,
                 text=sanitized_text,
                 source_sha256=fact.source_sha256,
                 fact_sha256=hashlib.sha256(
@@ -862,6 +869,9 @@ def prepare_resume_gateway_payload(
         job_description=sanitized_job,
         tailoring_instructions=sanitized_instructions,
         positioning_brief=build_jd_positioning_brief(
+            sanitized_job, sanitized_facts
+        ),
+        composition_evidence_plan=build_composition_evidence_plan(
             sanitized_job, sanitized_facts
         ),
         candidate_profile=GatewayCandidateProfile(

@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import html
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from soloscale.evidence_hub import EvidenceHub, EvidenceHubError, inspect_git_repository
@@ -49,19 +50,31 @@ def ensure_local_project_evidence(
     data_root: Path,
     *,
     repository_root: Path,
+    timing: Callable[[str, int], None] | None = None,
 ) -> bool:
     """Refresh a selected project only when its deterministic fingerprint changed."""
 
     root = Path(data_root)
-    current_source, _ = inspect_git_repository(repository_root)
+    freshness_started = time.perf_counter()
+    current_source, current_items = inspect_git_repository(repository_root)
+    if timing is not None:
+        timing(
+            "freshness_check_ms",
+            int((time.perf_counter() - freshness_started) * 1000),
+        )
     if EvidenceHub.catalog_exists(root):
         stored = EvidenceHub(root).git_repository_snapshot(repository_root)
         if stored is not None and stored[0].content_sha256 == current_source.content_sha256:
+            if timing is not None:
+                timing("local_git_refresh_ms", 0)
             return False
-    receipt = refresh_local_project_evidence(
-        root,
-        repository_root=repository_root,
-    )
+    refresh_started = time.perf_counter()
+    receipt = EvidenceHub(root).sync_source(current_source, items=current_items)
+    if timing is not None:
+        timing(
+            "local_git_refresh_ms",
+            int((time.perf_counter() - refresh_started) * 1000),
+        )
     if receipt.status is not ReceiptStatus.SUCCEEDED:
         raise EvidenceHubError("local project evidence refresh failed")
     return True

@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
 from soloscale.content_canon import CanonicalStory, StoryReadiness, load_month_one_canon
@@ -16,8 +18,11 @@ from soloscale.resume_models import (
     CandidateEvidencePack,
     CandidateEvidenceSource,
     CandidateProfile,
+    CompositionEvidencePlan,
+    CompositionRequirementPlan,
     JDPositioningBrief,
     ResumeAtomicFact,
+    ResumeEvidenceAdoptionTrace,
     ResumeEvidenceRetrievalHit,
     ResumeEvidenceRetrievalTrace,
     ResumeEvidenceSourceSummary,
@@ -58,6 +63,7 @@ _MAX_SENT_FACTS = 80
 _MIN_SENT_FACTS = 30
 _MAX_RETRIEVAL_HITS = 32
 _FACTS_PER_REQUIREMENT = 4
+_NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,]\d+)?%?\+?(?!\w)")
 
 
 def deterministic_hiring_signals(job_description: str) -> list[str]:
@@ -86,7 +92,11 @@ def deterministic_hiring_signals(job_description: str) -> list[str]:
 
 
 def _entry_terms(value: str) -> set[str]:
-    return {token.casefold() for token in _TOKEN_RE.findall(value)}
+    return {
+        normalized
+        for token in _TOKEN_RE.findall(value)
+        if (normalized := token.casefold().strip("./-"))
+    }
 
 
 _HIGH_SIGNAL_TERMS = {
@@ -130,10 +140,22 @@ def _story_fact_texts(story: CanonicalStory) -> list[tuple[str, str | None]]:
     return facts[:8]
 
 
+def _allowed_numbers(*values: str | None) -> list[str]:
+    return list(
+        dict.fromkeys(
+            match.group(0).casefold()
+            for value in values
+            if value
+            for match in _NUMBER_RE.finditer(value)
+        )
+    )
+
+
 def _compact_verified_facts(
     *,
     job_description: str,
     atomic_facts: list[ResumeAtomicFact],
+    hiring_signals: list[str] | None = None,
 ) -> list[ResumeAtomicFact]:
     """Keep a compact, requirement-balanced set of already approved facts."""
 
@@ -151,7 +173,7 @@ def _compact_verified_facts(
 
     requirements = [
         terms
-        for signal in deterministic_hiring_signals(job_description)
+        for signal in (hiring_signals or deterministic_hiring_signals(job_description))
         if (terms := _entry_terms(signal))
     ]
     if not requirements:
@@ -168,10 +190,12 @@ def _compact_verified_facts(
     original_order = {fact.fact_id: index for index, fact in enumerate(candidate_facts)}
 
     def authority(fact: ResumeAtomicFact) -> int:
+        if fact.metric is not None and fact.evidence_id.startswith("EVIDENCE-M1-"):
+            return 5
+        if fact.evidence_id.startswith("EVIDENCE-M1-"):
+            return 4
         if "verified-commit" in fact.capability_tags:
             return 3
-        if fact.evidence_id.startswith("EVIDENCE-M1-"):
-            return 2
         if "committed-summary" in fact.capability_tags:
             return 1
         return 0
@@ -248,11 +272,89 @@ def _compact_verified_facts(
     return [*profile_facts, *selected]
 
 
+def build_composition_evidence_plan(
+    job_description: str,
+    facts: list[ResumeAtomicFact],
+    *,
+    hiring_signals: list[str] | None = None,
+) -> CompositionEvidencePlan:
+    """Allocate only relevant verified facts to exact JD requirements."""
+
+    signals = hiring_signals or deterministic_hiring_signals(job_description)
+    fact_terms = {fact.fact_id: _entry_terms(fact.text) for fact in facts}
+    tag_terms = {
+        fact.fact_id: {
+            term for tag in fact.capability_tags for term in _entry_terms(tag)
+        }
+        for fact in facts
+    }
+
+    def rank(fact: ResumeAtomicFact, terms: set[str]) -> tuple[int, ...]:
+        lexical = len(fact_terms[fact.fact_id] & terms)
+        tags = len(tag_terms[fact.fact_id] & terms)
+        high_signal = int(
+            bool(
+                (fact_terms[fact.fact_id] | tag_terms[fact.fact_id])
+                & terms
+                & _HIGH_SIGNAL_TERMS
+            )
+        )
+        relevant = int(lexical >= 2 or tags >= 1 or high_signal > 0)
+        authority = (
+            5
+            if fact.metric is not None and fact.evidence_id.startswith("EVIDENCE-M1-")
+            else 4
+            if fact.evidence_id.startswith("EVIDENCE-M1-")
+            else 3
+            if "verified-commit" in fact.capability_tags
+            else 2
+            if fact.source_kind == "PROFILE_ENTRY"
+            else 1
+        )
+        differentiation = int(fact.source_kind == "CANDIDATE_EVIDENCE") + int(
+            len(fact_terms[fact.fact_id]) >= 8
+        )
+        freshness = int("verified-commit" in fact.capability_tags)
+        return relevant, high_signal, authority, lexical, tags, freshness, differentiation
+
+    requirements: list[CompositionRequirementPlan] = []
+    prioritized: list[str] = []
+    for index, signal in enumerate(signals, start=1):
+        terms = _entry_terms(signal)
+        ranked = sorted(
+            facts,
+            key=lambda fact: (
+                *(-value for value in rank(fact, terms)),
+                fact.fact_id,
+            ),
+        )
+        relevant_ids = [fact.fact_id for fact in ranked if rank(fact, terms)[0]][:8]
+        primary = relevant_ids[:2]
+        secondary = relevant_ids[2:6]
+        for fact_id in (*primary, *secondary):
+            if fact_id not in prioritized:
+                prioritized.append(fact_id)
+        requirements.append(
+            CompositionRequirementPlan(
+                requirement_id=f"REQ-{index:02d}",
+                requirement_sha256=hashlib.sha256(signal.encode()).hexdigest(),
+                primary_fact_ids=primary,
+                secondary_fact_ids=secondary,
+            )
+        )
+    return CompositionEvidencePlan(
+        job_description_sha256=hashlib.sha256(job_description.encode()).hexdigest(),
+        requirements=requirements,
+        prioritized_fact_ids=prioritized,
+    )
+
+
 def build_resume_evidence_retrieval_trace(
     *,
     job_description: str,
     facts: list[ResumeAtomicFact],
     knowledge_hits: list[RetrievalHit],
+    adoption: list[ResumeEvidenceAdoptionTrace] | None = None,
 ) -> ResumeEvidenceRetrievalTrace:
     """Build a local, body-free trace after the model input is frozen."""
 
@@ -382,6 +484,7 @@ def build_resume_evidence_retrieval_trace(
         sent_count=len(fact_ids),
         admitted_fact_ids=fact_ids,
         sent_fact_ids=fact_ids,
+        adoption=adoption or [],
     )
 
 
@@ -392,19 +495,21 @@ def _append_repository_facts(
     sources: list[CandidateEvidenceSource],
     data_root: Path,
     repository_root: Path,
+    snapshot_is_current: bool = False,
 ) -> None:
     target_id = _soloscale_target(profile)
     if target_id is None:
         return
     if not EvidenceHub.catalog_exists(data_root):
         raise EvidenceHubError("local project evidence has not been refreshed")
-    current_source, _ = inspect_git_repository(repository_root)
     stored_snapshot = EvidenceHub(data_root).git_repository_snapshot(repository_root)
     if stored_snapshot is None:
         raise EvidenceHubError("local project evidence has not been refreshed")
     stored_source, stored_items = stored_snapshot
-    if stored_source.content_sha256 != current_source.content_sha256:
-        raise EvidenceHubError("local project evidence is stale")
+    if not snapshot_is_current:
+        current_source, _ = inspect_git_repository(repository_root)
+        if stored_source.content_sha256 != current_source.content_sha256:
+            raise EvidenceHubError("local project evidence is stale")
     commit_items = sorted(
         (
             item
@@ -449,6 +554,7 @@ def _append_repository_facts(
                 source_kind="CANDIDATE_EVIDENCE",
                 project=stored_source.project or repository_root.name,
                 capability_tags=["repository", "verified-commit"],
+                source_refs=[item.native_id],
                 text=text,
                 source_sha256=stored_source.content_sha256,
                 fact_sha256=hashlib.sha256(
@@ -549,6 +655,7 @@ def _append_github_commit_facts(
                 source_kind="CANDIDATE_EVIDENCE",
                 project=item.project,
                 capability_tags=["repository", "committed-summary"],
+                source_refs=[item.native_id],
                 text=text,
                 source_sha256=source_sha256,
                 fact_sha256=hashlib.sha256(
@@ -564,9 +671,12 @@ def build_candidate_evidence_pack(
     data_root: Path | None = None,
     repository_root: Path | None = None,
     job_description: str = "",
+    repository_snapshot_is_current: bool = False,
+    timing: Callable[[str, int], None] | None = None,
 ) -> CandidateEvidencePack:
     """Retrieve locally, admit verified sources, and build compact model context."""
 
+    admission_started = time.perf_counter()
     atomic_facts = build_resume_atomic_facts(profile)
     sources: list[CandidateEvidenceSource] = []
     if repository_root is not None and data_root is None:
@@ -578,6 +688,7 @@ def build_candidate_evidence_pack(
             sources=sources,
             data_root=Path(data_root),
             repository_root=Path(repository_root),
+            snapshot_is_current=repository_snapshot_is_current,
         )
     if data_root is not None:
         _append_github_commit_facts(
@@ -622,6 +733,8 @@ def build_candidate_evidence_pack(
                             "evidence-grounding",
                         ],
                         metric=metric,
+                        allowed_numbers=_allowed_numbers(text, metric),
+                        source_refs=story.evidence_candidates,
                         text=text,
                         source_sha256=source_sha256,
                         fact_sha256=hashlib.sha256(
@@ -629,10 +742,35 @@ def build_candidate_evidence_pack(
                         ).hexdigest(),
                     )
                 )
+    if timing is not None:
+        timing(
+            "evidence_admission_ms",
+            int((time.perf_counter() - admission_started) * 1000),
+        )
+    requirement_started = time.perf_counter()
+    hiring_signals = deterministic_hiring_signals(job_description)
+    if timing is not None:
+        timing(
+            "requirement_extraction_ms",
+            int((time.perf_counter() - requirement_started) * 1000),
+        )
+    fusion_started = time.perf_counter()
     atomic_facts = _compact_verified_facts(
         job_description=job_description,
         atomic_facts=atomic_facts,
+        hiring_signals=hiring_signals,
     )
+    composition_plan = build_composition_evidence_plan(
+        job_description,
+        atomic_facts,
+        hiring_signals=hiring_signals,
+    )
+    if timing is not None:
+        timing(
+            "fusion_ms",
+            int((time.perf_counter() - fusion_started) * 1000),
+        )
+    pack_started = time.perf_counter()
     selected_evidence_ids = {
         fact.evidence_id
         for fact in atomic_facts
@@ -645,16 +783,24 @@ def build_candidate_evidence_pack(
         {
             "sources": [source.model_dump(mode="json") for source in sources],
             "atomic_facts": [fact.model_dump(mode="json") for fact in atomic_facts],
+            "composition_plan": composition_plan.model_dump(mode="json"),
         },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
-    return CandidateEvidencePack(
+    pack = CandidateEvidencePack(
         sources=sources,
         atomic_facts=atomic_facts,
+        composition_plan=composition_plan,
         pack_sha256=hashlib.sha256(canonical.encode()).hexdigest(),
     )
+    if timing is not None:
+        timing(
+            "candidate_pack_build_ms",
+            int((time.perf_counter() - pack_started) * 1000),
+        )
+    return pack
 
 
 def build_jd_positioning_brief(
@@ -699,6 +845,7 @@ def build_jd_positioning_brief(
 
 __all__ = [
     "build_candidate_evidence_pack",
+    "build_composition_evidence_plan",
     "build_resume_evidence_retrieval_trace",
     "build_jd_positioning_brief",
     "deterministic_hiring_signals",

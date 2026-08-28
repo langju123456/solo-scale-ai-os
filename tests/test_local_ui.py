@@ -20,7 +20,6 @@ from soloscale.content_ui import run_content_form
 from soloscale.content_workspace import save_content_review
 from soloscale.conversation_intake import parse_codex_session
 from soloscale.knowledge_models import ContentRole, RetrievalHit, SourceKind
-from soloscale.knowledge_store import InvalidKnowledgeQueryError
 from soloscale.learning_traceability import run_learning_traceability
 from soloscale.local_ui import (
     OllamaReadiness,
@@ -46,6 +45,7 @@ from soloscale.local_ui import (
     _run_user_resume,
     _save_ai_provider_preference,
     _search_job_evidence,
+    _serve_resume_download,
     _split_path_list,
     _user_page,
     _workspace_path,
@@ -775,7 +775,7 @@ def test_parse_submission_reads_text_and_docx_upload() -> None:
     assert submission.files["resume_template"].content == template
 
 
-def test_job_evidence_search_processes_every_normal_jd_term(
+def test_job_evidence_search_uses_one_bounded_high_signal_query(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     accepted_queries: list[str] = []
@@ -785,9 +785,8 @@ def test_job_evidence_search_processes_every_normal_jd_term(
             assert root == tmp_path
 
         def search(self, query: str, limit: int) -> list[RetrievalHit]:
-            assert limit == 3
-            if len(query.split()) > 4:
-                raise InvalidKnowledgeQueryError("query contains too many searchable terms")
+            assert limit == 8
+            assert len(query.split()) <= 8
             accepted_queries.append(query)
             return [
                 RetrievalHit(
@@ -815,11 +814,11 @@ def test_job_evidence_search_processes_every_normal_jd_term(
 
     hits = _search_job_evidence(job_description, tmp_path)
 
-    accepted_terms = {term for query in accepted_queries for term in query.split()}
-    assert set(terms).issubset(accepted_terms)
-    assert "line29" in accepted_terms
-    assert all(len(query.split()) <= 4 for query in accepted_queries)
-    assert len(hits) == len(accepted_queries)
+    expected_query = " ".join(
+        ["python", *(f"requirement{index}" for index in range(7))]
+    )
+    assert accepted_queries == [expected_query]
+    assert len(hits) == 1
 
 
 def test_create_resume_pdf_preview_uses_isolated_local_renderer(
@@ -846,6 +845,50 @@ def test_create_resume_pdf_preview_uses_isolated_local_renderer(
     assert _create_resume_pdf_preview(source, target) is True
     assert target.read_bytes().startswith(b"%PDF-")
     assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_desktop_resume_download_returns_exactly_one_docx_body(tmp_path: Path) -> None:
+    run_id = "resume-20260828T010101Z-aaaaaaaaaa"
+    run_dir = tmp_path / "resume-runs" / run_id
+    run_dir.mkdir(parents=True)
+    content = _uploaded_resume_docx()
+    (run_dir / "08_resume.docx").write_bytes(content)
+    _write_private_json(
+        run_dir / "09_user_ui.json",
+        {"output_filename": "Resume_LANG-JU_BeaconFire.docx"},
+    )
+
+    class FakeHandler:
+        def __init__(self) -> None:
+            self.status = 0
+            self.headers: dict[str, str] = {}
+            self.wfile = io.BytesIO()
+
+        def send_response(self, status: int) -> None:
+            self.status = status
+
+        def send_header(self, key: str, value: str) -> None:
+            self.headers[key] = value
+
+        def end_headers(self) -> None:
+            return
+
+        def send_error(self, status: int, message: str) -> None:
+            raise AssertionError((status, message))
+
+    handler = FakeHandler()
+    _serve_resume_download(  # type: ignore[arg-type]
+        handler,
+        tmp_path,
+        run_id,
+        desktop_mode=True,
+    )
+
+    assert handler.status == 200
+    assert handler.headers["Content-Type"].endswith("wordprocessingml.document")
+    assert handler.headers["Content-Disposition"].startswith("attachment;")
+    assert handler.wfile.getvalue() == content
+    assert b"<html" not in handler.wfile.getvalue()
 
 
 def test_codex_import_http_returns_immediately_and_exposes_polling_status(
@@ -1595,6 +1638,12 @@ def test_resume_ui_rejects_only_unsafe_rewrite_and_keeps_original_bullet(
     metadata = json.loads((run_dir / "09_user_ui.json").read_text())
     assert metadata["grounded_rewrites"] == 2
     assert metadata["rejected_rewrites"] == 1
+    adoption = metadata["evidence_adoption"]
+    assert any(item["proposed"] for item in adoption)
+    assert any(
+        "CLAIM_NEW_NUMBER" in item["rejection_rule_codes"] for item in adoption
+    )
+    assert any(item["accepted"] and item["rendered"] for item in adoption)
     paragraphs = {
         item.text
         for item in read_template_paragraphs((run_dir / "08_resume.docx").read_bytes())

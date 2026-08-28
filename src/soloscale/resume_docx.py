@@ -47,6 +47,7 @@ from soloscale.resume_models import (
     GroundedResumeBulletRewrite,
     JDPositioningBrief,
     ResumeAtomicFact,
+    ResumeEvidenceAdoptionTrace,
     ResumeEvidenceRetrievalTrace,
     ResumeExpertReviewResult,
     RoleStrategy,
@@ -217,6 +218,7 @@ class TailoredDocx:
     candidate_evidence_pack: CandidateEvidencePack | None = None
     positioning_brief: JDPositioningBrief | None = None
     evidence_retrieval_trace: ResumeEvidenceRetrievalTrace | None = None
+    evidence_adoption: tuple[ResumeEvidenceAdoptionTrace, ...] = ()
     role_strategy_fallback_applied: bool = False
     role_strategy_fallback_code: str | None = None
     expert_review: ResumeExpertReviewResult | None = None
@@ -1044,13 +1046,18 @@ def _validate_role_strategy(
                 break
 
         source_union = " ".join(fact.text for fact in resolved_facts)
-        invented_protected = _protected_facts(text) - _protected_facts(source_union)
+        allowed_numbers = {
+            value.casefold() for fact in resolved_facts for value in fact.allowed_numbers
+        }
+        invented_protected = (
+            _protected_facts(text) - _protected_facts(source_union) - allowed_numbers
+        )
         invented_numbers = {
             match.group(0).casefold() for match in _NUMBER_RE.finditer(text)
         } - {
             match.group(0).casefold()
             for match in _NUMBER_RE.finditer(source_union)
-        }
+        } - allowed_numbers
         output_words = _normalized_words(text) | _terms(text)
         source_words = _normalized_words(source_union) | _terms(source_union)
         introduced_words = output_words - source_words
@@ -1316,6 +1323,58 @@ def _deterministic_role_strategy_fallback(
     return strategy
 
 
+def _build_evidence_adoption_trace(
+    *,
+    facts: list[ResumeAtomicFact],
+    raw_strategy: RoleStrategy,
+    selected_strategy: RoleStrategy,
+    entries: dict[str, str],
+    diagnostics: ResumeValidationDiagnostics,
+    summary_rendered: bool,
+) -> tuple[ResumeEvidenceAdoptionTrace, ...]:
+    """Summarize fact adoption without retaining Resume or model-output bodies."""
+
+    raw_fact_ids_by_claim = {
+        rewrite.profile_entry_id: set(rewrite.source_fact_ids)
+        for rewrite in raw_strategy.bullet_rewrites
+    }
+    if raw_strategy.summary_rewrite is not None:
+        raw_fact_ids_by_claim["SUMMARY"] = set(
+            raw_strategy.summary_rewrite.source_fact_ids
+        )
+    proposed_fact_ids = (
+        set().union(*raw_fact_ids_by_claim.values())
+        if raw_fact_ids_by_claim
+        else set()
+    )
+    accepted_fact_ids: set[str] = set()
+    for rewrite in selected_strategy.bullet_rewrites:
+        if rewrite.text != entries[rewrite.profile_entry_id]:
+            accepted_fact_ids.update(rewrite.source_fact_ids)
+    if summary_rendered and selected_strategy.summary_rewrite is not None:
+        accepted_fact_ids.update(selected_strategy.summary_rewrite.source_fact_ids)
+    rejection_codes: dict[str, list[str]] = {}
+    for failure in diagnostics.failures:
+        if failure.claim_id is None:
+            continue
+        for fact_id in raw_fact_ids_by_claim.get(failure.claim_id, set()):
+            rejection_codes.setdefault(fact_id, []).append(failure.rule_code.value)
+    return tuple(
+        ResumeEvidenceAdoptionTrace(
+            fact_id=fact.fact_id,
+            admitted=True,
+            sent_to_model=True,
+            proposed=fact.fact_id in proposed_fact_ids,
+            accepted=fact.fact_id in accepted_fact_ids,
+            rendered=fact.fact_id in accepted_fact_ids,
+            rejection_rule_codes=list(
+                dict.fromkeys(rejection_codes.get(fact.fact_id, []))
+            ),
+        )
+        for fact in facts
+    )
+
+
 def _reorder_project_blocks_by_priority(
     body: ElementTree.Element,
     children: list[ElementTree.Element],
@@ -1571,7 +1630,11 @@ def tailor_resume_docx_with_gateway(
         "context; do not return or restate them. Unsupported requirements must be exact "
         "quotes from the JD. Preserve every __SS_PRIVATE_*__ placeholder exactly. "
         "The positioning_brief in the user payload is deterministic, read-only targeting "
-        "context. Deterministic hiring signals: "
+        "context. Follow composition_evidence_plan: use primary facts first, then "
+        "secondary facts only when they add a distinct supported component. Do not "
+        "force facts into a requirement with no allocation. Every factual number must "
+        "appear in a cited fact's text, metric, or allowed_numbers. "
+        "Deterministic hiring signals: "
         + json.dumps(deterministic_signals, ensure_ascii=False)
     )
     model_started = time.perf_counter()
@@ -1717,6 +1780,14 @@ def tailor_resume_docx_with_gateway(
                 info, tailored_document if info.filename == _DOCUMENT_PART else content
             )
     output = target.getvalue()
+    evidence_adoption = _build_evidence_adoption_trace(
+        facts=atomic_facts,
+        raw_strategy=raw_strategy,
+        selected_strategy=strategy,
+        entries=entries,
+        diagnostics=validation_diagnostics,
+        summary_rendered=summary_rewritten,
+    )
     return TailoredDocx(
         content=output,
         template_sha256=hashlib.sha256(template).hexdigest(),
@@ -1741,6 +1812,7 @@ def tailor_resume_docx_with_gateway(
         role_strategy=strategy,
         candidate_evidence_pack=candidate_evidence_pack,
         positioning_brief=positioning_brief,
+        evidence_adoption=evidence_adoption,
         role_strategy_fallback_applied=role_strategy_fallback_applied,
         role_strategy_fallback_code=role_strategy_fallback_code,
     )

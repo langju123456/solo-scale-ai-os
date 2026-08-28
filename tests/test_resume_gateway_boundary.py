@@ -218,6 +218,7 @@ def test_gateway_payload_removes_identifiers_and_has_strict_metadata_allowlist()
         "job_description",
         "tailoring_instructions",
         "positioning_brief",
+        "composition_evidence_plan",
         "candidate_profile",
         "support_context",
         "template_metadata",
