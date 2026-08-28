@@ -705,8 +705,8 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
         run_id=resume.run_id,
         repo_root=REPOSITORY_ROOT,
     )
-    assert "NEEDS_MAPPING" in before_learning
-    assert "Interview Defense →" not in before_learning
+    assert "需要关联" in before_learning
+    assert "面试答辩 →" not in before_learning
 
     selected = run_learning_traceability(
         data_root=data_root,
@@ -721,10 +721,10 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
         run_id=resume.run_id,
         repo_root=REPOSITORY_ROOT,
     )
-    assert "确认关联 Conversation RAG 锚点" in before_mapping
+    assert "确认关联对话式 RAG 锚点" in before_mapping
     assert max(selected.run_id, newer.run_id) in before_mapping
     assert _expected_repository_ref() in before_mapping
-    assert "Interview Defense →" not in before_mapping
+    assert "面试答辩 →" not in before_mapping
 
     map_interview_defense_bullet(
         data_root=data_root,
@@ -738,7 +738,7 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
         run_id=resume.run_id,
         repo_root=REPOSITORY_ROOT,
     )
-    assert "Interview Defense →" in mapped_panel
+    assert "面试答辩 →" in mapped_panel
     assert selected.run_id in mapped_panel
     assert "#interview-defense" in mapped_panel
 
@@ -753,13 +753,13 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
         },
     )
     assert 'id="interview-defense"' in page
-    assert f"Exact Learning run: <code>{selected.run_id}</code>" in page
-    assert "Reasoning anchors" in page
-    assert "Code anchors" in page
-    assert "Test anchors" in page
+    assert f"精确学习记录： <code>{selected.run_id}</code>" in page
+    assert "推理锚点" in page
+    assert "代码锚点" in page
+    assert "测试锚点" in page
     assert "src/soloscale/knowledge_store.py" in page
     assert "复制锚点包" in page
-    assert "do not prove authorship" in page
+    assert "不证明作者身份" in page
     assert len(list((data_root / "learning-runs").iterdir())) == run_count
 
     anchors_path = data_root / "learning-runs" / selected.run_id / "03_code_anchors.json"
@@ -771,9 +771,9 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
         run_id=resume.run_id,
         repo_root=REPOSITORY_ROOT,
     )
-    assert "NEEDS_MAPPING" in stale_panel
-    assert "Interview Defense →" not in stale_panel
-    assert "映射已失效" in stale_panel
+    assert "需要关联" in stale_panel
+    assert "面试答辩 →" not in stale_panel
+    assert "关联已失效" in stale_panel
 
     invalid = _learning_page(
         data_root,

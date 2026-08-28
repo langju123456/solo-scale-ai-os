@@ -54,7 +54,7 @@ def test_story_bank_and_create_are_distinct_views(tmp_path: Path) -> None:
         canon_format="video",
     )
 
-    assert "Month 1 · Engineering Story Library" in story_bank
+    assert "第一个月 · 工程故事库" in story_bank
     assert ".reference-video-upload,.grid{display:none!important}" in story_bank
     assert "target.searchParams.set('canon_story_id'" in story_bank
     assert 'aria-current="page">故事库</a>' in story_bank

@@ -81,9 +81,9 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     assert f"/content/downloads/{result.run_id}/linkedin.md" in page
     assert f"/content/downloads/{result.run_id}/video-script.md" in page
     assert "已私有保存" in page
-    assert "Editorial provenance" in page
+    assert "编辑流程溯源" in page
     assert "deterministic-content-template-v1" in page
-    assert "Writer → Fresh Reviewer → Reviser" in page
+    assert "流程：撰写 → 独立复核 → 修订 → 人工发布确认。" in page
     assert "没有连接或操作你的社交账号" in page
     assert result.run_id in page
     assert _form()["topic"] in page
@@ -169,8 +169,8 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
         ),
     )
     quality_approved = content_page(data_root=data_root, run_id=result.run_id)
-    assert "Human Media Quality" in quality_approved
-    assert "APPROVED · r1" in quality_approved
+    assert "人工媒体质量" in quality_approved
+    assert "已批准 · r1" in quality_approved
     assert f'action="/content/distribution/{result.run_id}"' in quality_approved
 
     rerendered = content_page(data_root=data_root, run_id=result.run_id)

@@ -215,6 +215,8 @@ from soloscale.ui_shell import (
     UILocale,
     normalize_ui_locale,
     render_app_shell,
+    ui_bool,
+    ui_display_value,
     ui_text,
     ui_url,
 )
@@ -4106,7 +4108,9 @@ def _user_result_card(
     defense = (
         ""
         if request_scoped
-        else _interview_defense_panel(data_root=run_dir.parents[1], run_id=run_dir.name)
+        else _interview_defense_panel(
+            data_root=run_dir.parents[1], run_id=run_dir.name, locale=locale
+        )
     )
     provenance_panel = _resume_provenance_panel(run_dir, locale)
     job_running = resume_job is not None and resume_job.phase not in {
@@ -4233,14 +4237,20 @@ def _validated_record_anchor_pack(
     return pack
 
 
-def _interview_defense_panel(*, data_root: Path, run_id: str, repo_root: Path | None = None) -> str:
+def _interview_defense_panel(
+    *,
+    data_root: Path,
+    run_id: str,
+    repo_root: Path | None = None,
+    locale: UILocale = DEFAULT_UI_LOCALE,
+) -> str:
     repo_root = repo_root or _repo_root()
     try:
         records = load_interview_defense_records(data_root=data_root, run_id=run_id)
     except (ResumeWorkspaceStorageError, ValueError):
         return (
-            '<section class="interview-defense"><h3>Interview Defense</h3>'
-            "<p>Unavailable.</p></section>"
+            f'<section class="interview-defense"><h3>{_escape(ui_text(locale, "面试答辩", "Interview Defense"))}</h3>'
+            f'<p>{_escape(ui_text(locale, "暂不可用。", "Unavailable."))}</p></section>'
         )
     available = _available_learning_anchor_pack(data_root, repo_root)
     rows: list[str] = []
@@ -4256,50 +4266,62 @@ def _interview_defense_panel(*, data_root: Path, run_id: str, repo_root: Path | 
                 )
             except (LearningTraceabilityError, OSError, ValueError):
                 display_status = "NEEDS_MAPPING"
-                action = "映射已失效；请修复原始 Learning run，或重新生成这次简历后再关联。"
-            else:
-                href = (
-                    "/learning?"
-                    + urllib.parse.urlencode(
-                        {
-                            "run_id": record.mapping.learning_run_id,
-                            "resume_run_id": run_id,
-                            "bullet_id": record.bullet_id,
-                        }
+                action = _escape(
+                    ui_text(
+                        locale,
+                        "关联已失效；请修复原始学习记录，或重新生成这次简历后再关联。",
+                        "The mapping is stale. Repair the original Learning run or regenerate this resume before mapping again.",
                     )
-                    + "#interview-defense"
                 )
-                action = f'<a href="{_escape(href)}">Interview Defense →</a>'
+            else:
+                href = ui_url(
+                    "/learning#interview-defense",
+                    locale,
+                    run_id=record.mapping.learning_run_id,
+                    resume_run_id=run_id,
+                    bullet_id=record.bullet_id,
+                )
+                action = f'<a href="{_escape(href)}">{_escape(ui_text(locale, "面试答辩", "Interview Defense"))} →</a>'
         elif available is not None:
             learning_run, _pack = available
             action = f"""<form method="post" action="/resume/interview-defense/map">
+  <input type="hidden" name="ui_locale" value="{locale}" />
   <input type="hidden" name="resume_run_id" value="{_escape(run_id)}" />
   <input type="hidden" name="bullet_id" value="{_escape(record.bullet_id)}" />
   <input type="hidden" name="learning_run_id" value="{_escape(learning_run)}" />
-  <button type="submit">确认关联 Conversation RAG 锚点</button>
+  <button type="submit">{_escape(ui_text(locale, '确认关联对话式 RAG 锚点', 'Confirm Conversation RAG anchors'))}</button>
 </form>"""
         else:
-            action = '<a href="/learning">先建立 Learning 黄金案例。</a>'
+            action = f'<a href="{ui_url("/learning", locale)}">{_escape(ui_text(locale, "先建立学习黄金案例。", "Build the Learning golden case first."))}</a>'
         rows.append(
             f"<li><code>{_escape(record.bullet_id)}</code> · "
-            f"{_escape(display_status)}<br />"
+            f"{_escape(ui_display_value(locale, display_status))}<br />"
             f"{_escape(record.bullet_text)}<br />{action}</li>"
         )
     if available is None:
-        availability = "当前没有可用的 Conversation RAG Learning run。"
+        availability = ui_text(
+            locale,
+            "当前没有可用的对话式 RAG 学习记录。",
+            "No Conversation RAG Learning run is currently available.",
+        )
     else:
         learning_run, pack = available
         project = pack.get("project")
         if not isinstance(project, dict):
-            availability = "当前没有可用的 Conversation RAG Learning run。"
+            availability = ui_text(
+                locale,
+                "当前没有可用的对话式 RAG 学习记录。",
+                "No Conversation RAG Learning run is currently available.",
+            )
         else:
             availability = (
-                "待你确认关联："
+                ui_text(locale, "待你确认关联：", "Awaiting your mapping confirmation: ")
+                +
                 f"{learning_run} · {project.get('repository')} · "
                 f"{project.get('branch')} · {project.get('commit')}"
             )
     return (
-        '<section class="interview-defense"><h3>Interview Defense</h3>'
+        f'<section class="interview-defense"><h3>{_escape(ui_text(locale, "面试答辩", "Interview Defense"))}</h3>'
         f"<p>{_escape(availability)}</p><ul>{''.join(rows)}</ul></section>"
     )
 
@@ -4626,11 +4648,11 @@ def _user_page(
               type="file" name="resume_template" accept=".pdf,.docx,.txt,.md" required
             />
           </label>
-          <label>Job Description
+          <label>{_escape(ui_text(locale, '职位描述（JD）', 'Job Description'))}
             <span class="hint">{_escape(ui_text(locale, '粘贴完整 JD，或在下方上传一个文件；两者选一个。', 'Paste the complete JD, or upload one file below. Choose one method.'))}</span>
             <textarea
               name="job_description"
-              placeholder="Paste the full job description here…"
+              placeholder="{_escape(ui_text(locale, '在此粘贴完整职位描述…', 'Paste the full job description here…'))}"
             >{job_description}</textarea>
           </label>
           <label>{_escape(ui_text(locale, '或者上传 JD（可选）', 'Or upload the JD (optional)'))}
@@ -4643,7 +4665,7 @@ def _user_page(
           <label>{_escape(ui_text(locale, '针对性说明（可选）', 'Tailoring instructions (optional)'))}
             <span class="hint">{_escape(ui_text(locale, '例如：突出 RAG、后端工程和产品交付。说明只影响已有内容的排序，不会新增经历。', 'For example: prioritize RAG, backend engineering, and product delivery. Instructions only affect ordering and never add experience.'))}</span>
             <textarea name="tailoring_instructions" maxlength="1200"
-              placeholder="Prioritize relevant existing projects and skills…"
+              placeholder="{_escape(ui_text(locale, '优先突出相关的已有项目与技能…', 'Prioritize relevant existing projects and skills…'))}"
             >{tailoring_instructions}</textarea>
           </label>
           <div class="metadata">
@@ -4765,31 +4787,51 @@ def _latest_learning_run(data_root: Path) -> Path | None:
     return candidates[-1] if candidates else None
 
 
-def _learning_graph(run_dir: Path) -> str:
+def _learning_graph(run_dir: Path, locale: UILocale) -> str:
     graph = _load_json_file(run_dir / "04_evidence_graph.json")
     if graph is None:
-        return '<p class="error">Graph artifact is unavailable.</p>'
+        return f'<p class="error">{_escape(ui_text(locale, "证据图暂不可用。", "Graph artifact is unavailable."))}</p>'
     nodes = graph.get("nodes", [])
     edges = graph.get("edges", [])
     if not isinstance(nodes, list) or not isinstance(edges, list):
-        return '<p class="error">Graph artifact has an invalid shape.</p>'
+        return f'<p class="error">{_escape(ui_text(locale, "证据图格式无效。", "Graph artifact has an invalid shape."))}</p>'
     node_json = json.dumps(nodes, ensure_ascii=True).replace("</", "<\\/")
     edge_json = json.dumps(edges, ensure_ascii=True).replace("</", "<\\/")
     run_id = json.dumps(run_dir.name)
+    locale_json = json.dumps(locale)
+    kind_labels = json.dumps(
+        {
+            "CONCEPT": ui_text(locale, "概念", "Concept"),
+            "CODE": ui_text(locale, "代码", "Code"),
+            "TEST": ui_text(locale, "测试", "Test"),
+            "DECISION": ui_text(locale, "决策", "Decision"),
+        },
+        ensure_ascii=False,
+    )
+    truth_labels = json.dumps(
+        {
+            value: ui_display_value(locale, value)
+            for value in ("UNKNOWN", "ENGINEERING_VERIFIED", "VERIFIED_EVIDENCE", "APPROVED_CLAIM")
+        },
+        ensure_ascii=False,
+    )
     return f"""<section class="panel graph-panel">
-  <h2>Interactive evidence graph</h2>
-  <p class="muted">Click a node for its evidence neighborhood. Double-click to focus it.</p>
+  <h2>{_escape(ui_text(locale, "交互式证据图", "Interactive evidence graph"))}</h2>
+  <p class="muted">{_escape(ui_text(locale, "单击节点查看关联证据，双击聚焦。", "Click a node for its evidence neighborhood. Double-click to focus it."))}</p>
   <div class="graph-scroll"><svg id="learning-graph" role="img"></svg></div>
   <div class="detail-grid">
-    <pre id="learning-node-detail">Select a Concept, Code, Test, or Decision node.</pre>
+    <pre id="learning-node-detail">{_escape(ui_text(locale, "请选择概念、代码、测试或决策节点。", "Select a Concept, Code, Test, or Decision node."))}</pre>
     <p><a id="learning-source-link" class="button-link hidden" target="_blank"
-      rel="noopener">Open grounded local source</a></p>
+      rel="noopener">{_escape(ui_text(locale, "打开有依据的本地源码", "Open grounded local source"))}</a></p>
   </div>
   <script>
   (function(){{
     const nodes={node_json};
     const edges={edge_json};
     const runId={run_id};
+    const locale={locale_json};
+    const kindLabels={kind_labels};
+    const truthLabels={truth_labels};
     const svg=document.getElementById('learning-graph');
     const detail=document.getElementById('learning-node-detail');
     const sourceLink=document.getElementById('learning-source-link');
@@ -4834,16 +4876,16 @@ def _learning_graph(run_dir: Path) -> str:
     function inspect(node){{
       detail.textContent=JSON.stringify({{
         id:node.id,
-        kind:node.kind,
+        kind:kindLabels[node.kind]||node.kind,
         label:node.label,
-        truth_stage:node.truth_stage,
+        truth_stage:truthLabels[node.truth_stage]||node.truth_stage,
         detail:node.detail,
         related:related(node.id),
         traceability:traceability(node.id),
       }},null,2);
       if(node.kind==='CODE'||node.kind==='TEST'){{
         sourceLink.href='/learning/source?run_id='+encodeURIComponent(runId)
-          +'&anchor_id='+encodeURIComponent(node.id);
+          +'&anchor_id='+encodeURIComponent(node.id)+'&lang='+encodeURIComponent(locale);
         sourceLink.classList.remove('hidden');
       }}else{{
         sourceLink.classList.add('hidden');
@@ -4883,7 +4925,7 @@ def _learning_graph(run_dir: Path) -> str:
         kind.setAttribute('text-anchor','middle');
         kind.setAttribute('fill','#bfdbfe');
         kind.setAttribute('font-size','10');
-        kind.textContent=node.kind;
+        kind.textContent=kindLabels[node.kind]||node.kind;
         label.setAttribute('x',node.x);
         label.setAttribute('y',node.y+12);
         label.setAttribute('text-anchor','middle');
@@ -4962,9 +5004,9 @@ def _learning_source_excerpt(
     return title, numbered
 
 
-def _learning_list(value: object) -> str:
+def _learning_list(value: object, locale: UILocale) -> str:
     if not isinstance(value, list):
-        return "<li>Not available.</li>"
+        return f"<li>{_escape(ui_text(locale, '暂无内容。', 'Not available.'))}</li>"
     return "".join(f"<li>{_escape(str(item))}</li>" for item in value)
 
 
@@ -5045,7 +5087,7 @@ def _anchor_pack_text(bullet: str, pack: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-def _anchor_pack_html(pack: dict[str, object]) -> str:
+def _anchor_pack_html(pack: dict[str, object], locale: UILocale) -> str:
     project, keywords, reasoning, code, tests = _anchor_pack_parts(pack)
 
     def rows(items: list[dict[str, object]], kind: str) -> str:
@@ -5065,11 +5107,11 @@ def _anchor_pack_html(pack: dict[str, object]) -> str:
 
     project_text = f"{project['repository']} · {project['branch']} · {project['commit']}"
     return f"""
-<p><strong>Project</strong><br /><code>{_escape(project_text)}</code></p>
-<p><strong>Keywords</strong><br />{_escape(", ".join(keywords))}</p>
-<details open><summary>Reasoning anchors</summary><ul>{rows(reasoning, "reasoning")}</ul></details>
-<details><summary>Code anchors</summary><ul>{rows(code, "code")}</ul></details>
-<details><summary>Test anchors</summary><ul>{rows(tests, "tests")}</ul></details>
+<p><strong>{_escape(ui_text(locale, '项目', 'Project'))}</strong><br /><code>{_escape(project_text)}</code></p>
+<p><strong>{_escape(ui_text(locale, '关键词', 'Keywords'))}</strong><br />{_escape(", ".join(keywords))}</p>
+<details open><summary>{_escape(ui_text(locale, '推理锚点', 'Reasoning anchors'))}</summary><ul>{rows(reasoning, "reasoning")}</ul></details>
+<details><summary>{_escape(ui_text(locale, '代码锚点', 'Code anchors'))}</summary><ul>{rows(code, "code")}</ul></details>
+<details><summary>{_escape(ui_text(locale, '测试锚点', 'Test anchors'))}</summary><ul>{rows(tests, "tests")}</ul></details>
 """
 
 
@@ -5128,22 +5170,26 @@ def _learning_page(
         exercises = learning_plan.get("exercises", {})
         explain = exercises.get("Explain", {}) if isinstance(exercises, dict) else {}
         trace = exercises.get("Trace", {}) if isinstance(exercises, dict) else {}
-        engineering_state = _escape(str(case.get("engineering_state", "UNKNOWN")))
-        mastery_level = _escape(str(mastery.get("level", "UNKNOWN")))
-        mastery_ready = _escape(str(mastery.get("interview_ready", False)))
-        next_action = _escape(str(mastery.get("next_action", "UNKNOWN")))
-        engineering_truth = _escape(str(claim.get("engineering_truth_stage", "UNKNOWN")))
-        interview_ready = _escape(str(claim.get("interview_ready", False)))
-        resume_eligible = _escape(str(claim.get("resume_eligible", False)))
+        engineering_state = _escape(
+            ui_display_value(locale, case.get("engineering_state", "UNKNOWN"))
+        )
+        mastery_level = _escape(ui_display_value(locale, mastery.get("level", "UNKNOWN")))
+        mastery_ready = _escape(ui_bool(locale, mastery.get("interview_ready") is True))
+        next_action = _escape(
+            ui_display_value(locale, mastery.get("next_action", "UNKNOWN"))
+        )
+        engineering_truth = _escape(
+            ui_display_value(locale, claim.get("engineering_truth_stage", "UNKNOWN"))
+        )
+        interview_ready = _escape(ui_bool(locale, claim.get("interview_ready") is True))
+        resume_eligible = _escape(ui_bool(locale, claim.get("resume_eligible") is True))
         explain_saved = (
-            '<p class="saved-response" role="status">Explain response saved privately. '
-            "Review is still required; mastery was not advanced.</p>"
+            f'<p class="saved-response" role="status">{_escape(ui_text(locale, "讲解回答已私有保存。仍需人工复核，掌握等级没有自动提升。", "Explain response saved privately. Review is still required; mastery was not advanced."))}</p>'
             if response_saved_stage == "explain"
             else ""
         )
         trace_saved = (
-            '<p class="saved-response" role="status">Trace response saved privately. '
-            "Review is still required; mastery was not advanced.</p>"
+            f'<p class="saved-response" role="status">{_escape(ui_text(locale, "追踪回答已私有保存。仍需人工复核，掌握等级没有自动提升。", "Trace response saved privately. Review is still required; mastery was not advanced."))}</p>'
             if response_saved_stage == "trace"
             else ""
         )
@@ -5164,21 +5210,20 @@ def _learning_page(
                     "</", "<\\/"
                 )
                 backlink = f"""<section id="interview-defense" class="panel">
-  <h2>Interview Defense anchors</h2>
+  <h2>{_escape(ui_text(locale, '面试答辩锚点', 'Interview Defense anchors'))}</h2>
   <p><strong>{_escape(linked.bullet_id)}</strong> · {_escape(linked.bullet_text)}</p>
-  <p>Exact Learning run: <code>{_escape(run_dir.name)}</code></p>
-  {_anchor_pack_html(pack)}
-  <p class="muted">这些锚点用于定位真实实现，不证明作者身份、掌握程度、语义支持、
-  测试执行或简历资格。</p>
-  <button id="copy-anchor-pack" type="button">复制锚点包</button>
+  <p>{_escape(ui_text(locale, '精确学习记录：', 'Exact Learning run:'))} <code>{_escape(run_dir.name)}</code></p>
+  {_anchor_pack_html(pack, locale)}
+  <p class="muted">{_escape(ui_text(locale, '这些锚点用于定位真实实现，不证明作者身份、掌握程度、语义支持、测试执行或简历资格。', 'These anchors locate real implementation; they do not prove authorship, mastery, semantic support, test execution, or resume eligibility.'))}</p>
+  <button id="copy-anchor-pack" type="button">{_escape(ui_text(locale, '复制锚点包', 'Copy anchor pack'))}</button>
   <span id="copy-anchor-status" class="muted"></span>
   <script>
     document.getElementById('copy-anchor-pack').addEventListener('click',async()=>{{
       try{{
         await navigator.clipboard.writeText({pack_json});
-        document.getElementById('copy-anchor-status').textContent=' 已复制';
+        document.getElementById('copy-anchor-status').textContent={json.dumps(' 已复制' if locale == 'zh-CN' else ' Copied')};
       }}catch(_error){{
-        document.getElementById('copy-anchor-status').textContent=' 复制不可用';
+        document.getElementById('copy-anchor-status').textContent={json.dumps(' 复制不可用' if locale == 'zh-CN' else ' Copy unavailable')};
       }}
     }});
   </script>
@@ -5192,97 +5237,98 @@ def _learning_page(
             ):
                 backlink = (
                     '<section id="interview-defense" class="panel error">'
-                    "<p>Interview Defense mapping is unavailable.</p></section>"
+                    f'<p>{_escape(ui_text(locale, "面试答辩关联暂不可用。", "Interview Defense mapping is unavailable."))}</p></section>'
                 )
         dashboard = f"""
 <section class="status-grid">
   <article class="status-card verified">
-    <span>Engineering</span><strong>{engineering_state}</strong>
-    <small>Real code + committed test definitions</small>
+    <span>{_escape(ui_text(locale, '工程状态', 'Engineering'))}</span><strong>{engineering_state}</strong>
+    <small>{_escape(ui_text(locale, '真实代码 + 已提交的测试定义', 'Real code + committed test definitions'))}</small>
   </article>
   <article class="status-card warning">
-    <span>Human mastery</span><strong>{mastery_level}</strong>
-    <small>Interview ready: {mastery_ready}</small>
+    <span>{_escape(ui_text(locale, '个人掌握', 'Human mastery'))}</span><strong>{mastery_level}</strong>
+    <small>{_escape(ui_text(locale, '面试就绪：', 'Interview ready:'))} {mastery_ready}</small>
   </article>
   <article class="status-card action">
-    <span>Exact next action</span><strong>{next_action}</strong>
-    <small>No automatic promotion</small>
+    <span>{_escape(ui_text(locale, '明确下一步', 'Exact next action'))}</span><strong>{next_action}</strong>
+    <small>{_escape(ui_text(locale, '不会自动升级', 'No automatic promotion'))}</small>
   </article>
 </section>
 <section class="panel hero-copy">
-  <p class="eyebrow">30-second explanation</p>
-  <h2>Conversation RAG · Chunking + Retrieval</h2>
-  <p>{_escape(str(learning_plan.get("plain_language_30_seconds", "Not available.")))}</p>
+  <p class="eyebrow">{_escape(ui_text(locale, '30 秒讲解', '30-second explanation'))}</p>
+  <h2>{_escape(ui_text(locale, '对话式 RAG · 分块与检索', 'Conversation RAG · Chunking + Retrieval'))}</h2>
+  <p>{_escape(str(learning_plan.get("plain_language_30_seconds", ui_text(locale, "暂无内容。", "Not available."))))}</p>
   <div class="button-row">
-    <a class="button-link" href="#exercise-explain">Start Explain</a>
-    <a class="button-link secondary" href="#exercise-trace">Start Trace</a>
+    <a class="button-link" href="#exercise-explain">{_escape(ui_text(locale, '开始讲解', 'Start Explain'))}</a>
+    <a class="button-link secondary" href="#exercise-trace">{_escape(ui_text(locale, '开始追踪', 'Start Trace'))}</a>
   </div>
 </section>
-{_learning_graph(run_dir)}
+{_learning_graph(run_dir, locale)}
 {backlink}
 <section class="panel">
-  <h2>Target JD relevance</h2>
-  <p>{_escape(str(claim.get("target_requirement", "Not available.")))}</p>
+  <h2>{_escape(ui_text(locale, '目标 JD 相关性', 'Target JD relevance'))}</h2>
+  <p>{_escape(str(claim.get("target_requirement", ui_text(locale, "暂无内容。", "Not available."))))}</p>
   <div class="truth-grid">
-    <div><span>Engineering truth</span><strong>{engineering_truth}</strong></div>
-    <div><span>Interview ready</span><strong>{interview_ready}</strong></div>
-    <div><span>Resume eligible</span><strong>{resume_eligible}</strong></div>
+    <div><span>{_escape(ui_text(locale, '工程事实', 'Engineering truth'))}</span><strong>{engineering_truth}</strong></div>
+    <div><span>{_escape(ui_text(locale, '面试就绪', 'Interview ready'))}</span><strong>{interview_ready}</strong></div>
+    <div><span>{_escape(ui_text(locale, '简历可用', 'Resume eligible'))}</span><strong>{resume_eligible}</strong></div>
   </div>
-  <p class="warning-text">{_escape(str(claim.get("rationale", "Not available.")))}</p>
+  <p class="warning-text">{_escape(str(claim.get("rationale", ui_text(locale, "暂无内容。", "Not available."))))}</p>
 </section>
 <details class="panel" open>
-  <summary>Architecture · 5 minutes</summary>
-  <ol>{_learning_list(architecture)}</ol>
+  <summary>{_escape(ui_text(locale, '架构讲解 · 5 分钟', 'Architecture · 5 minutes'))}</summary>
+  <ol>{_learning_list(architecture, locale)}</ol>
 </details>
 <details class="panel">
-  <summary>Code, evidence, and 15-minute deep dive</summary>
+  <summary>{_escape(ui_text(locale, '代码、证据与 15 分钟深挖', 'Code, evidence, and 15-minute deep dive'))}</summary>
   <pre>{_escape(json.dumps(deep_dive, ensure_ascii=False, indent=2))}</pre>
-  <h3>Decisions and trade-offs</h3><ul>{_learning_list(decisions)}</ul>
-  <h3>Known failures and unknowns</h3><ul>{_learning_list(unknowns)}</ul>
+  <h3>{_escape(ui_text(locale, '决策与权衡', 'Decisions and trade-offs'))}</h3><ul>{_learning_list(decisions, locale)}</ul>
+  <h3>{_escape(ui_text(locale, '已知失败与未知项', 'Known failures and unknowns'))}</h3><ul>{_learning_list(unknowns, locale)}</ul>
 </details>
 <section id="exercise-explain" class="panel exercise">
-  <p class="eyebrow">L1 · Explain exercise</p>
-  <h2>Start without an answer key</h2>
-  <p>{_escape(str(explain.get("prompt", "Not available.")))}</p>
-  <p class="muted">Completion requires a user-authored receipt;
-    opening this card does not pass L1.</p>
+  <p class="eyebrow">{_escape(ui_text(locale, 'L1 · 讲解练习', 'L1 · Explain exercise'))}</p>
+  <h2>{_escape(ui_text(locale, '先独立回答，不看标准答案', 'Start without an answer key'))}</h2>
+  <p>{_escape(str(explain.get("prompt", ui_text(locale, "暂无内容。", "Not available."))))}</p>
+  <p class="muted">{_escape(ui_text(locale, '完成需要你自己写下回答回执；仅打开此卡片不代表通过 L1。', 'Completion requires a user-authored receipt; opening this card does not pass L1.'))}</p>
   <form class="response-form" method="post"
     action="/learning/respond#exercise-explain">
+    <input type="hidden" name="ui_locale" value="{locale}" />
     <input type="hidden" name="run_id" value="{_escape(run_dir.name)}" />
     <input type="hidden" name="stage" value="Explain" />
     <input type="hidden" name="target_requirement" value="{target_requirement}" />
-    <label for="learning-explain-response">Your Explain response</label>
+    <label for="learning-explain-response">{_escape(ui_text(locale, '你的讲解回答', 'Your Explain response'))}</label>
     <textarea id="learning-explain-response" name="response" rows="8" maxlength="20000"
       required
-      placeholder="Explain it. Include one trade-off and one truth boundary."></textarea>
-    <button type="submit">Save private Explain response</button>
+      placeholder="{_escape(ui_text(locale, '请讲清楚它，并包含一个权衡和一个事实边界。', 'Explain it. Include one trade-off and one truth boundary.'))}"></textarea>
+    <button type="submit">{_escape(ui_text(locale, '私有保存讲解回答', 'Save private Explain response'))}</button>
   </form>
   {explain_saved}
-  <p class="muted">Saved locally as pending review. Submission never advances mastery.</p>
+  <p class="muted">{_escape(ui_text(locale, '回答会在本地保存为待复核；提交不会自动提升掌握等级。', 'Saved locally as pending review. Submission never advances mastery.'))}</p>
 </section>
 <section id="exercise-trace" class="panel exercise">
-  <p class="eyebrow">L2 · Trace exercise</p>
-  <h2>Follow the real symbols</h2>
-  <p>{_escape(str(trace.get("prompt", "Not available.")))}</p>
-  <p class="muted">Use the graph's Code and Test nodes to open bounded local excerpts.</p>
+  <p class="eyebrow">{_escape(ui_text(locale, 'L2 · 追踪练习', 'L2 · Trace exercise'))}</p>
+  <h2>{_escape(ui_text(locale, '沿着真实符号追踪', 'Follow the real symbols'))}</h2>
+  <p>{_escape(str(trace.get("prompt", ui_text(locale, "暂无内容。", "Not available."))))}</p>
+  <p class="muted">{_escape(ui_text(locale, '使用图中的代码和测试节点打开有限的本地摘录。', "Use the graph's Code and Test nodes to open bounded local excerpts."))}</p>
   <form class="response-form" method="post"
     action="/learning/respond#exercise-trace">
+    <input type="hidden" name="ui_locale" value="{locale}" />
     <input type="hidden" name="run_id" value="{_escape(run_dir.name)}" />
     <input type="hidden" name="stage" value="Trace" />
     <input type="hidden" name="target_requirement" value="{target_requirement}" />
-    <label for="learning-trace-response">Your Trace response</label>
+    <label for="learning-trace-response">{_escape(ui_text(locale, '你的追踪回答', 'Your Trace response'))}</label>
     <textarea id="learning-trace-response" name="response" rows="8" maxlength="20000"
       required
-      placeholder="Trace the recorded symbols and tests. Name any remaining unknowns."></textarea>
-    <button type="submit">Save private Trace response</button>
+      placeholder="{_escape(ui_text(locale, '追踪已记录的符号与测试，并指出仍然未知的部分。', 'Trace the recorded symbols and tests. Name any remaining unknowns.'))}"></textarea>
+    <button type="submit">{_escape(ui_text(locale, '私有保存追踪回答', 'Save private Trace response'))}</button>
   </form>
   {trace_saved}
-  <p class="muted">Saved locally as pending review. Submission never advances mastery.</p>
+  <p class="muted">{_escape(ui_text(locale, '回答会在本地保存为待复核；提交不会自动提升掌握等级。', 'Saved locally as pending review. Submission never advances mastery.'))}</p>
 </section>
 <section class="panel footnote">
-  <strong>Private run</strong> <code>{_escape(str(run_dir))}</code><br />
-  <span>Branch {_escape(str(run.get("branch", "")))} ·
-    commit {_escape(str(run.get("commit", "")))}</span>
+  <strong>{_escape(ui_text(locale, '私有记录', 'Private run'))}</strong> <code>{_escape(str(run_dir))}</code><br />
+  <span>{_escape(ui_text(locale, '分支', 'Branch'))} {_escape(str(run.get("branch", "")))} ·
+    {_escape(ui_text(locale, '提交', 'commit'))} {_escape(str(run.get("commit", "")))}</span>
 </section>
 """
     else:
@@ -5329,10 +5375,17 @@ def _learning_page(
     {result_html}
     {dashboard}
     """
+    learning_current_url = ui_url(
+        "/learning",
+        locale,
+        run_id=run_dir.name if run_dir is not None else "",
+        resume_run_id=form.get("resume_run_id", ""),
+        bullet_id=form.get("bullet_id", ""),
+    )
     return render_app_shell(
         active="learning",
         locale=locale,
-        current_url="/learning",
+        current_url=learning_current_url,
         title=f"SoloScale · {ui_text(locale, '学习工作台', 'Learning Workspace')}",
         eyebrow=ui_text(locale, "学习工作台", "Learning workspace"),
         heading=ui_text(locale, "看清自己会什么，也知道下一步练什么。", "See what you can explain—and what to practice next."),
@@ -5357,7 +5410,7 @@ def _control_tower_section(
     if not exists:
         return f'<p class="tool-state">{_escape(ui_text(locale, "还没有工程概览。生成后可以在这里查看。", "No engineering overview yet. Generate one to view it here."))}</p>'
     return (
-        '<p class="tool-state"><a href="/control-tower">'
+        f'<p class="tool-state"><a href="{ui_url("/control-tower", locale)}">'
         + _escape(ui_text(locale, "打开工程概览", "Open engineering overview"))
         + "</a></p>"
     )
@@ -6026,6 +6079,7 @@ def _serve_learning_source(
     handler: BaseHTTPRequestHandler,
     data_root: Path,
     repo_root: Path,
+    locale: UILocale,
 ) -> None:
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(handler.path).query)
     run_id = query.get("run_id", [""])[0]
@@ -6040,14 +6094,14 @@ def _serve_learning_source(
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         handler.send_error(404, str(exc))
         return
-    document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8" />
+    document = f"""<!doctype html><html lang="{locale}"><head><meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>{_escape(title)}</title><style>
 body{{margin:0;padding:24px;background:#07111f;color:#e5edf7;font-family:ui-monospace,monospace}}
 a{{color:#93c5fd}} pre{{white-space:pre;overflow:auto;background:#111827;border:1px solid #334155;
 border-radius:12px;padding:18px;line-height:1.55}}</style></head><body>
-<p><a href="/learning">← Learning Control Tower</a></p><h1>{_escape(title)}</h1>
-<p>Read-only bounded excerpt from a recorded anchor.</p>
+<p><a href="{ui_url('/learning', locale)}">← {_escape(ui_text(locale, '学习工作台', 'Learning Workspace'))}</a></p><h1>{_escape(title)}</h1>
+<p>{_escape(ui_text(locale, '来自已记录锚点的只读有限摘录。', 'Read-only bounded excerpt from a recorded anchor.'))}</p>
 <pre>{_escape(excerpt)}</pre></body></html>"""
     body = document.encode("utf-8")
     handler.send_response(200)
@@ -7183,7 +7237,12 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
         if path == "/learning/source":
-            _serve_learning_source(self, self.ui_data_root.absolute(), self.repo_root)
+            _serve_learning_source(
+                self,
+                self.ui_data_root.absolute(),
+                self.repo_root,
+                self.ui_locale,
+            )
             return
         if path == "/control-tower":
             _serve_control_tower(self, self.ui_data_root.absolute())

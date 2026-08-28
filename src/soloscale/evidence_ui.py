@@ -11,7 +11,13 @@ from pathlib import Path
 from soloscale.evidence_hub import EvidenceHub, EvidenceHubError, inspect_git_repository
 from soloscale.evidence_hub_models import EvidenceHubStatus, ReceiptStatus, SyncReceipt
 from soloscale.knowledge_store import KnowledgeStore
-from soloscale.ui_shell import DEFAULT_UI_LOCALE, UILocale, render_app_shell, ui_text
+from soloscale.ui_shell import (
+    DEFAULT_UI_LOCALE,
+    UILocale,
+    render_app_shell,
+    ui_display_value,
+    ui_text,
+)
 
 
 def refresh_evidence_catalog(
@@ -153,38 +159,42 @@ def _status_html(
             f'{html.escape(ui_text(locale, "刷新证据目录。", "Refresh evidence catalog."))}</p></section>'
         )
     counts = [
-        ("Sources", status.source_count),
-        ("Evidence", status.evidence_count),
-        ("Bundles", status.bundle_count),
-        ("Cases", status.case_count),
-        ("Assets", status.asset_count),
-        ("Outcomes", status.outcome_count),
+        (ui_text(locale, "来源", "Sources"), status.source_count),
+        (ui_text(locale, "证据", "Evidence"), status.evidence_count),
+        (ui_text(locale, "证据包", "Bundles"), status.bundle_count),
+        (ui_text(locale, "案例", "Cases"), status.case_count),
+        (ui_text(locale, "资产", "Assets"), status.asset_count),
+        (ui_text(locale, "结果", "Outcomes"), status.outcome_count),
     ]
     truth_counts = "".join(
-        f"<li>{html.escape(key)}: {value}</li>"
+        f"<li>{html.escape(ui_display_value(locale, key))}: {value}</li>"
         for key, value in sorted(status.truth_class_counts.items())
-    ) or "<li>None</li>"
+    ) or f"<li>{html.escape(ui_text(locale, '无', 'None'))}</li>"
     source_counts = "".join(
-        f"<li>{html.escape(key)}: {value}</li>"
+        f"<li>{html.escape(ui_display_value(locale, key))}: {value}</li>"
         for key, value in sorted(status.source_counts.items())
-    ) or "<li>None</li>"
-    last_refresh = status.last_receipt.completed_at.isoformat() if status.last_receipt else "Never"
+    ) or f"<li>{html.escape(ui_text(locale, '无', 'None'))}</li>"
+    last_refresh = (
+        status.last_receipt.completed_at.isoformat()
+        if status.last_receipt
+        else ui_text(locale, "从未", "Never")
+    )
     next_action = (
-        "Review the failed refresh, then refresh evidence catalog."
+        ui_text(locale, "查看刷新失败原因，再次刷新证据目录。", "Review the failed refresh, then refresh evidence catalog.")
         if status.last_receipt and status.last_receipt.status.value == "failed"
-        else "Refresh evidence catalog after adding sources."
+        else ui_text(locale, "添加来源后刷新证据目录。", "Refresh evidence catalog after adding sources.")
         if status.source_count == 0
-        else "Review evidence metadata before creating a bundle."
+        else ui_text(locale, "创建证据包前先检查证据元数据。", "Review evidence metadata before creating a bundle.")
     )
     metrics = "".join(
         f"<div class=\"metric\"><small>{label}</small><br><strong>{value}</strong></div>"
         for label, value in counts
     )
-    return f"""<section class=\"panel\"><h2>Catalog status</h2>
-<p>Last refresh: {html.escape(last_refresh)}</p><div class=\"grid\">{metrics}</div>
-<h3>Source types</h3><ul>{source_counts}</ul>
-<h3>Truth classes</h3><ul>{truth_counts}</ul>
-<p><strong>Next action:</strong> {html.escape(next_action)}</p></section>"""
+    return f"""<section class=\"panel\"><h2>{html.escape(ui_text(locale, '目录状态', 'Catalog status'))}</h2>
+<p>{html.escape(ui_text(locale, '上次刷新：', 'Last refresh:'))} {html.escape(last_refresh)}</p><div class=\"grid\">{metrics}</div>
+<h3>{html.escape(ui_text(locale, '来源类型', 'Source types'))}</h3><ul>{source_counts}</ul>
+<h3>{html.escape(ui_text(locale, '事实分类', 'Truth classes'))}</h3><ul>{truth_counts}</ul>
+<p><strong>{html.escape(ui_text(locale, '下一步：', 'Next action:'))}</strong> {html.escape(next_action)}</p></section>"""
 
 
 def _list_html(

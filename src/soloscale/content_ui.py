@@ -78,6 +78,8 @@ from soloscale.ui_shell import (
     UILocale,
     render_app_shell,
     render_creator_nav,
+    ui_bool,
+    ui_display_value,
     ui_text,
     ui_url,
 )
@@ -500,6 +502,7 @@ def _media_quality_section(
         for name, label in labels
     )
     status = receipt.decision.value if receipt is not None else "PENDING"
+    status_label = _escape(ui_display_value(locale, status))
     revision = f" · r{receipt.revision}" if receipt is not None else ""
     notice = (
         f'<p class="error" role="alert">{_escape(error)}</p>'
@@ -516,8 +519,8 @@ def _media_quality_section(
           <label>{_escape(ui_text(locale, '需要修正的具体问题（可选）', 'Concrete issues to fix (optional)'))}<textarea name="notes" maxlength="2000">{_escape(notes)}</textarea></label>
           <button class="secondary" type="submit">{_escape(ui_text(locale, '保存媒体质量检查', 'Save media-quality review'))}</button>
         </form>'''
-    return f'''<section class="media-quality-review"><div class="result-head"><div><span class="kicker">Human Media Quality</span>
-      <h2>{_escape(ui_text(locale, '这条成片值得发布吗？', 'Is this finished video worth publishing?'))}</h2></div><span class="review-status">{status}{revision}</span></div>
+    return f'''<section class="media-quality-review"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, '人工媒体质量', 'Human Media Quality'))}</span>
+      <h2>{_escape(ui_text(locale, '这条成片值得发布吗？', 'Is this finished video worth publishing?'))}</h2></div><span class="review-status">{status_label}{revision}</span></div>
       <p>{_escape(ui_text(locale, '全部八项通过后才会解锁统一发布包；这里不会执行发布。', 'All eight checks must pass before the distribution package unlocks. Nothing is published here.'))}</p>{notice}{form}</section>'''
 
 
@@ -747,7 +750,7 @@ def _result_html(
         for item in run.editorial_provenance
     )
     if not editorial_trace:
-        editorial_trace = "<li>Historical run · model provenance UNKNOWN</li>"
+        editorial_trace = f"<li>{_escape(ui_text(locale, '历史记录 · 模型溯源未知', 'Historical run · model provenance unknown'))}</li>"
     writer = run.editorial_provenance[0] if run.editorial_provenance else None
     engine_labels = {
         "soloscale_hosted": ui_text(locale, "SoloScale 托管 AI", "SoloScale Hosted AI"),
@@ -770,14 +773,14 @@ def _result_html(
             locale, "未提供视觉备注", "No visual notes supplied"
         )
         reference_card = f'''<section class="reference-card"><div class="result-head"><div>
-        <span class="kicker">Reference Intelligence</span>
+        <span class="kicker">{_escape(ui_text(locale, '参考内容洞察', 'Reference Intelligence'))}</span>
         <h3>{_escape(asset.title or ui_text(locale, '已蒸馏的参考表达模式', 'Distilled reference pattern'))}</h3>
         <p>{_escape(ui_text(locale, '只使用高层结构、节奏和呈现方式；事实仍只来自你的 Claim Ledger。', 'Only high-level structure, pacing, and presentation are used. Facts still come only from your claim ledger.'))}</p></div>
         <span class="reference-badge">{_escape(ui_text(locale, '原文私有', 'Raw text private'))}</span></div>
-        <div class="reference-pattern-grid"><div><strong>Hook</strong><p>{_escape(pattern.structure.hook)}</p></div>
+        <div class="reference-pattern-grid"><div><strong>{_escape(ui_text(locale, '开场钩子', 'Hook'))}</strong><p>{_escape(pattern.structure.hook)}</p></div>
         <div><strong>{_escape(ui_text(locale, '节奏 / 语气', 'Pacing / tone'))}</strong><p>{_escape(pattern.video.shot_cadence)} · {_escape(pattern.language.tone)}</p></div>
         <div><strong>{_escape(ui_text(locale, '视觉模式', 'Visual pattern'))}</strong><p>{_escape(visuals)}</p></div>
-        <div><strong>CTA</strong><p>{_escape(pattern.structure.cta)}</p></div></div>
+        <div><strong>{_escape(ui_text(locale, '行动引导', 'CTA'))}</strong><p>{_escape(pattern.structure.cta)}</p></div></div>
         <details><summary>{_escape(ui_text(locale, '查看叙事结构', 'View narrative progression'))}</summary><ol>{progression}</ol></details>
         <p class="reference-boundary">{_escape(ui_text(locale, '不会复用参考内容的事实、例子或独特措辞。', 'Reference facts, examples, and distinctive wording are not reused.'))}</p></section>'''
     review_fields = (
@@ -797,12 +800,12 @@ def _result_html(
     )
     buildlog_section = (
         f'''<section class="buildlog-handoff">
-        <span class="kicker">BuildLog publishing</span>
+        <span class="kicker">{_escape(ui_text(locale, 'BuildLog 发布', 'BuildLog publishing'))}</span>
         <h3>{_escape(ui_text(locale, '已批准内容包，可以进入精确发布预览', 'Approved bundle ready for exact publishing preview'))}</h3>
         <p>{_escape(ui_text(locale, 'BuildLog 会显示精确文本、检查重复内容，并仍然要求你输入 PUBLISH。', 'BuildLog shows the exact text, checks duplicates, and still requires you to type PUBLISH.'))}</p>
         {buildlog}</section>'''
         if decision is ContentReviewDecision.APPROVED
-        else f'''<section class="buildlog-handoff locked"><span class="kicker">BuildLog publishing</span>
+        else f'''<section class="buildlog-handoff locked"><span class="kicker">{_escape(ui_text(locale, 'BuildLog 发布', 'BuildLog publishing'))}</span>
         <h3>{_escape(ui_text(locale, '先批准这个统一内容包', 'Approve this unified bundle first'))}</h3>
         <p>{_escape(ui_text(locale, '批准只会解锁 BuildLog 预览，不会自动发布。', 'Approval only unlocks BuildLog preview; it does not publish.'))}</p></section>'''
     )
@@ -846,20 +849,20 @@ def _result_html(
       <div class="tabs" role="tablist">
         <button type="button" class="tab active" data-tab="canonical">{_escape(ui_text(locale, '主故事', 'Story'))}</button>
         <button type="button" class="tab" data-tab="linkedin">LinkedIn</button>
-        <button type="button" class="tab" data-tab="x-thread">X Thread</button>
-        <button type="button" class="tab" data-tab="x-post">X Post</button>
+        <button type="button" class="tab" data-tab="x-thread">{_escape(ui_text(locale, 'X 帖子串', 'X Thread'))}</button>
+        <button type="button" class="tab" data-tab="x-post">{_escape(ui_text(locale, 'X 单帖', 'X Post'))}</button>
         <button type="button" class="tab" data-tab="blog">{_escape(ui_text(locale, '博客', 'Blog'))}</button>
         <button type="button" class="tab" data-tab="youtube">YouTube</button>
         <button type="button" class="tab" data-tab="video">{_escape(ui_text(locale, '短视频脚本', 'Short-video script'))}</button>
       </div>
       <div class="tab-panel active" data-panel="canonical"><pre>{_escape(review_values['canonical_story'])}</pre></div>
       <div class="tab-panel" data-panel="linkedin">
-        <div class="panel-title"><h3>LinkedIn Draft</h3>
+        <div class="panel-title"><h3>{_escape(ui_text(locale, 'LinkedIn 草稿', 'LinkedIn Draft'))}</h3>
           <button type="button" class="copy" data-copy="linkedin-copy">{_escape(ui_text(locale, '复制', 'Copy'))}</button></div>
         <pre id="linkedin-copy">{_escape(review_values['linkedin'])}</pre>
       </div>
       <div class="tab-panel" data-panel="x-thread">
-        <div class="panel-title"><h3>X Thread</h3>
+        <div class="panel-title"><h3>{_escape(ui_text(locale, 'X 帖子串', 'X Thread'))}</h3>
           <button type="button" class="copy" data-copy="x-copy">{_escape(ui_text(locale, '复制全部', 'Copy all'))}</button></div>
         <pre id="x-copy">{_escape(review_values['x_thread'])}</pre>
       </div>
@@ -884,7 +887,7 @@ def _result_html(
       </div>
       <section class="unified-review"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, '统一审核', 'Unified review'))}</span>
         <h2>{_escape(ui_text(locale, '编辑一次，再决定整个内容包', 'Edit once, then decide the whole bundle'))}</h2></div>
-        <span class="review-status">{_escape(decision.value)} · r{revision}</span></div>
+        <span class="review-status">{_escape(ui_display_value(locale, decision.value))} · r{revision}</span></div>
         <form method="post" action="/content/review/{run_id}"><input type="hidden" name="ui_locale" value="{locale}" />
           {review_editors}
           <div class="review-actions"><button class="secondary" type="submit" name="review_action" value="save">{_escape(ui_text(locale, '保存修改', 'Save edits'))}</button>
@@ -893,9 +896,9 @@ def _result_html(
         </form></section>
       {media_quality_section}
       <p class="review-note">{_escape(ui_text(locale, 'SoloScale 没有连接或操作你的社交账号，也没有自动发布。', 'SoloScale did not connect to or operate your social accounts, and nothing was published automatically.'))}</p>
-      <details class="editorial-trace"><summary>Editorial provenance</summary>
+      <details class="editorial-trace"><summary>{_escape(ui_text(locale, '编辑流程溯源', 'Editorial provenance'))}</summary>
         <ol>{editorial_trace}</ol>
-        <p>Workflow: Writer → Fresh Reviewer → Reviser → Human publication gate.</p>
+        <p>{_escape(ui_text(locale, '流程：撰写 → 独立复核 → 修订 → 人工发布确认。', 'Workflow: Writer → Fresh Reviewer → Reviser → Human publication gate.'))}</p>
         <a class="text-link" href="/content/downloads/{run_id}/editorial-provenance.json"
           download>{_escape(ui_text(locale, '下载溯源记录', 'Download provenance record'))}</a>
       </details>
@@ -1024,7 +1027,7 @@ def _youtube_publishing_html(
             "UPLOADING": ui_text(locale, "正在上传", "Uploading"),
             "SUCCESS": ui_text(locale, "YouTube 上传成功", "YouTube upload succeeded"),
             "FAILED": job.error_message or ui_text(locale, "YouTube 操作失败", "YouTube operation failed"),
-        }.get(job.phase, job.phase)
+        }.get(job.phase, ui_display_value(locale, job.phase))
         progress = f" · {job.progress_percent}%" if job.progress_percent is not None else ""
         link = (
             f' · <a href="{_escape(job.video_url or "")}" target="_blank" rel="noopener noreferrer">{_escape(job.video_id or "YouTube")}</a>'
@@ -1061,7 +1064,7 @@ def _youtube_publishing_html(
                 )
         title = _escape(str(defaults.get("title", "")))
         description = _escape(str(defaults.get("description", "")))
-        cards.append(f'''<article class="youtube-upload-card"><strong>{_escape(run_id)}</strong>{"".join(receipts)}<form method="post" action="/publishing/youtube/upload"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="run_id" value="{_escape(run_id)}" /><label>{_escape(ui_text(locale, '目标频道', 'Target channel'))}<select name="channel_id">{account_options}</select></label><label>{_escape(ui_text(locale, '可见性', 'Privacy'))}<select name="privacy_status"><option value="private">Private</option><option value="unlisted">Unlisted</option><option value="public">Public</option></select></label><label class="wide">{_escape(ui_text(locale, '标题', 'Title'))}<input name="title" maxlength="100" value="{title}" required /></label><label class="wide">{_escape(ui_text(locale, '描述', 'Description'))}<textarea name="description" maxlength="5000">{description}</textarea></label><label class="wide">{_escape(ui_text(locale, '标签（逗号分隔）', 'Tags (comma-separated)'))}<input name="tags" maxlength="2000" /></label><label class="wide">{_escape(ui_text(locale, '输入 UPLOAD 才会真正上传', 'Type UPLOAD to perform the real upload'))}<input name="confirmation" autocomplete="off" required /></label><button type="submit">{_escape(ui_text(locale, '上传到所选频道', 'Upload to selected channel'))}</button></form></article>''')
+        cards.append(f'''<article class="youtube-upload-card"><strong>{_escape(run_id)}</strong>{"".join(receipts)}<form method="post" action="/publishing/youtube/upload"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="run_id" value="{_escape(run_id)}" /><label>{_escape(ui_text(locale, '目标频道', 'Target channel'))}<select name="channel_id">{account_options}</select></label><label>{_escape(ui_text(locale, '可见性', 'Privacy'))}<select name="privacy_status"><option value="private">{_escape(ui_text(locale, '私密', 'Private'))}</option><option value="unlisted">{_escape(ui_text(locale, '不公开列出', 'Unlisted'))}</option><option value="public">{_escape(ui_text(locale, '公开', 'Public'))}</option></select></label><label class="wide">{_escape(ui_text(locale, '标题', 'Title'))}<input name="title" maxlength="100" value="{title}" required /></label><label class="wide">{_escape(ui_text(locale, '描述', 'Description'))}<textarea name="description" maxlength="5000">{description}</textarea></label><label class="wide">{_escape(ui_text(locale, '标签（逗号分隔）', 'Tags (comma-separated)'))}<input name="tags" maxlength="2000" /></label><label class="wide">{_escape(ui_text(locale, '输入 UPLOAD 才会真正上传', 'Type UPLOAD to perform the real upload'))}<input name="confirmation" autocomplete="off" required /></label><button type="submit">{_escape(ui_text(locale, '上传到所选频道', 'Upload to selected channel'))}</button></form></article>''')
     empty = f'<p>{_escape(ui_text(locale, "还没有可上传的 Distribution Package。", "No Distribution Package is ready for upload."))}</p>'
     return f'''<section class="panel youtube-publish"><div class="youtube-publish-head"><div><span class="status-badge">YouTube</span><h2>{_escape(ui_text(locale, '选择频道并上传', 'Select a channel and upload'))}</h2><p>{_escape(ui_text(locale, '上传在独立后台任务中执行；不会自动重试。', 'Upload runs in a bounded background job with no automatic retry.'))}</p></div><a class="secondary-button" href="{ui_url('/creator/accounts', locale)}">{_escape(ui_text(locale, '管理频道', 'Manage channels'))}</a></div>{job_html}<div class="youtube-upload-list">{"".join(cards) or empty}</div></section>{refresh_script}'''
 
@@ -1092,12 +1095,22 @@ def _editorial_channel_html(
         receipt = None
     parts = preview.get("parts", [])
     exact_parts = "".join(
-        f"<article><h3>Part {index}</h3><pre>{_escape(str(part))}</pre></article>"
+        f"<article><h3>{_escape(ui_text(locale, '第', 'Part'))} {index}{_escape(ui_text(locale, ' 段', ''))}</h3><pre>{_escape(str(part))}</pre></article>"
         for index, part in enumerate(parts if isinstance(parts, list) else [], start=1)
     )
     image = cast(dict[str, object], preview.get("image")) if isinstance(preview.get("image"), dict) else {}
-    duplicate = _escape(str(preview.get("duplicate", "unknown")))
-    indeterminate = _escape(str(preview.get("indeterminate", "unknown")))
+    duplicate_value = preview.get("duplicate")
+    duplicate = _escape(
+        ui_bool(locale, duplicate_value)
+        if isinstance(duplicate_value, bool)
+        else ui_display_value(locale, duplicate_value or "UNKNOWN")
+    )
+    indeterminate_value = preview.get("indeterminate")
+    indeterminate = _escape(
+        ui_bool(locale, indeterminate_value)
+        if isinstance(indeterminate_value, bool)
+        else ui_display_value(locale, indeterminate_value or "UNKNOWN")
+    )
     image_path = _escape(str(preview.get("source_image_path", "BuildLog-staged image")))
     image_hash = _escape(str(image.get("sha256", "")))
     image_size = _escape(f"{image.get('width', '?')}×{image.get('height', '?')}")
@@ -1106,20 +1119,20 @@ def _editorial_channel_html(
     plan_hash = _escape(str(preview.get("plan_hash", "")))
     blocked = preview.get("duplicate") is True or preview.get("indeterminate") is True
     receipt_html = (
-        f"<p><strong>BuildLog result:</strong> {_escape(str(receipt.get('status', 'unknown')))} · "
-        f"plan {_escape(str(receipt.get('plan_id', '')))}</p>"
+        f"<p><strong>{_escape(ui_text(locale, 'BuildLog 结果：', 'BuildLog result:'))}</strong> {_escape(ui_display_value(locale, receipt.get('status', 'UNKNOWN')))} · "
+        f"{_escape(ui_text(locale, '计划', 'plan'))} {_escape(str(receipt.get('plan_id', '')))}</p>"
         if receipt is not None
         else (
-            "<p class=\"error\">Publication is blocked by a duplicate or unresolved prior attempt.</p>"
+            f'<p class="error">{_escape(ui_text(locale, "检测到重复内容或尚未解决的先前尝试，发布已阻止。", "Publication is blocked by a duplicate or unresolved prior attempt."))}</p>'
             if blocked
-            else f'''<form method="post" action="/publishing/editorial/{channel}/publish">
-<label>Type PUBLISH to approve this exact {label} plan<input name="confirmation" autocomplete="off" required></label>
+            else f'''<form method="post" action="/publishing/editorial/{channel}/publish"><input type="hidden" name="ui_locale" value="{locale}" />
+<label>{_escape(ui_text(locale, f'输入 PUBLISH 批准这份精确的 {label} 计划', f'Type PUBLISH to approve this exact {label} plan'))}<input name="confirmation" autocomplete="off" required></label>
 <button type="submit">PUBLISH {label}</button></form>'''
         )
     )
-    return f"""<section class="channel"><h2>{label} plan preview</h2>
-<p class="meta">Account: {_escape(str(preview.get("account_reference", "")))} · Display name: {account}<br>Aggregate plan hash: <code>{plan_hash}</code><br>Duplicate: {duplicate} · Indeterminate: {indeterminate}</p>
-{exact_parts}<h3>Image</h3><img src="/publishing/editorial/{channel}/image" alt="{alt}" style="display:block;max-width:100%;height:auto;border-radius:12px;border:1px solid #334155"><p class="meta">Path: {image_path}<br>SHA-256: <code>{image_hash}</code> · Dimensions: {image_size}<br>Alt text: {alt}</p>{receipt_html}</section>"""
+    return f"""<section class="channel"><h2>{label} {_escape(ui_text(locale, '计划预览', 'plan preview'))}</h2>
+<p class="meta">{_escape(ui_text(locale, '账号：', 'Account:'))} {_escape(str(preview.get("account_reference", "")))} · {_escape(ui_text(locale, '显示名称：', 'Display name:'))} {account}<br>{_escape(ui_text(locale, '聚合计划哈希：', 'Aggregate plan hash:'))} <code>{plan_hash}</code><br>{_escape(ui_text(locale, '重复：', 'Duplicate:'))} {duplicate} · {_escape(ui_text(locale, '状态不确定：', 'Indeterminate:'))} {indeterminate}</p>
+{exact_parts}<h3>{_escape(ui_text(locale, '图片', 'Image'))}</h3><img src="/publishing/editorial/{channel}/image" alt="{alt}" style="display:block;max-width:100%;height:auto;border-radius:12px;border:1px solid #334155"><p class="meta">{_escape(ui_text(locale, '路径：', 'Path:'))} {image_path}<br>SHA-256: <code>{image_hash}</code> · {_escape(ui_text(locale, '尺寸：', 'Dimensions:'))} {image_size}<br>{_escape(ui_text(locale, '替代文本：', 'Alt text:'))} {alt}</p>{receipt_html}</section>"""
 
 
 def _scan_html(
@@ -1244,14 +1257,14 @@ def _month_one_canon_html(
                 "thesis": story.one_sentence_thesis,
             }
         week_sections.append(
-            f'''<section class="canon-week" id="canon-week-{week}"><div class="canon-week-title"><span>WEEK {week}</span><h3>{_escape(week_labels[week])}</h3></div><div class="canon-stories">{''.join(cards)}</div></section>'''
+            f'''<section class="canon-week" id="canon-week-{week}"><div class="canon-week-title"><span>{_escape(ui_text(locale, f'第 {week} 周', f'WEEK {week}'))}</span><h3>{_escape(week_labels[week])}</h3></div><div class="canon-stories">{''.join(cards)}</div></section>'''
         )
     options = "".join(
         f'<option value="{status.value}">{_escape(status_labels[status])}</option>'
         for status in StoryReadiness
     )
     payload_json = json.dumps(story_payload, ensure_ascii=False).replace("</", "<\\/")
-    html_section = f'''<section class="month-one-canon" aria-labelledby="month-one-title"><div class="result-head"><div><span class="kicker">Month 1 · Engineering Story Library</span><h2 id="month-one-title">{_escape(ui_text(locale, '第一个月：从自动化幻想到可用结果', 'Month 1: From automation ambition to useful outcomes'))}</h2><p>{_escape(ui_text(locale, '24 个真实工程故事，按四周组织。先选故事，再补证、做视频或写博客；这里不会调用模型或发布。', 'Twenty-four real engineering stories across four weeks. Select one, then add evidence and produce a video or blog later; nothing here calls a model or publishes.'))}</p></div><label class="canon-filter">{_escape(ui_text(locale, '按就绪状态筛选', 'Filter by readiness'))}<select id="canon-status-filter"><option value="ALL">{_escape(ui_text(locale, '全部 24 个故事', 'All 24 stories'))}</option>{options}</select></label></div><nav class="canon-week-nav" aria-label="Month 1 weeks">{''.join(f'<a href="#canon-week-{week}">Week {week}</a>' for week in range(1, 5))}</nav>{''.join(week_sections)}</section>'''
+    html_section = f'''<section class="month-one-canon" aria-labelledby="month-one-title"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, '第一个月 · 工程故事库', 'Month 1 · Engineering Story Library'))}</span><h2 id="month-one-title">{_escape(ui_text(locale, '第一个月：从自动化幻想到可用结果', 'Month 1: From automation ambition to useful outcomes'))}</h2><p>{_escape(ui_text(locale, '24 个真实工程故事，按四周组织。先选故事，再补证、做视频或写博客；这里不会调用模型或发布。', 'Twenty-four real engineering stories across four weeks. Select one, then add evidence and produce a video or blog later; nothing here calls a model or publishes.'))}</p></div><label class="canon-filter">{_escape(ui_text(locale, '按就绪状态筛选', 'Filter by readiness'))}<select id="canon-status-filter"><option value="ALL">{_escape(ui_text(locale, '全部 24 个故事', 'All 24 stories'))}</option>{options}</select></label></div><nav class="canon-week-nav" aria-label="{_escape(ui_text(locale, '第一个月周次', 'Month 1 weeks'))}">{''.join(f'<a href="#canon-week-{week}">{_escape(ui_text(locale, f"第 {week} 周", f"Week {week}"))}</a>' for week in range(1, 5))}</nav>{''.join(week_sections)}</section>'''
     script = f'''
 const monthOneStories = {payload_json};
 const canonFilter = document.getElementById('canon-status-filter');
@@ -1549,12 +1562,12 @@ def content_page(
 <label>{_escape(ui_text(locale, '来源 / 项目链接', 'Source / project link'))}
   <input name="source_label" maxlength="500" required
     value="{_escape(values.get("source_label", ""))}"
-    placeholder="GitHub PR、公开文档或证据包标识" />
+    placeholder="{_escape(ui_text(locale, 'GitHub PR、公开文档或证据包标识', 'GitHub PR, public document, or evidence-bundle ID'))}" />
 </label>
 <label>{_escape(ui_text(locale, '已验证事实', 'Verified facts'))}
   <span class="hint">{_escape(ui_text(locale, '每行：事实 | 证据链接 | 这条证据不能证明什么（可选）', 'Each line: fact | evidence link | what it does not prove (optional)'))}</span>
   <textarea class="large" name="verified_claims" required
-    placeholder="Python CI checks passed. | https://github.com/... | Local run only."
+    placeholder="{_escape(ui_text(locale, 'Python CI 检查通过。| https://github.com/... | 仅代表本地运行。', 'Python CI checks passed. | https://github.com/... | Local run only.'))}"
   >{_escape(values.get("verified_claims", ""))}</textarea>
 </label>
 <label>{_escape(ui_text(locale, '个人观察（可选）', 'Personal observations (optional)'))}
@@ -1570,9 +1583,9 @@ def content_page(
   <span class="hint">{_escape(ui_text(locale, '每行一条，会使用未来时态和 PLANNED 标签。', 'One per line, written in future tense and labeled PLANNED.'))}</span>
   <textarea name="planned">{_escape(values.get("planned", ""))}</textarea>
 </label>
-<label>CTA
+<label>{_escape(ui_text(locale, '行动引导', 'CTA'))}
   <input name="call_to_action" maxlength="220" required
-    value="{_escape(values.get("call_to_action", "Follow the next measured iteration."))}" />
+    value="{_escape(values.get("call_to_action", ui_text(locale, "关注下一次经过测量的迭代。", "Follow the next measured iteration.")))}" />
 </label>
 <div class="boundary">{_escape(ui_text(locale, '草稿会先私有保存并等待你复核；SoloScale 不会自动发布。', 'Drafts stay private until you review them; SoloScale never publishes automatically.'))}</div>
 <div class="generate-actions">
@@ -1599,13 +1612,20 @@ def content_page(
     if workspace_view == "stories":
         current_url = "/creator/stories"
         heading = ui_text(locale, "从真实工程故事里，选择下一条内容。", "Choose the next story from real engineering work.")
-        description = ui_text(locale, "24 条 Month 1 Engineering Stories 现在有自己的故事库。", "The 24 Month 1 Engineering Stories now live in their own Story Bank.")
+        description = ui_text(locale, "首月的 24 条工程故事现在有自己的故事库。", "The 24 Month 1 Engineering Stories now live in their own Story Bank.")
         view_css = ".use-my-work,.scan-work,.scan-results,.reference-video-upload,.grid{display:none!important}"
     elif workspace_view == "create":
         current_url = "/creator/create"
         heading = ui_text(locale, "把一个真实故事，做成完整内容包。", "Turn one real story into a complete content package.")
         description = ui_text(locale, "生成、审核、视频与发布准备继续使用现有流程。", "Generation, review, video, and publishing preparation keep using the existing workflow.")
         view_css = ".month-one-canon{display:none!important}"
+    current_url = ui_url(
+        current_url,
+        locale,
+        run_id=run_id or "",
+        canon_story_id=canon_story_id or "",
+        canon_format=canon_format or "",
+    )
     if workspace_view != "all":
         body = render_creator_nav(active=workspace_view, locale=locale) + body
     script = f"""

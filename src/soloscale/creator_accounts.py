@@ -20,7 +20,13 @@ from soloscale.platform_accounts import (
     all_platform_snapshots,
     provider_label,
 )
-from soloscale.ui_shell import UILocale, render_app_shell, render_creator_nav, ui_text
+from soloscale.ui_shell import (
+    UILocale,
+    render_app_shell,
+    render_creator_nav,
+    ui_display_value,
+    ui_text,
+)
 from soloscale.youtube_publishing import (
     YouTubeJobSnapshot,
 )
@@ -250,7 +256,7 @@ def _youtube_job_html(job: YouTubeJobSnapshot | None, locale: UILocale) -> tuple
         actions = f'''<div class="oauth-actions"><a class="secondary-button" href="{url}" target="_blank" rel="noopener noreferrer">{ui_text(locale, "在浏览器中打开", "Open in browser")}</a><button type="button" class="secondary-button" onclick="copyAuthorizationUrl('{input_id}',this)">{ui_text(locale, "复制授权链接", "Copy authorization link")}</button><form method="post" action="/creator/accounts/youtube/cancel"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="job_id" value="{job.job_id}" /><button type="submit" class="danger-button">{ui_text(locale, "取消连接", "Cancel")}</button></form></div><input class="oauth-url" id="{input_id}" value="{url}" readonly />'''
     elif active:
         actions = f'''<form method="post" action="/creator/accounts/youtube/cancel"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="job_id" value="{job.job_id}" /><button type="submit" class="danger-button">{ui_text(locale, "取消连接", "Cancel")}</button></form>'''
-    return f'<div class="oauth-job" data-phase="{job.phase}">{html.escape(copies.get(job.phase, job.phase))}{actions}</div>', active
+    return f'<div class="oauth-job" data-phase="{job.phase}">{html.escape(copies.get(job.phase, ui_display_value(locale, job.phase)))}{actions}</div>', active
 
 
 def _provider_card(
@@ -267,12 +273,16 @@ def _provider_card(
         "READY_TO_CONNECT": ui_text(locale, "可以连接", "Ready to connect"),
         "CONNECTED": ui_text(locale, "已连接", "Connected"),
         "REAUTH_REQUIRED": ui_text(locale, "需要重新授权", "Reauthorization required"),
-    }.get(snapshot.connection_state, snapshot.connection_state)
+    }.get(snapshot.connection_state, ui_display_value(locale, snapshot.connection_state))
     dev = snapshot.developer_config
     if dev.configured:
         developer_copy = ui_text(locale, "开发者凭证已配置", "Developer integration configured")
     elif dev.required_setup:
-        developer_copy = dev.required_setup
+        developer_copy = ui_text(
+            locale,
+            "需要在对应平台的开发者后台完成设置。",
+            dev.required_setup,
+        )
     else:
         missing = ", ".join(field.replace("_", " ") for field in dev.missing_fields)
         developer_copy = ui_text(locale, "缺少：", "Missing: ") + missing
@@ -280,7 +290,7 @@ def _provider_card(
     if not identities:
         identities = f'<p>{ui_text(locale, "尚未连接账号。", "No account connected.")}</p>'
     chips = "".join(
-        f'<span data-state="{item.state}" title="{html.escape(item.reason, quote=True)}">{html.escape(_capability_copy(item, locale))}</span>'
+        f'<span data-state="{item.state}" title="{html.escape(ui_display_value(locale, item.state), quote=True)}">{html.escape(_capability_copy(item, locale))}</span>'
         for item in snapshot.capabilities
     )
     actions = ""
@@ -304,7 +314,7 @@ def _provider_card(
                 "CANCELLED": ui_text(locale, "连接已取消，可以立即重试", "Connection cancelled; you can retry now"),
                 "TIMED_OUT": ui_text(locale, "连接已超时，可以立即重试", "Connection timed out; you can retry now"),
                 "FAILED": ui_text(locale, "连接失败，可以立即重试", "Connection failed; you can retry now"),
-            }.get(auth_attempt.phase, auth_attempt.phase)
+            }.get(auth_attempt.phase, ui_display_value(locale, auth_attempt.phase))
             attempt_actions = ""
             if auth_attempt.phase == "WAITING_FOR_AUTHORIZATION" and auth_attempt.authorization_url:
                 url = html.escape(auth_attempt.authorization_url, quote=True)
@@ -325,7 +335,15 @@ def _provider_card(
 def _developer_field(platform: str, field: str, configured: bool, locale: UILocale) -> str:
     secret = field in {"client_secret", "app_secret"}
     placeholder = ui_text(locale, "已保存；留空则保持不变", "Saved; leave blank to keep") if configured else ""
-    return f'''<label>{html.escape(field.replace("_", " ").title())}<input name="{html.escape(field, quote=True)}" type="{"password" if secret else "text"}" autocomplete="{"new-password" if secret else "off"}" placeholder="{html.escape(placeholder, quote=True)}" /></label>'''
+    labels = {
+        "client_id": ui_text(locale, "客户端 ID", "Client ID"),
+        "client_secret": ui_text(locale, "客户端密钥", "Client secret"),
+        "app_id": ui_text(locale, "应用 ID", "App ID"),
+        "app_secret": ui_text(locale, "应用密钥", "App secret"),
+        "redirect_uri": ui_text(locale, "回调网址", "Redirect URI"),
+    }
+    label = labels.get(field, field.replace("_", " ").title())
+    return f'''<label>{html.escape(label)}<input name="{html.escape(field, quote=True)}" type="{"password" if secret else "text"}" autocomplete="{"new-password" if secret else "off"}" placeholder="{html.escape(placeholder, quote=True)}" /></label>'''
 
 
 def _independent_site_editor(account: CreatorAccount, locale: UILocale) -> str:

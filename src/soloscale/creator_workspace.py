@@ -25,6 +25,7 @@ from soloscale.ui_shell import (
     UILocale,
     render_app_shell,
     render_creator_nav,
+    ui_display_value,
     ui_text,
     ui_url,
 )
@@ -140,7 +141,7 @@ def creator_overview_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str
   <a class="creator-status-card" href="{ui_url('/creator/publish', locale)}"><span>{ui_text(locale, '可发布', 'Ready to publish')}</span><strong>{ready}</strong><p>{ui_text(locale, '个统一发布包', 'distribution packages')}</p></a>
   <a class="creator-status-card attention" href="{ui_url('/creator/history', locale)}"><span>{ui_text(locale, '需处理', 'Needs attention')}</span><strong>{account_attention + draft_attention}</strong><p>{ui_text(locale, '账号或内容等待处理', 'accounts or drafts need action')}</p></a>
 </section>
-<section class="week-panel"><div><span>{ui_text(locale, '本周', 'This week')}</span><strong>{content_count}</strong><small>{ui_text(locale, '内容', 'content runs')}</small></div><div><span>&nbsp;</span><strong>{video_count}</strong><small>{ui_text(locale, '视频', 'videos')}</small></div><div><span>&nbsp;</span><strong>${spend:.3f}</strong><small>API Cost</small></div></section>
+<section class="week-panel"><div><span>{ui_text(locale, '本周', 'This week')}</span><strong>{content_count}</strong><small>{ui_text(locale, '内容', 'content runs')}</small></div><div><span>&nbsp;</span><strong>{video_count}</strong><small>{ui_text(locale, '视频', 'videos')}</small></div><div><span>&nbsp;</span><strong>${spend:.3f}</strong><small>{ui_text(locale, 'API 成本', 'API Cost')}</small></div></section>
 <section class="creator-quick-actions"><a class="primary-button" href="{ui_url('/creator/stories', locale)}">{ui_text(locale, '打开故事库', 'Open Story Bank')}</a><a class="secondary-button" href="{ui_url('/creator/create', locale)}">{ui_text(locale, '开始创作', 'Start creating')}</a></section>'''
     return render_app_shell(
         active="content",
@@ -162,7 +163,7 @@ def creator_history_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str:
     """Render recent content/video state and locally recorded cost receipts."""
     runs = _recent_runs(data_root)
     cards = "".join(
-        f'''<article class="history-card"><div><span>{html.escape(item.review_status)}</span><h2>{html.escape(item.run.brief.topic)}</h2><p>{html.escape(item.run.run_id)}</p></div><div class="history-flags"><strong>{'VIDEO' if item.video_ready else 'NO VIDEO'}</strong><strong>{'PACKAGE READY' if item.distribution_ready else 'NOT READY'}</strong></div><a href="{ui_url('/creator/create', locale, run_id=item.run.run_id)}">{ui_text(locale, '打开', 'Open')} →</a></article>'''
+        f'''<article class="history-card"><div><span>{html.escape(ui_display_value(locale, item.review_status))}</span><h2>{html.escape(item.run.brief.topic)}</h2><p>{html.escape(item.run.run_id)}</p></div><div class="history-flags"><strong>{ui_text(locale, '视频已就绪', 'Video ready') if item.video_ready else ui_text(locale, '暂无视频', 'No video')}</strong><strong>{ui_text(locale, '发布包已就绪', 'Package ready') if item.distribution_ready else ui_text(locale, '发布包未就绪', 'Package not ready')}</strong></div><a href="{ui_url('/creator/create', locale, run_id=item.run.run_id)}">{ui_text(locale, '打开', 'Open')} →</a></article>'''
         for item in runs
     ) or f'<section class="empty"><h2>{ui_text(locale, "还没有创作历史", "No Creator history yet")}</h2></section>'
     try:

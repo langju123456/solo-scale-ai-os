@@ -99,7 +99,7 @@ def test_evidence_refresh_post_redirects_and_renders_metadata_only(tmp_path: Pat
         "Location": "/evidence?refresh=complete&lang=zh-CN",
         "Content-Length": "0",
     }
-    assert "Sources" in body and "Evidence" in body and "codex_session" in body
+    assert "来源" in body and "证据" in body and "Codex 对话" in body
     assert "private body" not in body
     assert "/private/thread.jsonl" not in body
 

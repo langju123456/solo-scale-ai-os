@@ -29,6 +29,58 @@ _SOURCE_STATE_PRESENTATION: dict[SourceState, tuple[str, str, str]] = {
     "NEEDS_ATTENTION": ("!", "需处理", "Needs attention"),
 }
 
+_UI_VALUE_PRESENTATION: dict[str, tuple[str, str]] = {
+    "UNKNOWN": ("未知", "Unknown"),
+    "ENGINEERING_VERIFIED": ("工程能力已验证", "Engineering verified"),
+    "VERIFIED_EVIDENCE": ("已验证证据", "Verified evidence"),
+    "APPROVED_CLAIM": ("已批准陈述", "Approved claim"),
+    "RAW_STATEMENT": ("原始陈述", "Raw statement"),
+    "DISTILLED_INSIGHT": ("提炼洞察", "Distilled insight"),
+    "DECISION": ("决策", "Decision"),
+    "IMPLEMENTED_CAPABILITY": ("已实现能力", "Implemented capability"),
+    "MASTERY_RECEIPT": ("掌握回执", "Mastery receipt"),
+    "personal_artifact": ("个人产物", "Personal artifact"),
+    "personal_context": ("个人背景", "Personal context"),
+    "external_knowledge": ("外部知识", "External knowledge"),
+    "outcome_receipt": ("结果回执", "Outcome receipt"),
+    "codex_session": ("Codex 对话", "Codex session"),
+    "chatgpt_export": ("ChatGPT 导出", "ChatGPT export"),
+    "buildlog_run": ("BuildLog 记录", "BuildLog run"),
+    "local_git": ("本地 Git", "Local Git"),
+    "succeeded": ("成功", "Succeeded"),
+    "failed": ("失败", "Failed"),
+    "L0 Seen": ("L0 · 已见过", "L0 · Seen"),
+    "L1 Explain": ("L1 · 能讲解", "L1 · Explain"),
+    "L2 Trace": ("L2 · 能追踪", "L2 · Trace"),
+    "L3 Rebuild": ("L3 · 能重建", "L3 · Rebuild"),
+    "L4 Debug": ("L4 · 能调试", "L4 · Debug"),
+    "L5 Defend": ("L5 · 能答辩", "L5 · Defend"),
+    "Explain": ("讲解", "Explain"),
+    "Trace": ("追踪", "Trace"),
+    "Rebuild": ("重建", "Rebuild"),
+    "Debug": ("调试", "Debug"),
+    "Defend": ("答辩", "Defend"),
+    "DRAFT": ("草稿", "Draft"),
+    "APPROVED": ("已批准", "Approved"),
+    "REJECTED": ("已拒绝", "Rejected"),
+    "PENDING": ("待处理", "Pending"),
+    "SUCCESS": ("已成功", "Success"),
+    "FAILED": ("失败", "Failed"),
+    "CANCELLED": ("已取消", "Cancelled"),
+    "TIMED_OUT": ("已超时", "Timed out"),
+    "STARTING": ("正在启动", "Starting"),
+    "WAITING": ("等待中", "Waiting"),
+    "WAITING_FOR_AUTHORIZATION": ("等待授权", "Waiting for authorization"),
+    "COMPLETING": ("正在完成", "Completing"),
+    "CONNECTED": ("已连接", "Connected"),
+    "ACTIVE": ("可用", "Active"),
+    "NOT_CONFIGURED": ("未配置", "Not configured"),
+    "REAUTH_REQUIRED": ("需要重新授权", "Reauthorization required"),
+    "REQUIRED_SETUP": ("需要设置", "Setup required"),
+    "MAPPED": ("已关联", "Mapped"),
+    "NEEDS_MAPPING": ("需要关联", "Needs mapping"),
+}
+
 _NAV_ITEMS: tuple[tuple[str, str, str, str], ...] = (
     ("home", "/", "首页", "Home"),
     ("resume", "/resume", "找到机会", "Get the job"),
@@ -62,6 +114,23 @@ def ui_text(locale: UILocale, chinese: str, english: str) -> str:
     return chinese if locale == "zh-CN" else english
 
 
+def ui_bool(locale: UILocale, value: bool) -> str:
+    """Render a boolean as interface copy without changing its stored value."""
+
+    return ui_text(locale, "是" if value else "否", "Yes" if value else "No")
+
+
+def ui_display_value(locale: UILocale, value: object) -> str:
+    """Localize a known internal value while preserving unknown user/source content."""
+
+    if isinstance(value, bool):
+        return ui_bool(locale, value)
+    raw_value = getattr(value, "value", value)
+    key = str(raw_value)
+    copies = _UI_VALUE_PRESENTATION.get(key)
+    return ui_text(locale, *copies) if copies is not None else key
+
+
 def ui_url(path: str, locale: UILocale, **query: str) -> str:
     """Build an internal product URL that retains the selected interface locale."""
     split = urllib.parse.urlsplit(path)
@@ -81,7 +150,7 @@ def render_source_state(state: SourceState, locale: UILocale) -> str:
     css_state = state.casefold().replace("_", "-")
     return (
         f'<span class="source-state source-state-{css_state}" '
-        f'data-source-state="{state}" title="{state}" '
+        f'data-source-state="{state}" title="{html.escape(label, quote=True)}" '
         f'aria-label="{html.escape(label)}">'
         f'<span class="source-state-symbol" aria-hidden="true">{symbol}</span>'
         f"<span>{html.escape(label)}</span></span>"
