@@ -44,6 +44,7 @@ MAX_RESUME_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_RESUME_UPLOAD_FILES = 3
 _MAX_EXTRACTED_TEXT = 250_000
 _MAX_PDF_DECOMPRESSED_BYTES = 8 * 1024 * 1024
+_MAX_PDF_OBJECT_HEADER_BYTES = 64 * 1024
 _DOCX_DOCUMENT = "word/document.xml"
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _W = f"{{{_W_NS}}}"
@@ -514,6 +515,44 @@ def _decode_pdf_literal(value: bytes) -> str:
     return output.decode("utf-8", errors="replace")
 
 
+def _pdf_stream_data(
+    content: bytes,
+    match: re.Match[bytes],
+    dictionary: bytes,
+) -> bytes:
+    """Return exact stream bytes when a direct PDF /Length is available."""
+
+    length_matches = list(
+        re.finditer(rb"/Length\s+(-?\d+)(?:\s+(\d+)\s+R)?", dictionary)
+    )
+    if len(length_matches) != 1 or length_matches[0].group(2) is not None:
+        return match.group(1)
+    direct_length = int(length_matches[0].group(1))
+    if direct_length < 0:
+        raise ResumeUploadError("PDF stream has an invalid declared length")
+    start = match.start(1)
+    end = start + direct_length
+    if end > len(content):
+        raise ResumeUploadError("PDF stream has an invalid declared length")
+    if re.match(rb"\r?\nendstream\b", content[end : end + 12]) is None:
+        raise ResumeUploadError("PDF stream has an invalid declared boundary")
+    return content[start:end]
+
+
+def _pdf_stream_dictionary(content: bytes, match: re.Match[bytes]) -> bytes:
+    """Return the bounded dictionary/header for the stream's current PDF object."""
+
+    stream_start = match.start()
+    lower_bound = max(0, stream_start - _MAX_PDF_OBJECT_HEADER_BYTES)
+    previous_endobj = content.rfind(b"endobj", lower_bound, stream_start)
+    object_start = (
+        previous_endobj + len(b"endobj")
+        if previous_endobj >= 0
+        else lower_bound
+    )
+    return content[object_start:stream_start]
+
+
 def _pdf_text(content: bytes) -> tuple[str, int | None]:
     if b"/Encrypt" in content:
         raise ResumeUploadError("Password-protected PDF files are not accepted")
@@ -521,8 +560,8 @@ def _pdf_text(content: bytes) -> tuple[str, int | None]:
     segments: list[bytes] = []
     extracted_bytes = 0
     for match in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", content, re.DOTALL):
-        stream = match.group(1)
-        dictionary = content[max(0, match.start() - 400) : match.start()]
+        dictionary = _pdf_stream_dictionary(content, match)
+        stream = _pdf_stream_data(content, match, dictionary)
         if b"/FlateDecode" in dictionary:
             try:
                 decompressor = zlib.decompressobj()
@@ -637,9 +676,25 @@ def _canonical_heading(line: str) -> str | None:
     return _HEADING_ALIASES.get(" ".join(line.upper().rstrip(":").split()))
 
 
+def _xml_10_safe_text(text: str) -> str:
+    """Remove control characters that XML 1.0 cannot represent."""
+
+    return "".join(
+        character
+        for character in text
+        if (
+            ord(character) in {0x09, 0x0A, 0x0D}
+            or 0x20 <= ord(character) <= 0xD7FF
+            or 0xE000 <= ord(character) <= 0xFFFD
+            or 0x10000 <= ord(character) <= 0x10FFFF
+        )
+    )
+
+
 def normalize_text_resume_to_docx(text: str) -> bytes:
     """Create a minimal valid DOCX when the explicitly selected resume is not DOCX."""
 
+    text = _xml_10_safe_text(text)
     raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not raw_lines:
         raise ResumeUploadError("The selected resume contains no text")

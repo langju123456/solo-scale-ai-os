@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import zlib
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from soloscale.resume_gateway_boundary import (
     ResumeUploadError,
     ResumeUploadRole,
     SelectedResumeFile,
+    _pdf_stream_data,
+    _pdf_stream_dictionary,
     extract_selected_resume_files,
     normalize_text_resume_to_docx,
     prepare_resume_gateway_payload,
@@ -158,6 +161,63 @@ def test_upload_boundary_accepts_allowlist_and_rejects_unsafe_files(
         extract_selected_resume_files(
             [_selected(ResumeUploadRole.RESUME, "resume.pdf", compressed_pdf)]
         )
+
+
+def test_pdf_parser_respects_declared_stream_length_when_data_ends_in_cr() -> None:
+    text_stream = b"(Resume evidence) Tj " + (233).to_bytes(4, "big")
+    compressed = zlib.compress(text_stream)
+    assert compressed.endswith(b"\r")
+    pdf = (
+        b"%PDF-1.4\n1 0 obj <</Type /Page>> endobj\n"
+        + f"2 0 obj <</Length {len(compressed)} ".encode()
+        + (b" " * 450)
+        + b"/Filter /FlateDecode>> stream\n"
+        + compressed
+        + b"\nendstream endobj\n%%EOF"
+    )
+    stream_match = re.search(
+        rb"stream\r?\n(.*?)\r?\nendstream",
+        pdf,
+        re.DOTALL,
+    )
+    assert stream_match is not None
+    dictionary = _pdf_stream_dictionary(pdf, stream_match)
+    assert b"/Length" not in pdf[stream_match.start() - 400 : stream_match.start()]
+    extracted_stream = _pdf_stream_data(pdf, stream_match, dictionary)
+
+    uploads = extract_selected_resume_files(
+        [_selected(ResumeUploadRole.RESUME, "resume.pdf", pdf)]
+    )
+
+    assert len(extracted_stream) == len(compressed)
+    assert extracted_stream == compressed
+    assert uploads[ResumeUploadRole.RESUME].text == "Resume evidence"
+
+
+def test_pdf_parser_rejects_declared_length_beyond_the_stream_boundary() -> None:
+    compressed = zlib.compress(b"(Resume evidence) Tj")
+    pdf = (
+        b"%PDF-1.4\n1 0 obj <</Type /Page>> endobj\n"
+        + f"2 0 obj <</Filter /FlateDecode /Length {len(compressed) + 5}>> stream\n".encode()
+        + compressed
+        + b"\nendstream endobj\n%%EOF"
+    )
+
+    with pytest.raises(ResumeUploadError, match="invalid declared"):
+        extract_selected_resume_files(
+            [_selected(ResumeUploadRole.RESUME, "resume.pdf", pdf)]
+        )
+
+
+def test_text_docx_normalization_removes_invalid_xml_characters() -> None:
+    source = _plain_resume().replace(
+        "Evidence-grounded AI engineer.",
+        "Evidence\x00 & < \x12grounded AI engineer.",
+    )
+
+    profile = extract_candidate_profile(normalize_text_resume_to_docx(source))
+
+    assert profile.summary == "Evidence & < grounded AI engineer."
 
 
 def test_gateway_payload_removes_identifiers_and_has_strict_metadata_allowlist() -> None:
