@@ -14,7 +14,7 @@ from typing import Literal
 from uuid import uuid4
 
 from soloscale.evidence_capture import capture_assets, capture_outcome
-from soloscale.evidence_hub import EvidenceHub
+from soloscale.evidence_hub import EvidenceHub, EvidenceHubError, inspect_git_repository
 from soloscale.learning_models import (
     ClaimEligibility,
     CodeAnchor,
@@ -25,6 +25,7 @@ from soloscale.learning_models import (
     InterviewQuestion,
     KnowledgeGraphEdge,
     KnowledgeGraphNode,
+    LearningProjectBinding,
     LearningResponseReceipt,
     LearningTask,
     LearningTraceabilityRun,
@@ -64,8 +65,41 @@ _LEARNING_RUN_ID_PATTERN = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class LearningCaseDefinition:
+    """Fixture-owned anchors; these are never generic repository requirements."""
+
+    case_id: str
+    case_kind: Literal["SEED_CASE", "DOGFOOD_CASE"]
+    required_paths: tuple[str, ...]
+
+
+CONVERSATION_RAG_SEED_CASE = LearningCaseDefinition(
+    case_id=CASE_ID,
+    case_kind="SEED_CASE",
+    required_paths=(
+        "docs/conversations/2026-08-06-agent-swarm-to-surface-routing.md",
+        "docs/decisions/ADR-0004-private-conversation-rag.md",
+        "docs/conversation-rag.md",
+        "src/soloscale/conversation_intake.py",
+        "src/soloscale/knowledge_store.py",
+        "tests/test_conversation_intake.py",
+        "tests/test_knowledge_store.py",
+    ),
+)
+
+
 class LearningTraceabilityError(Exception):
     """Raised when the bounded case cannot be grounded or stored safely."""
+
+
+class LearningFixtureAnchorError(LearningTraceabilityError):
+    """Raised when a valid project does not satisfy one fixture's own anchors."""
+
+    def __init__(self, case_id: str, missing_paths: tuple[str, ...]) -> None:
+        super().__init__(f"learning fixture anchors are unavailable for {case_id}")
+        self.case_id = case_id
+        self.missing_paths = missing_paths
 
 
 @dataclass(frozen=True)
@@ -171,6 +205,46 @@ def _repository_identity(repository_root: Path) -> _RepositoryIdentity:
         commit=commit,
         remote=remote or None,
     )
+
+
+def inspect_learning_project(repository_root: Path) -> LearningProjectBinding:
+    """Resolve one selected Git project through the canonical Evidence source adapter."""
+
+    root = Path(repository_root).expanduser().resolve()
+    identity = _repository_identity(root)
+    try:
+        source, _items = inspect_git_repository(root)
+    except EvidenceHubError as exc:
+        raise LearningTraceabilityError("selected project evidence is unavailable") from exc
+    return LearningProjectBinding(
+        project_source_id=source.source_id,
+        project=source.project or identity.name,
+        repository=identity.name,
+        branch=identity.branch,
+        commit=identity.commit,
+    )
+
+
+def missing_learning_case_anchors(
+    repository_root: Path,
+    definition: LearningCaseDefinition = CONVERSATION_RAG_SEED_CASE,
+) -> tuple[str, ...]:
+    """Return fixture-owned tracked paths missing from the selected project HEAD."""
+
+    root = Path(repository_root).expanduser().resolve()
+    identity = _repository_identity(root)
+    missing: list[str] = []
+    for relative_path in definition.required_paths:
+        tracked = _git(
+            root,
+            "ls-files",
+            "--error-unmatch",
+            relative_path,
+            required=False,
+        )
+        if not tracked or _git_bytes(root, "show", f"{identity.commit}:{relative_path}") is None:
+            missing.append(relative_path)
+    return tuple(missing)
 
 
 def _resolve_symbol(
@@ -843,7 +917,7 @@ def _build_graph(
         KnowledgeGraphNode(
             id="CLAIM-GATE",
             kind="CLAIM_ELIGIBILITY",
-            label="Resume claim blocked pending ownership and mastery",
+            label="Resume claim blocked pending ownership",
             detail={
                 "resume_eligible": claim.resume_eligible,
                 "rationale": claim.rationale,
@@ -1123,6 +1197,10 @@ def run_learning_traceability(
     repository_root = repository_root.resolve()
     data_root = data_root.expanduser().absolute()
     identity = _repository_identity(repository_root)
+    project_binding = inspect_learning_project(repository_root)
+    missing_fixture_paths = missing_learning_case_anchors(repository_root)
+    if missing_fixture_paths:
+        raise LearningFixtureAnchorError(CASE_ID, missing_fixture_paths)
     source_records = [
         _source_record(
             repository_root,
@@ -1303,8 +1381,9 @@ def run_learning_traceability(
             "Owned retrieval reliability end to end",
         ],
         rationale=(
-            "Code and committed test definitions are real, but personal contribution and L5 "
-            "interview mastery are not established. No resume claim is approved."
+            "Code and committed test definitions are real, but personal contribution is not "
+            "proven by repository evidence. Interview readiness stays NOT_READY until L5 "
+            "mastery receipts exist; resume eligibility remains pending ownership proof."
         ),
     )
     questions = [
@@ -1405,6 +1484,8 @@ def run_learning_traceability(
         run_id=run_id,
         case_id=CASE_ID,
         evidence_bundle_id=evidence_bundle_id,
+        project_source_id=project_binding.project_source_id,
+        case_kind=CONVERSATION_RAG_SEED_CASE.case_kind,
         repository=identity.name,
         branch=identity.branch,
         commit=identity.commit,
@@ -1427,13 +1508,17 @@ def run_learning_traceability(
         "00_input.json": {
             "schema_version": "0.1",
             "case_id": CASE_ID,
+            "case_kind": CONVERSATION_RAG_SEED_CASE.case_kind,
             "target_requirement": requirement,
             "repository_root": str(repository_root),
+            "project_binding": project_binding.model_dump(mode="json"),
             "private_source_bodies_read": False,
         },
         "01_case.json": {
             "schema_version": "0.1",
             "case_id": CASE_ID,
+            "case_kind": CONVERSATION_RAG_SEED_CASE.case_kind,
+            "project_binding": project_binding.model_dump(mode="json"),
             "title": "Conversation RAG: stable chunking and bounded retrieval",
             "engineering_state": "ENGINEERING_VERIFIED",
             "source_records": [item.model_dump(mode="json") for item in source_records],

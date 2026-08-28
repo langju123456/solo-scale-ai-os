@@ -206,6 +206,16 @@ class LearningResponseReceipt(ContractModel):
     truth_stage: Literal[TruthStage.RAW_STATEMENT] = TruthStage.RAW_STATEMENT
 
 
+class LearningProjectBinding(ContractModel):
+    """Explicit Evidence source identity for the project behind one Learning case."""
+
+    project_source_id: StableId
+    project: NonBlankStr
+    repository: NonBlankStr
+    branch: NonBlankStr
+    commit: NonBlankStr
+
+
 class InterviewQuestion(ContractModel):
     id: StableId
     case_id: StableId
@@ -230,16 +240,16 @@ class ClaimEligibility(ContractModel):
 
     @model_validator(mode="after")
     def validate_claim_gate(self) -> ClaimEligibility:
-        fully_gated = (
+        claim_ready = (
             self.engineering_truth_stage is TruthStage.APPROVED_CLAIM
             and self.ownership_confidence is OwnershipConfidence.CONFIRMED
-            and self.mastery_level is MasteryLevel.L5_DEFEND
-            and self.interview_ready
         )
-        if self.resume_eligible is not fully_gated:
-            raise ValueError("resume_eligible must match truth, ownership, and mastery gates")
+        if self.resume_eligible is not claim_ready:
+            raise ValueError("resume_eligible must match truth and ownership gates")
         if self.resume_eligible != (self.approved_claim is not None):
             raise ValueError("approved_claim must exist exactly when resume_eligible is true")
+        if self.interview_ready is not (self.mastery_level is MasteryLevel.L5_DEFEND):
+            raise ValueError("interview_ready requires L5 Defend")
         return self
 
 
@@ -261,6 +271,8 @@ class LearningTraceabilityRun(ContractModel):
     run_id: StableId
     case_id: StableId
     evidence_bundle_id: str | None = None
+    project_source_id: StableId
+    case_kind: Literal["SEED_CASE", "DOGFOOD_CASE"] = "SEED_CASE"
     repository: NonBlankStr
     branch: NonBlankStr
     commit: NonBlankStr

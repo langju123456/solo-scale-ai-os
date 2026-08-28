@@ -19,6 +19,7 @@ from soloscale.content_models import ContentReviewDecision
 from soloscale.content_ui import run_content_form
 from soloscale.content_workspace import save_content_review
 from soloscale.conversation_intake import parse_codex_session
+from soloscale.evidence_hub import EvidenceHub
 from soloscale.knowledge_models import ContentRole, RetrievalHit, SourceKind
 from soloscale.learning_traceability import run_learning_traceability
 from soloscale.local_ui import (
@@ -42,6 +43,7 @@ from soloscale.local_ui import (
     _result_card,
     _resume_graph,
     _run_action,
+    _run_learning_workspace,
     _run_user_resume,
     _save_ai_provider_preference,
     _search_job_evidence,
@@ -764,6 +766,8 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
     assert "推理锚点" in page
     assert "代码锚点" in page
     assert "测试锚点" in page
+    assert "练习语言" in page
+    assert "独立于界面语言" in page
     assert "src/soloscale/knowledge_store.py" in page
     assert "复制锚点包" in page
     assert "不证明作者身份" in page
@@ -789,13 +793,68 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
     )
     assert "Interactive evidence graph" not in invalid
 
-    packaged_resources = tmp_path / "packaged-resources"
-    packaged_resources.mkdir()
-    unavailable = _learning_page(data_root, packaged_resources, {})
-    assert "需要连接 SoloScale 源码目录" in unavailable
-    assert "选择源码目录" in unavailable
-    assert 'href="soloscale://choose-source-checkout"' in unavailable
-    assert "<button disabled" not in unavailable
+    no_project = _learning_page(data_root, None, {"run_id": selected.run_id})
+    assert "这个练习需要一个已连接的代码项目" in no_project
+    assert 'href="/work?lang=zh-CN"' in no_project
+    assert 'data-learning-capability="explain" data-state="AVAILABLE"' in no_project
+    assert (
+        'data-learning-capability="trace" data-state="NEEDS_PROJECT_EVIDENCE"'
+        in no_project
+    )
+    assert (
+        'data-learning-capability="debug" data-state="NEEDS_PROJECT_EVIDENCE"'
+        in no_project
+    )
+    assert 'id="learning-explain-response"' in no_project
+    assert 'id="learning-trace-response"' not in no_project
+    assert "This is not a supported SoloScale checkout" not in no_project
+
+
+def test_learning_wrong_project_degrades_only_the_seed_case(tmp_path: Path) -> None:
+    repository = tmp_path / "another-project"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repository, check=True)
+    (repository / "README.md").write_text("another project\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "initial evidence",
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    page = _learning_page(tmp_path / "data", repository, {})
+
+    assert "当前项目已连接，但不适用于这个示例练习" in page
+    assert "这个项目没有找到此练习需要的代码锚点" in page
+    assert "This is not a supported SoloScale checkout" not in page
+    assert "pyproject.toml" not in page
+    assert "knowledge_store.py" not in page
+
+
+def test_learning_run_preflights_stale_project_evidence_before_build(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+
+    result = _run_learning_workspace(
+        {"target_requirement": "Build retrieval systems for AI context and memory."},
+        data_root,
+        REPOSITORY_ROOT,
+    )
+
+    assert result.return_code == 0
+    snapshot = EvidenceHub(data_root).git_repository_snapshot(REPOSITORY_ROOT)
+    assert snapshot is not None
 
 
 def test_parse_submission_reads_text_and_docx_upload() -> None:

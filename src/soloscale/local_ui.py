@@ -102,8 +102,11 @@ from soloscale.knowledge_store import (
 )
 from soloscale.learning_traceability import (
     DEFAULT_TARGET_REQUIREMENT,
+    LearningFixtureAnchorError,
     LearningTraceabilityError,
+    inspect_learning_project,
     load_interview_anchor_pack,
+    missing_learning_case_anchors,
     run_learning_traceability,
     save_learning_response,
 )
@@ -258,6 +261,7 @@ from soloscale.work_ui import (
     import_chatgpt_export,
     import_chatgpt_export_bytes,
     load_work_context,
+    preflight_work_sources,
     refresh_selected_knowledge_sources,
     refresh_work_source,
     render_use_my_work,
@@ -3131,19 +3135,36 @@ def _run_learning_workspace(
     start = time.perf_counter()
     requirement = form.get("target_requirement", "").strip()
     try:
+        preflight = preflight_work_sources(data_root, workspace_root=repo_root)
+        local_git = next(
+            (source for source in preflight.sources if source.kind == "local_git"),
+            None,
+        )
+        if local_git is not None and local_git.action_required:
+            refresh_work_source(data_root, "local_git", workspace_root=repo_root)
         run = run_learning_traceability(
             data_root=data_root,
             repository_root=repo_root,
             target_requirement=requirement,
         )
-    except (LearningTraceabilityError, OSError, ValueError) as exc:
+    except LearningFixtureAnchorError:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         return UIActionResult(
             "learning-traceability",
             "local deterministic traceability build",
             1,
             "",
-            str(exc),
+            "这个项目没有找到此练习需要的代码锚点。你可以选择其他项目或创建新的学习案例。",
+            elapsed_ms,
+        )
+    except (LearningTraceabilityError, EvidenceHubError, OSError, ValueError):
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        return UIActionResult(
+            "learning-traceability",
+            "local deterministic traceability build",
+            1,
+            "",
+            "当前学习案例无法建立。请检查已选择项目后重试。",
             elapsed_ms,
         )
     elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -5127,12 +5148,21 @@ def _anchor_pack_html(pack: dict[str, object], locale: UILocale) -> str:
 
 def _learning_page(
     data_root: Path,
-    repo_root: Path,
+    repo_root: Path | None,
     form: dict[str, str],
     result: UIActionResult | None = None,
     locale: UILocale = DEFAULT_UI_LOCALE,
 ) -> str:
-    learning_repository_available = _is_supported_learning_repository(repo_root)
+    project_binding = None
+    fixture_missing_anchors: tuple[str, ...] = ()
+    if repo_root is not None:
+        try:
+            project_binding = inspect_learning_project(repo_root)
+            fixture_missing_anchors = missing_learning_case_anchors(repo_root)
+        except (LearningTraceabilityError, OSError, ValueError):
+            project_binding = None
+    project_available = project_binding is not None
+    fixture_available = project_available and not fixture_missing_anchors
     requested_run_id = form.get("run_id", "")
     if requested_run_id:
         run_dir = (
@@ -5167,12 +5197,27 @@ def _learning_page(
             if path_text:
                 run_dir = Path(path_text)
     dashboard = ""
+    project_matches_run = False
     if run_dir is not None:
         case = _load_json_file(run_dir / "01_case.json") or {}
         mastery = _load_json_file(run_dir / "06_mastery.json") or {}
         learning_plan = _load_json_file(run_dir / "07_learning_plan.json") or {}
         claim = _load_json_file(run_dir / "09_claim_eligibility.json") or {}
         run = _load_json_file(run_dir / "run.json") or {}
+        run_project_source_id = run.get("project_source_id")
+        project_matches_run = bool(
+            project_binding is not None
+            and (
+                (
+                    isinstance(run_project_source_id, str)
+                    and run_project_source_id == project_binding.project_source_id
+                )
+                or (
+                    not isinstance(run_project_source_id, str)
+                    and run.get("repository") == project_binding.repository
+                )
+            )
+        )
         architecture = learning_plan.get("architecture_walkthrough_5_minutes", [])
         deep_dive = learning_plan.get("technical_deep_dive_15_minutes", {})
         decisions = learning_plan.get("decisions_and_trade_offs", [])
@@ -5203,11 +5248,42 @@ def _learning_page(
             if response_saved_stage == "trace"
             else ""
         )
+        trace_exercise = (
+            f"""<section id="exercise-trace" class="panel exercise">
+  <p class="eyebrow">{_escape(ui_text(locale, 'L2 · 追踪练习', 'L2 · Trace exercise'))}</p>
+  <h2>{_escape(ui_text(locale, '沿着真实符号追踪', 'Follow the real symbols'))}</h2>
+  <p>{_escape(str(trace.get('prompt', ui_text(locale, '暂无内容。', 'Not available.'))))}</p>
+  <p class="muted">{_escape(ui_text(locale, '使用图中的代码和测试节点打开有限的本地摘录。', "Use the graph's Code and Test nodes to open bounded local excerpts."))}</p>
+  <form class="response-form" method="post" action="/learning/respond#exercise-trace">
+    <input type="hidden" name="ui_locale" value="{locale}" />
+    <input type="hidden" name="run_id" value="{_escape(run_dir.name)}" />
+    <input type="hidden" name="stage" value="Trace" />
+    <input type="hidden" name="target_requirement" value="{target_requirement}" />
+    <label for="learning-trace-response">{_escape(ui_text(locale, '你的追踪回答', 'Your Trace response'))}</label>
+    <textarea id="learning-trace-response" name="response" rows="8" maxlength="20000" required
+      placeholder="{_escape(ui_text(locale, '追踪已记录的符号与测试，并指出仍然未知的部分。', 'Trace the recorded symbols and tests. Name any remaining unknowns.'))}"></textarea>
+    <button type="submit">{_escape(ui_text(locale, '私有保存追踪回答', 'Save private Trace response'))}</button>
+  </form>
+  {trace_saved}
+  <p class="muted">{_escape(ui_text(locale, '回答会在本地保存为待复核；提交不会自动提升掌握等级。', 'Saved locally as pending review. Submission never advances mastery.'))}</p>
+</section>"""
+            if project_matches_run
+            else f"""<section id="exercise-trace" class="panel exercise needs-project">
+  <p class="eyebrow">{_escape(ui_text(locale, 'L2 · 追踪练习', 'L2 · Trace exercise'))}</p>
+  <h2>{_escape(ui_text(locale, '需要项目证据', 'Project evidence required'))}</h2>
+  <p>{_escape(ui_text(locale, '这个练习需要一个已连接的代码项目。讲解练习仍然可用。', 'This exercise needs a connected code project. Explain remains available.'))}</p>
+  <a class="button-link" href="{ui_url('/work', locale)}">{_escape(ui_text(locale, '选择项目', 'Choose project'))}</a>
+</section>"""
+        )
         backlink = ""
         resume_run_id = form.get("resume_run_id", "")
         bullet_id = form.get("bullet_id", "")
         if resume_run_id or bullet_id:
             try:
+                if repo_root is None:
+                    raise LearningTraceabilityError(
+                        "selected project evidence is unavailable"
+                    )
                 records = load_interview_defense_records(data_root=data_root, run_id=resume_run_id)
                 linked = next(item for item in records if item.bullet_id == bullet_id)
                 pack = _validated_record_anchor_pack(
@@ -5263,6 +5339,10 @@ def _learning_page(
     <span>{_escape(ui_text(locale, '明确下一步', 'Exact next action'))}</span><strong>{next_action}</strong>
     <small>{_escape(ui_text(locale, '不会自动升级', 'No automatic promotion'))}</small>
   </article>
+  <article class="status-card">
+    <span>{_escape(ui_text(locale, '练习语言', 'Practice language'))}</span><strong>English</strong>
+    <small>{_escape(ui_text(locale, '独立于界面语言', 'Independent of UI locale'))}</small>
+  </article>
 </section>
 <section class="panel hero-copy">
   <p class="eyebrow">{_escape(ui_text(locale, '30 秒讲解', '30-second explanation'))}</p>
@@ -5315,26 +5395,7 @@ def _learning_page(
   {explain_saved}
   <p class="muted">{_escape(ui_text(locale, '回答会在本地保存为待复核；提交不会自动提升掌握等级。', 'Saved locally as pending review. Submission never advances mastery.'))}</p>
 </section>
-<section id="exercise-trace" class="panel exercise">
-  <p class="eyebrow">{_escape(ui_text(locale, 'L2 · 追踪练习', 'L2 · Trace exercise'))}</p>
-  <h2>{_escape(ui_text(locale, '沿着真实符号追踪', 'Follow the real symbols'))}</h2>
-  <p>{_escape(str(trace.get("prompt", ui_text(locale, "暂无内容。", "Not available."))))}</p>
-  <p class="muted">{_escape(ui_text(locale, '使用图中的代码和测试节点打开有限的本地摘录。', "Use the graph's Code and Test nodes to open bounded local excerpts."))}</p>
-  <form class="response-form" method="post"
-    action="/learning/respond#exercise-trace">
-    <input type="hidden" name="ui_locale" value="{locale}" />
-    <input type="hidden" name="run_id" value="{_escape(run_dir.name)}" />
-    <input type="hidden" name="stage" value="Trace" />
-    <input type="hidden" name="target_requirement" value="{target_requirement}" />
-    <label for="learning-trace-response">{_escape(ui_text(locale, '你的追踪回答', 'Your Trace response'))}</label>
-    <textarea id="learning-trace-response" name="response" rows="8" maxlength="20000"
-      required
-      placeholder="{_escape(ui_text(locale, '追踪已记录的符号与测试，并指出仍然未知的部分。', 'Trace the recorded symbols and tests. Name any remaining unknowns.'))}"></textarea>
-    <button type="submit">{_escape(ui_text(locale, '私有保存追踪回答', 'Save private Trace response'))}</button>
-  </form>
-  {trace_saved}
-  <p class="muted">{_escape(ui_text(locale, '回答会在本地保存为待复核；提交不会自动提升掌握等级。', 'Saved locally as pending review. Submission never advances mastery.'))}</p>
-</section>
+{trace_exercise}
 <section class="panel footnote">
   <strong>{_escape(ui_text(locale, '私有记录', 'Private run'))}</strong> <code>{_escape(str(run_dir))}</code><br />
   <span>{_escape(ui_text(locale, '分支', 'Branch'))} {_escape(str(run.get("branch", "")))} ·
@@ -5350,20 +5411,25 @@ def _learning_page(
 </section>
 """
     repository_notice = ""
-    if not learning_repository_available:
+    if not project_available:
         repository_notice = f"""<section class="notice warning" role="status">
-  <strong>{_escape(ui_text(locale, '需要连接 SoloScale 源码目录', 'Connect a SoloScale source checkout'))}</strong>
-  <p>{_escape(ui_text(locale, 'Learning 会引用真实代码、测试和 Git commit，因此不能在安装包里伪造项目证据。点击下方按钮选择本机 SoloScale Git checkout；简历、内容和视频仍可正常使用。', 'Learning cites real code, tests, and a Git commit, so the installed app never fabricates project evidence. Use the button below to choose a local SoloScale Git checkout; Resume, Content, and Video remain available.'))}</p>
+  <strong>{_escape(ui_text(locale, '这个练习需要一个已连接的代码项目。', 'This exercise needs a connected code project.'))}</strong>
+  <p>{_escape(ui_text(locale, '选择一个本地 Git 项目以启用代码级追踪和调试；已有证据支持的讲解练习仍可继续。', 'Choose a local Git project to enable code-level Trace and Debug practice. Explain remains available when an existing case has enough evidence.'))}</p>
+</section>"""
+    elif not fixture_available:
+        repository_notice = f"""<section class="notice warning" role="status">
+  <strong>{_escape(ui_text(locale, '当前项目已连接，但不适用于这个示例练习。', 'The current project is connected but does not match this seed exercise.'))}</strong>
+  <p>{_escape(ui_text(locale, '这个项目没有找到此练习需要的代码锚点。你可以选择其他项目或创建新的学习案例。', 'This project does not contain the code anchors required by this exercise. Choose another project or create a new Learning case.'))}</p>
 </section>"""
     build_button = (
         f'<button type="submit">{_escape(ui_text(locale, "创建 / 刷新学习案例", "Build / refresh learning case"))}</button>'
-        if learning_repository_available
-        else f'<a class="button-link" href="soloscale://choose-source-checkout">{_escape(ui_text(locale, "选择源码目录", "Choose source checkout"))}</a>'
+        if fixture_available
+        else f'<a class="button-link" href="{ui_url("/work", locale)}">{_escape(ui_text(locale, "选择项目", "Choose project"))}</a>'
     )
     work_summary = render_use_my_work(
         load_work_context(
             data_root,
-            workspace_root=repo_root if learning_repository_available else None,
+            workspace_root=repo_root if project_available else None,
         ),
         locale,
         boundary=ui_text(
@@ -5372,9 +5438,34 @@ def _learning_page(
             "Interview practice uses only project, code, and test anchors explicitly recorded for the current case. Your mastery still requires your own work.",
         ),
     )
+    explain_state = "AVAILABLE" if run_dir is not None else "NEEDS_CASE_EVIDENCE"
+    trace_state = "AVAILABLE" if run_dir is not None and project_matches_run else "NEEDS_PROJECT_EVIDENCE"
+    debug_state = (
+        "NEEDS_CASE_STAGE"
+        if run_dir is not None and project_matches_run
+        else "NEEDS_PROJECT_EVIDENCE"
+    )
+    capability_state_labels = {
+        "AVAILABLE": ui_text(locale, "可用", "Available"),
+        "NEEDS_PROJECT_EVIDENCE": ui_text(
+            locale, "需要项目证据", "Needs project evidence"
+        ),
+        "NEEDS_CASE_EVIDENCE": ui_text(
+            locale, "需要案例证据", "Needs case evidence"
+        ),
+        "NEEDS_CASE_STAGE": ui_text(
+            locale, "当前案例尚未开放", "Not available in this case yet"
+        ),
+    }
+    capabilities = f"""<section class="learning-capabilities" aria-label="{_escape(ui_text(locale, '练习能力', 'Exercise capabilities'))}">
+  <article data-learning-capability="explain" data-state="{explain_state}"><span>EXPLAIN</span><strong>{_escape(capability_state_labels[explain_state])}</strong></article>
+  <article data-learning-capability="trace" data-state="{trace_state}"><span>TRACE</span><strong>{_escape(capability_state_labels[trace_state])}</strong></article>
+  <article data-learning-capability="debug" data-state="{debug_state}"><span>DEBUG</span><strong>{_escape(capability_state_labels[debug_state])}</strong></article>
+</section>"""
     body = f"""
     {work_summary}
     {repository_notice}
+    {capabilities}
     <form class="panel build-form" method="post" action="/learning/run">
       <input type="hidden" name="ui_locale" value="{locale}" />
       <label>{_escape(ui_text(locale, '当前目标 JD 要求', 'Current target-JD requirement'))}
@@ -5406,9 +5497,10 @@ def _learning_page(
 .use-my-work{display:grid;grid-template-columns:minmax(260px,.75fr) 1fr auto;gap:16px;align-items:center;padding:15px 18px;border:1px solid #d9e2dc;border-radius:15px;background:linear-gradient(110deg,#fff,#f1f8f5)}.use-my-work>div{display:grid;gap:3px}.use-my-work strong{font-size:13px}.use-my-work p{margin:0;color:var(--text-muted);font-size:13px}.use-my-work a{font-weight:800;text-decoration:none;white-space:nowrap}
 .button-link{display:inline-flex;align-items:center;min-height:44px;border-radius:13px;padding:11px 15px;background:var(--brand);color:white;font-weight:800;text-decoration:none}.button-link.secondary{background:var(--success)}.button-row{display:flex;gap:10px;flex-wrap:wrap}
 .saved-response{border-left:3px solid var(--success);padding:9px 12px;background:var(--success-soft);color:var(--success);border-radius:8px}
+.learning-capabilities{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.learning-capabilities article{display:grid;gap:6px;border:1px solid var(--border);border-radius:13px;padding:14px;background:var(--surface-subtle)}.learning-capabilities span{font-size:.75rem;letter-spacing:.08em;color:var(--text-muted)}.learning-capabilities strong{font-size:.78rem;color:var(--brand)}.learning-capabilities [data-state="NEEDS_PROJECT_EVIDENCE"] strong,.learning-capabilities [data-state="NEEDS_CASE_EVIDENCE"] strong,.learning-capabilities [data-state="NEEDS_CASE_STAGE"] strong{color:var(--warning)}
 .status-grid,.truth-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.status-card,.truth-grid div{border:1px solid var(--border);border-radius:14px;padding:16px;background:var(--surface-subtle);display:grid;gap:7px}.status-card span,.truth-grid span{color:var(--text-muted);text-transform:uppercase;letter-spacing:.09em;font-size:.75rem}.status-card strong{font-size:1.15rem}.verified strong{color:var(--success)}.warning strong,.warning-text{color:var(--warning)}.action strong{color:var(--brand)}
 .hero-copy p:not(.eyebrow){max-width:820px;font-size:1.08rem;line-height:1.7}.graph-scroll{overflow:auto;background:#f7f9fc;border:1px solid var(--border);border-radius:12px}#learning-graph{width:1060px;display:block}.panel pre{background:#f7f9fc;color:#2c3548}.panel details summary,details.panel summary{cursor:pointer;font-size:1.05rem;font-weight:750}.hidden{display:none}.footnote span{color:var(--text-muted)}
-@media(max-width:760px){.use-my-work,.status-grid,.truth-grid,.build-form{grid-template-columns:1fr}}
+@media(max-width:760px){.use-my-work,.learning-capabilities,.status-grid,.truth-grid,.build-form{grid-template-columns:1fr}}
 """,
     )
 
@@ -5966,13 +6058,15 @@ def _serve_resume_preview(handler: BaseHTTPRequestHandler, data_root: Path, run_
 def _serve_learning_source(
     handler: BaseHTTPRequestHandler,
     data_root: Path,
-    repo_root: Path,
+    repo_root: Path | None,
     locale: UILocale,
 ) -> None:
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(handler.path).query)
     run_id = query.get("run_id", [""])[0]
     anchor_id = query.get("anchor_id", [""])[0]
     try:
+        if repo_root is None:
+            raise ValueError("select a connected project to open code evidence")
         title, excerpt = _learning_source_excerpt(
             data_root,
             repo_root,
@@ -6346,7 +6440,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         if response_saved_stage is not None:
             display_form["response_saved_stage"] = response_saved_stage
         page = _learning_page(
-            data_root, self.repo_root, display_form, result, self.ui_locale
+            data_root, self.workspace_root, display_form, result, self.ui_locale
         )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -7166,7 +7260,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             _serve_learning_source(
                 self,
                 self.ui_data_root.absolute(),
-                self.repo_root,
+                self.workspace_root,
                 self.ui_locale,
             )
             return
@@ -8830,7 +8924,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(length)
             self.latest_learning_form = _parse_form(body)
             self._adopt_ui_locale(self.latest_learning_form)
-            if not _is_supported_learning_repository(self.repo_root):
+            if self.workspace_root is None:
                 self._send_learning_page(
                     UIActionResult(
                         "learning-traceability",
@@ -8839,8 +8933,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                         "",
                         ui_text(
                             self.ui_locale,
-                            "请先从 SoloScale AI OS 菜单选择本地 SoloScale Git checkout。",
-                            "Choose a local SoloScale Git checkout from the SoloScale AI OS menu first.",
+                            "这个练习需要一个已连接的代码项目。请先选择项目。",
+                            "This exercise needs a connected code project. Choose a project first.",
                         ),
                         0,
                     )
@@ -8848,7 +8942,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 return
             self._send_learning_page(
                 _run_learning_workspace(
-                    self.latest_learning_form, self.ui_data_root.absolute(), self.repo_root
+                    self.latest_learning_form,
+                    self.ui_data_root.absolute(),
+                    self.workspace_root,
                 )
             )
             return
@@ -8882,9 +8978,11 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             mapping_form = _parse_form(self.rfile.read(length))
             self._adopt_ui_locale(mapping_form)
             try:
+                if self.workspace_root is None:
+                    raise ValueError("select a connected project first")
                 map_interview_defense_bullet(
                     data_root=self.ui_data_root.absolute(),
-                    repository_root=self.repo_root,
+                    repository_root=self.workspace_root,
                     resume_run_id=mapping_form.get("resume_run_id", ""),
                     bullet_id=mapping_form.get("bullet_id", ""),
                     learning_run_id=mapping_form.get("learning_run_id", ""),
