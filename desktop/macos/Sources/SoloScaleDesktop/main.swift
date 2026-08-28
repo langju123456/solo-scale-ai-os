@@ -50,7 +50,6 @@ private enum StartupDestination {
         return components.queryItems ?? []
     }
 }
-private let repositoryPreferenceKey = "SoloScaleRepositoryRoot"
 private let workspacePreferenceKey = "SoloScaleWorkspaceRoot"
 private let localePreferenceKey = "SoloScaleUILocale"
 private let releasesURL = URL(
@@ -246,29 +245,6 @@ private final class BackendController: NSObject, ObservableObject {
         }
     }
     func failWebSession(_ message: String) { failStart(message) }
-    func chooseRepository() {
-        let panel = NSOpenPanel()
-        panel.title = "Choose a SoloScale source checkout"
-        panel.prompt = "Choose"
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let selected = panel.url else { return }
-        guard isSupportedRepository(selected) else {
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "This is not a supported SoloScale checkout"
-            alert.informativeText = "Choose a Git checkout containing pyproject.toml and src/soloscale/knowledge_store.py."
-            alert.runModal()
-            return
-        }
-        UserDefaults.standard.set(selected.path, forKey: repositoryPreferenceKey)
-        restart()
-    }
-    func forgetRepository() {
-        UserDefaults.standard.removeObject(forKey: repositoryPreferenceKey)
-        restart()
-    }
     func chooseWorkRepository() {
         let panel = NSOpenPanel()
         panel.title = "Choose a local Git project"
@@ -498,9 +474,7 @@ private final class BackendController: NSObject, ObservableObject {
            !environmentRoot.isEmpty {
             return environmentRoot
         }
-        guard let stored = UserDefaults.standard.string(forKey: repositoryPreferenceKey),
-              isSupportedRepository(URL(fileURLWithPath: stored)) else { return nil }
-        return stored
+        return nil
     }
     private func configuredWorkspaceRoot() -> String? {
         if let environmentRoot = ProcessInfo.processInfo.environment["SOLOSCALE_WORKSPACE_ROOT"],
@@ -524,17 +498,6 @@ private final class BackendController: NSObject, ObservableObject {
         alert.messageText = title
         alert.informativeText = detail
         alert.runModal()
-    }
-    private func isSupportedRepository(_ root: URL) -> Bool {
-        let manager = FileManager.default
-        return manager.fileExists(atPath: root.appendingPathComponent(".git").path)
-            && manager.fileExists(atPath: root.appendingPathComponent("pyproject.toml").path)
-            && manager.fileExists(
-                atPath: root
-                    .appendingPathComponent("src")
-                    .appendingPathComponent("soloscale")
-                    .appendingPathComponent("knowledge_store.py").path
-            )
     }
     private func isRegularLocalGitRepository(_ root: URL) -> Bool {
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
@@ -695,8 +658,6 @@ private struct LocalWebView: NSViewRepresentable {
                 decisionHandler(.cancel)
                 DispatchQueue.main.async { [weak self] in
                     switch components.host {
-                    case "choose-source-checkout":
-                        self?.backend.chooseRepository()
                     case "choose-work-repository":
                         self?.backend.chooseWorkRepository()
                     case "choose-chatgpt-export":
@@ -877,13 +838,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
                 CommandMenu("Project") {
-                    Button("Choose SoloScale Source Checkout…") {
-                        appDelegate.backend.chooseRepository()
-                    }
-                    Button("Forget Source Checkout") {
-                        appDelegate.backend.forgetRepository()
-                    }
-                    Divider()
                     Button("Choose Work Project…") {
                         appDelegate.backend.chooseWorkRepository()
                     }

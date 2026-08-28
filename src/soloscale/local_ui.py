@@ -1091,15 +1091,6 @@ def _desktop_bootstrap_response_proof(
     return hmac.new(token.encode(), payload, hashlib.sha256).hexdigest()
 
 
-def _is_supported_learning_repository(repository_root: Path) -> bool:
-    """Return true only for a real SoloScale Git checkout used by Learning traces."""
-    return (
-        (repository_root / ".git").exists()
-        and (repository_root / "pyproject.toml").is_file()
-        and (repository_root / "src" / "soloscale" / "knowledge_store.py").is_file()
-    )
-
-
 def _resolve_soloscale_command() -> tuple[list[str], dict[str, str]]:
     env = os.environ.copy()
     cli = shutil.which("soloscale")
