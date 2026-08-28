@@ -11,7 +11,7 @@ import re
 import stat
 import tempfile
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -32,6 +32,7 @@ from soloscale.evidence_hub import (
     EvidenceHubError,
     inspect_git_repository,
 )
+from soloscale.evidence_ui import refresh_local_project_evidence
 from soloscale.github_connect import GitHubConnectionState, GitHubConnectionStore
 from soloscale.knowledge_models import ParsedSource, SyncReport
 from soloscale.knowledge_store import KnowledgeStore, KnowledgeStoreError
@@ -77,7 +78,8 @@ class WorkContextSnapshot:
     reusable_items: int = 0
     project_connected: bool = False
     project_name: str | None = None
-    project_state: SourceState = "AVAILABLE"
+    project_authorization_state: SourceState = "NOT_CONNECTED"
+    project_freshness_state: SourceState = "UNAVAILABLE"
     project_head: str | None = None
     project_branch: str | None = None
     project_dirty_count: int = 0
@@ -87,9 +89,30 @@ class WorkContextSnapshot:
     github_connected: bool = False
     github_account_login: str | None = None
     github_selected_repositories: int = 0
-    github_state: SourceState = "NOT_CONNECTED"
+    github_authorization_state: SourceState = "NOT_CONNECTED"
+    github_freshness_state: SourceState = "UNAVAILABLE"
+    codex_freshness_state: SourceState = "UNAVAILABLE"
+    chatgpt_freshness_state: SourceState = "UNAVAILABLE"
     codex_folder_available: bool = False
     last_synced: bool = False
+    preflight_trace_id: str | None = None
+    preflight_at: str | None = None
+
+    @property
+    def project_state(self) -> SourceState:
+        """Backward-compatible combined view: freshness when authorized."""
+
+        if self.project_authorization_state != "READY":
+            return self.project_authorization_state
+        return self.project_freshness_state
+
+    @property
+    def github_state(self) -> SourceState:
+        """Backward-compatible combined view: freshness when authorized."""
+
+        if self.github_authorization_state != "READY":
+            return self.github_authorization_state
+        return self.github_freshness_state
 
     @property
     def ai_conversations(self) -> int:
@@ -115,6 +138,72 @@ class WorkImportResult:
     updated: int
     skipped: int
     failed: int
+    trace_id: str | None = None
+
+
+WorkSourceKind = Literal["local_git", "codex", "github", "chatgpt_export"]
+
+_WORK_SOURCE_KINDS: tuple[WorkSourceKind, ...] = (
+    "local_git",
+    "codex",
+    "github",
+    "chatgpt_export",
+)
+
+
+def _work_trace_id(prefix: str) -> str:
+    """Return a short private trace id for a work-source control-plane action."""
+
+    return f"{prefix}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:10]}"
+
+
+@dataclass(frozen=True)
+class WorkSourcePreflight:
+    """One canonical work source with authorization and freshness kept separate."""
+
+    kind: WorkSourceKind
+    authorization_state: SourceState
+    freshness_state: SourceState
+    action_required: bool
+    last_refreshed_at: str | None = None
+
+
+@dataclass(frozen=True)
+class WorkSourcesPreflight:
+    """Read-only canonical freshness preflight over every explicit work source."""
+
+    trace_id: str
+    preflighted_at: str
+    sources: tuple[WorkSourcePreflight, ...]
+    knowledge_documents: int = 0
+    codex_sessions: int = 0
+    chatgpt_exports: int = 0
+    buildlog_runs: int = 0
+    last_synced: bool = False
+    codex_folder_available: bool = False
+    project_head: str | None = None
+    project_branch: str | None = None
+    project_dirty_count: int = 0
+    project_new_commits: int | None = None
+    project_indexed_at: str | None = None
+    project_fact_count: int = 0
+    github_account_login: str | None = None
+    github_selected_repositories: int = 0
+    github_evidence_refreshed_at: str | None = None
+
+    @property
+    def stale_kinds(self) -> tuple[WorkSourceKind, ...]:
+        return tuple(source.kind for source in self.sources if source.action_required)
+
+    @property
+    def action_required(self) -> bool:
+        return bool(self.stale_kinds)
+
+    def by_kind(self, kind: WorkSourceKind) -> WorkSourcePreflight:
+        for source in self.sources:
+            if source.kind == kind:
+                return source
+        raise KeyError(kind)
 
 
 @dataclass(frozen=True)
@@ -629,16 +718,23 @@ def _count_private_runs(root: Path, directory_name: str, prefix: str) -> int:
         return 0
 
 
-def load_work_context(
+def preflight_work_sources(
     data_root: Path,
     *,
     workspace_root: Path | None = None,
     github_connected: bool = False,
     home: Path | None = None,
-) -> WorkContextSnapshot:
-    """Load safe product counts without creating a catalog or reading source bodies."""
+) -> WorkSourcesPreflight:
+    """Canonical read-only freshness preflight for every explicit work source.
+
+    Never writes. Authorization (is this source connected/usable?) and freshness
+    (is its indexed evidence current?) are reported as separate states so the UI
+    and refresh routes share one source of truth.
+    """
 
     root = Path(data_root)
+    trace_id = _work_trace_id("work-preflight")
+    preflighted_at = datetime.now(UTC).isoformat()
     knowledge_documents = 0
     codex_sessions = 0
     chatgpt_exports = 0
@@ -657,13 +753,6 @@ def load_work_context(
             buildlog_runs = knowledge_status.source_counts.get("buildlog_run", 0)
             last_synced = knowledge_status.last_synced_at is not None
 
-    reusable_items = 0
-    if EvidenceHub.catalog_exists(root):
-        try:
-            reusable_items = EvidenceHub(root).status().evidence_count
-        except (EvidenceHubError, OSError, ValueError):
-            reusable_items = 0
-
     selected_home = home or Path.home()
     codex_home = selected_home / ".codex"
     codex_folder_available = any(
@@ -677,8 +766,10 @@ def load_work_context(
         and (workspace_root / ".git").exists()
         and not (workspace_root / ".git").is_symlink()
     )
-    project_name = workspace_root.name if project_connected and workspace_root else None
-    project_state: SourceState = "AVAILABLE"
+    project_authorization_state: SourceState = (
+        "READY" if project_connected else "NOT_CONNECTED"
+    )
+    project_freshness_state: SourceState = "UNAVAILABLE"
     project_head: str | None = None
     project_branch: str | None = None
     project_dirty_count = 0
@@ -699,13 +790,14 @@ def load_work_context(
                 else None
             )
         except (EvidenceHubError, OSError, ValueError):
-            project_state = "NEEDS_ATTENTION"
+            project_authorization_state = "NEEDS_ATTENTION"
+            project_freshness_state = "NEEDS_ATTENTION"
         else:
             if stored_snapshot is None:
-                project_state = "STALE"
+                project_freshness_state = "STALE"
             else:
                 stored_source, stored_items = stored_snapshot
-                project_state = (
+                project_freshness_state = (
                     "READY"
                     if stored_source.content_sha256 == current_source.content_sha256
                     else "STALE"
@@ -727,47 +819,154 @@ def load_work_context(
                 project_fact_count = len(stored_commits)
     github_account_login: str | None = None
     github_selected_repositories = 0
-    github_state: SourceState = "NOT_CONNECTED"
+    github_authorization_state: SourceState = "NOT_CONNECTED"
+    github_freshness_state: SourceState = "UNAVAILABLE"
+    github_evidence_refreshed_at: str | None = None
     if github_connected:
-        github_state = "AVAILABLE"
+        github_authorization_state = "AVAILABLE"
+        github_freshness_state = "AVAILABLE"
         try:
             github_connection = GitHubConnectionStore(root).load()
         except (OSError, ValueError):
-            github_state = "NEEDS_ATTENTION"
+            github_authorization_state = "NEEDS_ATTENTION"
+            github_freshness_state = "NEEDS_ATTENTION"
         else:
             if github_connection is not None:
+                github_authorization_state = "READY"
                 github_account_login = github_connection.account_login
                 github_selected_repositories = len(
                     github_connection.selected_repository_ids
                 )
                 if github_connection.last_error_code:
-                    github_state = "NEEDS_ATTENTION"
+                    github_authorization_state = "NEEDS_ATTENTION"
+                    github_freshness_state = "NEEDS_ATTENTION"
                 elif github_selected_repositories and github_connection.evidence_refreshed_at:
-                    github_state = "READY"
+                    github_freshness_state = "READY"
+                    github_evidence_refreshed_at = (
+                        github_connection.evidence_refreshed_at.isoformat()
+                    )
                 elif github_selected_repositories:
-                    github_state = "STALE"
-    return WorkContextSnapshot(
-        resume_runs=_count_private_runs(root, "resume-runs", "resume-"),
+                    github_freshness_state = "STALE"
+                else:
+                    github_freshness_state = "AVAILABLE"
+            else:
+                github_freshness_state = "AVAILABLE"
+    codex_freshness_state: SourceState = (
+        "READY"
+        if codex_sessions
+        else "NEEDS_ATTENTION"
+        if not codex_folder_available
+        else "AVAILABLE"
+    )
+    chatgpt_freshness_state: SourceState = (
+        "READY" if chatgpt_exports else "UNAVAILABLE"
+    )
+    sources = (
+        WorkSourcePreflight(
+            kind="local_git",
+            authorization_state=project_authorization_state,
+            freshness_state=project_freshness_state,
+            action_required=project_freshness_state in {"STALE", "NEEDS_ATTENTION"},
+            last_refreshed_at=project_indexed_at,
+        ),
+        WorkSourcePreflight(
+            kind="codex",
+            authorization_state="READY" if codex_sessions or codex_folder_available else "NOT_CONNECTED",
+            freshness_state=codex_freshness_state,
+            action_required=False,
+        ),
+        WorkSourcePreflight(
+            kind="github",
+            authorization_state=github_authorization_state,
+            freshness_state=github_freshness_state,
+            action_required=github_freshness_state in {"STALE", "NEEDS_ATTENTION"},
+            last_refreshed_at=github_evidence_refreshed_at,
+        ),
+        WorkSourcePreflight(
+            kind="chatgpt_export",
+            authorization_state="READY" if chatgpt_exports else "NOT_CONNECTED",
+            freshness_state=chatgpt_freshness_state,
+            action_required=False,
+        ),
+    )
+    return WorkSourcesPreflight(
+        trace_id=trace_id,
+        preflighted_at=preflighted_at,
+        sources=sources,
+        knowledge_documents=knowledge_documents,
         codex_sessions=codex_sessions,
         chatgpt_exports=chatgpt_exports,
         buildlog_runs=buildlog_runs,
-        knowledge_documents=knowledge_documents,
-        reusable_items=reusable_items,
-        project_connected=project_connected,
-        project_name=project_name,
-        project_state=project_state,
+        last_synced=last_synced,
+        codex_folder_available=codex_folder_available,
         project_head=project_head,
         project_branch=project_branch,
         project_dirty_count=project_dirty_count,
         project_new_commits=project_new_commits,
         project_indexed_at=project_indexed_at,
         project_fact_count=project_fact_count,
-        github_connected=github_connected,
         github_account_login=github_account_login,
         github_selected_repositories=github_selected_repositories,
-        github_state=github_state,
-        codex_folder_available=codex_folder_available,
-        last_synced=last_synced,
+        github_evidence_refreshed_at=github_evidence_refreshed_at,
+    )
+
+
+def load_work_context(
+    data_root: Path,
+    *,
+    workspace_root: Path | None = None,
+    github_connected: bool = False,
+    home: Path | None = None,
+) -> WorkContextSnapshot:
+    """Load safe product counts without creating a catalog or reading source bodies."""
+
+    root = Path(data_root)
+    preflight = preflight_work_sources(
+        root,
+        workspace_root=workspace_root,
+        github_connected=github_connected,
+        home=home,
+    )
+    local_git = preflight.by_kind("local_git")
+    github = preflight.by_kind("github")
+    codex = preflight.by_kind("codex")
+    chatgpt = preflight.by_kind("chatgpt_export")
+    project_connected = local_git.authorization_state in {"READY", "NEEDS_ATTENTION"}
+    project_name = workspace_root.name if project_connected and workspace_root else None
+    reusable_items = 0
+    if EvidenceHub.catalog_exists(root):
+        try:
+            reusable_items = EvidenceHub(root).status().evidence_count
+        except (EvidenceHubError, OSError, ValueError):
+            reusable_items = 0
+    return WorkContextSnapshot(
+        resume_runs=_count_private_runs(root, "resume-runs", "resume-"),
+        codex_sessions=preflight.codex_sessions,
+        chatgpt_exports=preflight.chatgpt_exports,
+        buildlog_runs=preflight.buildlog_runs,
+        knowledge_documents=preflight.knowledge_documents,
+        reusable_items=reusable_items,
+        project_connected=project_connected,
+        project_name=project_name,
+        project_authorization_state=local_git.authorization_state,
+        project_freshness_state=local_git.freshness_state,
+        project_head=preflight.project_head,
+        project_branch=preflight.project_branch,
+        project_dirty_count=preflight.project_dirty_count,
+        project_new_commits=preflight.project_new_commits,
+        project_indexed_at=preflight.project_indexed_at,
+        project_fact_count=preflight.project_fact_count,
+        github_connected=github_connected,
+        github_account_login=preflight.github_account_login,
+        github_selected_repositories=preflight.github_selected_repositories,
+        github_authorization_state=github.authorization_state,
+        github_freshness_state=github.freshness_state,
+        codex_freshness_state=codex.freshness_state,
+        chatgpt_freshness_state=chatgpt.freshness_state,
+        codex_folder_available=preflight.codex_folder_available,
+        last_synced=preflight.last_synced,
+        preflight_trace_id=preflight.trace_id,
+        preflight_at=preflight.preflighted_at,
     )
 
 
@@ -778,7 +977,55 @@ def _import_result(report: SyncReport, *, discovered: int, parse_failures: int =
         updated=report.updated,
         skipped=report.skipped,
         failed=report.failed + parse_failures,
+        trace_id=_work_trace_id("work-import"),
     )
+
+
+def refresh_work_source(
+    data_root: Path,
+    kind: WorkSourceKind,
+    *,
+    workspace_root: Path | None = None,
+    codex_home: Path | None = None,
+    chatgpt_export: Path | None = None,
+    github_refresh: Callable[[], None] | None = None,
+) -> WorkImportResult:
+    """Route one explicit incremental refresh to its canonical source implementation."""
+
+    root = Path(data_root)
+    if kind == "local_git":
+        if workspace_root is None:
+            raise WorkContextError("Select one local Git repository before refreshing it.")
+        receipt = refresh_local_project_evidence(root, repository_root=workspace_root)
+        if receipt.status.value != "succeeded":
+            raise WorkContextError("Local Git project evidence refresh failed.")
+        return WorkImportResult(
+            discovered=0,
+            imported=0,
+            updated=0,
+            skipped=0,
+            failed=0,
+            trace_id=_work_trace_id("work-refresh"),
+        )
+    if kind == "codex":
+        return import_codex_history(root, codex_home=codex_home)
+    if kind == "chatgpt_export":
+        if chatgpt_export is None:
+            raise WorkContextError("Choose a ChatGPT export file before importing it.")
+        return import_chatgpt_export(root, chatgpt_export)
+    if kind == "github":
+        if github_refresh is None:
+            raise WorkContextError("GitHub refresh requires the Desktop App connection.")
+        github_refresh()
+        return WorkImportResult(
+            discovered=0,
+            imported=0,
+            updated=0,
+            skipped=0,
+            failed=0,
+            trace_id=_work_trace_id("work-refresh"),
+        )
+    raise WorkContextError(f"Unknown work source kind: {kind}")
 
 
 def import_codex_history(
@@ -895,6 +1142,7 @@ def render_use_my_work(
     locale: UILocale = DEFAULT_UI_LOCALE,
     *,
     boundary: str,
+    return_path: str | None = None,
 ) -> str:
     """Render a truthful, non-configurable summary for one outcome page."""
 
@@ -921,10 +1169,15 @@ def render_use_my_work(
             "还没有添加工作资料；你仍然可以先完成当前任务。",
             "No work has been added yet. You can still complete this task first.",
         )
+    manage_url = (
+        ui_url("/work", locale, **{"return_path": return_path})
+        if return_path
+        else ui_url("/work", locale)
+    )
     return f"""<aside class="use-my-work">
   <div><span class="kicker">{html.escape(ui_text(locale, '使用我的工作资料', 'Use my work'))}</span><strong>{html.escape(summary)}</strong></div>
   <p>{html.escape(boundary)}</p>
-  <a href="{ui_url('/work', locale)}">{html.escape(ui_text(locale, '管理资料', 'Manage work'))} →</a>
+  <a href="{manage_url}">{html.escape(ui_text(locale, '管理资料', 'Manage work'))} →</a>
 </aside>"""
 
 
@@ -937,12 +1190,20 @@ def _source_row(
     summary: str,
     detail: str = "",
     actions: str = "",
+    kind: str | None = None,
+    authorization_state: SourceState | None = None,
 ) -> str:
     """Render one compact source row with a shared semantic state."""
 
     detail_html = f"<p>{html.escape(detail)}</p>" if detail else ""
     actions_html = f'<div class="source-actions">{actions}</div>' if actions else ""
-    return f'''<article class="source-row" data-source="{html.escape(key)}">
+    kind_html = f' data-source-kind="{html.escape(kind)}"' if kind else ""
+    authorization_html = (
+        f' data-authorization-state="{html.escape(authorization_state)}"'
+        if authorization_state
+        else ""
+    )
+    return f'''<article class="source-row" data-source="{html.escape(key)}" data-freshness-state="{html.escape(state)}"{kind_html}{authorization_html}>
   {render_source_state(state, locale)}
   <div class="source-copy"><h3>{html.escape(name)}</h3><strong>{html.escape(summary)}</strong>{detail_html}</div>
   {actions_html}
@@ -961,9 +1222,12 @@ def work_page(
     codex_job: CodexImportJobSnapshot | None = None,
     notice: str | None = None,
     error: str | None = None,
+    return_path: str | None = None,
 ) -> str:
     """Render the truthful Work Context onboarding and source setup page."""
 
+    if not return_path or not return_path.startswith("/") or return_path.startswith("//"):
+        return_path = "/"
     snapshot = load_work_context(
         data_root,
         workspace_root=workspace_root,
@@ -979,6 +1243,21 @@ def work_page(
         codex_job is not None
         and (codex_job.phase == "FAILED" or codex_job.failed > 0)
     )
+    stale_sources: list[str] = []
+    if snapshot.project_state == "STALE":
+        stale_sources.append("Local Git")
+    if snapshot.github_state == "STALE":
+        stale_sources.append("GitHub")
+    preflight_notice = ""
+    if stale_sources:
+        preflight_notice = ui_text(
+            locale,
+            f"已自动预检：以下资料需要刷新：{', '.join(stale_sources)}。每次只增量更新所选来源。",
+            f"Automatic preflight found sources that need a refresh: {', '.join(stale_sources)}. Refresh each selected source incrementally.",
+        )
+        preflight_notice = (
+            f'<div class="notice preflight-notice" role="status" data-preflight-trace-id="{html.escape(snapshot.preflight_trace_id or "")}" data-preflight-at="{html.escape(snapshot.preflight_at or "")}">{html.escape(preflight_notice)}</div>'
+        )
     codex_progress = ""
     codex_job_marker = ""
     if codex_job_active and codex_job is not None:
@@ -1038,10 +1317,7 @@ def work_page(
     connected_rows: list[str] = []
     add_more_rows: list[str] = []
 
-    resume_actions = (
-        f'<a class="source-control" href="{ui_url("/resume", locale)}">{html.escape(ui_text(locale, "查看", "View"))}</a>'
-        f'<a class="source-control" href="{ui_url("/resume#resume-form", locale)}">{html.escape(ui_text(locale, "上传或更新简历", "Upload or update resume"))}</a>'
-    )
+    resume_actions = f'<a class="source-control" href="{ui_url("/resume#resume-form", locale)}">{html.escape(ui_text(locale, "上传或更新简历", "Upload or update resume"))}</a>'
     if snapshot.resume_runs:
         connected_rows.append(
             _source_row(
@@ -1052,6 +1328,7 @@ def work_page(
                 summary=ui_text(locale, f"{snapshot.resume_runs} 份申请记录", f"{snapshot.resume_runs} application records"),
                 detail=ui_text(locale, "只使用你确认过的经历。", "Uses only experience you have confirmed."),
                 actions=resume_actions,
+                kind="resume-library",
             )
         )
     else:
@@ -1064,6 +1341,7 @@ def work_page(
                 summary=ui_text(locale, "还没有简历申请记录", "No resume application records yet"),
                 detail=ui_text(locale, "上传现有简历后即可开始。", "Upload your current resume to get started."),
                 actions=f'<a class="source-control" href="{ui_url("/resume#resume-form", locale)}">{html.escape(ui_text(locale, "上传简历", "Upload resume"))}</a>',
+                kind="resume-library",
             )
         )
 
@@ -1135,6 +1413,8 @@ def work_page(
                     ". Only commit summaries and change fingerprints are stored; project source is neither stored nor uploaded.",
                 ),
                 actions=change_project + prepare_project,
+                kind="local-git",
+                authorization_state=snapshot.project_authorization_state,
             )
         )
     else:
@@ -1152,6 +1432,8 @@ def work_page(
                 summary=ui_text(locale, "还没有选择项目", "No project selected"),
                 detail=ui_text(locale, "只使用你通过系统选择器明确授权的 Git 项目。", "Only a Git project you explicitly choose through the system picker is used."),
                 actions=project_action,
+                kind="local-git",
+                authorization_state=snapshot.project_authorization_state,
             )
         )
 
@@ -1168,6 +1450,7 @@ def work_page(
                     "后台增量处理；你可以继续使用其他页面。单个会话失败不会停止其余会话。",
                     "Incremental processing continues in the background. You can keep using other pages, and one failed session does not stop the rest.",
                 ),
+                kind="codex",
             )
         )
     elif codex_job_needs_attention and codex_job is not None:
@@ -1198,6 +1481,7 @@ def work_page(
                     "Existing work remains unchanged; you can run the update again.",
                 ),
                 actions=codex_action,
+                kind="codex",
             )
         )
     elif snapshot.codex_sessions:
@@ -1210,6 +1494,7 @@ def work_page(
                 summary=ui_text(locale, f"已导入 {snapshot.codex_sessions} 个会话", f"{snapshot.codex_sessions} sessions imported"),
                 detail=ui_text(locale, "只有你明确批准导入时才会读取标准历史目录。", "The standard history folder is read only after your explicit import approval."),
                 actions=codex_action,
+                kind="codex",
             )
         )
     elif snapshot.codex_folder_available:
@@ -1222,6 +1507,7 @@ def work_page(
                 summary=ui_text(locale, "这台 Mac 上有可添加的 Codex 资料", "Codex data is available to add on this Mac"),
                 detail=ui_text(locale, "导入前只确认标准目录存在，不读取正文。", "Before approval, SoloScale checks only that the standard folder exists, not its contents."),
                 actions=codex_action,
+                kind="codex",
             )
         )
     else:
@@ -1233,6 +1519,7 @@ def work_page(
                 name=codex_name,
                 summary=ui_text(locale, "未找到标准 Codex 历史目录", "No standard Codex history folder found"),
                 detail=ui_text(locale, "现有资料不受影响；此页不会扫描其他文件夹。", "Existing work is unaffected, and this page does not scan other folders."),
+                kind="codex",
             )
         )
 
@@ -1246,6 +1533,7 @@ def work_page(
                 summary=ui_text(locale, f"已导入 {snapshot.chatgpt_exports} 个对话", f"{snapshot.chatgpt_exports} conversations imported"),
                 detail=ui_text(locale, "只读取你主动选择并批准导入的官方导出文件。", "Only an official export you explicitly choose and approve is read."),
                 actions=chatgpt_action,
+                kind="chatgpt-export",
             )
         )
     else:
@@ -1258,6 +1546,7 @@ def work_page(
                 summary=ui_text(locale, "已选择文件，等待你批准导入", "File selected; waiting for your import approval") if chatgpt_export_selected else ui_text(locale, "导入 ChatGPT 官方导出的 JSON 或 ZIP", "Import an official ChatGPT JSON or ZIP export"),
                 detail=ui_text(locale, "SoloScale 只读取你主动选择的文件。", "SoloScale reads only the file you explicitly choose."),
                 actions=chatgpt_action,
+                kind="chatgpt-export",
             )
         )
 
@@ -1292,6 +1581,8 @@ def work_page(
                     "Reads metadata only from repositories authorized on GitHub and explicitly selected in SoloScale; GitHub is never modified.",
                 ),
                 actions=github_actions,
+                kind="github",
+                authorization_state=snapshot.github_authorization_state,
             )
         )
     else:
@@ -1317,6 +1608,8 @@ def work_page(
                 summary=ui_text(locale, "尚未连接 GitHub", "GitHub is not connected"),
                 detail=github_detail,
                 actions=github_action,
+                kind="github",
+                authorization_state=snapshot.github_authorization_state,
             )
         )
 
@@ -1331,7 +1624,7 @@ def work_page(
         detail=ui_text(locale, "当前不扫描任意文件夹，也不显示无法执行的操作。", "SoloScale does not scan arbitrary folders or show actions that cannot run."),
     )
 
-    body = f"""{notice_html}{error_html}{codex_job_marker}
+    body = f"""{notice_html}{error_html}{codex_job_marker}{preflight_notice}
 <section class="privacy-note" aria-labelledby="privacy-heading">
   <div><strong id="privacy-heading">{html.escape(ui_text(locale, '只读取你明确选择的资料。本地优先，不扫描整台 Mac。', 'Only work you explicitly choose is read. Local first; no whole-Mac scanning.'))}</strong>
   <details><summary>{html.escape(ui_text(locale, '了解数据边界', 'Understand the data boundary'))}</summary>
@@ -1360,8 +1653,8 @@ def work_page(
   </section>
 </div>
 <footer class="work-actions">
-  <a class="quiet-action" href="{ui_url('/', locale)}">{html.escape(ui_text(locale, '稍后再添加', 'Add more later'))}</a>
-  <a class="primary" href="{ui_url('/', locale)}">{html.escape(ui_text(locale, '完成并继续', 'Continue'))}</a>
+  <a class="quiet-action" href="{ui_url(return_path, locale)}">{html.escape(ui_text(locale, '稍后再添加', 'Add more later'))}</a>
+  <a class="primary" href="{ui_url(return_path, locale)}">{html.escape(ui_text(locale, '完成并继续', 'Continue'))}</a>
 </footer>"""
     return render_app_shell(
         active="work",

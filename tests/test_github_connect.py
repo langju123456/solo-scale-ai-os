@@ -227,6 +227,8 @@ def test_github_read_only_selection_evidence_and_resume_boundary(
         github_connect_available=True,
     )
     assert snapshot.github_state == "READY"
+    assert snapshot.github_authorization_state == "READY"
+    assert snapshot.github_freshness_state == "READY"
     assert snapshot.github_selected_repositories == 1
     assert "operator · 已选择 1 个仓库" in page
     assert 'href="/work/github?lang=zh-CN"' in page

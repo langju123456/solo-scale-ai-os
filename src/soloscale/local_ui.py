@@ -87,7 +87,6 @@ from soloscale.evidence_ui import (
     ensure_local_project_evidence,
     evidence_page,
     refresh_evidence_catalog,
-    refresh_local_project_evidence,
 )
 from soloscale.github_connect import (
     GitHubConnectError,
@@ -260,6 +259,7 @@ from soloscale.work_ui import (
     import_chatgpt_export_bytes,
     load_work_context,
     refresh_selected_knowledge_sources,
+    refresh_work_source,
     render_use_my_work,
     render_work_context_strip,
     work_page,
@@ -4576,6 +4576,7 @@ def _user_page(
             "本次简历仍只使用你确认的模板经历作为事实；其他资料只帮助发现相关项目，不会自动新增经历。",
             "This resume still treats only your approved template experience as fact. Other work can help discovery, but never adds claims automatically.",
         ),
+        return_path="/resume",
     )
     template_preview_id = form.get("resume_template_preview_id", "").strip()
     if (
@@ -5786,11 +5787,8 @@ def _page(
     locale: UILocale = DEFAULT_UI_LOCALE,
     provider_notice: str | None = None,
 ) -> str:
-    includes = form.get("include_codex") == "on"
     query = _escape(form.get("query", ""))
-    question = _escape(form.get("question", ""))
     source_kind = form.get("source_kind", "")
-    model = _escape(form.get("model", "qwen3:8b"))
     ai_preference = _load_ai_provider_preference(data_root)
     ai_provider_name = {
         ModelProviderId.SOLOSCALE_HOSTED: ui_text(
@@ -5799,25 +5797,6 @@ def _page(
         ModelProviderId.OLLAMA: ui_text(locale, "本地 AI", "Local AI"),
         ModelProviderId.OPENAI_COMPATIBLE: "OpenAI API",
     }[ai_preference.provider]
-    ollama_url = _escape(form.get("ollama_url", "http://127.0.0.1:11434"))
-    agent_source_kind = form.get("agent_source_kind", "")
-    resume_job_description = _escape(form.get("job_description", ""))
-    candidate_name = _escape(form.get("candidate_name", ""))
-    candidate_headline = _escape(form.get("candidate_headline", ""))
-    candidate_summary = _escape(form.get("candidate_summary", ""))
-    candidate_skills = _escape(form.get("candidate_skills", ""))
-    candidate_base_resume = _escape(form.get("candidate_base_resume", ""))
-    company_name = _escape(form.get("company_name", ""))
-    company_url = _escape(form.get("company_url", ""))
-    job_title = _escape(form.get("job_title", ""))
-    job_id = _escape(form.get("job_id", ""))
-    resume_library_root = _escape(
-        form.get(
-            "resume_library_root",
-            str(Path.home() / "Documents" / "Resume Applications"),
-        )
-    )
-    resume_mode = form.get("resume_mode", ResumeMode.LOCAL_ONLY.value)
     result_section = (
         f'<section class="card full result-wrap"><h2>{_escape(ui_text(locale, "最近一次运行", "Latest run"))}</h2>{_result_card(action_result, locale)}</section>'
         if action_result is not None
@@ -5851,33 +5830,6 @@ def _page(
     </section>
 
     <section class="card full tool-card">
-      <span class="kicker">{_escape(ui_text(locale, '资料同步', 'Knowledge refresh'))}</span>
-      <h2>{_escape(ui_text(locale, '刷新本地资料索引', 'Refresh the local knowledge index'))}</h2>
-      <p class="tool-description">{_escape(ui_text(locale, '需要生成简历或内容前，手动刷新一次即可；它不是后台监控器。', 'Refresh before creating a resume or content. This is an explicit action, not a background watcher.'))}</p>
-      <form method="post" action="/run">
-        <input type="hidden" name="action" value="knowledge-sync" />
-        <label class="check-row">
-          <input type="checkbox" name="include_codex" {"checked" if includes else ""} />
-          <span><strong>{_escape(ui_text(locale, '包含 Codex 对话记录', 'Include Codex conversation records'))}</strong>
-          <small>{_escape(ui_text(locale, '关闭后，本次刷新不会读取 Codex 来源。', 'When off, this refresh skips Codex sources.'))}</small></span>
-        </label>
-        <details class="technical-details source-settings">
-          <summary>{_escape(ui_text(locale, '选择其他资料来源（可选）', 'Choose other sources (optional)'))}</summary>
-          <label>{_escape(ui_text(locale, 'Codex 数据目录', 'Codex data directory'))}
-            <input name="codex_home" value="{_escape(form.get("codex_home", ""))}" />
-          </label>
-          <label>{_escape(ui_text(locale, 'ChatGPT 导出文件（每行或逗号分隔）', 'ChatGPT export files (one per line or comma-separated)'))}
-            <textarea name="chatgpt_exports" rows="2">{_escape(form.get("chatgpt_exports", ""))}</textarea>
-          </label>
-          <label>{_escape(ui_text(locale, 'BuildLog 项目目录（每行或逗号分隔）', 'BuildLog project directories (one per line or comma-separated)'))}
-            <textarea name="buildlog_roots" rows="2">{_escape(form.get("buildlog_roots", ""))}</textarea>
-          </label>
-        </details>
-        <button type="submit">{_escape(ui_text(locale, '刷新索引', 'Refresh index'))}</button>
-      </form>
-    </section>
-
-    <section class="card full tool-card">
       <span class="kicker">{_escape(ui_text(locale, '本地搜索', 'Local search'))}</span>
       <h2>{_escape(ui_text(locale, '搜索本地证据', 'Search local evidence'))}</h2>
       <p class="tool-description">{_escape(ui_text(locale, '按关键词检查系统目前能找到哪些资料。', 'Check which local records the system can find for a keyword.'))}</p>
@@ -5902,87 +5854,14 @@ def _page(
       </form>
     </section>
 
-    <section id="ai-providers" class="card full tool-card provider-settings">
+    <section class="card full tool-card provider-settings">
       <span class="kicker">{_escape(ui_text(locale, 'AI 服务', 'AI service'))}</span>
-      <h2>{_escape(ui_text(locale, '一个默认选择，贯穿所有工作流', 'One default choice across every workflow'))}</h2>
-      <p class="tool-description">{_escape(ui_text(locale, '简历和内容会自动使用同一个默认服务；连接、模型和密钥设置集中在独立页面。', 'Resume and Content automatically use the same default service. Connection, model, and credential setup live on one dedicated page.'))}</p>
-      {f'<p class="notice success" role="status">{_escape(provider_notice)}</p>' if provider_notice else ''}
+      <h2>{_escape(ui_text(locale, '当前 AI 服务（只读诊断）', 'Current AI service (read-only diagnostic)'))}</h2>
+      <p class="tool-description">{_escape(ui_text(locale, '显示当前默认服务与模型。连接、模型和密钥设置集中在独立页面。', 'Shows the current default service and model. Connection, model, and credential setup live on a dedicated page.'))}</p>
       <div class="provider-option"><span><strong>{_escape(ai_provider_name)}</strong><small>{_escape(ai_preference.model)}</small></span></div>
-      <a class="button-link" href="{ui_url('/settings/ai', locale)}">{_escape(ui_text(locale, '管理 AI 服务', 'Manage AI service'))}</a>
-    </section>
-
-    <section class="card full tool-card">
-      <span class="kicker">{_escape(ui_text(locale, '本地模型', 'Local model'))}</span>
-      <h2>{_escape(ui_text(locale, '用本地模型整理证据', 'Organize evidence with a local model'))}</h2>
-      <p class="tool-description">{_escape(ui_text(locale, '适合核对 JD 或准备面试；结果仍需你人工确认。', 'Useful for JD checks or interview preparation. You still review every result.'))}</p>
-      <form method="post" action="/run">
-        <input type="hidden" name="action" value="evidence-agent" />
-        <label>{_escape(ui_text(locale, '问题', 'Question'))}
-          <textarea name="question" rows="3">{question}</textarea>
-        </label>
-        <details class="technical-details source-settings">
-          <summary>{_escape(ui_text(locale, '模型设置', 'Model settings'))}</summary>
-          <label>{_escape(ui_text(locale, '模型', 'Model'))}<input name="model" value="{model}" /></label>
-          <label>Ollama URL<input name="ollama_url" value="{ollama_url}" /></label>
-          <label>{_escape(ui_text(locale, '资料类型（可选）', 'Source type (optional)'))}
-            <select name="agent_source_kind">
-              <option value="" {"selected" if agent_source_kind == "" else ""}>{_escape(ui_text(locale, '全部来源', 'All sources'))}</option>
-              <option value="codex_session" {"selected" if agent_source_kind == "codex_session" else ""}>Codex</option>
-              <option value="buildlog_run" {"selected" if agent_source_kind == "buildlog_run" else ""}>BuildLog</option>
-              <option value="chatgpt_export" {"selected" if agent_source_kind == "chatgpt_export" else ""}>ChatGPT export</option>
-            </select>
-          </label>
-        </details>
-        <button type="submit">{_escape(ui_text(locale, '运行证据问答', 'Run evidence assistant'))}</button>
-      </form>
     </section>
 
     <aside class="notice full">{_escape(ui_text(locale, '简历生成在“找到机会”页面。这里的证据结果只用于核对，不会自动写进简历。', 'Resume generation lives on the Get the job page. Evidence results here are for verification and are never inserted into a resume automatically.'))}</aside>
-
-    <details class="card full legacy-tool">
-      <summary>{_escape(ui_text(locale, '旧版简历工程工作区', 'Legacy resume engineering workspace'))}</summary>
-      <p class="tool-description">{_escape(ui_text(locale, '仅用于调试底层证据图。日常生成请使用“找到机会”页面。', 'For debugging the underlying evidence graph only. Use Get the job for normal generation.'))}</p>
-      <form method="post" action="/run">
-        <input type="hidden" name="action" value="resume-workspace" />
-        <label>Job Description
-          <textarea name="job_description" rows="7">{resume_job_description}</textarea>
-        </label>
-        <label>{_escape(ui_text(locale, '公司名称（可选）', 'Company name (optional)'))}<input name="company_name" value="{company_name}" /></label>
-        <label>{_escape(ui_text(locale, '岗位名称', 'Job title'))}<input name="job_title" value="{job_title}" /></label>
-        <label>Job ID<input name="job_id" value="{job_id}" /></label>
-        <label>Job URL<input name="company_url" value="{company_url}" /></label>
-        <label>{_escape(ui_text(locale, '简历保存目录', 'Resume library directory'))}
-          <input name="resume_library_root" value="{resume_library_root}" />
-        </label>
-        <label>{_escape(ui_text(locale, '姓名（可选）', 'Candidate name (optional)'))}
-          <input name="candidate_name" value="{candidate_name}" />
-        </label>
-        <label>{_escape(ui_text(locale, '职业标题（可选）', 'Headline (optional)'))}
-          <input name="candidate_headline" value="{candidate_headline}" />
-        </label>
-        <label>{_escape(ui_text(locale, '职业简介（可选）', 'Professional summary (optional)'))}
-          <textarea name="candidate_summary" rows="2">{candidate_summary}</textarea>
-        </label>
-        <label>{_escape(ui_text(locale, '技能（逗号分隔）', 'Skills (comma-separated)'))}
-          <input name="candidate_skills" value="{candidate_skills}" />
-        </label>
-        <label>{_escape(ui_text(locale, '已有简历要点（每行一条）', 'Existing resume bullets (one per line)'))}
-          <textarea
-            name="candidate_base_resume"
-            rows="5">{candidate_base_resume}</textarea>
-        </label>
-        <label>{_escape(ui_text(locale, '运行方式', 'Mode'))}
-          <select name="resume_mode">
-            <option value="local-only"
-              {"selected" if resume_mode == "local-only" else ""}>{_escape(ui_text(locale, '仅本地', 'Local only'))}</option>
-            <option value="hybrid"
-              {"selected" if resume_mode == "hybrid" else ""}
-            >{_escape(ui_text(locale, '混合研究（需要外部 provider）', 'Hybrid research (provider required)'))}</option>
-          </select>
-        </label>
-        <button type="submit">{_escape(ui_text(locale, '生成工程工作区', 'Generate engineering workspace'))}</button>
-      </form>
-    </details>
     {result_section}
   </div>"""
     locale_json = json.dumps(locale)
@@ -5992,8 +5871,8 @@ def _page(
         current_url="/advanced",
         title=f"SoloScale · {ui_text(locale, '高级工具', 'Advanced Tools')}",
         eyebrow=ui_text(locale, "高级工具", "Advanced tools"),
-        heading=ui_text(locale, "偶尔需要的工具，集中放在这里。", "Power tools, out of the way until you need them."),
-        description=ui_text(locale, "知识同步、证据检索和运行维护不会打扰日常产品流程。", "Knowledge sync, evidence search, and runtime maintenance stay outside your everyday product flow."),
+        heading=ui_text(locale, "只读诊断工具，集中放在这里。", "Read-only diagnostics, together in one place."),
+        description=ui_text(locale, "资料刷新与生成都在各自的工作页面；这里只保留检查、搜索与运行状态。", "Refreshing and generation live on their own pages. This page keeps checks, search, and runtime status only."),
         body=body,
         compact_hero=True,
         script=f"""
@@ -6544,6 +6423,13 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         values = query or {}
         notice_code = values.get("notice", [""])[0]
         error_code = values.get("error", [""])[0]
+        return_path = values.get("return_path", [""])[0]
+        if (
+            not return_path
+            or not return_path.startswith("/")
+            or return_path.startswith("//")
+        ):
+            return_path = "/"
         try:
             added = max(0, int(values.get("added", ["0"])[0]))
         except ValueError:
@@ -6673,6 +6559,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             codex_job=codex_job,
             notice=notices.get(notice_code),
             error=errors.get(error_code),
+            return_path=return_path,
         ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -7994,11 +7881,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             form = _parse_form(self.rfile.read(length)) if length else {}
             self._adopt_ui_locale(form)
             try:
-                if self.workspace_root is None:
-                    raise ValueError("select one local Git repository first")
-                receipt = refresh_local_project_evidence(
+                refresh_work_source(
                     self.ui_data_root.absolute(),
-                    repository_root=self.workspace_root,
+                    "local_git",
+                    workspace_root=self.workspace_root,
                 )
             except (EvidenceHubError, OSError, ValueError):
                 location = ui_url(
@@ -8008,11 +7894,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 location = ui_url(
                     "/work",
                     self.ui_locale,
-                    **(
-                        {"notice": "refreshed"}
-                        if receipt.status.value == "succeeded"
-                        else {"error": "refresh-failed"}
-                    ),
+                    notice="refreshed",
                 )
             self.send_response(303)
             self.send_header("Location", location)

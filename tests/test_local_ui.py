@@ -553,27 +553,34 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
 
 def test_advanced_page_is_bilingual_and_hides_command_language(tmp_path: Path) -> None:
     page = _page(None, tmp_path / ".soloscale", {})
-    assert "刷新本地资料索引" in page
-    assert "包含 Codex 对话记录" in page
-    assert "旧版简历工程工作区" in page
-    assert 'id="ai-providers"' in page
+    assert "检查资料库状态" in page
+    assert "更新工程概览" in page
+    assert "搜索本地证据" in page
+    assert "当前 AI 服务（只读诊断）" in page
     assert "SoloScale 托管 AI" in page
-    assert 'href="/settings/ai?lang=zh-CN"' in page
-    assert "管理 AI 服务" in page
+    assert "刷新本地资料索引" not in page
+    assert "包含 Codex 对话记录" not in page
+    assert "旧版简历工程工作区" not in page
+    assert "运行证据问答" not in page
+    assert 'id="ai-providers"' not in page
+    assert 'href="/settings/ai?lang=zh-CN"' not in page
+    assert "管理 AI 服务" not in page
     assert 'action="/settings/ai-provider"' not in page
     assert "用于下一次内容生成" not in page
     assert "用于下一次简历生成" not in page
-    assert 'class="check-row"' in page
-    assert 'input[type="checkbox"]' in page
+    assert 'class="check-row"' not in page
+    assert '<input type="checkbox"' not in page
     assert "Run knowledge-sync" not in page
     assert "--no-codex" not in page
     assert "未匹配到动作" not in page
 
     english = _page(None, tmp_path / ".soloscale", {}, "en")
     assert '<html lang="en">' in english
-    assert "Refresh the local knowledge index" in english
-    assert "Include Codex conversation records" in english
-    assert "Legacy resume engineering workspace" in english
+    assert "Check knowledge status" in english
+    assert "Search local evidence" in english
+    assert "Current AI service (read-only diagnostic)" in english
+    assert "Refresh the local knowledge index" not in english
+    assert "Legacy resume engineering workspace" not in english
     assert "Run knowledge-status" not in english
 
 
@@ -2174,9 +2181,11 @@ def test_resume_graph_renders_clickable_native_svg(tmp_path: Path) -> None:
 
 
 def test_resume_workspace_defaults_to_documents_application_library(tmp_path: Path) -> None:
-    page = _page(None, tmp_path / ".soloscale", {})
     expected = Path.home() / "Documents" / "Resume Applications"
-    assert f'value="{expected}"' in page
+    advanced = _page(None, tmp_path / ".soloscale", {})
+    assert "resume_library_root" not in advanced
+    resume_page = _user_page(None, tmp_path / ".soloscale", {})
+    assert f'value="{expected}"' in resume_page
 
 
 def test_resume_workspace_rejects_unknown_mode_without_crashing(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import stat
 import subprocess
 import time
@@ -15,6 +16,8 @@ from soloscale.work_ui import (
     import_chatgpt_export,
     import_codex_history,
     load_work_context,
+    preflight_work_sources,
+    refresh_work_source,
     work_page,
 )
 
@@ -146,6 +149,8 @@ def test_chatgpt_import_is_explicit_source_preserving_and_body_free_in_ui(
     )
 
     assert result.imported == 1
+    assert result.trace_id is not None
+    assert result.trace_id.startswith("work-import-")
     assert snapshot.chatgpt_exports == 1
     assert snapshot.knowledge_documents == 1
     assert hashlib.sha256(export.read_bytes()).hexdigest() == before
@@ -385,3 +390,114 @@ def test_shared_source_states_have_stable_semantics() -> None:
         rendered = render_source_state(state, "en")
         assert f'data-source-state="{state}"' in rendered
         assert symbol in rendered
+
+
+def test_work_source_preflight_separates_authorization_freshness_and_trace(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+
+    preflight = preflight_work_sources(data_root)
+    local_git = preflight.by_kind("local_git")
+    github = preflight.by_kind("github")
+
+    assert local_git.authorization_state == "NOT_CONNECTED"
+    assert local_git.freshness_state == "UNAVAILABLE"
+    assert local_git.action_required is False
+    assert github.authorization_state == "NOT_CONNECTED"
+    assert github.freshness_state == "UNAVAILABLE"
+    assert github.action_required is False
+    assert preflight.action_required is False
+    assert preflight.trace_id.startswith("work-preflight-")
+    assert preflight.preflighted_at.endswith("+00:00")
+
+    snapshot = load_work_context(data_root)
+    assert snapshot.project_authorization_state == "NOT_CONNECTED"
+    assert snapshot.project_freshness_state == "UNAVAILABLE"
+    assert snapshot.project_state == "NOT_CONNECTED"
+    assert snapshot.github_authorization_state == "NOT_CONNECTED"
+    assert snapshot.github_freshness_state == "UNAVAILABLE"
+    assert snapshot.github_state == "NOT_CONNECTED"
+    assert snapshot.preflight_trace_id.startswith("work-preflight-")
+    assert snapshot.preflight_at.endswith("+00:00")
+
+
+def test_stale_source_auto_preflight_incremental_refresh_and_continue(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    (project / "feature.txt").write_text("verified feature", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "feature.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(project),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "feat: add verified local project evidence",
+        ],
+        check=True,
+    )
+
+    preflight = preflight_work_sources(data_root, workspace_root=project)
+    local_git = preflight.by_kind("local_git")
+    assert local_git.authorization_state == "READY"
+    assert local_git.freshness_state == "STALE"
+    assert local_git.action_required is True
+    assert preflight.action_required is True
+
+    page = work_page(
+        data_root=data_root,
+        workspace_root=project,
+        desktop_mode=True,
+        return_path="/resume",
+    )
+    assert "已自动预检" in page
+    assert 'data-preflight-trace-id="work-preflight-' in page
+    assert 'data-preflight-at="' in page
+    assert 'data-source-kind="local-git"' in page
+    assert 'data-authorization-state="READY"' in page
+    assert 'data-freshness-state="STALE"' in page
+    assert 'href="/resume?lang=zh-CN"' in page
+
+    result = refresh_work_source(data_root, "local_git", workspace_root=project)
+    assert result.trace_id is not None
+    assert result.trace_id.startswith("work-refresh-")
+
+    refreshed = preflight_work_sources(data_root, workspace_root=project)
+    assert refreshed.by_kind("local_git").freshness_state == "READY"
+    assert refreshed.by_kind("local_git").action_required is False
+    assert refreshed.action_required is False
+    ready_page = work_page(
+        data_root=data_root,
+        workspace_root=project,
+        desktop_mode=True,
+    )
+    assert "已自动预检" not in ready_page
+
+
+def test_resume_library_row_no_longer_loops_back_to_the_generator(
+    tmp_path: Path,
+) -> None:
+    page = work_page(
+        data_root=tmp_path / "data",
+        workspace_root=None,
+        desktop_mode=True,
+    )
+    row = re.search(
+        r'<article class="source-row" data-source="resume-library".*?</article>',
+        page,
+        re.DOTALL,
+    )
+    assert row is not None
+    assert "查看" not in row.group(0)
+    assert "上传简历" in row.group(0)
+    assert 'data-source-kind="resume-library"' in row.group(0)
