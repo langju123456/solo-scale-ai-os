@@ -49,6 +49,7 @@ from soloscale.local_ui import (
     _split_path_list,
     _user_page,
     _workspace_path,
+    _workspace_paths,
     _write_private_bytes,
     _write_private_json,
 )
@@ -60,6 +61,7 @@ from soloscale.model_gateway import (
 )
 from soloscale.resume_docx import read_template_paragraphs
 from soloscale.resume_models import CandidateProfile
+from soloscale.resume_template_intake import inspect_template_html
 from soloscale.resume_workspace import (
     map_interview_defense_bullet,
     run_resume_workspace,
@@ -290,13 +292,44 @@ class RecordingResumeGateway:
             }
             unsupported = []
             guidance = "Lead with customer delivery and requirements translation."
+        output_locale = request_payload.get("output_locale", "en-US")
+        role_summary = "JD-conditioned strategy for the selected role."
+        if output_locale == "zh-CN":
+            translations = {
+                "PROFILE-01": "围绕 customer-facing 场景改进智能体可靠性与需求转化。",
+                "PROFILE-02": "面向 Ardent Mills 与 Kangni 完成需求转化和协作。",
+                "PROFILE-03": "快速构建 SoloScale 全栈生成式 AI 工作流，覆盖 RAG 与 agents。",
+                "PROFILE-04": "设计 BuildLog 架构，支持 AI-assisted 开发与 evals。",
+            }
+            rewrites = translations
+            if synthesis_target == "PROFILE-01":
+                rewrites["PROFILE-01"] = (
+                    "围绕 customer-facing 场景完成需求转化，并与 Ardent Mills "
+                    "及 Kangni 协作改进智能体可靠性。"
+                )
+            elif synthesis_target == "PROFILE-03":
+                rewrites["PROFILE-03"] = (
+                    "快速构建 SoloScale 全栈生成式 AI 工作流，并以 BuildLog "
+                    "支持 RAG、agents 与 AI-assisted 开发。"
+                )
+            if summary_rewrite is not None:
+                summary_rewrite = {
+                    "text": rewrites[synthesis_target or "PROFILE-01"],
+                    "source_fact_ids": [
+                        fact_id
+                        for source_id in synthesis_sources
+                        for fact_id in fact_ids_by_source[source_id]
+                    ],
+                }
+            role_summary = "面向目标岗位、受事实约束的简历策略。"
+            guidance = "使用自然中文重组已批准事实，不增加经历。"
         skill_ids = {
             "Customer delivery, requirements, stakeholders": "SKILL-01",
             "Python, RAG, agents, evals": "SKILL-02",
         }
         return schema.model_validate(
             {
-                "role_summary": "JD-conditioned strategy for the selected role.",
+                "role_summary": role_summary,
                 "evidence_priority": priority,
                 "skill_priority": [skill_ids[item] for item in skills],
                 "bullet_rewrites": {
@@ -481,6 +514,12 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
     assert 'name="support_document"' in page
     assert 'name="job_description"' in page
     assert 'name="tailoring_instructions"' in page
+    assert 'action="/resume/template-preview"' in page
+    assert 'name="layout_template_file"' in page
+    assert 'name="layout_template_url"' in page
+    assert 'name="layout_template_html"' in page
+    assert 'name="resume_output_language"' in page
+    assert '<option value="both"' in page
     assert 'name="approve_resume_processing"' in page
     assert 'name="retention_mode"' not in page
     assert 'name="approve_candidate_claims"' not in page
@@ -1566,6 +1605,152 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
     rendered_fde = _user_page(fde_result, tmp_path / "data-FDE", {})
     assert "查看本次证据来源" in rendered_fde
     assert "查看 JD 要求覆盖" in rendered_fde
+
+
+def test_resume_ui_generates_bilingual_variants_from_one_evidence_pack(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class EmptyStore:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+        def search(self, query: str, limit: int) -> list[RetrievalHit]:
+            del query, limit
+            return []
+
+    def create_preview(_source: Path, target: Path) -> bool:
+        _write_private_bytes(target, b"%PDF-1.4\nsynthetic bilingual preview\n")
+        return True
+
+    monkeypatch.setattr("soloscale.local_ui.KnowledgeStore", EmptyStore)
+    monkeypatch.setattr(
+        "soloscale.local_ui._create_resume_pdf_preview", create_preview
+    )
+    gateway = RecordingResumeGateway()
+    data_root = tmp_path / "data-bilingual"
+    result = _run_user_resume(
+        {
+            "job_description": (
+                "Engineer in Residence\nrapid prototyping full-stack GenAI "
+                "AI-assisted coding agents RAG evals architecture"
+            ),
+            "generation_mode": "ollama",
+            "provider_model": "test-model",
+            "company_name": "BeaconFire",
+            "job_title": "AI Engineer",
+            "approve_resume_processing": "yes",
+            "resume_output_language": "both",
+        },
+        {
+            "resume_template": UploadedFile(
+                filename="Lang_Ju_Resume.docx",
+                content_type="application/octet-stream",
+                content=_role_resume_docx(),
+            )
+        },
+        data_root,
+        tmp_path / "repo",
+        gateway=gateway,
+    )
+
+    assert result.return_code == 0, result.stderr
+    run_dirs = _workspace_paths(result.stdout)
+    assert len(run_dirs) == 2
+    metadata = [
+        json.loads((run_dir / "09_user_ui.json").read_text())
+        for run_dir in run_dirs
+    ]
+    assert {item["output_locale"] for item in metadata} == {"en-US", "zh-CN"}
+    assert len({item["resume_project_id"] for item in metadata}) == 1
+    assert len({item["candidate_evidence_pack_sha256"] for item in metadata}) == 1
+    assert all((run_dir / "08_resume.docx").is_file() for run_dir in run_dirs)
+    assert all((run_dir / "10_resume_preview.pdf").is_file() for run_dir in run_dirs)
+    assert {Path(item["output_filename"]).stem.rsplit("_", 1)[-1] for item in metadata} == {
+        "en-US",
+        "zh-CN",
+    }
+    provenance = [
+        json.loads((run_dir / "12_resume_provenance.json").read_text())
+        for run_dir in run_dirs
+    ]
+    assert all(receipt["all_exported_claims_supported"] is True for receipt in provenance)
+    request_payloads = [json.loads(request) for request in gateway.requests]
+    assert request_payloads[0]["candidate_profile"]["atomic_facts"] == (
+        request_payloads[1]["candidate_profile"]["atomic_facts"]
+    )
+    request_locales = [payload["output_locale"] for payload in request_payloads]
+    assert request_locales == ["en-US", "zh-CN"]
+    rendered = _user_page(result, data_root, {})
+    assert "en-US" in rendered
+    assert "zh-CN" in rendered
+    chinese_dir = next(
+        run_dir
+        for run_dir, item in zip(run_dirs, metadata, strict=True)
+        if item["output_locale"] == "zh-CN"
+    )
+    chinese_paragraphs = [
+        item.text
+        for item in read_template_paragraphs(
+            (chinese_dir / "08_resume.docx").read_bytes()
+        )
+        if item.text
+    ]
+    assert "个人简介" in chinese_paragraphs
+    assert "项目经历" in chinese_paragraphs
+    assert any("快速构建 SoloScale" in item for item in chinese_paragraphs)
+
+
+def test_resume_ui_uses_confirmed_template_only_for_section_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "soloscale.local_ui._create_resume_pdf_preview", lambda _source, _target: False
+    )
+    receipt = inspect_template_html(
+        """
+        <h2>Skills</h2><p>Senior Java Engineer</p>
+        <h2>Summary</h2><p>Led a $10M customer platform.</p>
+        <h2>Projects</h2><h2>Experience</h2><h2>Education</h2>
+        """
+    )
+    data_root = tmp_path / "data-template"
+    result = _run_user_resume(
+        {
+            "job_description": "Required: Python, RAG, and agents.",
+            "generation_mode": "template",
+            "approve_resume_processing": "yes",
+            "resume_output_language": "en-US",
+            "resume_template_preview_id": receipt.preview_id,
+            "approve_layout_template": "yes",
+        },
+        {
+            "resume_template": UploadedFile(
+                filename="Lang_Ju_Resume.docx",
+                content_type="application/octet-stream",
+                content=_role_resume_docx(),
+            )
+        },
+        data_root,
+        tmp_path / "repo",
+        template_receipt=receipt,
+    )
+
+    assert result.return_code == 0, result.stderr
+    run_dir = _workspace_path(result.stdout)
+    assert run_dir is not None
+    paragraphs = [
+        item.text
+        for item in read_template_paragraphs((run_dir / "08_resume.docx").read_bytes())
+        if item.text
+    ]
+    assert paragraphs.index("TECHNICAL SKILLS") < paragraphs.index("SUMMARY")
+    assert "Senior Java Engineer" not in paragraphs
+    assert "Led a $10M customer platform." not in paragraphs
+    run_payload = json.loads((run_dir / "run.json").read_text())
+    template_receipt = run_payload["template_receipt"]
+    assert template_receipt["source_sha256"] == receipt.source_sha256
+    assert template_receipt["candidate_facts_imported"] is False
+    assert "Senior Java Engineer" not in json.dumps(template_receipt)
 
 
 def test_resume_ui_rejects_only_unsafe_rewrite_and_keeps_original_bullet(

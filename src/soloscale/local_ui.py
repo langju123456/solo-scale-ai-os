@@ -149,6 +149,7 @@ from soloscale.resume_docx import (
     ResumeTemplateError,
     TailoredDocx,
     apply_resume_expert_review,
+    apply_resume_template_structure,
     extract_candidate_profile,
     read_template_paragraphs,
     request_resume_expert_review,
@@ -179,6 +180,13 @@ from soloscale.resume_models import (
     ResumeMode,
     ResumeProvenanceReceipt,
     build_resume_atomic_facts,
+)
+from soloscale.resume_template_intake import (
+    ResumeTemplateReceipt,
+    inspect_template_file,
+    inspect_template_html,
+    inspect_template_url,
+    template_metadata_from_receipt,
 )
 from soloscale.resume_workspace import (
     ResumeWorkspaceStorageError,
@@ -319,6 +327,7 @@ class ResumeJobManager:
         evidence_repository_root: Path | None = None,
         gateway: ModelGateway | None,
         expert_gateway: ModelGateway | None = None,
+        template_receipt: ResumeTemplateReceipt | None = None,
         allow_persistent_storage: bool = False,
         initial_timings_ms: dict[str, int] | None = None,
     ) -> str:
@@ -343,6 +352,7 @@ class ResumeJobManager:
             evidence_repository_root,
             gateway,
             expert_gateway,
+            template_receipt,
             allow_persistent_storage,
         )
         return job_id
@@ -386,6 +396,7 @@ class ResumeJobManager:
         evidence_repository_root: Path | None,
         gateway: ModelGateway | None,
         expert_gateway: ModelGateway | None,
+        template_receipt: ResumeTemplateReceipt | None,
         allow_persistent_storage: bool,
     ) -> None:
         def progress(phase: str) -> None:
@@ -403,6 +414,7 @@ class ResumeJobManager:
                 evidence_repository_root=evidence_repository_root,
                 gateway=gateway,
                 expert_gateway=expert_gateway,
+                template_receipt=template_receipt,
                 allow_persistent_storage=allow_persistent_storage,
                 create_preview=False,
                 progress=progress,
@@ -1401,6 +1413,18 @@ def _user_resume_filename(
     )
 
 
+def _resume_variant_filename(
+    filename: str,
+    output_locale: Literal["en-US", "zh-CN"],
+    *,
+    include_locale: bool,
+) -> str:
+    if not include_locale:
+        return filename
+    path = Path(filename)
+    return f"{path.stem}_{output_locale}{path.suffix}"
+
+
 _JOB_EVIDENCE_PRIORITY_TERMS = (
     "python",
     "rag",
@@ -1832,6 +1856,9 @@ def _save_request_scoped_resume_run(
     tailoring_instructions: str,
     approved_claims: list[dict[str, str]],
     create_preview: bool = True,
+    output_locale: Literal["en-US", "zh-CN"] = "en-US",
+    resume_project_id: str | None = None,
+    template_receipt: ResumeTemplateReceipt | None = None,
 ) -> Path:
     """Persist only the generated result and body-free receipts for upload-first use."""
 
@@ -1933,6 +1960,8 @@ def _save_request_scoped_resume_run(
     )
     user_metadata: dict[str, object] = {
         "schema_version": "1.0",
+        "resume_project_id": resume_project_id,
+        "output_locale": output_locale,
         "retention": "request_scoped_sources_not_persisted",
         "template_source_format": source_format,
         "template_sha256": tailored.template_sha256,
@@ -2020,6 +2049,11 @@ def _save_request_scoped_resume_run(
         "expert_review_model": tailored.expert_model,
         "expert_rewrites": tailored.expert_rewrites,
         "expert_review_sha256": expert_review_sha256,
+        "template_receipt": (
+            template_receipt.model_dump(mode="json")
+            if template_receipt is not None
+            else None
+        ),
     }
     _write_private_json(run_dir / "09_user_ui.json", user_metadata)
     job_sha256 = hashlib.sha256(job_description.encode("utf-8")).hexdigest()
@@ -2032,6 +2066,8 @@ def _save_request_scoped_resume_run(
             "schema_version": "1.0",
             "status": "REQUEST_SCOPED_DRAFT_READY",
             "run_id": run_id,
+            "resume_project_id": resume_project_id,
+            "output_locale": output_locale,
             "source_inputs_retained": False,
             "source_input_lifetime": "request_only",
             "job_description_sha256": job_sha256,
@@ -2051,6 +2087,13 @@ def _save_request_scoped_resume_run(
             "model_call_profile": tailored.model_call_profile,
             "final_human_review_required": True,
             "job_application_submitted": False,
+            "template_receipt_sha256": (
+                hashlib.sha256(
+                    template_receipt.model_dump_json().encode("utf-8")
+                ).hexdigest()
+                if template_receipt is not None
+                else None
+            ),
         },
     )
     artifacts = [
@@ -2078,6 +2121,8 @@ def _save_request_scoped_resume_run(
             "schema_version": "1.0",
             "run_id": run_id,
             "status": "DRAFT_REQUIRES_HUMAN_REVIEW",
+            "resume_project_id": resume_project_id,
+            "output_locale": output_locale,
             "retention": "request_scoped_sources_not_persisted",
             "artifact_paths": artifacts,
             "job_description_sha256": job_sha256,
@@ -2090,6 +2135,11 @@ def _save_request_scoped_resume_run(
             "candidate_evidence_pack_sha256": pack.pack_sha256 if pack else None,
             "candidate_evidence_fact_count": len(pack.atomic_facts) if pack else 0,
             "positioning_role_title": None,
+            "template_receipt": (
+                template_receipt.model_dump(mode="json")
+                if template_receipt is not None
+                else None
+            ),
         },
     )
     return run_dir
@@ -2104,6 +2154,7 @@ def _run_user_resume(
     evidence_repository_root: Path | None = None,
     gateway: ModelGateway | None = None,
     expert_gateway: ModelGateway | None = None,
+    template_receipt: ResumeTemplateReceipt | None = None,
     allow_persistent_storage: bool = False,
     create_preview: bool = True,
     progress: Callable[[str], None] | None = None,
@@ -2156,6 +2207,30 @@ def _run_user_resume(
             "AI generation mode is invalid.",
             0,
         )
+    output_language = form.get("resume_output_language", "en-US").strip()
+    if output_language not in {"en-US", "zh-CN", "both"}:
+        return UIActionResult(
+            "tailored-resume",
+            "resume generation",
+            2,
+            "",
+            "Resume output language is invalid.",
+            0,
+        )
+    output_locales: tuple[Literal["en-US", "zh-CN"], ...] = (
+        ("en-US", "zh-CN")
+        if output_language == "both"
+        else (cast(Literal["en-US", "zh-CN"], output_language),)
+    )
+    if generation_mode == "template" and output_language != "en-US":
+        return UIActionResult(
+            "tailored-resume",
+            "resume generation",
+            2,
+            "",
+            "Natural Chinese Resume output requires an AI provider; safe offline mode does not mechanically translate Resume claims.",
+            0,
+        )
     expert_review_mode = form.get("expert_review_mode", "local").strip()
     if generation_mode == "template":
         expert_review_mode = "local"
@@ -2166,6 +2241,15 @@ def _run_user_resume(
             2,
             "",
             "Expert review mode is invalid.",
+            0,
+        )
+    if output_language == "both" and expert_review_mode == "openai_sol":
+        return UIActionResult(
+            "tailored-resume",
+            "resume expert review",
+            2,
+            "",
+            "Generate bilingual base resumes first; optional expert review is available one locale at a time.",
             0,
         )
     if expert_review_mode == "openai_sol":
@@ -2243,6 +2327,22 @@ def _run_user_resume(
             if resume_upload.source_format == "docx"
             else normalize_text_resume_to_docx(resume_upload.text)
         )
+        template_preview_id = form.get("resume_template_preview_id", "").strip()
+        if template_preview_id:
+            if form.get("approve_layout_template") != "yes":
+                raise ResumeUploadError(
+                    "Review and approve the detected template structure before generation"
+                )
+            if (
+                template_receipt is None
+                or template_receipt.preview_id != template_preview_id
+            ):
+                raise ResumeUploadError(
+                    "The selected template preview is unavailable; read the template again"
+                )
+            template_bytes = apply_resume_template_structure(
+                template_bytes, template_receipt.detected_sections
+            )
         profile_started = time.perf_counter()
         profile = extract_candidate_profile(template_bytes)
         if timing is not None:
@@ -2300,39 +2400,59 @@ def _run_user_resume(
         )
         _record_resume_event(data_root, ResumeFunnelEventType.GENERATION_STARTED)
         generation_started = time.perf_counter()
+        tailored_variants: list[
+            tuple[Literal["en-US", "zh-CN"], TailoredDocx]
+        ] = []
         if generation_mode == "template":
             selected_gateway = None
-            tailored = tailor_resume_docx(template_bytes, relevance_text)
+            tailored_variants.append(
+                ("en-US", tailor_resume_docx(template_bytes, relevance_text))
+            )
         else:
             selected_gateway = gateway or model_gateway_for(
                 generation_mode,
                 model=form.get("provider_model", "qwen3:8b"),
             )
             assert candidate_evidence_pack is not None
-            candidate_artifact_path, candidate_recorder = (
-                _new_resume_candidate_recorder(data_root)
+            gateway_template_metadata = (
+                template_metadata_from_receipt(template_receipt)
+                if template_receipt is not None
+                else resume_upload.template_metadata
             )
-            tailored = tailor_resume_docx_with_gateway(
-                template_bytes,
-                job_description,
-                gateway=selected_gateway,
-                tailoring_instructions=tailoring_instructions,
-                template_metadata=resume_upload.template_metadata,
-                support_upload=support_upload,
-                candidate_recorder=candidate_recorder,
-                candidate_evidence_pack=candidate_evidence_pack,
-            )
-            # The gateway call above receives only verified atomic facts. Attach
-            # body-free discovery lineage locally after that boundary completes.
-            tailored = replace(
-                tailored,
-                evidence_retrieval_trace=build_resume_evidence_retrieval_trace(
-                    job_description=job_description,
-                    facts=candidate_evidence_pack.atomic_facts,
-                    knowledge_hits=discovery_hits,
-                    adoption=list(tailored.evidence_adoption),
-                ),
-            )
+            for output_locale in output_locales:
+                candidate_artifact_path, candidate_recorder = (
+                    _new_resume_candidate_recorder(data_root)
+                )
+                localized = tailor_resume_docx_with_gateway(
+                    template_bytes,
+                    job_description,
+                    gateway=selected_gateway,
+                    tailoring_instructions=tailoring_instructions,
+                    template_metadata=gateway_template_metadata,
+                    support_upload=support_upload,
+                    candidate_recorder=candidate_recorder,
+                    candidate_evidence_pack=candidate_evidence_pack,
+                    output_locale=output_locale,
+                )
+                # The gateway receives only verified atomic facts. Body-free local
+                # discovery lineage is attached after that boundary completes.
+                tailored_variants.append(
+                    (
+                        output_locale,
+                        replace(
+                            localized,
+                            evidence_retrieval_trace=(
+                                build_resume_evidence_retrieval_trace(
+                                    job_description=job_description,
+                                    facts=candidate_evidence_pack.atomic_facts,
+                                    knowledge_hits=discovery_hits,
+                                    adoption=list(localized.evidence_adoption),
+                                )
+                            ),
+                        ),
+                    )
+                )
+        tailored = tailored_variants[0][1]
         if timing is not None:
             timing(
                 "model_generation_ms",
@@ -2423,6 +2543,7 @@ def _run_user_resume(
                     "expert_review_ms",
                     int((time.perf_counter() - expert_started) * 1000),
                 )
+            tailored_variants[0] = (tailored_variants[0][0], tailored)
         output_name = _user_resume_filename(
             profile,
             form.get("company_name", "").strip() or None,
@@ -2435,32 +2556,52 @@ def _run_user_resume(
             if progress is not None:
                 progress("EXPORTING")
             docx_started = time.perf_counter()
-            run_dir = _save_request_scoped_resume_run(
-                data_root=data_root,
-                job_description=job_description,
-                profile=profile,
-                tailored=tailored,
-                output_name=output_name,
-                source_format=resume_upload.source_format,
-                tailoring_instructions=tailoring_instructions,
-                approved_claims=approved_claims,
-                create_preview=create_preview,
-            )
-            _record_resume_event(
-                data_root,
-                ResumeFunnelEventType.GENERATION_COMPLETED,
-                run_id=run_dir.name,
-            )
+            resume_project_id = f"resume-project-{uuid4().hex[:12]}"
+            run_dirs: list[Path] = []
+            for output_locale, variant in tailored_variants:
+                variant_name = _resume_variant_filename(
+                    output_name,
+                    output_locale,
+                    include_locale=len(tailored_variants) > 1,
+                )
+                run_dir = _save_request_scoped_resume_run(
+                    data_root=data_root,
+                    job_description=job_description,
+                    profile=profile,
+                    tailored=variant,
+                    output_name=variant_name,
+                    source_format=resume_upload.source_format,
+                    tailoring_instructions=tailoring_instructions,
+                    approved_claims=approved_claims,
+                    create_preview=create_preview,
+                    output_locale=output_locale,
+                    resume_project_id=resume_project_id,
+                    template_receipt=template_receipt,
+                )
+                run_dirs.append(run_dir)
+                _record_resume_event(
+                    data_root,
+                    ResumeFunnelEventType.GENERATION_COMPLETED,
+                    run_id=run_dir.name,
+                )
             if timing is not None:
                 timing("docx_ms", int((time.perf_counter() - docx_started) * 1000))
             elapsed_ms = int((time.perf_counter() - started) * 1000)
+            workspace_lines = [f"Resume workspace: {run_dirs[0]}"]
+            workspace_lines.extend(
+                f"Resume variant workspace: {value}" for value in run_dirs[1:]
+            )
             return UIActionResult(
                 "tailored-resume",
                 "request-scoped resume generation",
                 0,
-                f"Resume workspace: {run_dir}",
+                "\n".join(workspace_lines),
                 "",
                 elapsed_ms,
+            )
+        if len(tailored_variants) > 1:
+            raise ResumeUploadError(
+                "Bilingual output is available in the private Desktop draft flow"
             )
         library_root = (
             Path(
@@ -2498,6 +2639,7 @@ def _run_user_resume(
             application_resume_bytes=tailored.content,
             application_resume_filename=output_name,
             application_resume_metadata={
+                "output_locale": tailored.output_locale,
                 "template_source_format": resume_upload.source_format,
                 "template_sha256": tailored.template_sha256,
                 "claims_preserved": tailored.claims_preserved,
@@ -2523,6 +2665,29 @@ def _run_user_resume(
                 "tailoring_instructions_sha256": hashlib.sha256(
                     tailoring_instructions.encode("utf-8")
                 ).hexdigest(),
+                "template_receipt_preview_id": (
+                    template_receipt.preview_id if template_receipt is not None else ""
+                ),
+                "template_receipt_source_type": (
+                    template_receipt.source_type.value
+                    if template_receipt is not None
+                    else ""
+                ),
+                "template_receipt_source_sha256": (
+                    template_receipt.source_sha256
+                    if template_receipt is not None
+                    else ""
+                ),
+                "template_receipt_source_url": (
+                    template_receipt.source_url or ""
+                    if template_receipt is not None
+                    else ""
+                ),
+                "template_receipt_sections_json": (
+                    json.dumps(template_receipt.detected_sections, ensure_ascii=False)
+                    if template_receipt is not None
+                    else ""
+                ),
             },
             mode=ResumeMode.LOCAL_ONLY,
         )
@@ -2566,6 +2731,7 @@ def _run_user_resume(
         )
         user_metadata: dict[str, object] = {
             "schema_version": "1.0",
+            "output_locale": tailored.output_locale,
             "template_source_format": resume_upload.source_format,
             "template_sha256": tailored.template_sha256,
             "output_filename": output_name,
@@ -2672,6 +2838,11 @@ def _run_user_resume(
             "expert_review_model": tailored.expert_model,
             "expert_rewrites": tailored.expert_rewrites,
             "expert_review_sha256": expert_review_sha256,
+            "template_receipt": (
+                template_receipt.model_dump(mode="json")
+                if template_receipt is not None
+                else None
+            ),
         }
         _write_private_json(run_dir / "09_user_ui.json", user_metadata)
         if tailored.role_strategy is not None:
@@ -2830,63 +3001,73 @@ def _run_user_resume(
 
 
 def _resume_result_run_dir(data_root: Path, result: UIActionResult) -> Path | None:
-    raw_run_dir = _workspace_path(result.stdout)
-    if raw_run_dir is None or _RUN_ID_RE.fullmatch(raw_run_dir.name) is None:
-        return None
+    run_dirs = _resume_result_run_dirs(data_root, result)
+    return run_dirs[0] if run_dirs else None
+
+
+def _resume_result_run_dirs(data_root: Path, result: UIActionResult) -> list[Path]:
+    valid: list[Path] = []
     runs_root = data_root.expanduser().absolute() / "resume-runs"
-    expected = runs_root / raw_run_dir.name
-    try:
-        _reject_symlink_ancestry(expected)
-        if (
-            raw_run_dir.expanduser().resolve() != expected.resolve()
-            or expected.parent != runs_root
-            or not expected.is_dir()
-        ):
-            return None
-    except OSError:
-        return None
-    return expected
+    for raw_run_dir in _workspace_paths(result.stdout):
+        if _RUN_ID_RE.fullmatch(raw_run_dir.name) is None:
+            continue
+        expected = runs_root / raw_run_dir.name
+        try:
+            _reject_symlink_ancestry(expected)
+            if (
+                raw_run_dir.expanduser().resolve() != expected.resolve()
+                or expected.parent != runs_root
+                or not expected.is_dir()
+            ):
+                continue
+        except OSError:
+            continue
+        valid.append(expected)
+    return valid
 
 
 def _finalize_resume_preview(data_root: Path, result: UIActionResult) -> bool:
     """Render and register a PDF after the downloadable DOCX is already ready."""
 
-    run_dir = _resume_result_run_dir(data_root, result)
-    if run_dir is None:
+    run_dirs = _resume_result_run_dirs(data_root, result)
+    if not run_dirs:
         return False
-    source = _resume_run_artifact(data_root, run_dir.name, "08_resume.docx")
-    if source is None:
-        return False
-    target = run_dir / "10_resume_preview.pdf"
-    if target.is_symlink():
-        return False
-    created = _create_resume_pdf_preview(source, target)
-
-    metadata_path = run_dir / "09_user_ui.json"
-    metadata = _load_json_file(metadata_path)
-    if metadata is not None:
-        metadata["preview_generated"] = created
-        metadata["preview_url"] = (
-            f"/previews/{run_dir.name}/resume.pdf" if created else ""
+    all_created = True
+    for run_dir in run_dirs:
+        source = _resume_run_artifact(data_root, run_dir.name, "08_resume.docx")
+        target = run_dir / "10_resume_preview.pdf"
+        created = bool(
+            source is not None
+            and not target.is_symlink()
+            and _create_resume_pdf_preview(source, target)
         )
-        _write_private_json(metadata_path, metadata)
 
-    run_path = run_dir / "run.json"
-    run_payload = _load_json_file(run_path)
-    if run_payload is not None:
-        route = run_payload.get("route")
-        if not isinstance(route, dict):
-            route = {}
-            run_payload["route"] = route
-        route["preview_generated"] = created
-        artifacts = run_payload.get("artifact_paths")
-        if not isinstance(artifacts, list):
-            artifacts = []
-            run_payload["artifact_paths"] = artifacts
-        if created and "10_resume_preview.pdf" not in artifacts:
-            artifacts.append("10_resume_preview.pdf")
-        _write_private_json(run_path, run_payload)
-    return created
+        metadata_path = run_dir / "09_user_ui.json"
+        metadata = _load_json_file(metadata_path)
+        if metadata is not None:
+            metadata["preview_generated"] = created
+            metadata["preview_url"] = (
+                f"/previews/{run_dir.name}/resume.pdf" if created else ""
+            )
+            _write_private_json(metadata_path, metadata)
+
+        run_path = run_dir / "run.json"
+        run_payload = _load_json_file(run_path)
+        if run_payload is not None:
+            route = run_payload.get("route")
+            if not isinstance(route, dict):
+                route = {}
+                run_payload["route"] = route
+            route["preview_generated"] = created
+            artifacts = run_payload.get("artifact_paths")
+            if not isinstance(artifacts, list):
+                artifacts = []
+                run_payload["artifact_paths"] = artifacts
+            if created and "10_resume_preview.pdf" not in artifacts:
+                artifacts.append("10_resume_preview.pdf")
+            _write_private_json(run_path, run_payload)
+        all_created = all_created and created
+    return all_created
 
 
 def _persist_resume_job_timings(
@@ -3063,6 +3244,30 @@ def _parse_submission(
             raise ValueError("表单文字不是有效的 UTF-8。") from exc
         fields.setdefault(field_name, value)
     return FormSubmission(fields=fields, files=files)
+
+
+def _prepare_resume_template_preview(
+    submission: FormSubmission,
+) -> ResumeTemplateReceipt:
+    upload = submission.files.get("layout_template_file")
+    pasted_html = submission.fields.get("layout_template_html", "").strip()
+    source_url = submission.fields.get("layout_template_url", "").strip()
+    selected = sum(
+        (
+            bool(upload is not None and upload.content),
+            bool(pasted_html),
+            bool(source_url),
+        )
+    )
+    if selected != 1:
+        raise ResumeUploadError("Choose exactly one template source: file, URL, or HTML")
+    if upload is not None and upload.content:
+        receipt = inspect_template_file(upload.filename, upload.content)
+    elif pasted_html:
+        receipt = inspect_template_html(pasted_html)
+    else:
+        receipt = inspect_template_url(source_url)
+    return receipt
 
 
 def _build_control_tower_path(data_root: Path) -> Path:
@@ -3339,11 +3544,19 @@ def _resume_graph(raw_stdout: str) -> str:
 
 
 def _workspace_path(raw_stdout: str) -> Path | None:
-    prefix = "Resume workspace: "
-    path_text = next(
-        (line[len(prefix) :] for line in raw_stdout.splitlines() if line.startswith(prefix)), ""
-    )
-    return Path(path_text) if path_text else None
+    paths = _workspace_paths(raw_stdout)
+    return paths[0] if paths else None
+
+
+def _workspace_paths(raw_stdout: str) -> list[Path]:
+    prefixes = ("Resume workspace: ", "Resume variant workspace: ")
+    values: list[Path] = []
+    for line in raw_stdout.splitlines():
+        for prefix in prefixes:
+            if line.startswith(prefix):
+                values.append(Path(line[len(prefix) :]))
+                break
+    return values
 
 
 def _resume_provenance_panel(
@@ -3608,6 +3821,34 @@ def _user_result_card(
     verification = _load_json_file(run_dir / "07_verification.json") or {}
     gaps_payload = _load_json_file(run_dir / "05_gaps.json") or {}
     user_metadata = _load_json_file(run_dir / "09_user_ui.json") or {}
+    variant_cards: list[str] = []
+    for variant_dir in _workspace_paths(result.stdout)[1:]:
+        if (
+            _RUN_ID_RE.fullmatch(variant_dir.name) is None
+            or variant_dir.parent != run_dir.parent
+            or variant_dir.is_symlink()
+        ):
+            continue
+        variant_metadata = _load_json_file(variant_dir / "09_user_ui.json") or {}
+        variant_locale = str(variant_metadata.get("output_locale", ""))
+        variant_download = str(variant_metadata.get("download_url", ""))
+        variant_preview = str(variant_metadata.get("preview_url", ""))
+        variant_name = str(
+            variant_metadata.get("output_filename", "Tailored Resume.docx")
+        )
+        if variant_locale not in {"en-US", "zh-CN"} or not variant_download:
+            continue
+        preview_link = (
+            f'<a href="{_escape(variant_preview)}" target="_blank" rel="noopener">PDF</a>'
+            if variant_preview
+            else ""
+        )
+        variant_cards.append(
+            '<article class="resume-variant-card">'
+            f'<strong>{_escape(variant_locale)}</strong>'
+            f'<a class="secondary-button download" href="{_escape(variant_download)}" download title="{_escape(variant_name)}">DOCX</a>'
+            f'{preview_link}</article>'
+        )
     request_scoped = (
         user_metadata.get("retention") == "request_scoped_sources_not_persisted"
     )
@@ -3645,6 +3886,7 @@ def _user_result_card(
     download_url = str(user_metadata.get("download_url", ""))
     preview_url = str(user_metadata.get("preview_url", ""))
     output_name = str(user_metadata.get("output_filename", "Tailored Resume.docx"))
+    output_locale = str(user_metadata.get("output_locale", "en-US"))
     internal_path = str(user_metadata.get("internal_docx", run_dir / "08_resume.docx"))
     external_path = str(user_metadata.get("external_docx", ""))
     project_count = user_metadata.get("project_blocks_reordered", 0)
@@ -3878,6 +4120,8 @@ def _user_result_card(
     </div>
     {download}
   </div>
+  <p class="privacy-note"><strong>{_escape(ui_text(locale, '输出语言', 'Output language'))}:</strong> {_escape(output_locale)}</p>
+  {f'<div class="resume-variant-downloads">{"".join(variant_cards)}</div>' if variant_cards else ''}
   <div class="metrics" aria-label="{_escape(ui_text(locale, '覆盖情况', 'Coverage'))}">
     <div><strong>{_escape(str(coverage.get("total", 0)))}</strong><span>{_escape(ui_text(locale, '岗位要求', 'Requirements'))}</span></div>
     <div><strong>{_escape(str(coverage.get("lexical_candidate_strong", 0)))}</strong><span>{_escape(ui_text(locale, '强证据候选', 'Strong candidates'))}</span></div>
@@ -4234,6 +4478,7 @@ def _user_page(
     desktop_mode: bool = False,
     workspace_root: Path | None = None,
     resume_job: ResumeJobSnapshot | None = None,
+    template_receipt: ResumeTemplateReceipt | None = None,
 ) -> str:
     job_description = _escape(form.get("job_description", ""))
     company_name = _escape(form.get("company_name", ""))
@@ -4284,15 +4529,80 @@ def _user_page(
             "This resume still treats only your approved template experience as fact. Other work can help discovery, but never adds claims automatically.",
         ),
     )
+    template_preview_id = form.get("resume_template_preview_id", "").strip()
+    if (
+        template_receipt is not None
+        and template_preview_id
+        and template_receipt.preview_id != template_preview_id
+    ):
+        template_receipt = None
+    template_error = form.get("template_preview_error", "").strip()
+    if template_receipt is not None:
+        section_labels = {
+            "SUMMARY": ui_text(locale, "个人简介", "Summary"),
+            "PROJECT HIGHLIGHTS": ui_text(locale, "项目经历", "Projects"),
+            "EDUCATION": ui_text(locale, "教育经历", "Education"),
+            "TECHNICAL SKILLS": ui_text(locale, "技术技能", "Technical skills"),
+            "WORK EXPERIENCE": ui_text(locale, "工作经历", "Work experience"),
+        }
+        detected_sections = "".join(
+            f'<li>✓ {_escape(section_labels.get(item, item))}</li>'
+            for item in template_receipt.detected_sections
+        )
+        template_preview = f"""<section class="template-preview success-state">
+          <span class="status-badge">{_escape(ui_text(locale, '模板已识别', 'Template detected'))}</span>
+          <h3>{_escape(ui_text(locale, '请确认结构后再生成', 'Confirm the structure before generating'))}</h3>
+          <ul>{detected_sections}</ul>
+          <p>{_escape(ui_text(locale, '模板只控制栏目顺序；其中的姓名、公司、数字和正文不会成为你的候选事实。', 'The template controls section order only. Names, companies, metrics, and body copy from it never become candidate facts.'))}</p>
+        </section>"""
+    else:
+        template_preview = ""
+    template_error_html = (
+        f'<p class="template-error" role="alert">{_escape(template_error)}</p>'
+        if template_error
+        else ""
+    )
+    language_value = form.get("resume_output_language", "en-US")
+    if language_value not in {"en-US", "zh-CN", "both"}:
+        language_value = "en-US"
     job_panel = _resume_job_panel(resume_job, locale) if resume_job is not None else ""
     body = f"""{work_summary}{job_panel}<div class="{workspace_class}">
       <section class="input-card">
         <span class="result-kicker">{_escape(ui_text(locale, '输入', 'Input'))}</span>
         <h2>{_escape(ui_text(locale, '简历 + Job Description', 'Resume + Job Description'))}</h2>
         <p>{_escape(ui_text(locale, 'AI 只能排序、压缩和改写你批准的事实，不能新增经历；生成后请做最后一次人工检查。', 'AI may rank, compress, and rewrite only the facts you approve. It cannot add experience, and you complete the final review.'))}</p>
+        <details class="template-intake" {'open' if template_receipt is not None or template_error else ''}>
+          <summary>{_escape(ui_text(locale, '更换简历结构模板（可选）', 'Change layout template (optional)'))}</summary>
+          <p>{_escape(ui_text(locale, '先读取模板，再确认使用。支持 DOCX、HTML/HTM、TXT/MD；PDF 仅在结构可可靠识别时接受。', 'Read and confirm a template first. DOCX, HTML/HTM, TXT/MD are supported; PDF is accepted only when its structure is reliable.'))}</p>
+          {template_error_html}
+          <form method="post" action="/resume/template-preview" enctype="multipart/form-data">
+            <input type="hidden" name="ui_locale" value="{locale}" />
+            <label>{_escape(ui_text(locale, '上传模板文件', 'Upload template file'))}
+              <input type="file" name="layout_template_file" accept=".docx,.html,.htm,.pdf,.txt,.md" />
+            </label>
+            <label>{_escape(ui_text(locale, '或模板网页 URL', 'Or template webpage URL'))}
+              <input type="url" name="layout_template_url" placeholder="https://example.com/resume-template" />
+            </label>
+            <label>{_escape(ui_text(locale, '或粘贴 HTML', 'Or paste HTML'))}
+              <textarea name="layout_template_html" maxlength="1048576" placeholder="&lt;html&gt;…&lt;/html&gt;"></textarea>
+            </label>
+            <button class="secondary-button" type="submit">{_escape(ui_text(locale, '读取并预览模板', 'Read and preview template'))}</button>
+          </form>
+          {template_preview}
+        </details>
         <form id="resume-form" method="post" action="/generate" enctype="multipart/form-data">
           <input type="hidden" name="ui_locale" value="{locale}" />
           <input type="hidden" name="provider_model" value="{provider_model}" />
+          <input type="hidden" name="resume_template_preview_id" value="{_escape(template_receipt.preview_id if template_receipt is not None else '')}" />
+          <label>{_escape(ui_text(locale, '输出语言', 'Output language'))}
+            <select name="resume_output_language">
+              <option value="en-US" {'selected' if language_value == 'en-US' else ''}>English (en-US)</option>
+              <option value="zh-CN" {'selected' if language_value == 'zh-CN' else ''}>中文 (zh-CN)</option>
+              <option value="both" {'selected' if language_value == 'both' else ''}>{_escape(ui_text(locale, '英文 + 中文', 'English + Chinese'))}</option>
+            </select>
+            <span class="hint">{_escape(ui_text(locale, '双语会分别完成两次语言编辑；两版共享同一套 FACT IDs 和事实边界。', 'Both performs two locale-specific editorial passes. The variants share the same FACT IDs and truth boundary.'))}</span>
+          </label>
+          {f'<label><input type="checkbox" name="approve_layout_template" value="yes" required />{_escape(ui_text(locale, "我已预览并确认使用这个结构模板；模板正文不会作为我的经历。", "I reviewed and approve this structure template. Its body copy is not my experience."))}</label>' if template_receipt is not None else ''}
           <label>{_escape(ui_text(locale, '现有简历', 'Current resume'))}
             <span class="hint">{_escape(ui_text(locale, '支持 PDF、DOCX、TXT、MD；每个文件最大 5 MB。DOCX 会保留原版式，其他格式会生成简洁 Word 版。', 'PDF, DOCX, TXT, and MD are supported, up to 5 MB each. DOCX keeps its layout; other formats produce a clean Word version.'))}</span>
             <input
@@ -4408,6 +4718,7 @@ def _user_page(
 .workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:22px}.workspace.has-result{grid-template-columns:minmax(320px,.72fr) minmax(0,1.28fr)}
 .input-card h2,.result-card h2{margin:7px 0 8px;font-size:25px;letter-spacing:-.025em}.input-card>p,.result-card p{color:var(--text-muted)}
 .input-card form{gap:18px;margin-top:24px}.input-card textarea{min-height:220px}.input-card input[type=file]{padding:18px;border-style:dashed;background:#fafbff}
+.template-intake{margin:18px 0;padding:14px 16px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.template-intake>summary{cursor:pointer;font-weight:850}.template-intake>p{margin:10px 0 0;color:var(--text-muted);font-size:12px}.template-intake form{margin-top:14px}.template-intake textarea{min-height:120px}.template-preview{margin-top:14px;padding:14px;border:1px solid #badbcd;border-radius:12px;background:var(--success-soft)}.template-preview h3{margin:7px 0}.template-preview ul{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0;padding:0;list-style:none}.template-preview li{padding:5px 8px;border-radius:999px;background:#fff;font-size:11px;font-weight:750}.template-error{color:var(--danger);font-weight:750}.resume-variant-card{display:flex;align-items:center;gap:9px;margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--surface-subtle)}.resume-variant-card strong{margin-right:auto}
 .metadata{display:grid;grid-template-columns:1fr 1fr;gap:12px}#progress{display:none;padding:14px;border-radius:13px;background:var(--brand-soft);color:var(--brand)}#progress.visible{display:block}
 .error-state{border-color:#efc7c4}.result-header{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.download{flex:0 0 auto;margin-top:4px}
 .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:22px 0}.metrics div{padding:12px;border:1px solid var(--border);border-radius:13px;text-align:center}.metrics strong{display:block;font-size:24px}.metrics span{display:block;color:var(--text-muted);font-size:11px;margin-top:3px}
@@ -5746,6 +6057,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     latest_user_form: dict[str, str] = {}
     latest_learning_form: dict[str, str] = {}
     latest_content_form: dict[str, str] = {}
+    latest_resume_template_receipt: ResumeTemplateReceipt | None = None
     resume_job_manager: ResumeJobManager | None = None
     video_story_job_manager: LocalVideoJobManager | None = None
     creator_video_job_manager: CreatorVideoJobManager | None = None
@@ -6016,6 +6328,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             desktop_mode=self.desktop_session_token is not None,
             workspace_root=self.workspace_root,
             resume_job=resume_job,
+            template_receipt=self.latest_resume_template_receipt,
         )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -6456,6 +6769,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             _apply_ai_provider_preference(
                 self.latest_user_form, self.ui_data_root.absolute()
             )
+            preview_id = query.get("template_preview", [""])[0]
+            if preview_id:
+                self.latest_user_form["resume_template_preview_id"] = preview_id
+                self.latest_user_form.pop("template_preview_error", None)
             self._send_user_page(None)
             return
         ai_settings_detail = {
@@ -8006,6 +8323,41 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if path == "/resume/template-preview":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if length < 0 or length > MAX_UPLOAD_BYTES:
+                self.send_error(413, "Upload is too large")
+                return
+            body = self.rfile.read(length)
+            try:
+                submission = _parse_submission(
+                    body, self.headers.get("Content-Type", "")
+                )
+                self._adopt_ui_locale(submission.fields)
+                template_preview_receipt = _prepare_resume_template_preview(submission)
+            except (OSError, UnicodeError, ValueError) as exc:
+                self.latest_user_form["template_preview_error"] = str(exc)
+                location = ui_url("/resume", self.ui_locale)
+            else:
+                self.latest_resume_template_receipt = template_preview_receipt
+                self.latest_user_form["resume_template_preview_id"] = (
+                    template_preview_receipt.preview_id
+                )
+                self.latest_user_form.pop("template_preview_error", None)
+                location = ui_url(
+                    f"/resume?template_preview={template_preview_receipt.preview_id}",
+                    self.ui_locale,
+                )
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
         if path not in {"/run", "/generate"}:
             self.send_error(404, "Not found")
             return
@@ -8062,6 +8414,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     evidence_repository_root=self.workspace_root,
                     gateway=resume_gateway,
                     expert_gateway=expert_gateway,
+                    template_receipt=self.latest_resume_template_receipt,
                     initial_timings_ms={"post_response_ms": post_response_ms},
                 )
             except RuntimeError:
@@ -8073,6 +8426,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     "generation_mode",
                     "provider_model",
                     "expert_review_mode",
+                    "resume_output_language",
+                    "resume_template_preview_id",
                 )
             }
             self.latest_user_form["ui_locale"] = self.ui_locale

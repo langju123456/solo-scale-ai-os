@@ -219,12 +219,14 @@ def test_gateway_payload_removes_identifiers_and_has_strict_metadata_allowlist()
         "tailoring_instructions",
         "positioning_brief",
         "composition_evidence_plan",
+        "output_locale",
         "candidate_profile",
         "support_context",
         "template_metadata",
         "privacy",
         "output_contract",
     }
+    assert prepared.payload.output_locale == "en-US"
     for forbidden_key in (
         "filename",
         "local_path",

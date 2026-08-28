@@ -20,6 +20,7 @@ from soloscale.resume_docx import (
     _remove_trailing_empty_paragraphs,
     _select_safe_rewrites,
     _validate_role_strategy,
+    apply_resume_template_structure,
     extract_candidate_profile,
     read_template_paragraphs,
     tailor_resume_docx,
@@ -163,6 +164,26 @@ def test_extract_profile_and_tailor_preserve_every_candidate_claim() -> None:
         for name in source.namelist():
             if name != "word/document.xml":
                 assert tailored.read(name) == source.read(name)
+
+
+def test_external_template_reorders_sections_without_importing_body_copy() -> None:
+    template = _template_docx()
+    reordered = apply_resume_template_structure(
+        template,
+        [
+            "TECHNICAL SKILLS",
+            "SUMMARY",
+            "PROJECT HIGHLIGHTS",
+            "WORK EXPERIENCE",
+            "EDUCATION",
+        ],
+    )
+
+    before = [item.text for item in read_template_paragraphs(template) if item.text]
+    after = [item.text for item in read_template_paragraphs(reordered) if item.text]
+    assert sorted(after) == sorted(before)
+    assert after.index("TECHNICAL SKILLS") < after.index("SUMMARY")
+    assert "Senior Engineer at Example Template Company" not in after
 
 
 def test_rejects_non_docx_upload() -> None:
@@ -765,6 +786,80 @@ def test_multi_source_synthesis_uses_union_and_falls_back_only_unsafe_slots() ->
         ResumeValidationRuleCode.CLAIM_SCALE_INFLATION,
         ResumeValidationRuleCode.CLAIM_OUTCOME_INFLATION,
         ResumeValidationRuleCode.CLAIM_TECHNOLOGY_INFLATION,
+        ResumeValidationRuleCode.CLAIM_NEW_NUMBER,
+    }
+
+
+def test_chinese_editorial_synthesis_keeps_fact_boundary_and_rejects_inflation() -> None:
+    profile = CandidateProfile(
+        summary="Evidence-grounded engineer.",
+        skills=["RAG", "FastAPI"],
+        project_bullets=[
+            "Built RAG retrieval.",
+            "Added FastAPI orchestration.",
+        ],
+    )
+    fact_ids = _fact_ids(profile, "PROFILE-01", "PROFILE-02")
+    safe = RoleStrategy(
+        role_summary="RAG and FastAPI role",
+        top_hiring_signals=["Required: RAG and FastAPI."],
+        evidence_priority=["PROFILE-01", "PROFILE-02"],
+        skill_priority=["RAG", "FastAPI"],
+        bullet_rewrites=[
+            GroundedResumeBulletRewrite(
+                profile_entry_id="PROFILE-01",
+                kind="SYNTHESIS",
+                text="设计并实现 RAG 检索与 FastAPI 编排工作流。",
+                source_profile_entry_ids=["PROFILE-01", "PROFILE-02"],
+                source_fact_ids=fact_ids,
+            ),
+            GroundedResumeBulletRewrite(
+                profile_entry_id="PROFILE-02",
+                text="通过 FastAPI 完成服务编排。",
+                source_fact_ids=_fact_ids(profile, "PROFILE-02"),
+            ),
+        ],
+        summary_rewrite=GroundedResumeSummaryRewrite(
+            text="专注于 RAG 检索与 FastAPI 编排的证据驱动工程师。",
+            source_profile_entry_ids=["PROFILE-01", "PROFILE-02"],
+            source_fact_ids=fact_ids,
+        ),
+        rewrite_guidance="使用自然中文表达，不增加事实。",
+    )
+
+    selected, _entries, diagnostics = _select_safe_rewrites(
+        safe,
+        profile=profile,
+        job_description="Required: RAG and FastAPI.",
+        output_locale="zh-CN",
+    )
+    assert diagnostics.validator_status == "accepted", [
+        (failure.rule_code, failure.claim_id, failure.json_path)
+        for failure in diagnostics.failures
+    ]
+    assert selected.bullet_rewrites[0].kind == "SYNTHESIS"
+    assert selected.summary_rewrite is not None
+
+    inflated_payload = safe.model_dump(mode="json")
+    inflated_payload["bullet_rewrites"][0]["text"] = (
+        "主导企业级 RAG 与 FastAPI 平台，为客户显著提升 40% 收入。"
+    )
+    inflated = RoleStrategy.model_validate(inflated_payload)
+    selected, _entries, diagnostics = _select_safe_rewrites(
+        inflated,
+        profile=profile,
+        job_description="Required: RAG and FastAPI.",
+        output_locale="zh-CN",
+    )
+    assert selected.bullet_rewrites[0].text == "Built RAG retrieval."
+    assert diagnostics.validator_status == "selective_pass"
+    assert {
+        failure.rule_code for failure in diagnostics.failures
+    } >= {
+        ResumeValidationRuleCode.CLAIM_ROLE_INFLATION,
+        ResumeValidationRuleCode.CLAIM_CLIENT_INFLATION,
+        ResumeValidationRuleCode.CLAIM_SCALE_INFLATION,
+        ResumeValidationRuleCode.CLAIM_OUTCOME_INFLATION,
         ResumeValidationRuleCode.CLAIM_NEW_NUMBER,
     }
 
