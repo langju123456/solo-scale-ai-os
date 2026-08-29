@@ -7688,8 +7688,14 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             elif mining_notice == "empty":
                 notice = ui_text(
                     self.ui_locale,
-                    "没有新的已批准证据；先刷新工作资料。",
-                    "No new approved evidence yet; refresh work sources first.",
+                    "扫描完成，没有发现新的可用故事。",
+                    "Scan complete; no new usable stories were found.",
+                )
+            elif mining_notice == "error":
+                notice = ui_text(
+                    self.ui_locale,
+                    "故事挖掘未能完成；请检查已批准的工作证据后重试。",
+                    "Story mining could not complete; check approved work evidence and try again.",
                 )
             self._send_content_page(workspace_view="stories", notice=notice)
             return
@@ -8939,6 +8945,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 story.story_id for story in load_month_one_canon().stories
             ] + [candidate.candidate_id for candidate in load_story_candidates(data_root)]
             mined: tuple[StoryCandidate, ...] = ()
+            mining_notice = "empty"
             try:
                 mined = mine_story_candidates(
                     data_root,
@@ -8946,15 +8953,16 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     existing_story_ids=existing_ids,
                     limit=5,
                 )
+                mining_notice = "ok" if mined else "empty"
             except StoryMiningError:
-                mined = ()
+                mining_notice = "error"
             self.send_response(303)
             self.send_header(
                 "Location",
                 ui_url(
                     "/creator/stories",
                     self.ui_locale,
-                    mining_notice="ok" if mined else "empty",
+                    mining_notice=mining_notice,
                 ),
             )
             self.send_header("Content-Length", "0")

@@ -69,6 +69,17 @@ def test_story_bank_and_create_are_distinct_views(tmp_path: Path) -> None:
     assert 'aria-current="page">创作</a>' in create
 
 
+def test_story_bank_surfaces_mining_result_in_its_own_view(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    story_bank = content_page(
+        data_root=data_root,
+        workspace_view="stories",
+        notice="扫描完成，没有发现新的可用故事。",
+    )
+    assert "扫描完成，没有发现新的可用故事。" in story_bank
+    assert 'data-loading-label="正在扫描…"' in story_bank
+
+
 def test_publish_and_history_stay_inside_creator_workspace(tmp_path: Path) -> None:
     data_root = tmp_path / ".soloscale"
     result = run_content_form(_content_form(), data_root)

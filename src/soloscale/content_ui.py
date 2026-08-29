@@ -1371,7 +1371,9 @@ def _scan_html(
       <div class="candidate-grid">{''.join(cards)}</div></section>'''
 
 
-def _story_mining_html(data_root: Path, locale: UILocale) -> str:
+def _story_mining_html(
+    data_root: Path, locale: UILocale, notice: str | None = None
+) -> str:
     """Live Story Bank action: mine a small batch from approved evidence."""
 
     try:
@@ -1382,7 +1384,12 @@ def _story_mining_html(data_root: Path, locale: UILocale) -> str:
         f'''<article class="mined-candidate"><strong>{_escape(candidate.working_title_cn if locale == 'zh-CN' else candidate.working_title_en)}</strong><p>{_escape(candidate.one_sentence_thesis)}</p><small>{_escape(candidate.generated_by)} · {len(candidate.source_evidence_ids)} {_escape(ui_text(locale, '条证据', 'evidence items'))} · {_escape(ui_text(locale, '确定性草稿', 'Deterministic draft'))}</small><form method="post" action="/creator/production/start" class="canon-direct-form"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="source_kind" value="STORY" /><input type="hidden" name="source_story_id" value="{candidate.candidate_id}" /><label>{_escape(ui_text(locale, '语言', 'Language'))}<select name="language"><option value="中文">中文</option><option value="English">English</option></select></label><button type="submit" name="production_action" value="article">{_escape(ui_text(locale, '生成文章', 'Generate article'))}</button><button class="secondary-button" type="submit" name="production_action" value="video">{_escape(ui_text(locale, '生成视频', 'Generate video'))}</button><button class="secondary-button" type="submit" name="production_action" value="queue">{_escape(ui_text(locale, '生成并加入队列', 'Generate and queue'))}</button></form></article>'''
         for candidate in candidates
     ) or f'''<p class="hint">{_escape(ui_text(locale, '还没有挖掘出的候选故事。', 'No mined story candidates yet.'))}</p>'''
-    form = f'''<form method="post" action="/creator/stories/mine"><input type="hidden" name="ui_locale" value="{locale}" /><button class="secondary-button" type="submit">{_escape(ui_text(locale, '从最新工作生成更多故事', 'Generate More Stories'))}</button></form>'''
+    notice_html = (
+        f'<p class="notice" role="status">{_escape(notice)}</p>'
+        if notice
+        else ""
+    )
+    form = f'''<form method="post" action="/creator/stories/mine" data-loading-label="{_escape(ui_text(locale, '正在扫描…', 'Scanning…'))}"><input type="hidden" name="ui_locale" value="{locale}" /><button class="secondary-button" type="submit" data-loading-label="{_escape(ui_text(locale, '正在扫描…', 'Scanning…'))}">{_escape(ui_text(locale, '从最新工作生成更多故事', 'Generate More Stories'))}</button></form>'''
     note = _escape(
         ui_text(
             locale,
@@ -1390,7 +1397,7 @@ def _story_mining_html(data_root: Path, locale: UILocale) -> str:
             "Candidates are deterministic drafts from approved evidence with no model call (model_calls=0); real semantic mining requires a separately authorized model run.",
         )
     )
-    return f'''<section class="story-mining"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, '活的故事库', 'Live Story Bank'))}</span><h2>{_escape(ui_text(locale, '从最新工作生成更多故事', 'Generate More Stories'))}</h2><p>{note}</p></div>{form}</div><div class="mined-grid">{candidate_cards}</div></section>'''
+    return f'''<section class="story-mining"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, '活的故事库', 'Live Story Bank'))}</span><h2>{_escape(ui_text(locale, '从最新工作生成更多故事', 'Generate More Stories'))}</h2><p>{note}</p></div>{form}</div>{notice_html}<div class="mined-grid">{candidate_cards}</div></section>'''
 
 
 def _creator_production_jobs_html(data_root: Path, locale: UILocale) -> str:
@@ -1776,7 +1783,7 @@ def content_page(
         locale, creator_story_bank=workspace_view == "stories", data_root=data_root
     )
     story_mining_section = (
-        _story_mining_html(data_root, locale)
+        _story_mining_html(data_root, locale, notice=notice)
         if workspace_view == "stories"
         else ""
     )
