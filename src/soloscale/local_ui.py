@@ -31,6 +31,11 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
+from soloscale.application_record import (
+    ApplicationStatus,
+    list_application_records,
+    update_application_status,
+)
 from soloscale.casebook_models import EvidenceKind
 from soloscale.casebook_store import CasebookError, CasebookStore
 from soloscale.content_canon import load_month_one_canon
@@ -4712,6 +4717,51 @@ def _home_page(
     )
 
 
+def _applications_section_html(
+    resume_library_root: Path, *, locale: UILocale
+) -> str:
+    try:
+        records = list_application_records(resume_library_root)
+    except (OSError, ValueError):
+        records = []
+    if not records:
+        return ""
+    status_labels = {
+        ApplicationStatus.DRAFT: ui_text(locale, "草稿", "Draft"),
+        ApplicationStatus.READY_TO_APPLY: ui_text(locale, "可投递", "Ready to apply"),
+        ApplicationStatus.APPLIED: ui_text(locale, "已投递", "Applied"),
+        ApplicationStatus.INTERVIEW: ui_text(locale, "面试中", "Interview"),
+        ApplicationStatus.OFFER: ui_text(locale, "Offer", "Offer"),
+        ApplicationStatus.REJECTED: ui_text(locale, "未通过", "Rejected"),
+        ApplicationStatus.WITHDRAWN: ui_text(locale, "已撤回", "Withdrawn"),
+    }
+    cards: list[str] = []
+    for record in records:
+        status_options = "".join(
+            f'<option value="{status.value}" {"selected" if status is record.status else ""}>{_escape(status_labels[status])}</option>'
+            for status in ApplicationStatus
+        )
+        company = _escape(record.company or ui_text(locale, "未记录公司", "Company not recorded"))
+        role = _escape(record.role or ui_text(locale, "未记录职位", "Role not recorded"))
+        resume_action = (
+            f'<a class="text-link" href="{ui_url(f"/downloads/{record.soloscale_run_id}/resume.docx", locale)}">{_escape(ui_text(locale, "打开简历", "Open resume"))} →</a>'
+            if record.soloscale_run_id
+            else ""
+        )
+        interview = (
+            ui_text(locale, "是", "Yes")
+            if record.interview_ready is True
+            else ui_text(locale, "否", "No")
+            if record.interview_ready is False
+            else ui_text(locale, "未评估", "Not assessed")
+        )
+        next_action = _escape(record.next_action or ui_text(locale, "下一步由你决定", "Next action is yours to decide"))
+        cards.append(
+            f'''<article class="application-card"><div><span class="status-badge">{_escape(status_labels[record.status])}</span><h3>{role} · {company}</h3><p>{_escape(record.job_id or ui_text(locale, "无 JD 标识", "No JD identity"))}{(" · " + _escape(record.source_url)) if record.source_url else ""}</p><div class="application-truth"><span>{_escape(ui_text(locale, "面试就绪", "Interview ready"))}: <strong>{interview}</strong></span><span>{_escape(ui_text(locale, "下一步", "Next action"))}: <strong>{next_action}</strong></span></div></div><div class="application-actions">{resume_action}<form method="post" action="/applications/status"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="resume_library_root" value="{_escape(str(resume_library_root))}" /><input type="hidden" name="directory_name" value="{_escape(record.directory_name)}" /><select name="status">{status_options}</select><input name="note" placeholder="{_escape(ui_text(locale, "备注（可选）", "Note (optional)"))}" /><input name="next_action" placeholder="{_escape(ui_text(locale, "下一步（可选）", "Next action (optional)"))}" /><button type="submit">{_escape(ui_text(locale, "更新状态", "Update status"))}</button></form><a class="text-link" href="{ui_url('/learning', locale)}">{_escape(ui_text(locale, "准备面试 / 练习缺口", "Prepare interview / practice gap"))} →</a></div></article>'''
+        )
+    return f'''<section class="applications-overview" id="applications"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, "申请与机会", "Applications / Opportunities"))}</span><h2>{_escape(ui_text(locale, "追踪每一次申请，而不是把简历草稿误当作投递记录。", "Track each application instead of mistaking resume drafts for applications."))}</h2><p>{_escape(ui_text(locale, "状态只在你记录真实外部结果后更新；SoloScale 不会替你发明投递或 Offer。", "Status updates only after you record a real external result; SoloScale never invents an application or offer."))}</p></div></div><div class="application-list">{''.join(cards)}</div></section>'''
+
+
 def _user_page(
     action_result: UIActionResult | None,
     data_root: Path,
@@ -4810,7 +4860,10 @@ def _user_page(
     if language_value not in {"en-US", "zh-CN", "both"}:
         language_value = "en-US"
     job_panel = _resume_job_panel(resume_job, locale) if resume_job is not None else ""
-    body = f"""{work_summary}{job_panel}<div class="{workspace_class}">
+    applications_section = _applications_section_html(
+        resume_library_root, locale=locale
+    )
+    body = f"""{work_summary}{applications_section}{job_panel}<div class="{workspace_class}">
       <section class="input-card">
         <span class="result-kicker">{_escape(ui_text(locale, '输入', 'Input'))}</span>
         <h2>{_escape(ui_text(locale, '简历 + Job Description', 'Resume + Job Description'))}</h2>
@@ -4969,7 +5022,8 @@ def _user_page(
 .result-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(180px,.55fr);gap:18px}.preview-heading{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:10px}.preview-heading h3{margin:0}.preview-link{font-size:12px;font-weight:700;text-decoration:none}
 .resume-pdf-shell{height:680px;overflow:hidden;border:1px solid var(--border);border-radius:14px;background:#dfe3ea}.resume-pdf-preview{width:100%;height:100%;border:0;background:white}.preview-note{margin:9px 0 0;font-size:12px}.resume-preview{max-height:450px;overflow:auto}.gap-list{padding-left:20px;color:var(--text-muted);font-size:13px}.result-card details{margin-top:18px;border-top:1px solid var(--border);padding-top:15px;font-size:13px}.result-card summary{cursor:pointer;font-weight:700}code{word-break:break-all}
 .resume-provenance>p{color:var(--text-muted)}.provenance-summary{display:flex;align-items:baseline;gap:7px;margin:12px 0}.provenance-summary strong{font-size:26px;color:var(--success)}.provenance-claims{display:grid;gap:9px}.provenance-claim{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:12px;border:1px solid var(--border);border-radius:12px;background:#f8fbf9}.provenance-claim strong{font-size:13px;line-height:1.45}.provenance-claim p{margin:6px 0 0;color:var(--text-muted);font-size:11px}.provenance-claim .status-badge{flex:none;padding:5px 8px;border-radius:999px;background:#e5f5ed;color:#166044;font-size:10px;font-weight:800}
-@media(max-width:900px){.use-my-work,.workspace,.workspace.has-result,.result-grid{grid-template-columns:1fr}.resume-job-steps{grid-template-columns:repeat(3,1fr)}.job-timings ul{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.metadata,.metrics{grid-template-columns:1fr 1fr}.result-header,.resume-job-header,.resume-job-actions{display:block}.download{display:block;margin-top:16px}.resume-pdf-shell{height:560px}.resume-job-steps,.job-timings ul{grid-template-columns:1fr 1fr}}
+.applications-overview{margin-bottom:20px;padding:20px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.applications-overview h2{margin:7px 0}.applications-overview p{color:var(--text-muted)}.application-list{display:grid;gap:12px;margin-top:16px}.application-card{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:start;padding:16px;border:1px solid var(--border);border-radius:15px;background:#fff}.application-card h3{margin:7px 0 5px}.application-card p{margin:0;color:var(--text-muted);font-size:12px}.application-truth{display:grid;gap:4px;margin-top:10px;font-size:12px;color:var(--text-muted)}.application-truth strong{color:var(--text)}.application-actions{display:grid;gap:10px;align-items:start}.application-actions form{display:grid;grid-template-columns:auto 1fr 1fr auto;gap:7px}.application-actions input,.application-actions select{min-width:0}.application-actions button{white-space:nowrap}
+@media(max-width:900px){.use-my-work,.workspace,.workspace.has-result,.result-grid,.application-card{grid-template-columns:1fr}.resume-job-steps{grid-template-columns:repeat(3,1fr)}.job-timings ul{grid-template-columns:repeat(2,1fr)}.application-actions form{grid-template-columns:1fr}}@media(max-width:560px){.metadata,.metrics{grid-template-columns:1fr 1fr}.result-header,.resume-job-header,.resume-job-actions{display:block}.download{display:block;margin-top:16px}.resume-pdf-shell{height:560px}.resume-job-steps,.job-timings ul{grid-template-columns:1fr 1fr}}
 """,
     )
 
@@ -9517,6 +9571,41 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 return
             self.send_response(303)
             self.send_header("Location", ui_url("/creator/publish", self.ui_locale))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/applications/status":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            application_form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(application_form)
+            library_value = application_form.get("resume_library_root", "").strip()
+            library_root = Path(
+                library_value
+                or (
+                    self.ui_data_root.absolute() / "resume-applications"
+                    if self.desktop_session_token is not None
+                    else Path.home() / "Documents" / "Resume Applications"
+                )
+            )
+            directory_name = application_form.get("directory_name", "").strip()
+            try:
+                status = ApplicationStatus(application_form.get("status", "").strip())
+                application_dir = library_root / "applications" / directory_name
+                if not application_dir.is_dir() or application_dir.is_symlink():
+                    raise ValueError("application directory not found")
+                update_application_status(
+                    application_dir=application_dir,
+                    status=status,
+                    note=application_form.get("note", ""),
+                    next_action=application_form.get("next_action", ""),
+                )
+            except (OSError, ValueError) as exc:
+                self.send_error(422, str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location", ui_url("/resume#applications", self.ui_locale)
+            )
             self.send_header("Content-Length", "0")
             self.end_headers()
             return

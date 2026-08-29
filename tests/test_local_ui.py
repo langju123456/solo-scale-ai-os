@@ -30,6 +30,7 @@ from soloscale.local_ui import (
     UIActionResult,
     UploadedFile,
     _ai_settings_page,
+    _applications_section_html,
     _apply_ai_provider_preference,
     _create_learning_case_ui,
     _create_resume_pdf_preview,
@@ -2397,3 +2398,28 @@ def test_create_learning_case_ui_archives_real_ci_evidence(tmp_path: Path) -> No
 
     cases = CasebookStore(data_root).list_cases()
     assert [case.id for case in cases] == ["ci-cd-automation"]
+
+
+def test_applications_section_truthfully_separates_drafts_and_applications(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "Resume Applications"
+    app_dir = library / "applications" / "app-one"
+    app_dir.mkdir(parents=True)
+    (app_dir / "application.json").write_text(
+        json.dumps(
+            {
+                "soloscale_run_id": "resume-run-1",
+                "company": "Faros",
+                "role": "AI-Native Builder",
+                "status": "DRAFT",
+                "resume_filename": "resume.docx",
+            }
+        ),
+        encoding="utf-8",
+    )
+    html = _applications_section_html(library, locale="zh-CN")
+    assert "申请与机会" in html
+    assert "更新状态" in html
+    assert "打开简历" in html
+    assert "准备面试 / 练习缺口" in html
