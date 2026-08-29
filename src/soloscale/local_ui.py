@@ -963,9 +963,24 @@ def _video_page(
     *,
     local_job: LocalVideoJobSnapshot | None = None,
     local_video_available: bool = False,
+    content_run_id: str | None = None,
+    content_data_root: Path | None = None,
 ) -> str:
     job = load_job(data_root, job_id) if job_id else None
     configuration = provider_status()
+    downstream_run = None
+    downstream_notice = ""
+    if content_run_id and content_data_root is not None:
+        try:
+            downstream_run = load_content_run(content_data_root, content_run_id)
+        except ContentWorkspaceError:
+            downstream_run = None
+    topic_value = ""
+    script_value = ""
+    if downstream_run is not None:
+        topic_value = downstream_run.brief.topic
+        script_value = downstream_run.drafts.video_script
+        downstream_notice = f'''<p class="notice" role="status">{_escape(ui_text(locale, '这是下游视频生产页；主题与分镜已从上游内容包带入，无需重新录入。', 'This is the downstream video production page; topic and storyboard are carried over from the upstream content package and do not need to be re-entered.'))} <a href="{ui_url('/creator/create', locale, run_id=content_run_id or '')}">{_escape(ui_text(locale, '打开上游内容包', 'Open upstream package'))} →</a></p>'''
     detail = ""
     if job:
         outgoing = html.escape(json.dumps(job.request.external_payload(), indent=2), quote=True)
@@ -1005,15 +1020,17 @@ def _video_page(
 <section class="card">
   <div class="provider-row"><span>Google Vertex AI · Veo</span><span class="status-badge">{_escape(configuration)}</span></div>
   {message}
+  {downstream_notice}
   <form method="post" action="/video/prepare">
     <input type="hidden" name="ui_locale" value="{locale}" />
-    <label>{_escape(ui_text(locale, '主题', 'Topic'))}<input name="topic" required></label>
-    <label>{_escape(ui_text(locale, '脚本或视频设计文档', 'Script or video design document'))}<textarea name="script" required></textarea></label>
+    <input type="hidden" name="content_run_id" value="{_escape(content_run_id or '')}" />
+    <label>{_escape(ui_text(locale, '主题', 'Topic'))}<input name="topic" value="{_escape(topic_value)}" required></label>
+    <label>{_escape(ui_text(locale, '脚本或视频设计文档', 'Script or video design document'))}<textarea name="script" required>{_escape(script_value)}</textarea></label>
     <details>
       <summary>{_escape(ui_text(locale, '可选：证据与来源', 'Optional: evidence and source'))}</summary>
       <label>{_escape(ui_text(locale, '证据 ID（每行一个）', 'Evidence IDs (one per line)'))}<textarea name="evidence_ids"></textarea></label>
       <label>{_escape(ui_text(locale, '明确选择的证据摘录（每行一个）', 'Explicitly selected evidence excerpts (one per line)'))}<textarea name="evidence_excerpts"></textarea></label>
-      <label>SoloScale content run ID<input name="content_run_id"></label>
+      <label>SoloScale content run ID<input name="content_run_id" value="{_escape(content_run_id or '')}"></label>
     </details>
     <div class="video-settings">
       <label>{_escape(ui_text(locale, '平台', 'Platform'))}<input name="platform" value="Short video"></label>
@@ -5959,13 +5976,13 @@ def _ai_settings_page(
             ),
             "LinkedIn": ui_text(
                 locale,
-                "由 BuildLog 管理授权、精确预览、去重和发布回执。",
-                "BuildLog owns authorization, exact preview, duplicate checks, and receipts.",
+                "已审核 Artifact 经发布队列绑定精确账号后执行；BuildLog 只提供历史与回执投影。",
+                "Approved artifacts run through the Publish Queue against an exact account; BuildLog provides history and receipt projection only.",
             ),
             "X": ui_text(
                 locale,
-                "由 BuildLog 管理授权、单帖或 Thread 发布和回执。",
-                "BuildLog owns authorization, post or thread publishing, and receipts.",
+                "单帖或 Thread 由发布队列选择精确 ChannelAccount；BuildLog 保留溯源与回执投影。",
+                "Posts and threads use the Publish Queue with an exact ChannelAccount; BuildLog retains provenance and receipt projection.",
             ),
             "YouTube": ui_text(
                 locale,
@@ -7094,6 +7111,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         job_id: str | None = None,
         error: str | None = None,
         local_job_id: str | None = None,
+        content_run_id: str | None = None,
     ) -> None:
         local_job = None
         manager = self.video_story_job_manager
@@ -7115,6 +7133,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.ui_locale,
                 local_job=local_job,
                 local_video_available=local_available,
+                content_run_id=content_run_id,
+                content_data_root=self.ui_data_root.absolute(),
             )
         except VideoGenerationError:
             page = _video_page(
@@ -7128,6 +7148,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.ui_locale,
                 local_job=local_job,
                 local_video_available=local_available,
+                content_run_id=content_run_id,
+                content_data_root=self.ui_data_root.absolute(),
             )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -7385,8 +7407,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 "saved": ui_text(self.ui_locale, "修改已保存。", "Edits saved."),
                 "approved": ui_text(
                     self.ui_locale,
-                    "内容包已批准；仍需在 BuildLog 精确预览中输入 PUBLISH 才会发布。",
-                    "Bundle approved. Publication still requires PUBLISH in the exact BuildLog preview.",
+                    "内容包已批准；仍需在发布队列的精确预览中输入 PUBLISH 才会发布。",
+                    "Bundle approved. Publication still requires PUBLISH in the exact Publish Queue preview.",
                 ),
                 "rejected": ui_text(
                     self.ui_locale, "内容包已拒绝；没有发布。", "Bundle rejected; nothing was published."
@@ -7499,6 +7521,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self._send_video_page(
                 query.get("job_id", [None])[0],
                 local_job_id=query.get("local_job_id", [None])[0],
+                content_run_id=query.get("content_run_id", [None])[0],
             )
             return
         if path == "/publishing":

@@ -305,6 +305,45 @@ def load_publish_queue(data_root: Path) -> tuple[PublishQueueItem, ...]:
     )
 
 
+def load_creator_production_job(
+    data_root: Path, job_id: str
+) -> CreatorProductionJob | None:
+    """Load one persisted ContentProject job without requiring the live manager."""
+
+    path = data_root.absolute() / _PROJECT_ROOT / job_id / "project.json"
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        return CreatorProductionJob.model_validate(_load_model(path, CreatorProductionJob))
+    except CreatorProductionError:
+        return None
+
+
+def load_creator_production_jobs(
+    data_root: Path, *, limit: int = 12
+) -> tuple[CreatorProductionJob, ...]:
+    """Return recent persisted ContentProject jobs, newest first."""
+
+    root = data_root.absolute() / _PROJECT_ROOT
+    if root.is_symlink() or not root.is_dir():
+        return ()
+    jobs: list[CreatorProductionJob] = []
+    for job_dir in root.iterdir():
+        if job_dir.is_symlink() or not job_dir.is_dir():
+            continue
+        path = job_dir / "project.json"
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            jobs.append(
+                CreatorProductionJob.model_validate(_load_model(path, CreatorProductionJob))
+            )
+        except CreatorProductionError:
+            continue
+    jobs.sort(key=lambda item: item.updated_at, reverse=True)
+    return tuple(jobs[:limit])
+
+
 def assign_artifact_to_account(
     *,
     data_root: Path,

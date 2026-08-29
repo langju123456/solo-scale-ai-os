@@ -33,6 +33,7 @@ from soloscale.content_workspace import (
 from soloscale.creator_production import (
     CreatorProductionError,
     CreatorProductionJob,
+    load_creator_production_jobs,
     load_publication_artifacts,
     load_publish_queue,
     sync_distribution_artifacts,
@@ -945,7 +946,7 @@ def _result_html(
         <div class="storyboard">{scenes}</div>
         {cost_panel}
         <div class="creator-video-result">
-          <p><a href="{ui_url('/video', locale)}">{_escape(ui_text(locale, '使用 Google Vertex AI 生成云端视频', 'Generate a cloud video with Google Vertex AI'))}</a></p>
+          <p><a href="{ui_url('/video', locale, content_run_id=run_id)}">{_escape(ui_text(locale, '在下游视频页使用 Google Vertex AI 生成云端视频', 'Generate a cloud video with Google Vertex AI on the downstream video page'))}</a></p>
           <details><summary>{_escape(ui_text(locale, '实验性本地 Remotion 渲染器', 'Experimental local Remotion renderer'))}</summary>
             {video_action}
           </details>
@@ -1098,7 +1099,7 @@ def editorial_publishing_page(
     package_cards = "".join(
         f'''<article class="package-history-card" data-approved-artifact="{_escape(str(package['run_id']))}"><span class="status-badge">{_escape(ui_text(locale, '预览就绪', 'Preview ready'))}</span>
         <strong>{_escape(str(package['run_id']))}</strong>
-        <p>{_escape(ui_text(locale, 'LinkedIn / X 由 BuildLog 控制；YouTube 可选择已授权频道上传。', 'LinkedIn / X remain BuildLog-controlled; YouTube can upload to a selected authorized channel.'))}</p>
+        <p>{_escape(ui_text(locale, 'LinkedIn / X 经发布队列绑定精确 ChannelAccount；YouTube 可选择已授权频道上传。', 'LinkedIn / X run through the Publish Queue against an exact ChannelAccount; YouTube can upload to a selected authorized channel.'))}</p>
         <a href="{ui_url('/creator/create' if creator_mode else '/content', locale, run_id=str(package['run_id']))}">{_escape(ui_text(locale, '打开完整内容包', 'Open full content package'))} →</a></article>'''
         for package in packages
     ) or f'''<article class="package-history-card empty"><strong>{_escape(ui_text(locale, '还没有统一发布包', 'No unified distribution package yet'))}</strong>
@@ -1127,7 +1128,7 @@ def editorial_publishing_page(
         title=f"SoloScale · {ui_text(locale, '发布中心', 'Publishing Center')}",
         eyebrow=ui_text(locale, "发布中心", "Publishing center"),
         heading=ui_text(locale, "把发布前的每一步，放在你手里。", "Keep every pre-publish decision in your hands."),
-        description=ui_text(locale, "先校验、再看精确预览，只有你明确确认后 BuildLog 才能调用平台。", "Verify first, inspect the exact preview, and let BuildLog call a platform only after your explicit confirmation."),
+        description=ui_text(locale, "先校验、再看精确预览，只有你明确确认后，发布队列才会把已审核 Artifact 交给精确 ChannelAccount 执行。", "Verify first, inspect the exact preview, and only after your explicit confirmation does the Publish Queue hand an approved artifact to an exact ChannelAccount."),
         body=body,
         extra_css="""
 .canonical-publish-queue{margin-bottom:22px}.publish-queue-head,.publish-queue-row{display:grid;grid-template-columns:minmax(190px,1.4fr) .55fr .6fr minmax(220px,1.3fr) .7fr;gap:12px;align-items:center}.publish-queue-head{padding:0 14px 8px;color:var(--text-muted);font-size:11px;font-weight:900}.publish-queue-row{padding:14px;border-top:1px solid var(--border)}.publish-queue-row small,.queue-destination small{display:block;color:var(--text-muted)}.queue-destination form{display:grid;grid-template-columns:1fr auto;gap:7px}.queue-destination button{padding:8px 10px}.package-history{margin-bottom:22px}.package-history h2{margin:10px 0 16px}.package-history-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.package-history-card{display:grid;gap:8px;padding:16px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.package-history-card p{margin:0;color:var(--text-muted)}.package-history-card a{font-weight:800;text-decoration:none}
@@ -1246,7 +1247,7 @@ def _editorial_channel_html(
     plan_hash = _escape(str(preview.get("plan_hash", "")))
     blocked = preview.get("duplicate") is True or preview.get("indeterminate") is True
     receipt_html = (
-        f"<p><strong>{_escape(ui_text(locale, 'BuildLog 结果：', 'BuildLog result:'))}</strong> {_escape(ui_display_value(locale, receipt.get('status', 'UNKNOWN')))} · "
+        f"<p><strong>{_escape(ui_text(locale, '发布回执（BuildLog 投影）：', 'Publication receipt (BuildLog projection):'))}</strong> {_escape(ui_display_value(locale, receipt.get('status', 'UNKNOWN')))} · "
         f"{_escape(ui_text(locale, '计划', 'plan'))} {_escape(str(receipt.get('plan_id', '')))}</p>"
         if receipt is not None
         else (
@@ -1331,6 +1332,62 @@ def _story_mining_html(data_root: Path, locale: UILocale) -> str:
         )
     )
     return f'''<section class="story-mining"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, '活的故事库', 'Live Story Bank'))}</span><h2>{_escape(ui_text(locale, '从最新工作生成更多故事', 'Generate More Stories'))}</h2><p>{note}</p></div>{form}</div><div class="mined-grid">{candidate_cards}</div></section>'''
+
+
+def _creator_production_jobs_html(data_root: Path, locale: UILocale) -> str:
+    """Persist one production lifecycle strip across Story Bank and Create views."""
+
+    try:
+        jobs = load_creator_production_jobs(data_root, limit=10)
+    except CreatorProductionError:
+        jobs = ()
+    if not jobs:
+        return ""
+    phase_copy = {
+        "QUEUED": ui_text(locale, "已加入后台队列", "Queued in background"),
+        "GENERATING_CONTENT": ui_text(locale, "正在生成内容", "Generating content"),
+        "RENDERING_VIDEO": ui_text(locale, "正在后台渲染视频", "Rendering video in background"),
+        "READY": ui_text(locale, "成品已就绪", "Artifacts ready"),
+        "AI_NOT_EXECUTED": "AI_NOT_EXECUTED",
+        "FAILED": ui_text(locale, "制作失败", "Production failed"),
+    }
+    output_copy = {
+        "ARTICLE": ui_text(locale, "文章", "Article"),
+        "VIDEO": ui_text(locale, "视频", "Video"),
+    }
+    active = False
+    rows: list[str] = []
+    for job in jobs:
+        phase = job.phase
+        if phase in {"QUEUED", "GENERATING_CONTENT", "RENDERING_VIDEO"}:
+            active = True
+            action = f'<a class="text-link" href="{ui_url("/creator/create", locale, creator_job=job.job_id)}">{_escape(ui_text(locale, "查看进度", "View progress"))} →</a>'
+        elif phase == "READY":
+            action = f'<a class="text-link" href="{ui_url("/creator/publish", locale, run_id=job.content_run_id or "")}">{_escape(ui_text(locale, "打开发布队列", "Open Publish Queue"))} →</a>'
+        elif phase == "AI_NOT_EXECUTED":
+            action = f'<a class="text-link" href="{ui_url("/settings/ai", locale)}">{_escape(ui_text(locale, "配置 AI 服务", "Configure AI service"))} →</a>'
+        else:
+            action = f'<a class="text-link" href="{ui_url("/creator/stories", locale)}">{_escape(ui_text(locale, "重新生成", "Retry"))} →</a>'
+        source = job.request.source_story_id or ui_text(locale, "自由创作", "Free create")
+        outputs = " + ".join(output_copy.get(item, item) for item in job.request.outputs)
+        meta = source
+        if job.content_run_id:
+            meta += f' · {_escape(job.content_run_id)}'
+        if job.error_code:
+            meta += f' · {_escape(job.error_code)}'
+        rows.append(
+            f'''<article class="creator-production-job" data-phase="{phase}"><span class="status-badge">{_escape(phase_copy.get(phase, phase))}</span><div><strong>{_escape(outputs)}</strong><small>{_escape(meta)}</small></div>{action}</article>'''
+        )
+    refresh = (
+        "<script>setTimeout(()=>location.reload(),1500)</script>" if active else ""
+    )
+    heading = ui_text(locale, "内容生产进度", "Content production progress")
+    note = ui_text(
+        locale,
+        "任务在后台持续运行；刷新或离开页面后仍会保留进度、失败原因和下一步。",
+        "Jobs keep running in the background; progress, failure reasons, and next steps survive refresh and navigation.",
+    )
+    return f'''<section class="creator-production-lifecycle" aria-label="{_escape(heading)}"><div class="result-head"><div><span class="kicker">ContentProject</span><h2>{_escape(heading)}</h2><p>{_escape(note)}</p></div></div><div class="creator-production-jobs">{''.join(rows)}</div></section>{refresh}'''
 
 
 def _month_one_canon_html(
@@ -1657,6 +1714,16 @@ def content_page(
     canon_section, canon_script = _month_one_canon_html(
         locale, creator_story_bank=workspace_view == "stories", data_root=data_root
     )
+    story_mining_section = (
+        _story_mining_html(data_root, locale)
+        if workspace_view == "stories"
+        else ""
+    )
+    production_lifecycle = (
+        _creator_production_jobs_html(data_root, locale)
+        if workspace_view in {"stories", "create"}
+        else ""
+    )
     reference_videos = recent_reference_videos(data_root)
     selected_reference_id = values.get("reference_id", "")
     reference_options = "".join(
@@ -1673,7 +1740,7 @@ def content_page(
         <label>{_escape(ui_text(locale, '选择 MP4（最多 200 MB）', 'Choose an MP4 (up to 200 MB)'))}<input type="file" name="reference_video" accept="video/mp4,.mp4" required /></label>
         <button class="secondary" type="submit">{_escape(ui_text(locale, '本地分析并加入参考库', 'Analyze locally and add to library'))}</button>
       </form></section>'''
-    body = f"""{job_notice}{work_summary}{canon_section}{scan_section}{reference_upload}<div class="grid">
+    body = f"""{production_lifecycle}{job_notice}{work_summary}{story_mining_section}{canon_section}{scan_section}{reference_upload}<div class="grid">
 <section class="form-card">
 <span class="kicker">{_escape(ui_text(locale, '输入', 'Input'))}</span><h2>{_escape(ui_text(locale, '证据 + 受众 + CTA', 'Evidence + audience + CTA'))}</h2>
 <p class="hint">{_escape(ui_text(locale, '第一条已验证事实会成为开头。数字、结果和结论都应附证据。', 'The first verified fact becomes the opening. Numbers, outcomes, and conclusions should include evidence.'))}</p>
@@ -1853,5 +1920,6 @@ if(document.querySelector('[data-video-job-active="true"]')){{
 .media-cost-panel,.media-quality-review,.distribution-package{margin-top:18px;padding:18px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.media-cost-panel h3,.media-quality-review h2{margin:6px 0}.media-quality-form{display:grid;gap:14px}.quality-checklist{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.quality-checklist label{display:flex;align-items:flex-start;gap:8px;padding:11px;border:1px solid var(--border);border-radius:12px;background:#fff}.quality-checklist input{width:auto;margin-top:2px}.media-quality-form textarea{min-height:82px}.media-quality-form button{width:auto;justify-self:start}.distribution-package.locked,.media-cost-panel.locked{opacity:.82}
 .month-one-canon{margin-bottom:22px;padding:22px;border:1px solid var(--border);border-radius:20px;background:linear-gradient(145deg,#fff,#f4f8ff)}.month-one-canon h2{margin:7px 0}.month-one-canon p{color:var(--text-muted)}.canon-filter{min-width:220px}.canon-week-nav{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}.canon-week-nav a{padding:7px 11px;border-radius:999px;background:var(--brand-soft);font-size:12px;font-weight:800;text-decoration:none}.canon-week{margin-top:22px}.canon-week-title{display:flex;align-items:baseline;gap:10px}.canon-week-title span{color:var(--brand);font-size:11px;font-weight:900;letter-spacing:.1em}.canon-week-title h3{margin:0}.canon-stories{display:grid;gap:10px;margin-top:11px}.canon-story{border:1px solid var(--border);border-radius:14px;background:#fff}.canon-story>summary{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;padding:14px;cursor:pointer;list-style:none}.canon-story>summary::-webkit-details-marker{display:none}.canon-story summary strong,.canon-story summary small{display:block}.canon-story summary small{margin-top:3px;color:var(--text-muted);font-size:11px}.canon-sequence{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--brand-soft);color:var(--brand);font-weight:900}.canon-status{padding:5px 8px;border-radius:999px;background:var(--surface-subtle);font-size:10px;font-style:normal;font-weight:850}.canon-status.ready_for_production{background:var(--success-soft);color:var(--success)}.canon-status.needs_evidence,.canon-status.needs_user_input{background:var(--warning-soft);color:var(--warning)}.canon-story-body{padding:0 16px 16px}.canon-thesis{font-weight:700;color:var(--text)!important}.six-layers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.six-layers>div,.canon-meta>div{padding:11px;border:1px solid var(--border);border-radius:11px;background:var(--surface-subtle)}.six-layers span{color:var(--brand);font-size:11px;font-weight:900}.six-layers p{margin:5px 0 0;font-size:12px}.canon-meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:9px}.canon-meta h4{margin:0 0 6px}.canon-meta ul{margin:0;padding-left:18px;color:var(--text-muted);font-size:12px}.canon-production{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;color:var(--text-muted);font-size:12px}.canon-actions{display:flex;gap:8px;margin-top:12px}.canon-actions button{width:auto}.canon-actions .secondary-button{background:var(--surface-subtle);color:var(--brand)}
 @media(max-width:900px){.use-my-work,.grid{grid-template-columns:1fr}.scan-work{align-items:flex-start;flex-direction:column}.result-head{display:block}.downloads{justify-content:flex-start;margin-top:12px}}@media(max-width:580px){.two,.reference-pattern-grid,.quality-checklist{grid-template-columns:1fr}}
+.creator-production-lifecycle{margin:0 0 18px;padding:16px 18px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.creator-production-lifecycle .result-head{align-items:start}.creator-production-lifecycle h2{margin:6px 0}.creator-production-lifecycle p{margin:0;color:var(--text-muted)}.creator-production-jobs{display:grid;gap:9px;margin-top:14px}.creator-production-job{display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center;padding:12px 14px;border:1px solid var(--border);border-radius:13px;background:#fff}.creator-production-job .status-badge{white-space:nowrap}.creator-production-job strong{display:block;font-size:14px}.creator-production-job small{display:block;color:var(--text-muted);font-size:12px}.creator-production-job .text-link{white-space:nowrap}
 """,
     )

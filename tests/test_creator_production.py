@@ -21,6 +21,8 @@ from soloscale.creator_production import (
     CreatorProductionRequest,
     assign_artifact_to_account,
     create_run_artifacts,
+    load_creator_production_job,
+    load_creator_production_jobs,
     load_publication_artifacts,
     load_publish_queue,
     wait_for_creator_job,
@@ -246,6 +248,40 @@ def test_creator_production_job_lifecycle(tmp_path: Path) -> None:
         failed_final = wait_for_creator_job(manager, data_root, failed.job_id)
         assert failed_final.phase == "FAILED"
         assert failed_final.error_code == "RUNTIMEERROR"
+    finally:
+        manager.shutdown()
+
+
+def test_creator_production_jobs_are_persisted_and_listed(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    run = run_content_workspace(data_root=data_root, brief=_brief())
+    manager = CreatorProductionJobManager()
+    try:
+        first = manager.submit(
+            data_root=data_root,
+            request=CreatorProductionRequest(
+                source_kind="CREATE",
+                outputs=["ARTICLE"],
+                language="English",
+                ai_editorial=False,
+            ),
+            runner=lambda: run.run_id,
+        )
+        second = manager.submit(
+            data_root=data_root,
+            request=CreatorProductionRequest(
+                source_kind="CREATE",
+                outputs=["VIDEO"],
+                language="English",
+                ai_editorial=False,
+            ),
+            runner=lambda: run.run_id,
+            renderer=lambda _run_id: None,
+        )
+        jobs = load_creator_production_jobs(data_root)
+        assert [job.job_id for job in jobs][:2] == [second.job_id, first.job_id]
+        assert load_creator_production_job(data_root, first.job_id).job_id == first.job_id
+        assert load_creator_production_job(data_root, "missing") is None
     finally:
         manager.shutdown()
 
