@@ -1172,7 +1172,7 @@ class ResumeGenerationContract(ContractModel):
 
     job_description_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     role_strategy: ResumeRoleStrategy
-    allowed_claims: list[ApplicationClaim] = Field(min_length=1, max_length=24)
+    allowed_claims: list[ApplicationClaim] = Field(default_factory=list, max_length=24)
     skills: list[str] = Field(default_factory=list, max_length=48)
     projects: list[str] = Field(default_factory=list, max_length=12)
     excluded_implications: list[str] = Field(default_factory=list, max_length=40)
@@ -1245,19 +1245,67 @@ class CoverageSummary(ContractModel):
     status: Literal[
         "STRONGLY_REPRESENTED",
         "PARTIALLY_REPRESENTED",
+        "AVAILABLE_BUT_NOT_SELECTED",
         "HIGH_VALUE_GAP",
-        "INTENTIONALLY_OMITTED",
-        "NO_EVIDENCE",
+        "UNSUPPORTED",
     ]
     detail: str = Field(min_length=1, max_length=400)
 
 
 class CoverageReport(ContractModel):
+    requirements_total: int = Field(ge=0)
     strongly_represented: list[str] = Field(default_factory=list, max_length=24)
     partially_represented: list[str] = Field(default_factory=list, max_length=24)
+    available_not_selected: list[str] = Field(default_factory=list, max_length=24)
     high_value_gaps: list[str] = Field(default_factory=list, max_length=24)
-    intentionally_omitted: list[str] = Field(default_factory=list, max_length=24)
+    unsupported: list[str] = Field(default_factory=list, max_length=24)
     summaries: list[CoverageSummary] = Field(default_factory=list, max_length=24)
+
+    @model_validator(mode="after")
+    def validate_full_accounting(self) -> CoverageReport:
+        accounted = (
+            len(self.strongly_represented)
+            + len(self.partially_represented)
+            + len(self.available_not_selected)
+            + len(self.high_value_gaps)
+            + len(self.unsupported)
+        )
+        if accounted != self.requirements_total:
+            raise ValueError("coverage must account for every requirement exactly once")
+        return self
+
+
+class ResumeQualityReview(ContractModel):
+    """Structured human-readable quality review; never expands truth."""
+
+    truth: int = Field(ge=1, le=5)
+    role_fit: int = Field(ge=1, le=5)
+    specificity: int = Field(ge=1, le=5)
+    differentiation: int = Field(ge=1, le=5)
+    scanability: int = Field(ge=1, le=5)
+    natural_language: int = Field(ge=1, le=5)
+    redundancy: int = Field(ge=1, le=5)
+    evidence_utilization: int = Field(ge=1, le=5)
+    strengths: list[str] = Field(default_factory=list, max_length=12)
+    weaknesses: list[str] = Field(default_factory=list, max_length=12)
+
+
+class GenerationPreflight(ContractModel):
+    """Exact intended paid-call preflight; never performs the call itself."""
+
+    provider: str = Field(min_length=1, max_length=120)
+    model: str = Field(min_length=1, max_length=120)
+    reasoning_effort: str = Field(min_length=1, max_length=40)
+    thinking_enabled: bool
+    credential_status: Literal["CONFIGURED", "NOT_CONFIGURED"]
+    job_description_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    requirements_total: int = Field(ge=0)
+    allowed_claim_ids: list[str] = Field(default_factory=list, max_length=24)
+    selected_projects: list[str] = Field(default_factory=list, max_length=12)
+    excluded_terms: list[str] = Field(default_factory=list, max_length=40)
+    estimated_stage: str = Field(min_length=1, max_length=120)
+    intended_calls: int = Field(default=1, ge=0, le=1)
+    automatic_retries: int = Field(default=0, ge=0, le=0)
 
 
 class GenerationReceipt(ContractModel):

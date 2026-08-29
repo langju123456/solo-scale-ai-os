@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -137,6 +137,7 @@ from soloscale.learning_traceability import (
     run_learning_traceability,
     save_learning_response,
 )
+from soloscale.mac_discovery import load_discovery_catalog
 from soloscale.media_cost import (
     BudgetPolicy,
     MediaCostError,
@@ -191,6 +192,7 @@ from soloscale.reference_video import (
     ReferenceVideoError,
     analyze_reference_video,
 )
+from soloscale.resume_claim_truth import build_claim_truth_result
 from soloscale.resume_docx import (
     ResumeTemplateError,
     TailoredDocx,
@@ -216,17 +218,36 @@ from soloscale.resume_gateway_boundary import (
     normalize_text_resume_to_docx,
     record_resume_funnel_event,
 )
+from soloscale.resume_generation import (
+    build_coverage_report,
+    build_generation_contract,
+    build_generation_preflight,
+    build_role_strategy,
+    render_application_resume,
+    select_allowed_claims,
+)
 from soloscale.resume_models import (
+    ApplicationClaim,
+    ApplicationResumeDraft,
     CandidateProfile,
+    ClaimTruthResult,
+    ContributionMode,
+    CoverageReport,
+    GeneratedResumeBullet,
+    GenerationPreflight,
     InterviewDefenseRecord,
     ResumeClaimProvenance,
     ResumeClaimVerificationStatus,
+    ResumeEvidenceCoverageMap,
     ResumeExpertReviewResult,
+    ResumeGenerationContract,
     ResumeHiringSignalReceipt,
     ResumeMode,
     ResumeProvenanceReceipt,
+    ResumeRoleStrategy,
     build_resume_atomic_facts,
 )
+from soloscale.resume_retrieval import build_evidence_coverage_map
 from soloscale.resume_template_intake import (
     ResumeTemplateReceipt,
     detect_resume_language,
@@ -894,6 +915,153 @@ def _gateway_from_preference(preference: AIProviderPreference) -> ModelGateway:
             )
         )
     return model_gateway_for(preference.provider)
+
+
+@dataclass(frozen=True)
+class ResumeIntelligencePreflightState:
+    coverage_map: ResumeEvidenceCoverageMap
+    claim_truth: ClaimTruthResult
+    strategy: ResumeRoleStrategy
+    claims: tuple[ApplicationClaim, ...]
+    contract: ResumeGenerationContract
+    preflight: GenerationPreflight
+    coverage: CoverageReport
+    planned_render: str
+    stage_timings: dict[str, float]
+    total_seconds: float
+
+
+def _run_resume_intelligence_preflight(
+    data_root: Path,
+    job_description: str,
+    *,
+    resume_library_root: Path | None = None,
+    owned_project_markers: tuple[str, ...] = (),
+    max_claims: int = 10,
+) -> ResumeIntelligencePreflightState:
+    """Run CP2→CP3→strategy→preflight locally; no provider call is performed."""
+
+    timings: dict[str, float] = {}
+    started = time.perf_counter()
+    mac_entries = load_discovery_catalog(data_root)
+    timings["catalog"] = time.perf_counter() - started
+    retrieval_started = time.perf_counter()
+    coverage_map = build_evidence_coverage_map(
+        job_description=job_description,
+        data_root=data_root,
+        library_root=resume_library_root,
+        mac_entries=mac_entries,
+    )
+    timings["retrieval"] = time.perf_counter() - retrieval_started
+    truth_started = time.perf_counter()
+    claim_truth = build_claim_truth_result(
+        job_description=job_description,
+        coverage_map=coverage_map,
+        owned_project_markers=owned_project_markers,
+    )
+    timings["claim_map"] = time.perf_counter() - truth_started
+    strategy_started = time.perf_counter()
+    strategy = build_role_strategy(
+        coverage_map=coverage_map, claim_truth=claim_truth
+    )
+    claims = tuple(select_allowed_claims(claim_truth, max_claims=max_claims))
+    contract = build_generation_contract(
+        job_description=job_description, strategy=strategy, claims=claims
+    )
+    timings["strategy"] = time.perf_counter() - strategy_started
+
+    preference = _load_ai_provider_preference(data_root)
+    if preference.provider is ModelProviderId.DEEPSEEK:
+        provider = "deepseek"
+        model = preference.deepseek_model
+        reasoning = preference.deepseek_reasoning_effort
+        thinking = preference.deepseek_thinking
+        credential_configured = deepseek_api_key_is_configured()
+    elif preference.provider is ModelProviderId.OPENAI_COMPATIBLE:
+        provider = "openai"
+        model = preference.openai_model
+        reasoning = "high"
+        thinking = True
+        credential_configured = openai_api_key_is_configured()
+    elif preference.provider is ModelProviderId.OLLAMA:
+        provider = "ollama"
+        model = preference.ollama_model
+        reasoning = "low"
+        thinking = False
+        credential_configured = _ollama_readiness(preference).ready
+    else:
+        provider = "soloscale_hosted"
+        model = preference.model
+        reasoning = "low"
+        thinking = False
+        credential_configured = False
+    preflight = build_generation_preflight(
+        job_description=job_description,
+        claim_truth=claim_truth,
+        strategy=strategy,
+        claims=claims,
+        provider=provider,
+        model=model,
+        reasoning_effort=reasoning,
+        thinking_enabled=thinking,
+        credential_configured=credential_configured,
+    )
+    planned_draft = (
+        _planned_application_draft(job_description, strategy, claims)
+        if claims
+        else None
+    )
+    coverage = build_coverage_report(claim_truth=claim_truth, draft=planned_draft)
+    planned_render = (
+        render_application_resume(planned_draft)
+        if planned_draft is not None
+        else "No allowed claims yet — the Application Resume has no content."
+    )
+    return ResumeIntelligencePreflightState(
+        coverage_map=coverage_map,
+        claim_truth=claim_truth,
+        strategy=strategy,
+        claims=claims,
+        contract=contract,
+        preflight=preflight,
+        coverage=coverage,
+        planned_render=planned_render,
+        stage_timings=timings,
+        total_seconds=time.perf_counter() - started,
+    )
+
+
+def _planned_application_draft(
+    job_description: str,
+    strategy: ResumeRoleStrategy,
+    claims: Sequence[ApplicationClaim],
+) -> ApplicationResumeDraft:
+    bullets: list[GeneratedResumeBullet] = []
+    for index, claim in enumerate(claims, start=1):
+        bullets.append(
+            GeneratedResumeBullet(
+                bullet_id=f"BULLET-{index:02d}",
+                section="PROJECTS",
+                text=claim.proposed_text,
+                source_claim_ids=[claim.claim_id],
+                project_identity=(
+                    strategy.selected_projects[0]
+                    if strategy.selected_projects
+                    else None
+                ),
+                contribution_mode=ContributionMode.AI_ASSISTED_USER_DIRECTED,
+                truth_boundary=claim.claim_class.value,
+            )
+        )
+    return ApplicationResumeDraft(
+        job_description_sha256=hashlib.sha256(job_description.encode()).hexdigest(),
+        headline=strategy.headline,
+        summary=strategy.positioning,
+        skills=[
+            term for term in strategy.emphasized_terms[:12] if term
+        ],
+        bullets=bullets,
+    )
 
 
 def _ollama_cli_path() -> str | None:
@@ -4868,7 +5036,8 @@ def _user_page(
     if language_value not in {"en-US", "zh-CN", "both"}:
         language_value = "en-US"
     job_panel = _resume_job_panel(resume_job, locale) if resume_job is not None else ""
-    body = f"""{work_summary}{job_panel}<div class="{workspace_class}">
+    canonical_banner = f'''<section class="notice info"><strong>{_escape(ui_text(locale, '新版简历智能（主流程）', 'Resume Intelligence (primary flow)'))}</strong> — {_escape(ui_text(locale, '证据检索 → 分级真实性 → 生成预检。旧版模板流程仅作兼容保留。', 'Evidence retrieval → graded truth → generation preflight. The legacy template flow remains only for compatibility.'))} <a class="button-link" href="{ui_url('/resume/intelligence', locale)}">{_escape(ui_text(locale, '打开', 'Open'))}</a></section>'''
+    body = f"""{work_summary}{job_panel}{canonical_banner}<div class="{workspace_class}">
       <section class="input-card">
         <span class="result-kicker">{_escape(ui_text(locale, '输入', 'Input'))}</span>
         <h2>{_escape(ui_text(locale, '简历 + Job Description', 'Resume + Job Description'))}</h2>
@@ -6260,6 +6429,120 @@ if(remove) remove.addEventListener('click',()=>window.webkit.messageHandlers.sol
     )
 
 
+def _resume_intelligence_page(
+    locale: UILocale,
+    data_root: Path,
+    *,
+    job_description: str = "",
+    state: ResumeIntelligencePreflightState | None = None,
+    notice: str | None = None,
+) -> str:
+    """Canonical Resume Intelligence flow; never performs a paid call here."""
+
+    notice_html = (
+        f'<p class="notice" role="status">{_escape(notice)}</p>' if notice else ""
+    )
+    if state is None:
+        body = f"""{notice_html}
+<section class="setup-card"><span class="kicker">{_escape(ui_text(locale, '新版简历智能', 'Resume Intelligence'))}</span>
+<h2>{_escape(ui_text(locale, '分析岗位 → 检索证据 → 分级真实性 → 生成预检', 'Analyze role → retrieve evidence → grade claims → generation preflight'))}</h2>
+<p>{_escape(ui_text(locale, '这是当前简历生成的主流程；旧版模板流程仅作兼容保留。', 'This is the canonical resume generation flow. The legacy template flow remains only for compatibility.'))}</p>
+<form method="post" action="/resume/intelligence"><input type="hidden" name="ui_locale" value="{locale}" />
+<label>{_escape(ui_text(locale, 'Job Description', 'Job Description'))}<textarea name="job_description" rows="16" maxlength="131072" required>{_escape(job_description)}</textarea></label>
+<label>{_escape(ui_text(locale, 'Resume Library 根目录（可选）', 'Resume Library root (optional)'))}<input name="resume_library_root" value="" /></label>
+<label>{_escape(ui_text(locale, '项目归属标记（可选，逗号分隔）', 'Project ownership markers (optional, comma separated)'))}<input name="project_markers" placeholder="solo-scale, ai-research-assistant" /></label>
+<button type="submit">{_escape(ui_text(locale, '分析并生成预检', 'Analyze and build preflight'))}</button></form></section>"""
+        return render_app_shell(
+            active="resume",
+            locale=locale,
+            current_url="/resume/intelligence",
+            title=f"SoloScale · {ui_text(locale, '简历智能', 'Resume Intelligence')}",
+            eyebrow=ui_text(locale, "简历", "Resume"),
+            heading=ui_text(locale, "证据 → 分级真实性 → 最强真实简历", "Evidence → graded truth → strongest truthful resume"),
+            description=ui_text(locale, "先完整预检，再决定是否授权一次真实生成。", "Complete the preflight before authorizing one real generation."),
+            body=body,
+            extra_css=".setup-card{max-width:780px;padding:24px;border:1px solid var(--border);border-radius:20px;background:var(--surface-subtle)}.setup-card form{display:grid;gap:14px}",
+        )
+
+    claim_truth = state.claim_truth
+    steps = [
+        (ui_text(locale, "分析 JD", "Analyzing JD"), True,
+         f"{len(state.coverage_map.requirements)} requirements"),
+        (ui_text(locale, "搜索证据", "Searching evidence"), True,
+         f"{len(state.coverage_map.candidates)} candidates"),
+        (ui_text(locale, "构建 claim map", "Building claim map"), True,
+         f"{claim_truth.verified_count} verified / {claim_truth.supported_derivation_count} derivation"),
+        (ui_text(locale, "生成角色策略", "Building role strategy"), True,
+         state.strategy.headline),
+        (ui_text(locale, "生成简历", "Generating Resume"), False,
+         ui_text(locale, "等待真实 DeepSeek 授权", "Awaiting real DeepSeek authorization")),
+        (ui_text(locale, "确定性验证", "Validating"), False,
+         ui_text(locale, "生成后执行", "After generation")),
+    ]
+    steps_html = "".join(
+        f'<li class="{"pass" if done else "pending"}">{"✓" if done else "○"} '
+        f"{_escape(label)} — {_escape(detail)}</li>"
+        for label, done, detail in steps
+    )
+    coverage = state.coverage
+    coverage_line = (
+        f"{coverage.requirements_total}/{coverage.requirements_total} · "
+        f"STRONG {len(coverage.strongly_represented)} · "
+        f"PARTIAL {len(coverage.partially_represented)} · "
+        f"AVAILABLE {len(coverage.available_not_selected)} · "
+        f"GAP {len(coverage.high_value_gaps)} · "
+        f"UNSUPPORTED {len(coverage.unsupported)}"
+    )
+    preflight = state.preflight
+    recommendation = (
+        f'<p class="service-state">{_escape(ui_text(locale, "简历生成推荐：DeepSeek V4 Pro / high（可在 AI 设置中切换）。", "Recommended for resume generation: DeepSeek V4 Pro / high (changeable in AI Settings)."))}</p>'
+        if preflight.provider == "deepseek"
+        and preflight.model == "deepseek-v4-flash"
+        else ""
+    )
+    application_html = "".join(
+        f"<li>{_escape(claim.proposed_text)}</li>" for claim in state.claims
+    ) or f"<li>{_escape(ui_text(locale, '暂无可写入的声明', 'No allowed claims yet'))}</li>"
+    target_html = "".join(
+        (
+            f'<li><strong>{_escape(gap.claim_class.value)}</strong> — '
+            f"{_escape(gap.suggested_wording)}<br>"
+            f"<small>{_escape(', '.join(gap.missing_proof[:4]))} · "
+            f"{_escape(' / '.join(action.value for action in gap.actions))}</small></li>"
+        )
+        for gap in claim_truth.target_gaps[:12]
+    ) or f"<li>{_escape(ui_text(locale, '没有待验证缺口', 'No open gaps'))}</li>"
+    body = f"""{notice_html}
+<section class="setup-card"><span class="kicker">{_escape(ui_text(locale, '阶段', 'Progress'))}</span>
+<ul class="readiness-list">{steps_html}</ul>
+<p class="service-state">{_escape(ui_text(locale, '耗时', 'Elapsed'))} {state.total_seconds:.1f}s · catalog {state.stage_timings.get('catalog', 0):.2f}s · retrieval {state.stage_timings.get('retrieval', 0):.2f}s · claim map {state.stage_timings.get('claim_map', 0):.2f}s</p></section>
+<section class="setup-card"><span class="kicker">{_escape(ui_text(locale, '生成预检', 'Generation preflight'))}</span>
+<p>provider={_escape(preflight.provider)} · model={_escape(preflight.model)} · reasoning={_escape(preflight.reasoning_effort)} · credential={_escape(preflight.credential_status)} · intended_calls={preflight.intended_calls} · automatic_retries={preflight.automatic_retries}</p>
+{recommendation}
+<p><strong>READY_FOR_REAL_DEEPSEEK_GENERATION</strong> — {_escape(ui_text(locale, '尚未发起任何付费调用；需要明确人工授权。', 'No paid call has been made; explicit human authorization is required.'))}</p></section>
+<section class="setup-card"><span class="kicker">{_escape(ui_text(locale, '覆盖', 'Coverage'))}</span><p>{_escape(coverage_line)}</p>
+<p>{_escape(ui_text(locale, '选中项目', 'Selected projects'))}: {_escape(', '.join(state.strategy.selected_projects) or '—')}</p>
+<p>{_escape(ui_text(locale, '排除表述', 'Excluded terms'))}: {_escape(', '.join(preflight.excluded_terms[:8]) or '—')}</p></section>
+<section class="setup-card"><span class="kicker">{_escape(ui_text(locale, 'APPLICATION RESUME（可提交候选）', 'APPLICATION RESUME (safe-to-submit candidates)'))}</span>
+<ul>{application_html}</ul><p class="service-state">{_escape(ui_text(locale, '生成后必须通过确定性验证才会标记为可提交。', 'Only after deterministic validation will this be marked safe to submit.'))}</p></section>
+<section class="setup-card"><span class="kicker">{_escape(ui_text(locale, 'TARGET / BENCHMARK（含缺口）', 'TARGET / BENCHMARK (contains gaps)'))}</span>
+<ul>{target_html}</ul><p class="service-state">{_escape(ui_text(locale, '目标简历包含未验证缺口，不可作为可提交版本。', 'The Target Resume contains unverified gaps and is not submit-ready.'))}</p></section>
+<section class="setup-card"><span class="kicker">{_escape(ui_text(locale, '确定性计划草稿', 'Deterministic planned draft'))}</span>
+<p>{_escape(ui_text(locale, '以下只是授权声明的确定性排版，不是最终生成结果。', 'This is only a deterministic arrangement of authorized claims, not the final generated resume.'))}</p>
+<pre>{_escape(state.planned_render)}</pre></section>"""
+    return render_app_shell(
+        active="resume",
+        locale=locale,
+        current_url="/resume/intelligence",
+        title=f"SoloScale · {ui_text(locale, '简历智能', 'Resume Intelligence')}",
+        eyebrow=ui_text(locale, "简历", "Resume"),
+        heading=state.strategy.headline,
+        description=ui_text(locale, "真实生成前预检完成。", "Generation preflight complete."),
+        body=body,
+        extra_css=".setup-card{max-width:880px;margin-top:16px;padding:24px;border:1px solid var(--border);border-radius:20px;background:var(--surface-subtle)}.readiness-list{list-style:none;padding:0;display:grid;gap:8px}.readiness-list .pass{color:var(--success)}.readiness-list .pending{color:var(--warning)}.setup-card ul{display:grid;gap:6px;padding-left:18px}.setup-card pre{white-space:pre-wrap;background:var(--surface);padding:12px;border-radius:12px;overflow:auto}",
+    )
+
+
 def _heygen_settings_page(
     data_root: Path,
     *,
@@ -7389,6 +7672,18 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         if resume_job_match is not None:
             self._send_resume_job_page(resume_job_match.group(1))
             return
+        if path == "/resume/intelligence":
+            page = _resume_intelligence_page(
+                self.ui_locale, self.ui_data_root.absolute()
+            )
+            body = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/resume":
             _apply_ai_provider_preference(
                 self.latest_user_form, self.ui_data_root.absolute()
@@ -7822,6 +8117,53 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         if not self._desktop_session_allowed():
             return
         resume_post_started = time.perf_counter() if path == "/generate" else None
+        if path == "/resume/intelligence":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 256 * 1024:
+                self.send_error(413, "Resume Intelligence request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            job_description = form.get("job_description", "").strip()
+            library_value = form.get("resume_library_root", "").strip()
+            markers = tuple(
+                marker.strip()
+                for marker in form.get("project_markers", "").split(",")
+                if marker.strip()
+            )
+            try:
+                state = _run_resume_intelligence_preflight(
+                    self.ui_data_root.absolute(),
+                    job_description,
+                    resume_library_root=(
+                        Path(library_value) if library_value else None
+                    ),
+                    owned_project_markers=markers,
+                )
+            except (OSError, ValueError):
+                state = None
+            page = _resume_intelligence_page(
+                self.ui_locale,
+                self.ui_data_root.absolute(),
+                job_description=job_description,
+                state=state,
+                notice=None if state is not None else ui_text(
+                    self.ui_locale,
+                    "预检未能完成；请检查 JD 与本地数据。",
+                    "The preflight could not complete. Check the JD and local data.",
+                ),
+            )
+            body = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/creator/accounts/youtube/connect":
             try:
                 length = int(self.headers.get("Content-Length", "0") or 0)

@@ -391,5 +391,6 @@ def test_claim_budget_avoids_redundant_repetition() -> None:
 def test_coverage_report_distinguishes_representation() -> None:
     claim_truth = _claim_truth()
     result, _gateway = _generate(_good_payload(_claim_ids(claim_truth)))
+    assert result.coverage_report.requirements_total == 1
     assert result.coverage_report.strongly_represented
-    assert result.coverage_report.high_value_gaps
+    assert result.target_gaps

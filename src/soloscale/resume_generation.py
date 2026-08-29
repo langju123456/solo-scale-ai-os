@@ -33,12 +33,14 @@ from soloscale.resume_models import (
     EvidenceAuthority,
     EvidenceOwnership,
     GeneratedResumeBullet,
+    GenerationPreflight,
     GenerationReceipt,
     GenerationViolation,
     GenerationViolationCode,
     ResumeEvidenceCoverageMap,
     ResumeGenerationContract,
     ResumeGenerationResult,
+    ResumeQualityReview,
     ResumeRoleStrategy,
     ValidationReport,
 )
@@ -76,6 +78,40 @@ _SCALE_TERMS = {
 }
 _OUTCOME_TERMS = {"reduced", "improved", "increased", "accelerated", "boosted", "grew"}
 _DEPLOYMENT_TERMS = {"deployed", "deployment", "cloud run", "gke", "vertex"}
+_FILLER_TERMS = {
+    "leveraged",
+    "utilized",
+    "passionate",
+    "dynamic",
+    "results-driven",
+    "seamless",
+    "robust",
+    "cutting-edge",
+}
+_INTERNAL_IDENTITY_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_CONTAINER_PROJECT_NAMES = {
+    "ai team",
+    "ai team worktrees",
+    "resume applications",
+    "career",
+    "work",
+    "docs",
+    "src",
+    "tests",
+    "runs",
+    "examples",
+}
+_PROJECT_TEXT_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("SoloScale AI OS", ("soloscale", "solo-scale")),
+    (
+        "AI Research Assistant",
+        ("ai-research-assistant", "vector_store.py", "ai-agent-demo"),
+    ),
+    ("BuildLog", ("buildlog",)),
+    ("SoloLeverage", ("company-site", "sololeverage")),
+)
 _MODEL_RULES = (
     ("Rephrase, compress, reorder, and combine only the provided authorized claims."),
     (
@@ -89,6 +125,53 @@ _MODEL_RULES = (
     ("Assign every bullet exactly the claim ids and contribution mode provided."),
     ("Do not mention excluded implications."),
 )
+
+
+def canonical_project_name(identity: str) -> str | None:
+    """Map an evidence-source identity to a resume project identity, or None."""
+
+    name = Path(identity).name.strip()
+    folded = name.casefold().strip(" .")
+    if not folded or folded in _CONTAINER_PROJECT_NAMES:
+        return None
+    if len(folded) > 80 or any(character in folded for character in ("?", "&", "%", "=")):
+        return None
+    if folded.startswith("unknown"):
+        return None
+    if _INTERNAL_IDENTITY_RE.fullmatch(folded) is not None:
+        return None
+    if folded.startswith(("resume-", "evidence-", "run-", "job-", "session-")):
+        return None
+    if (
+        folded in {"solo-scale-ai-os", "soloscale-ai-os", "soloscale"}
+        or folded.startswith("solo-scale-ai-os-")
+        or folded.startswith("soloscale-")
+    ):
+        return "SoloScale AI OS"
+    if folded.startswith("ai-research-assistant"):
+        return "AI Research Assistant"
+    if "buildlog" in folded:
+        return "BuildLog"
+    if folded.startswith("company-site") or "sololeverage" in folded:
+        return "SoloLeverage"
+    if "evidence-to-narrative" in folded:
+        return "Evidence-to-Narrative"
+    if folded in {"ai-data-vault"}:
+        return "AI Data Vault"
+    if folded in {".agency-agents", "agency-agents"}:
+        return "Agency Agents"
+    return name
+
+
+def normalize_resume_projects(identities: Sequence[str]) -> list[str]:
+    """Roll worktrees/containers up into canonical resume projects."""
+
+    normalized: list[str] = []
+    for identity in identities:
+        canonical = canonical_project_name(identity)
+        if canonical is not None and canonical not in normalized:
+            normalized.append(canonical)
+    return normalized
 
 
 class _GeneratedBulletPayload(BaseModel):
@@ -243,18 +326,19 @@ def build_role_strategy(
     )[:20]
     project_ranking: dict[str, int] = {}
     for candidate in coverage_map.candidates:
-        if not candidate.source_identity.strip():
+        if candidate.source_kind.value == "resume_library":
             continue
-        if candidate.source_kind.value not in {"local_git", "evidence_hub", "github"}:
-            continue
-        project_name = (
-            Path(candidate.source_identity).name
-            if candidate.source_kind.value == "local_git"
-            else candidate.source_identity
-        )
-        project_ranking[project_name] = (
-            project_ranking.get(project_name, 0) + 1
-        )
+        project_name = canonical_project_name(candidate.source_identity)
+        if project_name is not None:
+            project_ranking[project_name] = (
+                project_ranking.get(project_name, 0) + 1
+            )
+        combined = f"{candidate.text} {candidate.source_identity}".casefold()
+        for canonical, markers in _PROJECT_TEXT_MARKERS:
+            if any(marker in combined for marker in markers):
+                project_ranking[canonical] = (
+                    project_ranking.get(canonical, 0) + 1
+                )
     selected_projects = [
         name
         for name, _count in sorted(
@@ -588,23 +672,28 @@ def apply_editorial_review(
 def build_coverage_report(
     *,
     claim_truth: ClaimTruthResult,
-    draft: ApplicationResumeDraft,
+    draft: ApplicationResumeDraft | None,
 ) -> CoverageReport:
     claim_requirement_ids = {
         claim.claim_id: claim.requirement_id
         for claim in claim_truth.application_claims
     }
-    used = {
-        claim_requirement_ids.get(claim_id, "")
-        for bullet in draft.bullets
-        for claim_id in bullet.source_claim_ids
-    }
+    used = (
+        {
+            claim_requirement_ids.get(claim_id, "")
+            for bullet in draft.bullets
+            for claim_id in bullet.source_claim_ids
+        }
+        if draft is not None
+        else set()
+    )
     used.discard("")
     gap_requirements = {gap.requirement_id for gap in claim_truth.target_gaps}
     strongly: list[str] = []
     partially: list[str] = []
+    available_not_selected: list[str] = []
+    unsupported: list[str] = []
     gaps: list[str] = []
-    omitted: list[str] = []
     summaries: list[CoverageSummary] = []
     for requirement in claim_truth.requirement_maps:
         verified_claims = [
@@ -623,21 +712,23 @@ def build_coverage_report(
             status: Literal[
                 "STRONGLY_REPRESENTED",
                 "PARTIALLY_REPRESENTED",
+                "AVAILABLE_BUT_NOT_SELECTED",
                 "HIGH_VALUE_GAP",
-                "INTENTIONALLY_OMITTED",
-                "NO_EVIDENCE",
+                "UNSUPPORTED",
             ] = "STRONGLY_REPRESENTED"
             strongly.append(requirement.requirement_id)
         elif requirement.requirement_id in used and supported_claims:
             status = "PARTIALLY_REPRESENTED"
             partially.append(requirement.requirement_id)
-        elif verified_claims or supported_claims:
-            status = "INTENTIONALLY_OMITTED"
-            omitted.append(requirement.requirement_id)
-        else:
-            status = "NO_EVIDENCE"
-        if requirement.requirement_id in gap_requirements:
+        elif requirement.requirement_id in gap_requirements:
+            status = "HIGH_VALUE_GAP"
             gaps.append(requirement.requirement_id)
+        elif verified_claims or supported_claims:
+            status = "AVAILABLE_BUT_NOT_SELECTED"
+            available_not_selected.append(requirement.requirement_id)
+        else:
+            status = "UNSUPPORTED"
+            unsupported.append(requirement.requirement_id)
         summaries.append(
             CoverageSummary(
                 requirement_id=requirement.requirement_id,
@@ -646,10 +737,12 @@ def build_coverage_report(
             )
         )
     return CoverageReport(
+        requirements_total=len(claim_truth.requirement_maps),
         strongly_represented=strongly,
         partially_represented=partially,
-        high_value_gaps=sorted(set(gaps)),
-        intentionally_omitted=omitted,
+        available_not_selected=available_not_selected,
+        high_value_gaps=gaps,
+        unsupported=unsupported,
         summaries=summaries,
     )
 
@@ -676,6 +769,10 @@ def generate_application_resume(
         coverage_map=coverage_map, claim_truth=claim_truth
     )
     claims = select_allowed_claims(claim_truth, max_claims=max_claims)
+    if not claims:
+        raise GenerationProviderError(
+            "no allowed claims are available for generation"
+        )
     contract = build_generation_contract(
         job_description=job_description, strategy=strategy, claims=claims
     )
@@ -765,3 +862,135 @@ def deepseek_generation_gateway(gateway: object) -> ResumeGenerationGateway:
     """Wrap the canonical DeepSeek gateway for structured Resume generation."""
 
     return _DeepSeekGenerationGateway(gateway)
+
+
+def build_generation_preflight(
+    *,
+    job_description: str,
+    claim_truth: ClaimTruthResult,
+    strategy: ResumeRoleStrategy,
+    claims: Sequence[ApplicationClaim],
+    provider: str = "deepseek",
+    model: str = "deepseek-v4-pro",
+    reasoning_effort: str = "high",
+    thinking_enabled: bool = True,
+    credential_configured: bool = False,
+) -> GenerationPreflight:
+    """Exact intended call plan. This function never performs the call."""
+
+    excluded = sorted(
+        {
+            implication
+            for claim in claims
+            for implication in claim.excluded_implications
+        }
+    )
+    return GenerationPreflight(
+        provider=provider,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        thinking_enabled=thinking_enabled,
+        credential_status=(
+            "CONFIGURED" if credential_configured else "NOT_CONFIGURED"
+        ),
+        job_description_sha256=hashlib.sha256(job_description.encode()).hexdigest(),
+        requirements_total=len(claim_truth.requirement_maps),
+        allowed_claim_ids=[claim.claim_id for claim in claims],
+        selected_projects=strategy.selected_projects,
+        excluded_terms=excluded,
+        estimated_stage="one structured Application Resume generation",
+        intended_calls=1,
+        automatic_retries=0,
+    )
+
+
+def render_application_resume(draft: ApplicationResumeDraft) -> str:
+    """Public recruiter-facing text with no internal provenance labels."""
+
+    lines = [f"# {draft.headline}", "", draft.summary, "", "## Skills"]
+    lines.append(", ".join(draft.skills))
+    for section in ("EXPERIENCE", "PROJECTS", "INDEPENDENT_ENGINEERING", "EDUCATION"):
+        bullets = [item.text for item in draft.bullets if item.section == section]
+        if not bullets:
+            continue
+        lines.append("")
+        lines.append(f"## {section.title().replace('_', ' ')}")
+        lines.extend(f"- {text}" for text in bullets)
+    return "\n".join(lines) + "\n"
+
+
+def review_application_resume(
+    draft: ApplicationResumeDraft,
+    claim_truth: ClaimTruthResult,
+) -> ResumeQualityReview:
+    """Structured deterministic quality review; never expands truth."""
+
+    bullets = draft.bullets
+    texts = [bullet.text for bullet in bullets]
+    combined = " ".join(texts).casefold()
+    tech_terms = {
+        term
+        for text in texts
+        for term in capability_expansion(text).technology_terms
+    }
+    used_claim_ids = {
+        claim_id for bullet in bullets for claim_id in bullet.source_claim_ids
+    }
+    available_claim_ids = {
+        claim.claim_id for claim in claim_truth.application_claims
+    }
+    strengths: list[str] = []
+    weaknesses: list[str] = []
+
+    specificity = min(5, 2 + sum(
+        1 for text in texts
+        if len(capability_expansion(text).technology_terms) >= 2
+    ))
+    average_words = (
+        sum(len(text.split()) for text in texts) / max(len(texts), 1)
+    )
+    scanability = 5 if average_words <= 24 else 4 if average_words <= 34 else 2
+    filler_count = sum(1 for term in _FILLER_TERMS if term in combined)
+    natural_language = max(2, 5 - filler_count)
+    term_counts: dict[str, int] = {}
+    for text in texts:
+        for term in capability_expansion(text).technology_terms:
+            term_counts[term] = term_counts.get(term, 0) + 1
+    repeated = [term for term, count in term_counts.items() if count >= 3]
+    redundancy = max(2, 5 - len(repeated))
+    differentiation = min(5, 2 + len(tech_terms) // 3)
+    evidence_utilization = min(
+        5,
+        1 + round(4 * len(used_claim_ids) / max(len(available_claim_ids), 1)),
+    )
+    role_fit = min(5, 2 + len(tech_terms) // 4)
+    truth = 5 if bullets and all(
+        bullet.generation_status in {"MODEL_GENERATED", "DETERMINISTIC_REPAIR"}
+        for bullet in bullets
+    ) else 3
+    if len(tech_terms) >= 5:
+        strengths.append("technically specific evidence vocabulary")
+    if not repeated:
+        strengths.append("no repeated claim vocabulary")
+    if average_words <= 24:
+        strengths.append("concise recruiter-scannable bullets")
+    if filler_count:
+        weaknesses.append(f"{filler_count} filler word(s) present")
+    if repeated:
+        weaknesses.append(f"repeated technology terms: {', '.join(sorted(repeated)[:5])}")
+    if average_words > 34:
+        weaknesses.append("bullets run long")
+    if not weaknesses:
+        weaknesses.append("no deterministic weaknesses detected")
+    return ResumeQualityReview(
+        truth=truth,
+        role_fit=role_fit,
+        specificity=specificity,
+        differentiation=differentiation,
+        scanability=scanability,
+        natural_language=natural_language,
+        redundancy=redundancy,
+        evidence_utilization=evidence_utilization,
+        strengths=strengths,
+        weaknesses=weaknesses,
+    )
