@@ -20,6 +20,7 @@ from soloscale.content_workspace import (
     load_content_run,
 )
 from soloscale.creator_accounts import load_creator_accounts
+from soloscale.creator_production import list_creator_jobs
 from soloscale.media_cost import MediaCostError, load_cost_receipts
 from soloscale.ui_shell import (
     UILocale,
@@ -159,6 +160,22 @@ def creator_overview_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str
     )
 
 
+def _creator_job_phase_label(
+    locale: UILocale, phase: str, error_code: str | None = None
+) -> str:
+    label = {
+        "QUEUED": ui_text(locale, "已排队", "Queued"),
+        "GENERATING_CONTENT": ui_text(locale, "生成中", "Generating"),
+        "RENDERING_VIDEO": ui_text(locale, "渲染视频中", "Rendering video"),
+        "READY": ui_text(locale, "已就绪", "Ready"),
+        "AI_NOT_EXECUTED": "AI_NOT_EXECUTED",
+        "FAILED": ui_text(locale, "失败", "Failed"),
+    }.get(phase, ui_display_value(locale, phase))
+    if error_code:
+        label = f"{label} · {error_code}"
+    return label
+
+
 def creator_history_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str:
     """Render recent content/video state and locally recorded cost receipts."""
     runs = _recent_runs(data_root)
@@ -166,6 +183,16 @@ def creator_history_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str:
         f'''<article class="history-card"><div><span>{html.escape(ui_display_value(locale, item.review_status))}</span><h2>{html.escape(item.run.brief.topic)}</h2><p>{html.escape(item.run.run_id)}</p></div><div class="history-flags"><strong>{ui_text(locale, '视频已就绪', 'Video ready') if item.video_ready else ui_text(locale, '暂无视频', 'No video')}</strong><strong>{ui_text(locale, '发布包已就绪', 'Package ready') if item.distribution_ready else ui_text(locale, '发布包未就绪', 'Package not ready')}</strong></div><a href="{ui_url('/creator/create', locale, run_id=item.run.run_id)}">{ui_text(locale, '打开', 'Open')} →</a></article>'''
         for item in runs
     ) or f'<section class="empty"><h2>{ui_text(locale, "还没有创作历史", "No Creator history yet")}</h2></section>'
+    jobs = list_creator_jobs(data_root)
+    job_cards = "".join(
+        f'''<article class="history-card production-job" data-phase="{html.escape(item.phase)}"><div><span>{html.escape(_creator_job_phase_label(locale, item.phase, item.error_code))}</span><h2>{html.escape(item.request.source_story_id or item.content_project_id)}</h2><p>{html.escape(item.job_id)}</p></div><a href="{ui_url('/creator/create', locale, creator_job=item.job_id)}">{ui_text(locale, '打开任务', 'Open job')} →</a></article>'''
+        for item in jobs
+    )
+    production_section = (
+        f'''<section class="production-jobs"><div class="result-head"><span class="kicker">{ui_text(locale, "生产任务", "Production jobs")}</span><h2>{ui_text(locale, "后台生产生命周期", "Background production lifecycle")}</h2></div><div class="history-list">{job_cards}</div></section>'''
+        if jobs
+        else ""
+    )
     try:
         receipts = load_cost_receipts(data_root)
     except MediaCostError:
@@ -174,7 +201,7 @@ def creator_history_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str:
         (receipt.actual_cost_usd or receipt.estimated_cost_usd or Decimal(0) for receipt in receipts),
         Decimal(0),
     )
-    body = f'''{render_creator_nav(active="history", locale=locale)}<section class="history-summary"><strong>{len(runs)}</strong><span>{ui_text(locale, '最近内容任务', 'recent content runs')}</span><strong>{len(receipts)}</strong><span>{ui_text(locale, '成本回执', 'cost receipts')}</span><strong>${total:.3f}</strong><span>{ui_text(locale, '记录成本', 'recorded cost')}</span></section><section class="history-list">{cards}</section>'''
+    body = f'''{render_creator_nav(active="history", locale=locale)}<section class="history-summary"><strong>{len(runs)}</strong><span>{ui_text(locale, '最近内容任务', 'recent content runs')}</span><strong>{len(receipts)}</strong><span>{ui_text(locale, '成本回执', 'cost receipts')}</span><strong>${total:.3f}</strong><span>{ui_text(locale, '记录成本', 'recorded cost')}</span></section>{production_section}<section class="history-list">{cards}</section>'''
     return render_app_shell(
         active="content",
         locale=locale,

@@ -305,6 +305,42 @@ def load_publish_queue(data_root: Path) -> tuple[PublishQueueItem, ...]:
     )
 
 
+def list_creator_jobs(data_root: Path) -> tuple[CreatorProductionJob, ...]:
+    """Return persisted production jobs, most recently created first."""
+
+    root = data_root.absolute() / _PROJECT_ROOT
+    if root.is_symlink() or not root.is_dir():
+        return ()
+    jobs: list[CreatorProductionJob] = []
+    for directory in root.iterdir():
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        project_path = directory / "project.json"
+        if project_path.is_symlink() or not project_path.is_file():
+            continue
+        try:
+            jobs.append(
+                CreatorProductionJob.model_validate(
+                    _load_model(project_path, CreatorProductionJob)
+                )
+            )
+        except CreatorProductionError:
+            continue
+    jobs.sort(key=lambda item: item.created_at, reverse=True)
+    return tuple(jobs)
+
+
+def latest_job_for_story(
+    data_root: Path, story_id: str
+) -> CreatorProductionJob | None:
+    """Return the most recent production job submitted for one Story origin."""
+
+    for job in list_creator_jobs(data_root):
+        if job.request.source_story_id == story_id:
+            return job
+    return None
+
+
 def assign_artifact_to_account(
     *,
     data_root: Path,

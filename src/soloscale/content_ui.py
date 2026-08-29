@@ -33,6 +33,7 @@ from soloscale.content_workspace import (
 from soloscale.creator_production import (
     CreatorProductionError,
     CreatorProductionJob,
+    latest_job_for_story,
     load_publication_artifacts,
     load_publish_queue,
     sync_distribution_artifacts,
@@ -1098,7 +1099,7 @@ def editorial_publishing_page(
     package_cards = "".join(
         f'''<article class="package-history-card" data-approved-artifact="{_escape(str(package['run_id']))}"><span class="status-badge">{_escape(ui_text(locale, '预览就绪', 'Preview ready'))}</span>
         <strong>{_escape(str(package['run_id']))}</strong>
-        <p>{_escape(ui_text(locale, 'LinkedIn / X 由 BuildLog 控制；YouTube 可选择已授权频道上传。', 'LinkedIn / X remain BuildLog-controlled; YouTube can upload to a selected authorized channel.'))}</p>
+        <p>{_escape(ui_text(locale, 'LinkedIn / X / YouTube 通过 Publish Queue 绑定精确 ChannelAccount；只有已审核 Artifact 才能进入发布任务。', 'LinkedIn / X / YouTube publish through the Publish Queue with an exact ChannelAccount; only approved artifacts enter a publication task.'))}</p>
         <a href="{ui_url('/creator/create' if creator_mode else '/content', locale, run_id=str(package['run_id']))}">{_escape(ui_text(locale, '打开完整内容包', 'Open full content package'))} →</a></article>'''
         for package in packages
     ) or f'''<article class="package-history-card empty"><strong>{_escape(ui_text(locale, '还没有统一发布包', 'No unified distribution package yet'))}</strong>
@@ -1127,7 +1128,7 @@ def editorial_publishing_page(
         title=f"SoloScale · {ui_text(locale, '发布中心', 'Publishing Center')}",
         eyebrow=ui_text(locale, "发布中心", "Publishing center"),
         heading=ui_text(locale, "把发布前的每一步，放在你手里。", "Keep every pre-publish decision in your hands."),
-        description=ui_text(locale, "先校验、再看精确预览，只有你明确确认后 BuildLog 才能调用平台。", "Verify first, inspect the exact preview, and let BuildLog call a platform only after your explicit confirmation."),
+        description=ui_text(locale, "先校验、再看精确预览，只有你明确确认后平台才会被调用。", "Verify first, inspect the exact preview, and a platform is called only after your explicit confirmation."),
         body=body,
         extra_css="""
 .canonical-publish-queue{margin-bottom:22px}.publish-queue-head,.publish-queue-row{display:grid;grid-template-columns:minmax(190px,1.4fr) .55fr .6fr minmax(220px,1.3fr) .7fr;gap:12px;align-items:center}.publish-queue-head{padding:0 14px 8px;color:var(--text-muted);font-size:11px;font-weight:900}.publish-queue-row{padding:14px;border-top:1px solid var(--border)}.publish-queue-row small,.queue-destination small{display:block;color:var(--text-muted)}.queue-destination form{display:grid;grid-template-columns:1fr auto;gap:7px}.queue-destination button{padding:8px 10px}.package-history{margin-bottom:22px}.package-history h2{margin:10px 0 16px}.package-history-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.package-history-card{display:grid;gap:8px;padding:16px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.package-history-card p{margin:0;color:var(--text-muted)}.package-history-card a{font-weight:800;text-decoration:none}
@@ -1311,6 +1312,37 @@ def _scan_html(
       <div class="candidate-grid">{''.join(cards)}</div></section>'''
 
 
+def _creator_story_job_status(
+    data_root: Path, story_id: str, locale: UILocale
+) -> str:
+    """Render the durable status of the latest production job for one Story."""
+
+    job = latest_job_for_story(data_root, story_id)
+    if job is None:
+        return ""
+    phase_copy = {
+        "QUEUED": ui_text(locale, "已排队", "Queued"),
+        "GENERATING_CONTENT": ui_text(locale, "生成中", "Generating"),
+        "RENDERING_VIDEO": ui_text(locale, "渲染视频中", "Rendering video"),
+        "READY": ui_text(locale, "已就绪", "Ready"),
+        "AI_NOT_EXECUTED": "AI_NOT_EXECUTED",
+        "FAILED": ui_text(locale, "失败", "Failed"),
+    }
+    label = phase_copy.get(job.phase, ui_display_value(locale, job.phase))
+    if job.error_code:
+        label = f"{label} · {job.error_code}"
+    target = (
+        ui_url("/creator/publish", locale, run_id=job.content_run_id or "")
+        if job.phase == "READY"
+        else ui_url("/creator/create", locale, creator_job=job.job_id)
+    )
+    return (
+        f'<a class="creator-job-status" data-phase="{_escape(job.phase)}" '
+        f'href="{target}">{_escape(ui_text(locale, "任务", "Job"))}: '
+        f"{_escape(label)} →</a>"
+    )
+
+
 def _story_mining_html(data_root: Path, locale: UILocale) -> str:
     """Live Story Bank action: mine a small batch from approved evidence."""
 
@@ -1319,7 +1351,7 @@ def _story_mining_html(data_root: Path, locale: UILocale) -> str:
     except StoryMiningError:
         candidates = ()
     candidate_cards = "".join(
-        f'''<article class="mined-candidate"><strong>{_escape(candidate.working_title_cn if locale == 'zh-CN' else candidate.working_title_en)}</strong><p>{_escape(candidate.one_sentence_thesis)}</p><small>{_escape(candidate.generated_by)} · {len(candidate.source_evidence_ids)} {_escape(ui_text(locale, '条证据', 'evidence items'))} · {_escape(ui_text(locale, '确定性草稿', 'Deterministic draft'))}</small><form method="post" action="/creator/production/start" class="canon-direct-form"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="source_kind" value="STORY" /><input type="hidden" name="source_story_id" value="{candidate.candidate_id}" /><label>{_escape(ui_text(locale, '语言', 'Language'))}<select name="language"><option value="中文">中文</option><option value="English">English</option></select></label><button type="submit" name="production_action" value="article">{_escape(ui_text(locale, '生成文章', 'Generate article'))}</button><button class="secondary-button" type="submit" name="production_action" value="video">{_escape(ui_text(locale, '生成视频', 'Generate video'))}</button><button class="secondary-button" type="submit" name="production_action" value="queue">{_escape(ui_text(locale, '生成并加入队列', 'Generate and queue'))}</button></form></article>'''
+        f'''<article class="mined-candidate"><strong>{_escape(candidate.working_title_cn if locale == 'zh-CN' else candidate.working_title_en)}</strong><p>{_escape(candidate.one_sentence_thesis)}</p><small>{_escape(candidate.generated_by)} · {len(candidate.source_evidence_ids)} {_escape(ui_text(locale, '条证据', 'evidence items'))} · {_escape(ui_text(locale, '确定性草稿', 'Deterministic draft'))}</small>{_creator_story_job_status(data_root, candidate.candidate_id, locale)}<form method="post" action="/creator/production/start" class="canon-direct-form"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="source_kind" value="STORY" /><input type="hidden" name="source_story_id" value="{candidate.candidate_id}" /><label>{_escape(ui_text(locale, '语言', 'Language'))}<select name="language"><option value="中文">中文</option><option value="English">English</option></select></label><button type="submit" name="production_action" value="article">{_escape(ui_text(locale, '生成文章', 'Generate article'))}</button><button class="secondary-button" type="submit" name="production_action" value="video">{_escape(ui_text(locale, '生成视频', 'Generate video'))}</button><button class="secondary-button" type="submit" name="production_action" value="queue">{_escape(ui_text(locale, '生成并加入队列', 'Generate and queue'))}</button></form></article>'''
         for candidate in candidates
     ) or f'''<p class="hint">{_escape(ui_text(locale, '还没有挖掘出的候选故事。', 'No mined story candidates yet.'))}</p>'''
     form = f'''<form method="post" action="/creator/stories/mine"><input type="hidden" name="ui_locale" value="{locale}" /><button class="secondary-button" type="submit">{_escape(ui_text(locale, '从最新工作生成更多故事', 'Generate More Stories'))}</button></form>'''
@@ -1403,7 +1435,7 @@ def _month_one_canon_html(
                 <div class="six-layers">{layers}</div>
                 <div class="canon-meta"><div><h4>{_escape(ui_text(locale, '证据候选', 'Evidence candidates'))}</h4><ul>{evidence}</ul></div><div><h4>{_escape(ui_text(locale, '已核验指标', 'Verified metrics'))}</h4><ul>{metrics}</ul></div><div><h4>{_escape(ui_text(locale, '防止过度表达', 'Overclaim guardrails'))}</h4><ul>{guardrails}</ul></div></div>
                 <div class="canon-production"><span>{_escape(ui_text(locale, '主格式', 'Primary'))}: {_escape(story.primary_format)}</span><span>{_escape(ui_text(locale, '可复用', 'Repurpose'))}: {_escape(secondary)}</span></div>
-                <div class="canon-actions">{production_actions}<button class="secondary-button" type="button" data-canon-select="{story.story_id}" data-canon-format="blog">{_escape(ui_text(locale, '打开并编辑输入', 'Open and edit input'))}</button></div></div></details>'''
+                <div class="canon-actions">{production_actions}{_creator_story_job_status(data_root, story.story_id, locale)}<button class="secondary-button" type="button" data-canon-select="{story.story_id}" data-canon-format="blog">{_escape(ui_text(locale, '打开并编辑输入', 'Open and edit input'))}</button></div></div></details>'''
             )
             story_payload[story.story_id] = {
                 "title": story.title_cn if locale == "zh-CN" else story.working_title_en,
