@@ -1120,19 +1120,23 @@ def render_work_context_strip(
     """Render the compact shared foundation above the three outcome cards."""
 
     resume = ui_text(locale, "简历 ✓", "Resume ✓") if snapshot.resume_runs else ui_text(locale, "简历待添加", "Add resume")
+    conversations = ui_text(locale, f"{snapshot.ai_conversations} 个 AI 对话", f"{snapshot.ai_conversations} AI conversations") if snapshot.ai_conversations else ui_text(locale, "AI 对话待添加", "Add AI conversations")
     if snapshot.project_connected:
-        projects = (
-            ui_text(locale, "1 个项目 · 需刷新", "1 project · refresh needed")
-            if snapshot.project_state == "STALE"
-            else ui_text(locale, "1 个项目", "1 project")
+        branch = snapshot.project_branch or snapshot.project_head or ui_text(locale, "当前 HEAD", "HEAD")
+        project_identity = f"{snapshot.project_name or 'Git'} · {branch}"
+        project_line = ui_text(locale, f"当前工作项目：{project_identity}", f"Current work project: {project_identity}")
+        context_note = ui_text(
+            locale,
+            f"{resume} · {conversations} · 工程证据{'需刷新' if snapshot.project_state == 'STALE' else '已更新'}",
+            f"{resume} · {conversations} · engineering evidence {'needs refresh' if snapshot.project_state == 'STALE' else 'current'}",
         )
     else:
-        projects = ui_text(locale, "项目待添加", "Add project")
-    conversations = ui_text(locale, f"{snapshot.ai_conversations} 个 AI 对话", f"{snapshot.ai_conversations} AI conversations") if snapshot.ai_conversations else ui_text(locale, "AI 对话待添加", "Add AI conversations")
+        project_line = ui_text(locale, "当前工作项目：未选择", "Current work project: not selected")
+        context_note = f"{resume} · {conversations}"
     return f"""<section class="work-context-strip" aria-label="{html.escape(ui_text(locale, '我的工作资料', 'Your work'))}">
   <div><span class="kicker">{html.escape(ui_text(locale, '我的工作资料', 'Your work'))}</span>
-  <strong>{html.escape(resume)} · {html.escape(projects)} · {html.escape(conversations)}</strong></div>
-  <p>{html.escape(ui_text(locale, '添加一次，在简历、面试和内容中反复使用。', 'Bring it once, then reuse it across applications, interviews, and content.'))}</p>
+  <strong>{html.escape(project_line)}</strong><span class="context-note">{html.escape(context_note)}</span></div>
+  <p>{html.escape(ui_text(locale, 'Career / Learning 会在适当时复用该项目的工程证据，而不是自动写入每一份简历。', 'Career and Learning reuse this project evidence where appropriate; it is never written into every resume automatically.'))}</p>
   <a href="{ui_url('/work', locale)}">{html.escape(ui_text(locale, '添加或管理资料', 'Add or manage work'))}<span aria-hidden="true">→</span></a>
 </section>"""
 
