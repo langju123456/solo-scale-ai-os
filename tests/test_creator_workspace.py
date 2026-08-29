@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 from soloscale.content_canon import load_month_one_canon
@@ -9,6 +10,43 @@ from soloscale.creator_accounts import normalize_account, save_creator_account
 from soloscale.creator_production import create_run_artifacts
 from soloscale.creator_workspace import creator_history_page, creator_overview_page
 from soloscale.platform_accounts import ConnectedIdentity, save_connected_identity
+
+
+def _seal_video_files(data_root: Path, run_id: str) -> None:
+    run_dir = data_root / "content-runs" / run_id
+    for filename in ("21_creator_video_youtube.mp4", "10_creator_video.mp4"):
+        (run_dir / filename).write_bytes(b"rendered-video")
+
+
+def _draft_artifacts(
+    data_root: Path, run_id: str, outputs: list[str]
+) -> None:
+    if "VIDEO" in outputs:
+        _seal_video_files(data_root, run_id)
+    create_run_artifacts(
+        data_root=data_root,
+        content_project_id=f"project-{run_id}",
+        run_id=run_id,
+        outputs=outputs,
+    )
+
+
+def _approved_distribution_run(data_root: Path, run_id: str) -> None:
+    _seal_video_files(data_root, run_id)
+    save_content_review(
+        data_root=data_root,
+        run_id=run_id,
+        decision=ContentReviewDecision.APPROVED,
+    )
+    create_run_artifacts(
+        data_root=data_root,
+        content_project_id=f"project-{run_id}",
+        run_id=run_id,
+        outputs=["ARTICLE", "VIDEO"],
+    )
+    (data_root / "content-runs" / run_id / "26_distribution_package.json").write_text(
+        json.dumps({"run_id": run_id}), encoding="utf-8"
+    )
 
 
 def _content_form() -> dict[str, str]:
@@ -133,7 +171,10 @@ def test_publish_queue_shows_connected_account_capability_truth(
     )
 
     publish = editorial_publishing_page(
-        data_root=data_root, locale="en", creator_mode=True
+        data_root=data_root,
+        locale="en",
+        creator_mode=True,
+        selected_run_id=result.run_id,
     )
 
     assert "pinball" in publish
@@ -179,3 +220,111 @@ def test_publish_queue_targets_one_persisted_approved_artifact(tmp_path: Path) -
     assert "当前内容还没有可发布版本" in invalid_zh
     assert "This content has no publishable version yet" in invalid_en
     assert 'role="alert"' in invalid_zh
+
+
+def test_publish_center_requires_explicit_package_selection(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    run_id = run_content_form(_content_form(), data_root).run_id
+    assert run_id is not None
+    _draft_artifacts(data_root, run_id, ["ARTICLE"])
+
+    page = editorial_publishing_page(
+        data_root=data_root, locale="zh-CN", creator_mode=True
+    )
+
+    assert "请选择一个 Content Package" in page
+    assert 'data-artifact-id="' not in page
+    assert f"A verified engineering story · DRAFT · {run_id}" in page
+    assert "Select content package…" in page
+
+
+def test_publish_center_selector_scopes_artifacts_by_package(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    article_run = run_content_form(_content_form(), data_root).run_id
+    video_run = run_content_form(_content_form(), data_root).run_id
+    ready_run = run_content_form(_content_form(), data_root).run_id
+    assert article_run and video_run and ready_run
+
+    _draft_artifacts(data_root, article_run, ["ARTICLE"])
+    _draft_artifacts(data_root, video_run, ["VIDEO"])
+    _approved_distribution_run(data_root, ready_run)
+
+    article_artifacts = (
+        f"artifact-{article_run}-linkedin",
+        f"artifact-{article_run}-x",
+    )
+    video_artifacts = (
+        f"artifact-{video_run}-youtube",
+        f"artifact-{video_run}-douyin",
+    )
+    ready_artifacts = (
+        f"artifact-{ready_run}-linkedin",
+        f"artifact-{ready_run}-x",
+        f"artifact-{ready_run}-youtube",
+        f"artifact-{ready_run}-douyin",
+    )
+
+    no_selection = editorial_publishing_page(
+        data_root=data_root, locale="zh-CN", creator_mode=True
+    )
+    for run_id in (article_run, video_run, ready_run):
+        assert run_id in no_selection
+    assert f"· READY · {ready_run}" in no_selection
+    assert f"· DRAFT · {article_run}" in no_selection
+    assert f"· DRAFT · {video_run}" in no_selection
+
+    article_page = editorial_publishing_page(
+        data_root=data_root,
+        locale="zh-CN",
+        creator_mode=True,
+        selected_run_id=article_run,
+    )
+    assert "DRAFT · 需要审核后才能发布。" in article_page
+    for artifact in article_artifacts:
+        assert f'data-artifact-id="{artifact}"' in article_page
+    for other in (*video_artifacts, *ready_artifacts):
+        assert f'data-artifact-id="{other}"' not in article_page
+    assert "当前内容还没有可发布版本" not in article_page
+
+    video_page = editorial_publishing_page(
+        data_root=data_root,
+        locale="zh-CN",
+        creator_mode=True,
+        selected_run_id=video_run,
+    )
+    assert "DRAFT · 需要审核后才能发布。" in video_page
+    for artifact in video_artifacts:
+        assert f'data-artifact-id="{artifact}"' in video_page
+    for other in (*article_artifacts, *ready_artifacts):
+        assert f'data-artifact-id="{other}"' not in video_page
+
+    ready_page = editorial_publishing_page(
+        data_root=data_root,
+        locale="zh-CN",
+        creator_mode=True,
+        selected_run_id=ready_run,
+    )
+    assert "将发布已审核版本" in ready_page
+    for artifact in ready_artifacts:
+        assert f'data-artifact-id="{artifact}"' in ready_page
+    for other in (*article_artifacts, *video_artifacts):
+        assert f'data-artifact-id="{other}"' not in ready_page
+    assert "youtube-publish" in ready_page
+
+
+def test_publish_center_selector_falls_back_to_run_id_label(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    run_id = run_content_form(_content_form(), data_root).run_id
+    assert run_id is not None
+    _draft_artifacts(data_root, run_id, ["ARTICLE"])
+    shutil.rmtree(data_root / "content-runs" / run_id)
+
+    page = editorial_publishing_page(
+        data_root=data_root, locale="zh-CN", creator_mode=True
+    )
+
+    assert f"{run_id} · DRAFT · {run_id}" in page

@@ -18,7 +18,11 @@ from soloscale.content_canon_pipeline import (
     content_brief_from_month_one_story,
     content_brief_from_story_candidate,
 )
-from soloscale.content_distribution import recent_distribution_packages
+from soloscale.content_distribution import (
+    ContentDistributionError,
+    load_distribution_package,
+    recent_distribution_packages,
+)
 from soloscale.content_models import ContentBrief, ContentReviewDecision, ContentRun
 from soloscale.content_scan import RecentWorkScan, ScanRange, scan_recent_work
 from soloscale.content_workspace import (
@@ -1050,6 +1054,43 @@ def _connected_account_states(
     return states
 
 
+def _content_package_entries(data_root: Path) -> list[dict[str, str]]:
+    """Ordered, deduplicated Content Packages from the canonical artifact store.
+
+    A Content Package is selectable as soon as it has persisted PublicationArtifacts,
+    before any approved DistributionPackage exists. Its displayed status remains
+    truthful: DRAFT until a distribution package seals it.
+    """
+
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    try:
+        artifacts = load_publication_artifacts(data_root)
+    except CreatorProductionError:
+        return entries
+    for artifact in artifacts:
+        run_id = artifact.source_run_id
+        if run_id in seen:
+            continue
+        seen.add(run_id)
+        try:
+            topic = load_content_run(data_root, run_id).brief.topic
+        except ContentWorkspaceError:
+            topic = ""
+        try:
+            ready = load_distribution_package(data_root, run_id) is not None
+        except (ContentDistributionError, ContentWorkspaceError):
+            ready = False
+        entries.append(
+            {
+                "run_id": run_id,
+                "topic": topic.strip() or run_id,
+                "status": "READY" if ready else "DRAFT",
+            }
+        )
+    return entries
+
+
 def _creator_publish_queue_html(
     data_root: Path,
     *,
@@ -1065,6 +1106,9 @@ def _creator_publish_queue_html(
             sync_distribution_artifacts(data_root, run_id)
         except (CreatorProductionError, ContentWorkspaceError):
             continue
+    if selected_run_id is None:
+        empty = f'''<article class="publish-queue-row empty"><strong>{_escape(ui_text(locale, '请选择一个 Content Package', 'Please select a Content Package'))}</strong><span>{_escape(ui_text(locale, '选择内容包后，这里只显示该包的 artifacts 与发布上下文。', 'After selecting a content package, only its artifacts and publication context are shown here.'))}</span></article>'''
+        return f'''<section class="panel canonical-publish-queue"><span class="kicker">Publish Queue</span><h2>{_escape(ui_text(locale, 'Artifact + 精确账号 = 发布任务', 'Artifact + exact account = publication task'))}</h2><p>{_escape(ui_text(locale, '队列不重新生成内容；只有已审核 Artifact 才能绑定真实 ChannelAccount。', 'The queue never regenerates content; only approved artifacts can bind to a real ChannelAccount.'))}</p><div class="publish-queue-head"><span>{_escape(ui_text(locale, '内容', 'Content'))}</span><span>{_escape(ui_text(locale, '类型', 'Type'))}</span><span>{_escape(ui_text(locale, '平台', 'Platform'))}</span><span>{_escape(ui_text(locale, '账号', 'Account'))}</span><span>{_escape(ui_text(locale, '状态', 'Status'))}</span></div>{empty}</section>'''
     artifacts = load_publication_artifacts(data_root, run_id=selected_run_id)
     queue_by_artifact = {item.artifact_id: item for item in load_publish_queue(data_root)}
     identities = eligible_publish_identities(data_root)
@@ -1124,15 +1168,24 @@ def editorial_publishing_page(
 
     publish_identities = eligible_publish_identities(data_root)
     packages = recent_distribution_packages(data_root)
+    content_packages = _content_package_entries(data_root)
     selection_notice = ""
+    draft_notice = ""
     if selected_run_id:
-        packages = [
+        distribution_packages = [
             package
             for package in packages
             if str(package.get("run_id", "")) == selected_run_id
         ]
-        if packages:
+        has_artifacts = any(
+            entry["run_id"] == selected_run_id for entry in content_packages
+        )
+        if distribution_packages:
+            packages = distribution_packages
             selection_notice = f'''<p class="notice" role="status" data-approved-artifact="{_escape(selected_run_id)}">{_escape(ui_text(locale, '将发布已审核版本；编辑页中未保存的内容不会进入本次发布。', 'Using the approved version; unsaved editor changes will not enter this publication.'))}</p>'''
+        elif has_artifacts:
+            packages = []
+            draft_notice = f'''<p class="notice warning" role="status">{_escape(ui_text(locale, 'DRAFT · 需要审核后才能发布。', 'DRAFT · Review is required before publishing.'))}</p>'''
         elif error is None:
             error = ui_text(
                 locale,
@@ -1163,18 +1216,18 @@ def editorial_publishing_page(
     )
     creator_nav = render_creator_nav(active="publish", locale=locale) if creator_mode else ""
     package_options = "".join(
-        f'<option value="{_escape(str(package["run_id"]))}" {"selected" if selected_run_id == str(package["run_id"]) else ""}>{_escape(str(package["run_id"]))}</option>'
-        for package in packages
+        f'<option value="{_escape(entry["run_id"])}" {"selected" if selected_run_id == entry["run_id"] else ""}>{_escape(entry["topic"])} · {_escape(entry["status"])} · {_escape(entry["run_id"])}</option>'
+        for entry in content_packages
     )
     package_selector = (
-        f'''<section class="panel package-selector"><span class="kicker">{_escape(ui_text(locale, 'Ready Content Packages', 'Ready Content Packages'))}</span>
+        f'''<section class="panel package-selector"><span class="kicker">{_escape(ui_text(locale, '内容包', 'Content Packages'))}</span>
 <h2>{_escape(ui_text(locale, '选择要准备发布的内容包', 'Select a content package to prepare'))}</h2>
 <p class="muted">{_escape(ui_text(locale, '先明确选择内容包，再查看其可发布 Artifact 与精确 ChannelAccount；系统不会自动推断要发布哪一个。', 'Choose a content package explicitly before viewing its publishable artifacts and exact ChannelAccount; the system never infers which one to publish.'))}</p>
 <form method="get" action="{ui_url('/creator/publish' if creator_mode else '/publishing', locale)}" class="package-select-form"><select name="run_id" aria-label="{_escape(ui_text(locale, '选择内容包', 'Select content package'))}"><option value="">{_escape(ui_text(locale, 'Select content package…', 'Select content package…'))}</option>{package_options}</select><button type="submit">{_escape(ui_text(locale, '选择', 'Select'))}</button></form></section>'''
-        if packages
+        if content_packages
         else ""
     )
-    body = f"""{creator_nav}{selection_notice}{error_html}{package_selector}{queue_panel}<section class="panel package-history"><span class="kicker">{_escape(ui_text(locale, 'SoloScale 内容历史', 'SoloScale content history'))}</span>
+    body = f"""{creator_nav}{selection_notice}{draft_notice}{error_html}{package_selector}{queue_panel}<section class="panel package-history"><span class="kicker">{_escape(ui_text(locale, 'SoloScale 内容历史', 'SoloScale content history'))}</span>
 <h2>{_escape(ui_text(locale, '已批准、可继续处理的发布包', 'Approved packages ready for the next action'))}</h2>
 <div class="package-history-grid">{package_cards}</div></section>{youtube_panel}"""
     return render_app_shell(
