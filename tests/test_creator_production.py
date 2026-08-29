@@ -21,6 +21,7 @@ from soloscale.creator_production import (
     CreatorProductionRequest,
     assign_artifact_to_account,
     create_run_artifacts,
+    job_elapsed_seconds,
     load_creator_production_job,
     load_creator_production_jobs,
     load_publication_artifacts,
@@ -317,5 +318,35 @@ def test_generate_and_queue_auto_assigns_the_single_eligible_account(
         assert len(queue) == 1
         assert queue[0].channel_account_id == "linkedin:member:123"
         assert queue[0].platform == "linkedin"
+    finally:
+        manager.shutdown()
+
+
+def test_production_job_persists_observable_state(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    run = run_content_workspace(data_root=data_root, brief=_brief())
+    manager = CreatorProductionJobManager()
+    try:
+        job = manager.submit(
+            data_root=data_root,
+            request=CreatorProductionRequest(
+                source_kind="CREATE",
+                outputs=["ARTICLE"],
+                language="English",
+                ai_editorial=False,
+            ),
+            runner=lambda: run.run_id,
+            provider="template",
+            model=None,
+        )
+        finished = wait_for_creator_job(manager, data_root, job.job_id)
+        assert finished.phase == "READY"
+        assert finished.stage == "Artifacts sealed"
+        assert finished.provider == "template"
+        assert job_elapsed_seconds(finished) >= 0
+        persisted = load_creator_production_job(data_root, job.job_id)
+        assert persisted is not None
+        assert persisted.provider == "template"
+        assert persisted.stage == "Artifacts sealed"
     finally:
         manager.shutdown()

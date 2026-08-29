@@ -69,6 +69,10 @@ class CreatorProductionJob(_StrictModel):
     artifact_ids: list[str] = Field(default_factory=list)
     queue_item_ids: list[str] = Field(default_factory=list)
     model_calls: int = Field(default=0, ge=0)
+    provider: str | None = None
+    model: str | None = None
+    stage: str | None = None
+    timeout_seconds: int | None = Field(default=None, ge=0)
     error_code: str | None = None
 
 
@@ -108,6 +112,18 @@ class CreatorProductionError(ValueError):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def job_elapsed_seconds(job: CreatorProductionJob, *, now: datetime | None = None) -> int:
+    """Return whole elapsed seconds for a persisted production job."""
+
+    try:
+        started = datetime.fromisoformat(job.created_at)
+    except ValueError:
+        return 0
+    reference = now or datetime.now(UTC)
+    elapsed = (reference - started).total_seconds()
+    return max(0, int(elapsed))
 
 
 def _private_root(data_root: Path, name: str) -> Path:
@@ -406,6 +422,9 @@ class CreatorProductionJobManager:
         request: CreatorProductionRequest,
         runner: Callable[[], str],
         renderer: Callable[[str], None] | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> CreatorProductionJob:
         job_id = f"creator-job-{uuid4().hex[:16]}"
         job = CreatorProductionJob(
@@ -413,6 +432,10 @@ class CreatorProductionJobManager:
             content_project_id=f"project-{uuid4().hex[:16]}",
             request=request,
             phase="QUEUED",
+            stage="Queued",
+            provider=provider,
+            model=model,
+            timeout_seconds=timeout_seconds,
             created_at=_now(),
             updated_at=_now(),
         )
@@ -463,7 +486,16 @@ class CreatorProductionJobManager:
         if job is None:
             return
         try:
-            job = self._transition(data_root, job, "GENERATING_CONTENT")
+            job = self._transition(
+                data_root,
+                job,
+                "GENERATING_CONTENT",
+                stage=(
+                    "AI generation"
+                    if job.request.ai_editorial
+                    else "Template generation"
+                ),
+            )
             run_id = runner()
             run = load_content_run(data_root, run_id)
             model_calls = int(run.model_used)
@@ -487,7 +519,9 @@ class CreatorProductionJobManager:
             if "VIDEO" in job.request.outputs:
                 if renderer is None:
                     raise CreatorProductionError("Video renderer is unavailable")
-                job = self._transition(data_root, job, "RENDERING_VIDEO")
+                job = self._transition(
+                    data_root, job, "RENDERING_VIDEO", stage="Video rendering"
+                )
                 renderer(run_id)
             artifacts = create_run_artifacts(
                 data_root=data_root,
@@ -512,6 +546,7 @@ class CreatorProductionJobManager:
                 data_root,
                 job,
                 "READY",
+                stage="Artifacts sealed",
                 artifact_ids=[item.artifact_id for item in artifacts],
                 queue_item_ids=queue_ids,
             )
@@ -526,6 +561,7 @@ class CreatorProductionJobManager:
                 data_root,
                 current,
                 "AI_NOT_EXECUTED" if error_code == "AI_NOT_EXECUTED" else "FAILED",
+                stage="AI generation" if error_code == "AI_NOT_EXECUTED" else "Failed",
                 error_code=error_code,
             )
 

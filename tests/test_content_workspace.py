@@ -800,3 +800,59 @@ def test_content_review_is_versioned_and_regenerates_only_one_adaptation(
         for path in review_dirs
         for artifact in path.iterdir()
     )
+
+
+def test_public_projections_strip_internal_provenance_labels(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    brief = ContentBrief(
+        topic="A grounded engineering story",
+        audience="AI engineers",
+        language="English",
+        call_to_action="Share a similar trade-off.",
+        source_label="git:abc123",
+        claims=[
+            ContentClaim(
+                id="CLAIM-01",
+                text="A focused test passed.",
+                status=ClaimStatus.VERIFIED,
+                receipt="git:abc123",
+                limits="This does not prove production readiness.",
+            ),
+            ContentClaim(
+                id="CLAIM-02",
+                text="I observed this behavior.",
+                status=ClaimStatus.OBSERVED,
+                receipt="git:abc123",
+                limits="Keep this local.",
+            ),
+        ],
+    )
+    run = run_content_workspace(data_root=data_root, brief=brief)
+    public_blob = "\n".join(
+        [
+            run.drafts.linkedin,
+            run.drafts.x_post,
+            "\n".join(run.drafts.x_thread),
+            run.drafts.canonical_story,
+            run.drafts.blog,
+            run.drafts.youtube_script,
+            run.drafts.video_script,
+            *[scene.on_screen_text for scene in run.drafts.storyboard],
+            *[scene.voiceover for scene in run.drafts.storyboard],
+            *[scene.purpose for scene in run.drafts.storyboard],
+        ]
+    )
+    for banned in (
+        "VERIFIED",
+        "OBSERVED",
+        "HYPOTHESIS",
+        "PLANNED",
+        "CLAIM-",
+        "Limit:",
+        "Facts source:",
+        "Reference pattern applied:",
+        "Explicit boundaries:",
+        "Evidence map",
+        "Proof links:",
+    ):
+        assert banned not in public_blob, banned

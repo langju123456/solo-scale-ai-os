@@ -33,6 +33,7 @@ from soloscale.content_workspace import (
 from soloscale.creator_production import (
     CreatorProductionError,
     CreatorProductionJob,
+    job_elapsed_seconds,
     load_creator_production_jobs,
     load_publication_artifacts,
     load_publish_queue,
@@ -129,6 +130,49 @@ class ContentFormResult:
 
 def _escape(value: str) -> str:
     return html.escape(value or "", quote=True)
+
+
+def _provider_display_label(provider: str | None, locale: UILocale) -> str:
+    """Human-readable service label for a Creator production job."""
+
+    if provider == "template":
+        return ui_text(locale, "离线模板", "Offline template")
+    if provider == ModelProviderId.SOLOSCALE_HOSTED.value:
+        return ui_text(locale, "SoloScale 托管 AI", "SoloScale Hosted AI")
+    if provider == ModelProviderId.OLLAMA.value:
+        return ui_text(locale, "本地 Ollama", "Local Ollama")
+    if provider == ModelProviderId.OPENAI_COMPATIBLE.value:
+        return "OpenAI API"
+    return _escape(provider or ui_text(locale, "未知", "Unknown"))
+
+
+def _creator_job_state_detail(job: CreatorProductionJob, locale: UILocale) -> str:
+    """Concise observable state for a running/finished Creator production job."""
+
+    parts: list[str] = []
+    if job.stage:
+        parts.append(
+            f"{_escape(ui_text(locale, '阶段', 'Stage'))}: {_escape(job.stage)}"
+        )
+    if job.provider:
+        parts.append(
+            f"{_escape(ui_text(locale, '服务', 'Service'))}: {_provider_display_label(job.provider, locale)}"
+        )
+    if job.model:
+        parts.append(f"{_escape(ui_text(locale, '模型', 'Model'))}: {_escape(job.model)}")
+    elapsed = job_elapsed_seconds(job)
+    parts.append(
+        f"{_escape(ui_text(locale, '已用时', 'Elapsed'))}: {elapsed}s"
+    )
+    if job.model_calls:
+        parts.append(
+            f"{_escape(ui_text(locale, '模型调用', 'Model calls'))}: {job.model_calls}"
+        )
+    if job.timeout_seconds is not None:
+        parts.append(
+            f"{_escape(ui_text(locale, '超时', 'Timeout'))}: {job.timeout_seconds}s"
+        )
+    return " · ".join(parts)
 
 
 def _grounded_lines(raw: str, status: str) -> list[str]:
@@ -1119,7 +1163,19 @@ def editorial_publishing_page(
         selected_run_id=selected_run_id,
     )
     creator_nav = render_creator_nav(active="publish", locale=locale) if creator_mode else ""
-    body = f"""{creator_nav}{selection_notice}{error_html}{queue_panel}<section class="panel package-history"><span class="kicker">{_escape(ui_text(locale, 'SoloScale 内容历史', 'SoloScale content history'))}</span>
+    package_options = "".join(
+        f'<option value="{_escape(str(package["run_id"]))}" {"selected" if selected_run_id == str(package["run_id"]) else ""}>{_escape(str(package["run_id"]))}</option>'
+        for package in packages
+    )
+    package_selector = (
+        f'''<section class="panel package-selector"><span class="kicker">{_escape(ui_text(locale, 'Ready Content Packages', 'Ready Content Packages'))}</span>
+<h2>{_escape(ui_text(locale, '选择要准备发布的内容包', 'Select a content package to prepare'))}</h2>
+<p class="muted">{_escape(ui_text(locale, '先明确选择内容包，再查看其可发布 Artifact 与精确 ChannelAccount；系统不会自动推断要发布哪一个。', 'Choose a content package explicitly before viewing its publishable artifacts and exact ChannelAccount; the system never infers which one to publish.'))}</p>
+<form method="get" action="{ui_url('/creator/publish' if creator_mode else '/publishing', locale)}" class="package-select-form"><select name="run_id" aria-label="{_escape(ui_text(locale, '选择内容包', 'Select content package'))}"><option value="">{_escape(ui_text(locale, 'Select content package…', 'Select content package…'))}</option>{package_options}</select><button type="submit">{_escape(ui_text(locale, '选择', 'Select'))}</button></form></section>'''
+        if packages
+        else ""
+    )
+    body = f"""{creator_nav}{selection_notice}{error_html}{package_selector}{queue_panel}<section class="panel package-history"><span class="kicker">{_escape(ui_text(locale, 'SoloScale 内容历史', 'SoloScale content history'))}</span>
 <h2>{_escape(ui_text(locale, '已批准、可继续处理的发布包', 'Approved packages ready for the next action'))}</h2>
 <div class="package-history-grid">{package_cards}</div></section>{youtube_panel}"""
     return render_app_shell(
@@ -1133,6 +1189,7 @@ def editorial_publishing_page(
         body=body,
         extra_css="""
 .canonical-publish-queue{margin-bottom:22px}.publish-queue-head,.publish-queue-row{display:grid;grid-template-columns:minmax(190px,1.4fr) .55fr .6fr minmax(220px,1.3fr) .7fr;gap:12px;align-items:center}.publish-queue-head{padding:0 14px 8px;color:var(--text-muted);font-size:11px;font-weight:900}.publish-queue-row{padding:14px;border-top:1px solid var(--border)}.publish-queue-row small,.queue-destination small{display:block;color:var(--text-muted)}.queue-destination form{display:grid;grid-template-columns:1fr auto;gap:7px}.queue-destination button{padding:8px 10px}.package-history{margin-bottom:22px}.package-history h2{margin:10px 0 16px}.package-history-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.package-history-card{display:grid;gap:8px;padding:16px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.package-history-card p{margin:0;color:var(--text-muted)}.package-history-card a{font-weight:800;text-decoration:none}
+.package-selector{margin-bottom:18px;padding:18px;border:1px solid var(--border);border-radius:16px;background:var(--surface-subtle)}.package-selector h2{margin:8px 0 8px}.package-selector .muted{margin:0 0 12px}.package-select-form{display:grid;grid-template-columns:1fr auto;gap:9px;max-width:640px}.package-select-form select{min-width:0}.package-select-form button{padding:9px 14px}
 .youtube-publish{margin-bottom:22px}.youtube-publish-head{display:flex;justify-content:space-between;gap:16px;align-items:start}.youtube-publish-head h2{margin:8px 0}.youtube-upload-list{display:grid;gap:14px;margin-top:16px}.youtube-upload-card{padding:17px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.youtube-upload-card form{display:grid;grid-template-columns:1fr 1fr;gap:10px}.youtube-upload-card label{display:grid;gap:5px}.youtube-upload-card .wide{grid-column:1/-1}.youtube-upload-card textarea{min-height:110px}.youtube-upload-card button{justify-self:start}.youtube-job{padding:12px 14px;border-radius:12px;background:var(--brand-soft);color:var(--brand);font-weight:800}.youtube-receipt{padding:10px 12px;border-radius:10px;background:var(--success-soft);color:var(--success)}
 @media(max-width:900px){.publish-queue-head{display:none}.publish-queue-row,.package-history-grid{grid-template-columns:1fr}}
 """,
@@ -1377,8 +1434,9 @@ def _creator_production_jobs_html(data_root: Path, locale: UILocale) -> str:
             meta += f' · {_escape(job.content_run_id)}'
         if job.error_code:
             meta += f' · {_escape(job.error_code)}'
+        state_detail = _creator_job_state_detail(job, locale)
         rows.append(
-            f'''<article class="creator-production-job" data-phase="{phase}"><span class="status-badge">{_escape(phase_copy.get(phase, phase))}</span><div><strong>{_escape(outputs)}</strong><small>{_escape(meta)}</small></div>{action}</article>'''
+            f'''<article class="creator-production-job" data-phase="{phase}"><span class="status-badge">{_escape(phase_copy.get(phase, phase))}</span><div><strong>{_escape(outputs)}</strong><small>{_escape(meta)}</small><small class="job-state">{state_detail}</small></div>{action}</article>'''
         )
     refresh = (
         "<script>setTimeout(()=>location.reload(),1500)</script>" if active else ""
@@ -1630,7 +1688,8 @@ def content_page(
             if creator_job.phase in {"QUEUED", "GENERATING_CONTENT", "RENDERING_VIDEO"}
             else ""
         )
-        job_notice = f'''<div class="notice creator-production-status" role="status" data-phase="{creator_job.phase}"><strong>{_escape(phase_copy[creator_job.phase])}</strong><span>{_escape(creator_job.job_id)}</span>{f'<a href="{target}">{_escape(ui_text(locale, "打开发布队列", "Open Publish Queue"))} →</a>' if creator_job.phase == 'READY' else ''}</div>{refresh}'''
+        job_detail = _creator_job_state_detail(creator_job, locale)
+        job_notice = f'''<div class="notice creator-production-status" role="status" data-phase="{creator_job.phase}"><strong>{_escape(phase_copy[creator_job.phase])}</strong><span>{_escape(creator_job.job_id)}</span><span class="job-state">{job_detail}</span>{f'<a href="{target}">{_escape(ui_text(locale, "打开发布队列", "Open Publish Queue"))} →</a>' if creator_job.phase == 'READY' else ''}</div>{refresh}'''
     notice_html = (
         f'<div class="notice" role="status">{_escape(notice)}</div>' if notice else ""
     )

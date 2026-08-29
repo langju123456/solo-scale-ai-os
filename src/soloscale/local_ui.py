@@ -826,6 +826,48 @@ def _gateway_from_preference(preference: AIProviderPreference) -> ModelGateway:
     return model_gateway_for(preference.provider)
 
 
+def _preference_provider_configured(preference: AIProviderPreference) -> bool:
+    if preference.provider is ModelProviderId.OLLAMA:
+        return _ollama_readiness(preference).ready
+    if preference.provider is ModelProviderId.OPENAI_COMPATIBLE:
+        return openai_api_key_is_configured()
+    return (
+        model_gateway_for(ModelProviderId.SOLOSCALE_HOSTED).descriptor.configuration_state
+        is GatewayConfigurationState.CONFIGURED
+    )
+
+
+def _creator_generation_mode(
+    preference: AIProviderPreference, form: dict[str, str], source_kind: str
+) -> str:
+    """Resolve one truthful generation mode for a Creator production request.
+
+    A Story/Canon action has no inline mode selector, so when the saved provider is
+    not configured we fall back to the deterministic template instead of showing a
+    confusing AI_NOT_EXECUTED with no durable package.
+    """
+
+    explicit = form.get("generation_mode", "").strip()
+    if explicit:
+        return explicit
+    if source_kind == "STORY" and not _preference_provider_configured(preference):
+        return "template"
+    return preference.provider.value
+
+
+def _creator_job_provider_metadata(
+    preference: AIProviderPreference, generation_mode: str
+) -> tuple[str | None, str | None]:
+    if generation_mode == "template":
+        return "template", None
+    if generation_mode == ModelProviderId.OLLAMA.value:
+        return ModelProviderId.OLLAMA.value, preference.ollama_model
+    if generation_mode == ModelProviderId.OPENAI_COMPATIBLE.value:
+        return ModelProviderId.OPENAI_COMPATIBLE.value, preference.openai_model
+    hosted_model = model_gateway_for(ModelProviderId.SOLOSCALE_HOSTED).descriptor.model
+    return ModelProviderId.SOLOSCALE_HOSTED.value, hosted_model
+
+
 def _ollama_cli_path() -> str | None:
     discovered = shutil.which("ollama")
     if discovered:
@@ -8950,9 +8992,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 "中文" if form.get("language") == "中文" else "English"
             )
             preference = _load_ai_provider_preference(self.ui_data_root.absolute())
-            generation_mode = form.get("generation_mode", preference.provider_id.value)
+            generation_mode = _creator_generation_mode(preference, form, source_kind)
             ai_editorial = generation_mode != "template"
             gateway = _gateway_from_preference(preference) if ai_editorial else None
+            provider, model = _creator_job_provider_metadata(preference, generation_mode)
             data_root = self.ui_data_root.absolute()
             if source_kind == "STORY":
                 story_id = form.get("source_story_id", "")
@@ -9033,6 +9076,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 )
                 if "VIDEO" in outputs
                 else None,
+                provider=provider,
+                model=model,
             )
             self.send_response(303)
             self.send_header(

@@ -20,7 +20,7 @@ from soloscale.content_workspace import (
     load_content_run,
 )
 from soloscale.creator_accounts import load_creator_accounts
-from soloscale.creator_production import load_creator_production_jobs
+from soloscale.creator_production import job_elapsed_seconds, load_creator_production_jobs
 from soloscale.media_cost import MediaCostError, load_cost_receipts
 from soloscale.ui_shell import (
     UILocale,
@@ -177,7 +177,7 @@ def creator_history_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str:
         "VIDEO": ui_text(locale, "视频", "Video"),
     }
     job_cards = "".join(
-        f'''<article class="history-job" data-phase="{job.phase}"><span class="status-badge">{html.escape(job_phase_copy.get(job.phase, job.phase))}</span><div><strong>{html.escape(" + ".join(output_copy.get(item, item) for item in job.request.outputs))}</strong><p>{html.escape(job.request.source_story_id or ui_text(locale, "自由创作", "Free create"))}{(" · " + html.escape(job.content_run_id)) if job.content_run_id else ""}{(" · " + html.escape(job.error_code)) if job.error_code else ""}</p></div><a href="{ui_url('/creator/create', locale, creator_job=job.job_id) if job.phase in {'QUEUED', 'GENERATING_CONTENT', 'RENDERING_VIDEO'} else (ui_url('/creator/publish', locale, run_id=job.content_run_id or '') if job.phase == 'READY' else ui_url('/settings/ai', locale) if job.phase == 'AI_NOT_EXECUTED' else ui_url('/creator/stories', locale))}">{html.escape(ui_text(locale, "查看", "Open"))} →</a></article>'''
+        f'''<article class="history-job" data-phase="{job.phase}"><span class="status-badge">{html.escape(job_phase_copy.get(job.phase, job.phase))}</span><div><strong>{html.escape(" + ".join(output_copy.get(item, item) for item in job.request.outputs))}</strong><p>{html.escape(job.request.source_story_id or ui_text(locale, "自由创作", "Free create"))}{(" · " + html.escape(job.content_run_id)) if job.content_run_id else ""}{(" · " + html.escape(job.error_code)) if job.error_code else ""}{(" · " + html.escape(job.stage)) if job.stage else ""}{(" · " + html.escape(job.model)) if job.model else ""}{(" · " + ui_text(locale, "已用时", "Elapsed") + " " + str(job_elapsed_seconds(job)) + "s")}</p></div><a href="{ui_url('/creator/create', locale, creator_job=job.job_id) if job.phase in {'QUEUED', 'GENERATING_CONTENT', 'RENDERING_VIDEO'} else (ui_url('/creator/publish', locale, run_id=job.content_run_id or '') if job.phase == 'READY' else ui_url('/settings/ai', locale) if job.phase == 'AI_NOT_EXECUTED' else ui_url('/creator/stories', locale))}">{html.escape(ui_text(locale, "查看", "Open"))} →</a></article>'''
         for job in jobs
     )
     cards = "".join(
