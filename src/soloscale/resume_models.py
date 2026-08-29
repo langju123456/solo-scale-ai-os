@@ -861,3 +861,119 @@ class ResumeDeliveryReceipt(ContractModel):
     application_library_path: str | None = None
     error_type: str | None = None
     retry_safe: bool = False
+
+
+class EvidenceCandidateClass(StrEnum):
+    """Retrieval-time classification. Final claim eligibility is decided downstream."""
+
+    DIRECT = "direct"
+    SEMANTIC = "semantic"
+    ADJACENT_CAPABILITY = "adjacent_capability"
+    POTENTIAL_DERIVATION = "potential_derivation"
+    WEAK = "weak"
+    IRRELEVANT = "irrelevant"
+
+
+class ResumeRetrievalSourceKind(StrEnum):
+    MAC_CATALOG = "mac_catalog"
+    LOCAL_GIT = "local_git"
+    KNOWLEDGE_STORE = "knowledge_store"
+    EVIDENCE_HUB = "evidence_hub"
+    RESUME_LIBRARY = "resume_library"
+    BUILDLOG = "buildlog"
+    CODEX = "codex"
+    CHATGPT = "chatgpt"
+    GITHUB = "github"
+
+
+class ResumeRetrievalCandidate(ContractModel):
+    """One high-recall candidate with intact provenance; no final claim decision."""
+
+    candidate_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    source_kind: ResumeRetrievalSourceKind
+    source_identity: str = Field(min_length=1, max_length=300)
+    evidence_id: str | None = None
+    evidence_type: str = Field(min_length=1, max_length=80)
+    authority: str = Field(min_length=1, max_length=300)
+    text: str = Field(min_length=1, max_length=4000)
+    signals: list[str] = Field(default_factory=list, max_length=40)
+    candidate_class: EvidenceCandidateClass = EvidenceCandidateClass.IRRELEVANT
+    rationale: str = Field(min_length=1, max_length=400)
+    provenance: dict[str, str] = Field(default_factory=dict)
+    score: float = Field(ge=0)
+    requirement_classes: dict[str, EvidenceCandidateClass] = Field(default_factory=dict)
+    requirement_signals: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class ResumeRequirementExpansion(ContractModel):
+    """Bounded normalized requirement with capability-aware search vocabulary."""
+
+    requirement_id: str = Field(pattern=r"^REQ-\d{2}$")
+    text: str = Field(min_length=1, max_length=2000)
+    capability: str = Field(min_length=1, max_length=120)
+    technology_terms: list[str] = Field(default_factory=list, max_length=24)
+    synonyms: list[str] = Field(default_factory=list, max_length=80)
+    expanded_terms: list[str] = Field(default_factory=list, max_length=104)
+    likely_evidence_forms: list[str] = Field(default_factory=list, max_length=12)
+
+
+class ResumeRetrievalCoverage(ContractModel):
+    """One requirement's evidence coverage buckets; classifies, never destroys."""
+
+    requirement_id: str = Field(pattern=r"^REQ-\d{2}$")
+    normalized_capability: str = Field(min_length=1, max_length=120)
+    direct_evidence: list[str] = Field(default_factory=list, max_length=600)
+    semantic_evidence: list[str] = Field(default_factory=list, max_length=600)
+    related_projects: list[str] = Field(default_factory=list, max_length=600)
+    potential_derivations: list[str] = Field(default_factory=list, max_length=600)
+    weak_evidence: list[str] = Field(default_factory=list, max_length=600)
+    missing_proof: list[str] = Field(default_factory=list, max_length=12)
+    source_diversity: list[ResumeRetrievalSourceKind] = Field(
+        default_factory=list, max_length=10
+    )
+
+
+class ResumeRetrievalSourceStatus(ContractModel):
+    source_kind: ResumeRetrievalSourceKind
+    state: Literal["SEARCHED", "EMPTY", "UNAVAILABLE"]
+    detail: str | None = None
+    candidate_count: int = Field(default=0, ge=0)
+
+
+class ResumeEvidenceCoverageMap(ContractModel):
+    """Structured evidence coverage over one job description."""
+
+    job_description_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    requirements: list[ResumeRequirementExpansion] = Field(max_length=24)
+    coverage: list[ResumeRetrievalCoverage] = Field(max_length=24)
+    candidates: list[ResumeRetrievalCandidate] = Field(max_length=1200)
+    sources: list[ResumeRetrievalSourceStatus] = Field(max_length=10)
+    retrieved_count: int = Field(ge=0)
+    kept_count: int = Field(ge=0)
+    irrelevant_count: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_coverage_identity(self) -> ResumeEvidenceCoverageMap:
+        requirement_ids = [item.requirement_id for item in self.requirements]
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise ValueError("requirement identities must be unique")
+        coverage_ids = [item.requirement_id for item in self.coverage]
+        if coverage_ids != requirement_ids:
+            raise ValueError("coverage must match normalized requirements in order")
+        candidate_ids = {item.candidate_id for item in self.candidates}
+        referenced = {
+            candidate_id
+            for item in self.coverage
+            for candidate_id in (
+                *item.direct_evidence,
+                *item.semantic_evidence,
+                *item.related_projects,
+                *item.potential_derivations,
+                *item.weak_evidence,
+            )
+        }
+        if not referenced <= candidate_ids:
+            raise ValueError("coverage references an unknown candidate")
+        if len(candidate_ids) != len(self.candidates):
+            raise ValueError("candidate identities must be unique")
+        return self
