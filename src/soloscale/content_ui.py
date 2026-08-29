@@ -1768,7 +1768,7 @@ def content_page(
     }
     provider_label, provider_note = provider_copy[generation_mode]
     work_summary = render_use_my_work(
-        load_work_context(data_root),
+        load_work_context(data_root, workspace_root=repository_root),
         locale,
         boundary=ui_text(
             locale,

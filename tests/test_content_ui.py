@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -257,3 +258,43 @@ def test_content_page_scans_metadata_and_prefills_selected_candidate(
     assert "14 unsupported job requirements" in page
     assert 'name="generation_mode" value="template"' in page
     assert str(tmp_path) not in page
+
+
+def test_creator_page_shares_canonical_work_project_context(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    project = tmp_path / "selected-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    (project / "feature.txt").write_text("verified feature", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "feature.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(project),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "feat: add verified local project evidence",
+        ],
+        check=True,
+    )
+
+    connected = content_page(
+        data_root=data_root,
+        repository_root=project,
+        workspace_view="create",
+        locale="zh-CN",
+    )
+    assert "1 个本地项目" in connected
+
+    disconnected = content_page(
+        data_root=data_root,
+        repository_root=None,
+        workspace_view="create",
+        locale="zh-CN",
+    )
+    assert "1 个本地项目" not in disconnected
