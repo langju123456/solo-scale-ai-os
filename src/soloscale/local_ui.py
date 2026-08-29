@@ -3592,6 +3592,35 @@ def _run_action(form: dict[str, str], data_root: Path, repo_root: Path) -> UIAct
     return None
 
 
+def _human_duration(locale: UILocale, elapsed_ms: int) -> str:
+    """Render a primary duration without leaking raw adapter latency."""
+
+    seconds = max(0, int(elapsed_ms)) / 1000
+    if seconds < 1:
+        return ui_text(locale, f"{max(0, int(elapsed_ms))} 毫秒", f"{max(0, int(elapsed_ms))} ms")
+    return ui_text(locale, f"{seconds:.1f} 秒", f"{seconds:.1f}s")
+
+
+def _human_ai_service_label(
+    locale: UILocale, provider: str, model: str | None = None
+) -> str:
+    """Map internal provider vocabulary to human product truth."""
+
+    provider_key = (provider or "").strip().lower()
+    model_label = (model or "").strip()
+    if provider_key in {"openai_compatible", "openai", "openai_sol"}:
+        base = ui_text(locale, "OpenAI 兼容服务", "OpenAI-compatible service")
+    elif provider_key == "ollama":
+        base = ui_text(locale, "本地 Ollama", "Local Ollama")
+    elif provider_key == "soloscale_hosted":
+        base = ui_text(locale, "SoloScale 托管 AI", "SoloScale Hosted AI")
+    elif provider_key == "template":
+        return ui_text(locale, "安全离线模板", "Safe offline template")
+    else:
+        base = ui_text(locale, "已配置服务", "Configured service")
+    return f"{base} · {model_label}" if model_label else base
+
+
 def _result_card(
     result: UIActionResult | None, locale: UILocale = DEFAULT_UI_LOCALE
 ) -> str:
@@ -3618,7 +3647,7 @@ def _result_card(
   <p>{_escape(body)}</p>
   <details class="technical-details">
     <summary>{_escape(ui_text(locale, '查看技术详情', 'View technical details'))}</summary>
-    <p>{_escape(ui_text(locale, '耗时', 'Duration'))}: {result.elapsed_ms}ms</p>
+    <p>{_escape(ui_text(locale, '耗时', 'Duration'))}: {_escape(_human_duration(locale, result.elapsed_ms))}</p>
     <p>{_escape(ui_text(locale, '命令', 'Command'))}: <code>{_escape(result.command)}</code></p>
   </details>
   {workspace}
@@ -4201,6 +4230,9 @@ def _user_result_card(
     )
     generation_mode = str(user_metadata.get("generation_mode", "template"))
     provider = str(user_metadata.get("provider", "template"))
+    ai_service_label = _human_ai_service_label(
+        locale, provider, str(user_metadata.get("model") or "")
+    )
     if generation_mode == "ai":
         result_summary = ui_text(
             locale,
@@ -4209,8 +4241,8 @@ def _user_result_card(
         )
         privacy_note = ui_text(
             locale,
-            f"本次使用 {provider}。本地检索到 {retrieved_count} 条资料线索，最终只准入并提交 {admitted_count} 条已验证事实；原始对话、项目文件和未选资料未发送。",
-            f"This run used {provider}. Local retrieval found {retrieved_count} discovery clues; only {admitted_count} verified facts were admitted and sent. Raw conversations, project files, and unselected material were not sent.",
+            f"AI 服务：{ai_service_label}。本地检索到 {retrieved_count} 条资料线索，最终只准入并提交 {admitted_count} 条已验证事实；原始对话、项目文件和未选资料未发送。",
+            f"AI service: {ai_service_label}. Local retrieval found {retrieved_count} discovery clues; only {admitted_count} verified facts were admitted and sent. Raw conversations, project files, and unselected material were not sent.",
         )
         if user_metadata.get("role_strategy_fallback_applied") is True:
             result_summary += ui_text(
@@ -4344,7 +4376,7 @@ def _user_result_card(
     return f"""<section class="result-card success-state" aria-live="polite">
   <div class="result-header">
     <div>
-      <span class="result-kicker">{_escape(result_kicker)} · {display_elapsed_ms} ms</span>
+      <span class="result-kicker">{_escape(result_kicker)} · {_escape(_human_duration(locale, display_elapsed_ms))}</span>
       <h2>{_escape(result_heading)}</h2>
       <p>{_escape(result_summary)}</p>
     </div>
@@ -4762,6 +4794,19 @@ def _applications_section_html(
     return f'''<section class="applications-overview" id="applications"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, "申请与机会", "Applications / Opportunities"))}</span><h2>{_escape(ui_text(locale, "追踪每一次申请，而不是把简历草稿误当作投递记录。", "Track each application instead of mistaking resume drafts for applications."))}</h2><p>{_escape(ui_text(locale, "状态只在你记录真实外部结果后更新；SoloScale 不会替你发明投递或 Offer。", "Status updates only after you record a real external result; SoloScale never invents an application or offer."))}</p></div></div><div class="application-list">{''.join(cards)}</div></section>'''
 
 
+def _localized_file_input(
+    *,
+    name: str,
+    accept: str,
+    required: bool,
+    locale: UILocale,
+    button_label: str,
+    placeholder: str,
+) -> str:
+    required_attr = " required" if required else ""
+    return f'''<span class="file-control"><input class="file-native" type="file" name="{_escape(name)}" accept="{_escape(accept)}"{required_attr} data-file-placeholder="{_escape(placeholder)}" /><span class="file-button" aria-hidden="true">{_escape(button_label)}</span><span class="file-name" data-file-name-for="{_escape(name)}">{_escape(placeholder)}</span></span>'''
+
+
 def _user_page(
     action_result: UIActionResult | None,
     data_root: Path,
@@ -4875,7 +4920,7 @@ def _user_page(
           <form method="post" action="/resume/template-preview" enctype="multipart/form-data">
             <input type="hidden" name="ui_locale" value="{locale}" />
             <label>{_escape(ui_text(locale, '上传模板文件', 'Upload template file'))}
-              <input type="file" name="layout_template_file" accept=".docx,.html,.htm,.pdf,.txt,.md" />
+              {_localized_file_input(name="layout_template_file", accept=".docx,.html,.htm,.pdf,.txt,.md", required=False, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
             </label>
             <label>{_escape(ui_text(locale, '或模板网页 URL', 'Or template webpage URL'))}
               <input type="url" name="layout_template_url" placeholder="https://example.com/resume-template" />
@@ -4902,9 +4947,7 @@ def _user_page(
           {f'<label><input type="checkbox" name="approve_layout_template" value="yes" required />{_escape(ui_text(locale, "我已预览并确认使用这个结构模板；模板正文不会作为我的经历。", "I reviewed and approve this structure template. Its body copy is not my experience."))}</label>' if template_receipt is not None else ''}
           <label>{_escape(ui_text(locale, '现有简历', 'Current resume'))}
             <span class="hint">{_escape(ui_text(locale, '支持 PDF、DOCX、TXT、MD；每个文件最大 5 MB。DOCX 会保留原版式，其他格式会生成简洁 Word 版。', 'PDF, DOCX, TXT, and MD are supported, up to 5 MB each. DOCX keeps its layout; other formats produce a clean Word version.'))}</span>
-            <input
-              type="file" name="resume_template" accept=".pdf,.docx,.txt,.md" required
-            />
+            {_localized_file_input(name="resume_template", accept=".pdf,.docx,.txt,.md", required=True, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
           </label>
           <label>{_escape(ui_text(locale, '职位描述（JD）', 'Job Description'))}
             <span class="hint">{_escape(ui_text(locale, '粘贴完整 JD，或在下方上传一个文件；两者选一个。', 'Paste the complete JD, or upload one file below. Choose one method.'))}</span>
@@ -4914,11 +4957,11 @@ def _user_page(
             >{job_description}</textarea>
           </label>
           <label>{_escape(ui_text(locale, '或者上传 JD（可选）', 'Or upload the JD (optional)'))}
-            <input type="file" name="job_description_file" accept=".pdf,.docx,.txt,.md" />
+            {_localized_file_input(name="job_description_file", accept=".pdf,.docx,.txt,.md", required=False, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
           </label>
           <label>{_escape(ui_text(locale, '补充材料（可选，最多一份）', 'Supporting document (optional, one file)'))}
             <span class="hint">{_escape(ui_text(locale, '只提取与本次简历相关的摘要；不会上传原始文件、文件名或本地路径。', 'Only a task-relevant summary is prepared. The raw file, filename, and local path never enter the gateway payload.'))}</span>
-            <input type="file" name="support_document" accept=".pdf,.docx,.txt,.md" />
+            {_localized_file_input(name="support_document", accept=".pdf,.docx,.txt,.md", required=False, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
           </label>
           <label>{_escape(ui_text(locale, '针对性说明（可选）', 'Tailoring instructions (optional)'))}
             <span class="hint">{_escape(ui_text(locale, '例如：突出 RAG、后端工程和产品交付。说明只影响已有内容的排序，不会新增经历。', 'For example: prioritize RAG, backend engineering, and product delivery. Instructions only affect ordering and never add experience.'))}</span>
@@ -4987,6 +5030,12 @@ def _user_page(
     }};
     document.querySelectorAll('input[name="expert_review_mode"]').forEach((item)=>item.addEventListener('change',syncExpertApproval));
     syncExpertApproval();
+    document.querySelectorAll('input.file-native[type="file"]').forEach((input)=>{{
+      const name=document.querySelector(`[data-file-name-for="${{input.name}}"]`);
+      const update=()=>{{ if(name) name.textContent = input.files && input.files.length ? Array.from(input.files).map(f=>f.name).join(', ') : (input.dataset.filePlaceholder || ''); }};
+      input.addEventListener('change',update);
+      update();
+    }});
     if(resumeForm) resumeForm.addEventListener('submit',()=>{{
       const progress=document.getElementById('progress');
       const button=document.getElementById('generate-button');
@@ -5023,6 +5072,7 @@ def _user_page(
 .resume-pdf-shell{height:680px;overflow:hidden;border:1px solid var(--border);border-radius:14px;background:#dfe3ea}.resume-pdf-preview{width:100%;height:100%;border:0;background:white}.preview-note{margin:9px 0 0;font-size:12px}.resume-preview{max-height:450px;overflow:auto}.gap-list{padding-left:20px;color:var(--text-muted);font-size:13px}.result-card details{margin-top:18px;border-top:1px solid var(--border);padding-top:15px;font-size:13px}.result-card summary{cursor:pointer;font-weight:700}code{word-break:break-all}
 .resume-provenance>p{color:var(--text-muted)}.provenance-summary{display:flex;align-items:baseline;gap:7px;margin:12px 0}.provenance-summary strong{font-size:26px;color:var(--success)}.provenance-claims{display:grid;gap:9px}.provenance-claim{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:12px;border:1px solid var(--border);border-radius:12px;background:#f8fbf9}.provenance-claim strong{font-size:13px;line-height:1.45}.provenance-claim p{margin:6px 0 0;color:var(--text-muted);font-size:11px}.provenance-claim .status-badge{flex:none;padding:5px 8px;border-radius:999px;background:#e5f5ed;color:#166044;font-size:10px;font-weight:800}
 .applications-overview{margin-bottom:20px;padding:20px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.applications-overview h2{margin:7px 0}.applications-overview p{color:var(--text-muted)}.application-list{display:grid;gap:12px;margin-top:16px}.application-card{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:start;padding:16px;border:1px solid var(--border);border-radius:15px;background:#fff}.application-card h3{margin:7px 0 5px}.application-card p{margin:0;color:var(--text-muted);font-size:12px}.application-truth{display:grid;gap:4px;margin-top:10px;font-size:12px;color:var(--text-muted)}.application-truth strong{color:var(--text)}.application-actions{display:grid;gap:10px;align-items:start}.application-actions form{display:grid;grid-template-columns:auto 1fr 1fr auto;gap:7px}.application-actions input,.application-actions select{min-width:0}.application-actions button{white-space:nowrap}
+.file-control{position:relative;display:inline-flex;align-items:center;gap:10px;min-width:220px;padding:10px 12px;border:1px dashed var(--border);border-radius:12px;background:#fafbff}.file-native{position:absolute;inset:0;opacity:0;width:100%;height:100%;cursor:pointer;z-index:2}.file-button{padding:7px 11px;border-radius:9px;background:var(--brand);color:#fff;font-weight:800;font-size:12px;pointer-events:none}.file-name{color:var(--text-muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px}.file-control:focus-within{outline:3px solid var(--focus);outline-offset:2px}
 @media(max-width:900px){.use-my-work,.workspace,.workspace.has-result,.result-grid,.application-card{grid-template-columns:1fr}.resume-job-steps{grid-template-columns:repeat(3,1fr)}.job-timings ul{grid-template-columns:repeat(2,1fr)}.application-actions form{grid-template-columns:1fr}}@media(max-width:560px){.metadata,.metrics{grid-template-columns:1fr 1fr}.result-header,.resume-job-header,.resume-job-actions{display:block}.download{display:block;margin-top:16px}.resume-pdf-shell{height:560px}.resume-job-steps,.job-timings ul{grid-template-columns:1fr 1fr}}
 """,
     )
