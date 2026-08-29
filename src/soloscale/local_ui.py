@@ -67,9 +67,21 @@ from soloscale.creator_production import (
     assign_artifact_to_account,
 )
 from soloscale.creator_workspace import creator_history_page, creator_overview_page
+from soloscale.deepseek_provider import (
+    DEEPSEEK_BASE_URL,
+    DEEPSEEK_DISPLAY_NAME,
+    DEEPSEEK_MODEL_IDS,
+    DeepSeekReasoningEffort,
+    DeepSeekStatus,
+    check_deepseek_connection,
+    deepseek_display_name,
+    load_deepseek_settings,
+    save_deepseek_settings,
+)
 from soloscale.desktop_credentials import (
     DesktopCredentialError,
     configure_desktop_credentials_from_stdin,
+    deepseek_api_key_is_configured,
     github_access_token,
     github_access_token_is_configured,
     heygen_api_key_is_configured,
@@ -144,11 +156,14 @@ from soloscale.media_quality import (
 )
 from soloscale.model_gateway import (
     GatewayConfigurationState,
+    GatewayDescriptor,
+    GatewayTransportScope,
     ModelGateway,
     ModelGatewayInvalidResponse,
     ModelGatewayNotConfigured,
     ModelGatewayTransportError,
     ModelProviderId,
+    UnconfiguredModelGateway,
     model_gateway_for,
 )
 from soloscale.platform_accounts import (
@@ -604,6 +619,9 @@ class AIProviderPreference:
     ollama_model: str = "qwen3:8b"
     ollama_url: str = _OLLAMA_DEFAULT_URL
     openai_model: str = _OPENAI_DEFAULT_MODEL
+    deepseek_model: str = DEEPSEEK_MODEL_IDS[0]
+    deepseek_reasoning_effort: str = DeepSeekReasoningEffort.HIGH.value
+    deepseek_thinking: bool = True
 
     @property
     def provider(self) -> ModelProviderId:
@@ -617,6 +635,8 @@ class AIProviderPreference:
             return self.ollama_model
         if self.default_provider is ModelProviderId.OPENAI_COMPATIBLE:
             return self.openai_model
+        if self.default_provider is ModelProviderId.DEEPSEEK:
+            return self.deepseek_model
         return "zai/glm-5.2"
 
 
@@ -650,10 +670,22 @@ def _load_ai_provider_preference(data_root: Path) -> AIProviderPreference:
         ollama_model = str(payload.get("ollama_model", legacy_model or "qwen3:8b")).strip()
         openai_model = str(payload.get("openai_model", _OPENAI_DEFAULT_MODEL)).strip()
         ollama_url = str(payload.get("ollama_url", _OLLAMA_DEFAULT_URL)).strip()
+        deepseek_model = str(
+            payload.get("deepseek_model", DEEPSEEK_MODEL_IDS[0])
+        ).strip()
+        deepseek_effort = str(
+            payload.get(
+                "deepseek_reasoning_effort", DeepSeekReasoningEffort.HIGH.value
+            )
+        ).strip()
+        deepseek_thinking = payload.get("deepseek_thinking", True)
         if (
             not _PROVIDER_MODEL_RE.fullmatch(ollama_model)
             or not _PROVIDER_MODEL_RE.fullmatch(openai_model)
             or not _valid_ollama_url(ollama_url)
+            or deepseek_model not in DEEPSEEK_MODEL_IDS
+            or deepseek_effort not in {effort.value for effort in DeepSeekReasoningEffort}
+            or not isinstance(deepseek_thinking, bool)
         ):
             return AIProviderPreference()
     except (FileNotFoundError, OSError, UnicodeError, ValueError, json.JSONDecodeError):
@@ -663,6 +695,9 @@ def _load_ai_provider_preference(data_root: Path) -> AIProviderPreference:
         ollama_model=ollama_model,
         ollama_url=ollama_url,
         openai_model=openai_model,
+        deepseek_model=deepseek_model,
+        deepseek_reasoning_effort=deepseek_effort,
+        deepseek_thinking=deepseek_thinking,
     )
 
 
@@ -673,6 +708,9 @@ def _save_ai_provider_preference(
     model: str | None = None,
     ollama_url: str | None = None,
     openai_model: str | None = None,
+    deepseek_model: str | None = None,
+    deepseek_reasoning_effort: str | None = None,
+    deepseek_thinking: bool | None = None,
     set_default: bool = True,
 ) -> AIProviderPreference:
     try:
@@ -688,6 +726,19 @@ def _save_ai_provider_preference(
         requested_openai_model = openai_model if openai_model is not None else model
         if requested_openai_model is not None:
             selected_openai_model = requested_openai_model.strip() or _OPENAI_DEFAULT_MODEL
+    selected_deepseek_model = current.deepseek_model
+    if selected is ModelProviderId.DEEPSEEK and deepseek_model is not None:
+        selected_deepseek_model = deepseek_model.strip() or DEEPSEEK_MODEL_IDS[0]
+    selected_deepseek_effort = current.deepseek_reasoning_effort
+    if selected is ModelProviderId.DEEPSEEK and deepseek_reasoning_effort is not None:
+        selected_deepseek_effort = deepseek_reasoning_effort.strip().casefold() or (
+            DeepSeekReasoningEffort.HIGH.value
+        )
+    selected_deepseek_thinking = (
+        current.deepseek_thinking
+        if deepseek_thinking is None
+        else deepseek_thinking
+    )
     selected_ollama_url = (ollama_url or current.ollama_url).strip()
     if not _PROVIDER_MODEL_RE.fullmatch(selected_ollama_model):
         raise ValueError("Local model name is invalid")
@@ -695,6 +746,12 @@ def _save_ai_provider_preference(
         raise ValueError("OpenAI model name is invalid")
     if not _valid_ollama_url(selected_ollama_url):
         raise ValueError("Ollama URL must use the local loopback address")
+    if selected_deepseek_model not in DEEPSEEK_MODEL_IDS:
+        raise ValueError("DeepSeek model selection is invalid")
+    if selected_deepseek_effort not in {
+        effort.value for effort in DeepSeekReasoningEffort
+    }:
+        raise ValueError("DeepSeek reasoning effort is invalid")
     path = _ai_provider_preference_path(data_root)
     _reject_symlink_ancestry(path.parent)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -704,6 +761,9 @@ def _save_ai_provider_preference(
         ollama_model=selected_ollama_model,
         ollama_url=selected_ollama_url,
         openai_model=selected_openai_model,
+        deepseek_model=selected_deepseek_model,
+        deepseek_reasoning_effort=selected_deepseek_effort,
+        deepseek_thinking=selected_deepseek_thinking,
     )
     _atomic_private_write(
         path,
@@ -714,6 +774,9 @@ def _save_ai_provider_preference(
                 "ollama_model": preference.ollama_model,
                 "ollama_url": preference.ollama_url,
                 "openai_model": preference.openai_model,
+                "deepseek_model": preference.deepseek_model,
+                "deepseek_reasoning_effort": preference.deepseek_reasoning_effort,
+                "deepseek_thinking": preference.deepseek_thinking,
             },
             ensure_ascii=False,
             indent=2,
@@ -816,6 +879,19 @@ def _gateway_from_preference(preference: AIProviderPreference) -> ModelGateway:
             model=preference.openai_model,
             openai_endpoint=_OPENAI_CHAT_COMPLETIONS_URL,
             openai_api_key=openai_api_key(),
+        )
+    if preference.provider is ModelProviderId.DEEPSEEK:
+        # Checkpoint 5 will migrate generation onto the canonical DeepSeek gateway.
+        # Until then this fails closed instead of silently routing to another provider.
+        return UnconfiguredModelGateway(
+            GatewayDescriptor(
+                provider=ModelProviderId.DEEPSEEK,
+                display_name="DeepSeek V4 (generation migration pending)",
+                configuration_state=GatewayConfigurationState.NOT_CONFIGURED,
+                transport_scope=GatewayTransportScope.EXTERNAL,
+                model=preference.deepseek_model,
+                base_url=DEEPSEEK_BASE_URL,
+            )
         )
     return model_gateway_for(preference.provider)
 
@@ -5895,12 +5971,14 @@ def _ai_settings_page(
         is GatewayConfigurationState.CONFIGURED
     )
     openai_ready = openai_api_key_is_configured()
+    deepseek_ready = deepseek_api_key_is_configured()
     provider_names = {
         ModelProviderId.OLLAMA: ui_text(locale, "本地 AI", "Local AI"),
         ModelProviderId.SOLOSCALE_HOSTED: ui_text(
             locale, "SoloScale 托管 AI", "SoloScale Hosted AI"
         ),
         ModelProviderId.OPENAI_COMPATIBLE: "OpenAI API",
+        ModelProviderId.DEEPSEEK: DEEPSEEK_DISPLAY_NAME,
     }
     status_map = {
         ModelProviderId.OLLAMA: (
@@ -5918,11 +5996,17 @@ def _ai_settings_page(
             if openai_ready
             else ui_text(locale, "未配置", "Not configured")
         ),
+        ModelProviderId.DEEPSEEK: (
+            ui_text(locale, "已配置", "Configured")
+            if deepseek_ready
+            else ui_text(locale, "未配置", "Not configured")
+        ),
     }
     models = {
         ModelProviderId.OLLAMA: preference.ollama_model,
         ModelProviderId.SOLOSCALE_HOSTED: hosted_gateway.descriptor.model or "—",
         ModelProviderId.OPENAI_COMPATIBLE: preference.openai_model,
+        ModelProviderId.DEEPSEEK: deepseek_display_name(preference.deepseek_model),
     }
     notice_html = (
         f'<p class="notice" role="status">{_escape(notice)}</p>' if notice else ""
@@ -5937,6 +6021,7 @@ def _ai_settings_page(
                 ("local", ModelProviderId.OLLAMA),
                 ("hosted", ModelProviderId.SOLOSCALE_HOSTED),
                 ("openai", ModelProviderId.OPENAI_COMPATIBLE),
+                ("deepseek", ModelProviderId.DEEPSEEK),
             )
             if provider is not preference.provider
         )
@@ -5987,7 +6072,7 @@ def _ai_settings_page(
   <span class="kicker">{_escape(ui_text(locale, '当前 AI 服务', 'Current AI service'))}</span>
   <div><h2>{_escape(provider_names[preference.provider])}</h2><p>{_escape(models[preference.provider])}</p></div>
   <strong class="ready-dot">● {_escape(status_map[preference.provider])}</strong>
-  <a class="button-link" href="{ui_url('/settings/ai/' + {'ollama':'local','soloscale_hosted':'hosted','openai_compatible':'openai'}[preference.provider.value], locale)}">{_escape(ui_text(locale, '管理', 'Manage'))}</a>
+  <a class="button-link" href="{ui_url('/settings/ai/' + {'ollama':'local','soloscale_hosted':'hosted','openai_compatible':'openai','deepseek':'deepseek'}[preference.provider.value], locale)}">{_escape(ui_text(locale, '管理', 'Manage'))}</a>
 </section>
 <section class="other-services"><span class="kicker">{_escape(ui_text(locale, '其他选择', 'Other options'))}</span>{other_cards}</section>
 <section class="connected-services"><span class="kicker">{_escape(ui_text(locale, '创作与发布服务', 'Creation and publishing services'))}</span>
@@ -6076,6 +6161,84 @@ if(setup) setup.addEventListener('submit',async(event)=>{{
 }});
 const remove=document.getElementById('delete-openai-key');
 if(remove) remove.addEventListener('click',()=>window.webkit.messageHandlers.soloscaleCredentials.postMessage({{action:'deleteOpenAIKey',returnPath:{json.dumps(ui_url('/settings/ai/openai', locale, provider='removed'))}}}));
+"""
+    elif detail == "deepseek":
+        deepseek_settings = load_deepseek_settings(
+            data_root, api_key_configured=deepseek_ready
+        )
+        status_labels = {
+            DeepSeekStatus.NOT_CONFIGURED: ui_text(locale, "未配置", "Not configured"),
+            DeepSeekStatus.CONFIGURED_NOT_TESTED: ui_text(
+                locale, "已配置，未测试", "Configured, not tested"
+            ),
+            DeepSeekStatus.READY: ui_text(locale, "已就绪", "Ready"),
+            DeepSeekStatus.CONNECTION_FAILED: ui_text(
+                locale, "连接失败", "Connection failed"
+            ),
+        }
+        desktop_note = ui_text(
+            locale,
+            "API key 只会保存到 macOS Keychain；页面、设置文件和日志都不会显示它。",
+            "The API key is stored only in macOS Keychain and never appears in pages, settings files, or logs.",
+        )
+        unavailable = (
+            ""
+            if desktop_mode
+            else f'<p class="notice warning">{_escape(ui_text(locale, "请在 SoloScale Desktop App 中配置 DeepSeek；普通浏览器不会接收密钥。", "Configure DeepSeek in the SoloScale Desktop App. A normal browser never accepts the key."))}</p>'
+        )
+        save_disabled = "" if desktop_mode else " disabled"
+        delete_button = (
+            f'<button id="delete-deepseek-key" class="danger" type="button">{_escape(ui_text(locale, "移除 Keychain 密钥", "Remove Keychain key"))}</button>'
+            if deepseek_ready and desktop_mode
+            else ""
+        )
+        model_options = "".join(
+            (
+                f'<label class="provider-option"><input type="radio" name="deepseek_model" '
+                f'value="{model_id}" {"checked" if preference.deepseek_model == model_id else ""} />'
+                f"<span><strong>{_escape(deepseek_display_name(model_id))}</strong>"
+                f"<small>{model_id} · 1M context</small></span></label>"
+            )
+            for model_id in DEEPSEEK_MODEL_IDS
+        )
+        effort_options = "".join(
+            f'<option value="{effort.value}" {"selected" if preference.deepseek_reasoning_effort == effort.value else ""}>{effort.value.title()}</option>'
+            for effort in DeepSeekReasoningEffort
+        )
+        thinking_checked = "checked" if preference.deepseek_thinking else ""
+        body = f"""<a class="back-link" href="{ui_url('/settings/ai', locale)}">← {_escape(ui_text(locale, 'AI 服务', 'AI Service'))}</a>{notice_html}{unavailable}
+<section class="setup-card"><span class="kicker">DeepSeek</span><h2>{_escape(status_labels[deepseek_settings.status])}</h2><p>{_escape(desktop_note)}</p>
+<form id="deepseek-setup"><input type="hidden" id="deepseek-locale" value="{locale}" />
+<label>API Key<input id="deepseek-api-key" type="password" maxlength="512" autocomplete="new-password" value="" placeholder="sk-…"{save_disabled} /></label>
+<div class="button-row"><button id="save-deepseek-key" type="submit"{save_disabled}>{_escape(ui_text(locale, '保存并使用 DeepSeek', 'Save & use DeepSeek'))}</button>{delete_button}</div></form>
+<form method="post" action="/settings/ai/deepseek"><input type="hidden" name="ui_locale" value="{locale}" />
+<label>{_escape(ui_text(locale, '模型', 'Model'))}</label>{model_options}
+<label>{_escape(ui_text(locale, '推理强度', 'Reasoning effort'))}<select id="deepseek-effort" name="deepseek_reasoning_effort">{effort_options}</select></label>
+<label class="check-row"><input type="checkbox" id="deepseek-thinking" name="deepseek_thinking" value="true" {thinking_checked} /><span><strong>{_escape(ui_text(locale, 'Thinking', 'Thinking'))}</strong><small>{_escape(ui_text(locale, '启用 / 禁用', 'Enabled / Disabled'))}</small></span></label>
+<div class="button-row"><button class="secondary" name="action" value="save" type="submit">{_escape(ui_text(locale, '保存模型设置', 'Save model settings'))}</button><button class="secondary" name="action" value="test" type="submit" {'disabled' if not deepseek_ready else ''}>{_escape(ui_text(locale, '测试连接', 'Test connection'))}</button><button class="secondary" name="action" value="use_default" type="submit" {'disabled' if not deepseek_ready else ''}>{_escape(ui_text(locale, '设为默认', 'Use as default'))}</button></div></form>
+<p id="deepseek-setup-status" role="status"></p>
+<details class="technical-details"><summary>{_escape(ui_text(locale, '高级信息', 'Advanced diagnostics'))}</summary>
+provider_id=deepseek · transport=responses · base_url={DEEPSEEK_BASE_URL} · model_id={_escape(preference.deepseek_model)} · context=1,000,000 · responses_api=yes · json_output=yes · tool_calling=yes · reasoning=low/high/max</details></section>"""
+        current_url = "/settings/ai/deepseek"
+        script = f"""
+const setup=document.getElementById('deepseek-setup');
+if(setup) setup.addEventListener('submit',async(event)=>{{
+  event.preventDefault();
+  const status=document.getElementById('deepseek-setup-status');
+  const key=document.getElementById('deepseek-api-key');
+  const effort=document.getElementById('deepseek-effort');
+  const model=document.querySelector('input[name="deepseek_model"]:checked');
+  const thinking=document.getElementById('deepseek-thinking');
+  const bridge=window.webkit?.messageHandlers?.soloscaleCredentials;
+  if(!bridge){{status.textContent={json.dumps(ui_text(locale, '请在 Desktop App 中完成设置。', 'Complete setup in the Desktop App.'))};return;}}
+  if(!key.value.trim()){{status.textContent={json.dumps(ui_text(locale, '请输入 API key。', 'Enter an API key.'))};return;}}
+  const response=await fetch('/settings/ai/deepseek',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:new URLSearchParams({{ui_locale:document.getElementById('deepseek-locale').value,action:'prepare',deepseek_model:(model?model.value:'{DEEPSEEK_MODEL_IDS[0]}'),deepseek_reasoning_effort:effort.value,deepseek_thinking:String(thinking.checked)}})}});
+  if(!response.ok){{status.textContent={json.dumps(ui_text(locale, '模型设置无法保存。', 'The model setting could not be saved.'))};return;}}
+  const secret=key.value; key.value='';
+  bridge.postMessage({{action:'saveDeepSeekKey',apiKey:secret,returnPath:{json.dumps(ui_url('/settings/ai/deepseek', locale, provider='saved'))}}});
+}});
+const remove=document.getElementById('delete-deepseek-key');
+if(remove) remove.addEventListener('click',()=>window.webkit.messageHandlers.soloscaleCredentials.postMessage({{action:'deleteDeepSeekKey',returnPath:{json.dumps(ui_url('/settings/ai/deepseek', locale, provider='deepseek-removed'))}}}));
 """
     else:
         raise ValueError("unknown AI settings detail")
@@ -6624,6 +6787,11 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.ui_locale,
                 "OpenAI API key 已从 macOS Keychain 移除。",
                 "The OpenAI API key was removed from macOS Keychain.",
+            ),
+            "deepseek-removed": ui_text(
+                self.ui_locale,
+                "DeepSeek API key 已从 macOS Keychain 移除。",
+                "The DeepSeek API key was removed from macOS Keychain.",
             ),
             "ready": ui_text(
                 self.ui_locale,
@@ -7236,6 +7404,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             "/settings/ai/local": "local",
             "/settings/ai/openai": "openai",
             "/settings/ai/hosted": "hosted",
+            "/settings/ai/deepseek": "deepseek",
         }
         if path in ai_settings_detail:
             self._send_ai_settings_page(
@@ -8043,6 +8212,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             "/settings/ai/local",
             "/settings/ai/openai",
             "/settings/ai/hosted",
+            "/settings/ai/deepseek",
         }:
             try:
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -8053,7 +8223,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 return
             form = _parse_form(self.rfile.read(length))
             self._adopt_ui_locale(form)
-            if "api_key" in form or "openai_api_key" in form:
+            if "api_key" in form or "openai_api_key" in form or "deepseek_api_key" in form:
                 self.send_error(400, "Credentials are not accepted by this endpoint")
                 return
             action = form.get("action", "")
@@ -8125,6 +8295,69 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                         outcome = "saved"
                     elif action == "use_default":
                         outcome = "unavailable"
+                elif path == "/settings/ai/deepseek":
+                    deepseek_thinking = form.get("deepseek_thinking", "") == "true"
+                    if action == "prepare":
+                        if self.desktop_session_token is None:
+                            outcome = "unavailable"
+                        else:
+                            _save_ai_provider_preference(
+                                data_root,
+                                provider=ModelProviderId.DEEPSEEK.value,
+                                deepseek_model=form.get(
+                                    "deepseek_model", DEEPSEEK_MODEL_IDS[0]
+                                ),
+                                deepseek_reasoning_effort=form.get(
+                                    "deepseek_reasoning_effort",
+                                    DeepSeekReasoningEffort.HIGH.value,
+                                ),
+                                deepseek_thinking=deepseek_thinking,
+                            )
+                            outcome = "prepared"
+                    else:
+                        preference = _save_ai_provider_preference(
+                            data_root,
+                            provider=ModelProviderId.DEEPSEEK.value,
+                            deepseek_model=form.get(
+                                "deepseek_model", DEEPSEEK_MODEL_IDS[0]
+                            ),
+                            deepseek_reasoning_effort=form.get(
+                                "deepseek_reasoning_effort",
+                                DeepSeekReasoningEffort.HIGH.value,
+                            ),
+                            deepseek_thinking=deepseek_thinking,
+                            set_default=False,
+                        )
+                        save_deepseek_settings(
+                            data_root,
+                            model_id=preference.deepseek_model,
+                            reasoning_effort=preference.deepseek_reasoning_effort,
+                            thinking_enabled=preference.deepseek_thinking,
+                            api_key_configured=deepseek_api_key_is_configured(),
+                        )
+                        if action == "test":
+                            status, _category = check_deepseek_connection(data_root)
+                            outcome = {
+                                DeepSeekStatus.READY: "ready",
+                                DeepSeekStatus.NOT_CONFIGURED: "not-configured",
+                                DeepSeekStatus.CONNECTION_FAILED: "test-failed",
+                            }.get(status, "not-ready")
+                        elif action == "use_default":
+                            if deepseek_api_key_is_configured():
+                                _save_ai_provider_preference(
+                                    data_root,
+                                    provider=ModelProviderId.DEEPSEEK.value,
+                                    deepseek_model=preference.deepseek_model,
+                                    deepseek_reasoning_effort=(
+                                        preference.deepseek_reasoning_effort
+                                    ),
+                                    deepseek_thinking=preference.deepseek_thinking,
+                                )
+                                outcome = "saved"
+                            else:
+                                outcome = "not-configured"
+                        elif action in {"", "save"}:
+                            outcome = "saved"
                 else:
                     if action == "prepare":
                         if self.desktop_session_token is None:
@@ -8167,7 +8400,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 ValueError,
             ):
                 outcome = "invalid"
-            if path == "/settings/ai/openai" and action == "prepare":
+            if path in {"/settings/ai/openai", "/settings/ai/deepseek"} and action == "prepare":
                 if outcome == "prepared":
                     self.send_response(204)
                     self.send_header("Cache-Control", "no-store")

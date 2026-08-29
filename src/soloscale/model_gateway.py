@@ -46,6 +46,7 @@ class ModelProviderId(StrEnum):
     SOLOSCALE_HOSTED = "soloscale_hosted"
     OLLAMA = "ollama"
     OPENAI_COMPATIBLE = "openai_compatible"
+    DEEPSEEK = "deepseek"
 
 
 class GatewayConfigurationState(StrEnum):
