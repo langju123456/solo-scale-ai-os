@@ -1142,3 +1142,144 @@ class ClaimTruthResult(ContractModel):
         if any(count < 0 for count in self.contamination_counts.values()):
             raise ValueError("contamination counts must be non-negative")
         return self
+
+
+class ContributionMode(StrEnum):
+    """How engineering contribution was made; independent of claim truth."""
+
+    USER_DIRECT = "user_direct"
+    AI_ASSISTED_USER_DIRECTED = "ai_assisted_user_directed"
+    AGENT_GENERATED_USER_REVIEWED = "agent_generated_user_reviewed"
+    EXTERNAL_UNKNOWN = "external_unknown"
+
+
+class ResumeRoleStrategy(ContractModel):
+    """JD-conditioned positioning derived from the graded claim map."""
+
+    role_title: str = Field(min_length=1, max_length=200)
+    positioning: str = Field(min_length=1, max_length=500)
+    headline: str = Field(min_length=1, max_length=240)
+    prioritized_requirement_ids: list[str] = Field(min_length=1, max_length=24)
+    emphasized_terms: list[str] = Field(min_length=1, max_length=40)
+    unsupported_terms: list[str] = Field(default_factory=list, max_length=40)
+    selected_projects: list[str] = Field(default_factory=list, max_length=12)
+    claim_allocations: dict[str, list[str]] = Field(default_factory=dict)
+    recruiter_scan_priorities: list[str] = Field(default_factory=list, max_length=12)
+
+
+class ResumeGenerationContract(ContractModel):
+    """Bounded generation context. The model may rephrase, never expand truth."""
+
+    job_description_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    role_strategy: ResumeRoleStrategy
+    allowed_claims: list[ApplicationClaim] = Field(min_length=1, max_length=24)
+    skills: list[str] = Field(default_factory=list, max_length=48)
+    projects: list[str] = Field(default_factory=list, max_length=12)
+    excluded_implications: list[str] = Field(default_factory=list, max_length=40)
+    required_sections: list[str] = Field(default_factory=list, max_length=6)
+    model_rules: list[str] = Field(default_factory=list, max_length=12)
+
+
+class GeneratedResumeBullet(ContractModel):
+    """One generated bullet that retains its authorized claim provenance."""
+
+    bullet_id: str = Field(pattern=r"^BULLET-\d{2}$")
+    section: Literal["EXPERIENCE", "PROJECTS", "INDEPENDENT_ENGINEERING", "EDUCATION"]
+    text: str = Field(min_length=1, max_length=600)
+    source_claim_ids: list[str] = Field(min_length=1, max_length=8)
+    project_identity: str | None = Field(default=None, max_length=240)
+    contribution_mode: ContributionMode
+    generation_status: Literal["MODEL_GENERATED", "DETERMINISTIC_REPAIR"] = (
+        "MODEL_GENERATED"
+    )
+    truth_boundary: str = Field(min_length=1, max_length=400)
+
+
+class ApplicationResumeDraft(ContractModel):
+    """Structured Application Resume draft; provenance never reaches public output."""
+
+    job_description_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    headline: str = Field(min_length=1, max_length=240)
+    summary: str = Field(min_length=1, max_length=900)
+    skills: list[str] = Field(min_length=1, max_length=48)
+    bullets: list[GeneratedResumeBullet] = Field(min_length=1, max_length=40)
+
+    @model_validator(mode="after")
+    def validate_bullet_identity(self) -> ApplicationResumeDraft:
+        bullet_ids = [item.bullet_id for item in self.bullets]
+        if len(bullet_ids) != len(set(bullet_ids)):
+            raise ValueError("generated bullet ids must be unique")
+        return self
+
+
+class GenerationViolationCode(StrEnum):
+    UNAUTHORIZED_TECHNOLOGY = "unauthorized_technology"
+    INVENTED_METRIC = "invented_metric"
+    INVENTED_OUTCOME = "invented_outcome"
+    OWNERSHIP_INFLATION = "ownership_inflation"
+    SCALE_INFLATION = "scale_inflation"
+    DEPLOYMENT_INFLATION = "deployment_inflation"
+    WEAKENED_CLAIM = "weakened_claim"
+    UNKNOWN_SOURCE_CLAIM = "unknown_source_claim"
+    CONTRIBUTION_MODE_INFLATION = "contribution_mode_inflation"
+
+
+class GenerationViolation(ContractModel):
+    bullet_id: str = Field(pattern=r"^BULLET-\d{2}$")
+    rule_code: GenerationViolationCode
+    detail: str = Field(min_length=1, max_length=300)
+
+
+class ValidationReport(ContractModel):
+    checked_count: int = Field(ge=0)
+    violations: list[GenerationViolation] = Field(default_factory=list, max_length=80)
+    repaired_count: int = Field(ge=0)
+    rejected_count: int = Field(ge=0)
+    rejected_skills: list[str] = Field(default_factory=list, max_length=48)
+    valid: bool
+    post_editorial_validated: bool = False
+
+
+class CoverageSummary(ContractModel):
+    requirement_id: str = Field(pattern=r"^REQ-\d{2}$")
+    status: Literal[
+        "STRONGLY_REPRESENTED",
+        "PARTIALLY_REPRESENTED",
+        "HIGH_VALUE_GAP",
+        "INTENTIONALLY_OMITTED",
+        "NO_EVIDENCE",
+    ]
+    detail: str = Field(min_length=1, max_length=400)
+
+
+class CoverageReport(ContractModel):
+    strongly_represented: list[str] = Field(default_factory=list, max_length=24)
+    partially_represented: list[str] = Field(default_factory=list, max_length=24)
+    high_value_gaps: list[str] = Field(default_factory=list, max_length=24)
+    intentionally_omitted: list[str] = Field(default_factory=list, max_length=24)
+    summaries: list[CoverageSummary] = Field(default_factory=list, max_length=24)
+
+
+class GenerationReceipt(ContractModel):
+    provider: str = Field(min_length=1, max_length=120)
+    model: str = Field(min_length=1, max_length=120)
+    reasoning_effort: str = Field(min_length=1, max_length=40)
+    thinking_enabled: bool
+    model_calls: int = Field(ge=0)
+    latency_ms: int = Field(ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    cache_tokens: int | None = Field(default=None, ge=0)
+    status: Literal["SUCCEEDED", "FAILED", "NOT_EXECUTED"]
+    error_category: str | None = None
+    real_call: bool = False
+
+
+class ResumeGenerationResult(ContractModel):
+    job_description_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    role_strategy: ResumeRoleStrategy
+    application_draft: ApplicationResumeDraft
+    coverage_report: CoverageReport
+    validation_report: ValidationReport
+    generation_receipt: GenerationReceipt
+    target_gaps: list[TargetGap] = Field(default_factory=list, max_length=80)

@@ -146,6 +146,37 @@ _GENERIC_APPLICATION_ACTIONS = (
     GapAction.IGNORE,
 )
 _ABSTRACTION_COMPONENTS = frozenset({"vector / similarity retrieval"})
+_GENERIC_TECH_TERMS = frozenset(
+    {
+        "agent",
+        "agents",
+        "agentic",
+        "api",
+        "apis",
+        "service",
+        "workflow",
+        "backend",
+        "test",
+        "suite",
+        "data",
+        "layer",
+        "frontend",
+        "deployment",
+        "pipeline",
+        "engineering",
+        "work",
+        "web",
+        "documentation",
+        "planning",
+        "memory",
+        "schema",
+        "prompt",
+        "prompts",
+        "quality",
+        "reliability",
+        "evaluation",
+    }
+)
 
 
 def _evidence_terms(candidate: ResumeRetrievalCandidate) -> set[str]:
@@ -429,7 +460,13 @@ def propose_claim_text(
             return f"Built retrieval components using {_join_tech(tech[:2])}."
         return "Worked with retrieval and vector-search components."
     noun = _CAPABILITY_NOUNS.get(capability, "engineering work")
-    tech = sorted(term for term in terms if len(term) <= 24)[:2]
+    distinctive = sorted(
+        term
+        for term in terms
+        if len(term) <= 24 and term not in _GENERIC_TECH_TERMS
+    )
+    fallback = sorted(term for term in terms if len(term) <= 24)
+    tech = (distinctive or fallback)[:2]
     if claim_class is ClaimClass.VERIFIED:
         if tech:
             return f"Implemented {noun} using {_join_tech(tech)}."
