@@ -1,13 +1,14 @@
 import json
 import os
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from soloscale.content_models import ContentReviewDecision
 from soloscale.content_scan import scan_recent_work
 from soloscale.content_ui import ContentFormStatus, content_page, run_content_form
 from soloscale.content_workspace import load_content_run, save_content_review
+from soloscale.creator_production import CreatorProductionJob, CreatorProductionRequest
 from soloscale.media_quality import MediaQualityChecklist, save_media_quality_review
 
 
@@ -298,3 +299,35 @@ def test_creator_page_shares_canonical_work_project_context(tmp_path: Path) -> N
         locale="zh-CN",
     )
     assert "1 个本地项目" not in disconnected
+
+
+def test_template_job_displays_zero_model_calls_and_stable_elapsed(
+    tmp_path: Path,
+) -> None:
+    created = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
+    job = CreatorProductionJob(
+        job_id="creator-job-display",
+        content_project_id="project-display",
+        request=CreatorProductionRequest(
+            source_kind="STORY",
+            source_story_id="M1-13",
+            outputs=["ARTICLE"],
+            language="中文",
+            ai_editorial=False,
+        ),
+        phase="READY",
+        created_at=created.isoformat(),
+        updated_at=(created + timedelta(seconds=7)).isoformat(),
+        stage="Artifacts sealed",
+        provider="template",
+        model=None,
+        model_calls=0,
+    )
+    page = content_page(
+        data_root=tmp_path / ".soloscale",
+        creator_job=job,
+        workspace_view="create",
+        locale="zh-CN",
+    )
+    assert "模型调用: 0" in page
+    assert "已用时: 7s" in page

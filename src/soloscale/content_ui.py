@@ -164,10 +164,9 @@ def _creator_job_state_detail(job: CreatorProductionJob, locale: UILocale) -> st
     parts.append(
         f"{_escape(ui_text(locale, '已用时', 'Elapsed'))}: {elapsed}s"
     )
-    if job.model_calls:
-        parts.append(
-            f"{_escape(ui_text(locale, '模型调用', 'Model calls'))}: {job.model_calls}"
-        )
+    parts.append(
+        f"{_escape(ui_text(locale, '模型调用', 'Model calls'))}: {job.model_calls}"
+    )
     if job.timeout_seconds is not None:
         parts.append(
             f"{_escape(ui_text(locale, '超时', 'Timeout'))}: {job.timeout_seconds}s"

@@ -38,6 +38,7 @@ ProductionPhase = Literal[
     "FAILED",
 ]
 QueueStatus = Literal["DRAFT", "READY", "PUBLISHED", "FAILED"]
+_RUNNING_PHASES = frozenset({"QUEUED", "GENERATING_CONTENT", "RENDERING_VIDEO"})
 
 _PROJECT_ROOT = "creator-projects"
 _ARTIFACT_ROOT = "creator-artifacts"
@@ -115,13 +116,24 @@ def _now() -> str:
 
 
 def job_elapsed_seconds(job: CreatorProductionJob, *, now: datetime | None = None) -> int:
-    """Return whole elapsed seconds for a persisted production job."""
+    """Return whole elapsed seconds for a persisted production job.
+
+    A running job uses a live clock from its creation time. A terminal job uses
+    its last persisted transition (``updated_at``) so its displayed duration is
+    stable across refresh, navigation, and history rendering.
+    """
 
     try:
         started = datetime.fromisoformat(job.created_at)
     except ValueError:
         return 0
-    reference = now or datetime.now(UTC)
+    if job.phase in _RUNNING_PHASES:
+        reference = now or datetime.now(UTC)
+    else:
+        try:
+            reference = datetime.fromisoformat(job.updated_at)
+        except ValueError:
+            reference = started
     elapsed = (reference - started).total_seconds()
     return max(0, int(elapsed))
 

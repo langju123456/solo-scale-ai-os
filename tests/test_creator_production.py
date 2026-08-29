@@ -17,8 +17,10 @@ from soloscale.content_workspace import (
 )
 from soloscale.creator_production import (
     CreatorProductionError,
+    CreatorProductionJob,
     CreatorProductionJobManager,
     CreatorProductionRequest,
+    ProductionPhase,
     assign_artifact_to_account,
     create_run_artifacts,
     job_elapsed_seconds,
@@ -350,3 +352,53 @@ def test_production_job_persists_observable_state(tmp_path: Path) -> None:
         assert persisted.stage == "Artifacts sealed"
     finally:
         manager.shutdown()
+
+
+def _persisted_job(
+    phase: ProductionPhase,
+    *,
+    created: datetime,
+    updated: datetime,
+    provider: str = "template",
+    model_calls: int = 0,
+) -> CreatorProductionJob:
+    return CreatorProductionJob(
+        job_id="creator-job-elapsed",
+        content_project_id="project-elapsed",
+        request=CreatorProductionRequest(
+            source_kind="CREATE",
+            outputs=["ARTICLE"],
+            language="English",
+            ai_editorial=False,
+        ),
+        phase=phase,
+        created_at=created.isoformat(),
+        updated_at=updated.isoformat(),
+        stage="Artifacts sealed" if phase == "READY" else "AI generation",
+        provider=provider,
+        model=None,
+        model_calls=model_calls,
+    )
+
+
+def test_job_elapsed_is_live_while_running_and_stable_after_terminal() -> None:
+    base = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
+
+    running = _persisted_job(
+        "GENERATING_CONTENT", created=base, updated=base + timedelta(seconds=2)
+    )
+    assert job_elapsed_seconds(running, now=base + timedelta(seconds=5)) == 5
+    assert job_elapsed_seconds(running, now=base + timedelta(seconds=30)) == 30
+
+    ready = _persisted_job(
+        "READY", created=base, updated=base + timedelta(seconds=7)
+    )
+    assert job_elapsed_seconds(ready, now=base + timedelta(seconds=8)) == 7
+    assert job_elapsed_seconds(ready, now=base + timedelta(seconds=99)) == 7
+
+    failed = _persisted_job(
+        "FAILED",
+        created=base,
+        updated=base + timedelta(seconds=12),
+    )
+    assert job_elapsed_seconds(failed, now=base + timedelta(seconds=60)) == 12
