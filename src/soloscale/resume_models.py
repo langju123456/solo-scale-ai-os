@@ -977,3 +977,168 @@ class ResumeEvidenceCoverageMap(ContractModel):
         if len(candidate_ids) != len(self.candidates):
             raise ValueError("candidate identities must be unique")
         return self
+
+
+class ClaimClass(StrEnum):
+    """Graded truth for one resume claim. Final export gate is downstream."""
+
+    VERIFIED = "VERIFIED"
+    SUPPORTED_DERIVATION = "SUPPORTED_DERIVATION"
+    HIGH_VALUE_GAP = "HIGH_VALUE_GAP"
+    UNSUPPORTED = "UNSUPPORTED"
+
+
+class EvidenceAuthority(StrEnum):
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW_CONTEXTUAL = "LOW_CONTEXTUAL"
+    NON_SUPPORTING = "NON_SUPPORTING"
+
+
+class EvidenceOwnership(StrEnum):
+    PROVEN = "PROVEN"
+    UNPROVEN = "UNPROVEN"
+
+
+class ContaminationKind(StrEnum):
+    NONE = "NONE"
+    JD_QUERY_ECHO = "JD_QUERY_ECHO"
+    COURSE_EXPOSURE = "COURSE_EXPOSURE"
+    MODEL_SUGGESTION = "MODEL_SUGGESTION"
+
+
+class ClaimStrength(StrEnum):
+    STRONG = "STRONG"
+    MODERATE = "MODERATE"
+    BOUNDED = "BOUNDED"
+    CONTRIBUTION_SAFE = "CONTRIBUTION_SAFE"
+    EXPOSURE_SAFE = "EXPOSURE_SAFE"
+    LEARNING_ONLY = "LEARNING_ONLY"
+
+
+class GapAction(StrEnum):
+    SEARCH_MORE = "SEARCH_MORE"
+    USER_SUPPLEMENT = "USER_SUPPLEMENT"
+    LEARNING_CASE = "LEARNING_CASE"
+    IGNORE = "IGNORE"
+
+
+class ClaimValidationCode(StrEnum):
+    UNSUPPORTED_CLASS = "UNSUPPORTED_CLASS"
+    NON_SUPPORTING_EVIDENCE = "NON_SUPPORTING_EVIDENCE"
+    OWNERSHIP_UNPROVEN = "OWNERSHIP_UNPROVEN"
+    TECHNOLOGY_INFLATION = "TECHNOLOGY_INFLATION"
+    NEW_NUMBER = "NEW_NUMBER"
+    ECHO_CONTAMINATION = "ECHO_CONTAMINATION"
+
+
+class GradedEvidence(ContractModel):
+    """Authority/ownership/contamination classification for one retrieved candidate."""
+
+    evidence_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    source_kind: ResumeRetrievalSourceKind
+    authority: EvidenceAuthority
+    ownership: EvidenceOwnership
+    contamination: ContaminationKind
+    capability_terms: list[str] = Field(default_factory=list, max_length=40)
+    is_implementation: bool = False
+
+
+class ClaimComponentVerdict(ContractModel):
+    """Graded verdict for one capability component of one requirement."""
+
+    component: str = Field(min_length=1, max_length=120)
+    claim_class: ClaimClass
+    evidence_ids: list[str] = Field(default_factory=list, max_length=80)
+    missing_proof: list[str] = Field(default_factory=list, max_length=12)
+    rationale: str = Field(min_length=1, max_length=400)
+
+
+class RequirementClaimMap(ContractModel):
+    requirement_id: str = Field(pattern=r"^REQ-\d{2}$")
+    requirement_text: str = Field(min_length=1, max_length=2000)
+    capability: str = Field(min_length=1, max_length=120)
+    components: list[ClaimComponentVerdict] = Field(min_length=1, max_length=12)
+
+
+class ApplicationClaim(ContractModel):
+    """One claim allowed into the submit-ready Application Resume."""
+
+    claim_id: str = Field(pattern=r"^CLAIM-\d{2}$")
+    requirement_id: str = Field(pattern=r"^REQ-\d{2}$")
+    claim_class: ClaimClass
+    strength: ClaimStrength
+    proposed_text: str = Field(min_length=1, max_length=600)
+    evidence_ids: list[str] = Field(min_length=1, max_length=24)
+    authority: EvidenceAuthority
+    ownership: EvidenceOwnership
+    derivation_rationale: str = Field(min_length=1, max_length=400)
+    truth_boundary: str = Field(min_length=1, max_length=400)
+    excluded_implications: list[str] = Field(default_factory=list, max_length=24)
+    technology_vocabulary: list[str] = Field(default_factory=list, max_length=200)
+
+    @model_validator(mode="after")
+    def validate_application_class(self) -> ApplicationClaim:
+        if self.claim_class not in {
+            ClaimClass.VERIFIED,
+            ClaimClass.SUPPORTED_DERIVATION,
+        }:
+            raise ValueError("Application Resume may contain only VERIFIED or SUPPORTED_DERIVATION")
+        return self
+
+
+class TargetGap(ContractModel):
+    """One clearly labeled non-submit-safe item in the Target Resume."""
+
+    gap_id: str = Field(pattern=r"^GAP-\d{2}$")
+    requirement_id: str = Field(pattern=r"^REQ-\d{2}$")
+    capability: str = Field(min_length=1, max_length=120)
+    claim_class: ClaimClass
+    suggested_wording: str = Field(min_length=1, max_length=600)
+    why_it_matters: str = Field(min_length=1, max_length=400)
+    evidence_found: list[str] = Field(default_factory=list, max_length=24)
+    missing_proof: list[str] = Field(min_length=1, max_length=12)
+    actions: list[GapAction] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_target_class(self) -> TargetGap:
+        if self.claim_class not in {
+            ClaimClass.HIGH_VALUE_GAP,
+            ClaimClass.UNSUPPORTED,
+        }:
+            raise ValueError("target gaps must be HIGH_VALUE_GAP or UNSUPPORTED")
+        return self
+
+
+class ClaimTruthResult(ContractModel):
+    """Graded claim map plus Application/Target separation for one JD."""
+
+    job_description_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    requirement_maps: list[RequirementClaimMap] = Field(max_length=24)
+    evidence: list[GradedEvidence] = Field(default_factory=list, max_length=1200)
+    application_claims: list[ApplicationClaim] = Field(max_length=80)
+    target_gaps: list[TargetGap] = Field(max_length=80)
+    verified_count: int = Field(ge=0)
+    supported_derivation_count: int = Field(ge=0)
+    high_value_gap_count: int = Field(ge=0)
+    unsupported_count: int = Field(ge=0)
+    contamination_counts: dict[ContaminationKind, int] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_claim_identity(self) -> ClaimTruthResult:
+        requirement_ids = [item.requirement_id for item in self.requirement_maps]
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise ValueError("requirement claim maps must be unique")
+        evidence_ids = {item.evidence_id for item in self.evidence}
+        application_ids = [item.claim_id for item in self.application_claims]
+        gap_ids = [item.gap_id for item in self.target_gaps]
+        if len(application_ids) != len(set(application_ids)):
+            raise ValueError("application claim ids must be unique")
+        if len(gap_ids) != len(set(gap_ids)):
+            raise ValueError("target gap ids must be unique")
+        for claim in self.application_claims:
+            if not set(claim.evidence_ids) <= evidence_ids:
+                raise ValueError("application claim references unknown evidence")
+        if any(count < 0 for count in self.contamination_counts.values()):
+            raise ValueError("contamination counts must be non-negative")
+        return self
