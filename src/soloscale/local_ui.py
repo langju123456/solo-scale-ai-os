@@ -31,7 +31,8 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
-from soloscale.casebook_store import CasebookStore
+from soloscale.casebook_models import EvidenceKind
+from soloscale.casebook_store import CasebookError, CasebookStore
 from soloscale.content_canon import load_month_one_canon
 from soloscale.content_distribution import (
     ContentDistributionError,
@@ -5327,7 +5328,7 @@ def _practice_panel_html(data_root: Path, form: dict[str, str], locale: UILocale
     if not cases:
         return f"""<section class="panel practice-panel" id="practice">
   <h2>{_escape(ui_text(locale, '编码练习（VS Code）', 'Coding practice (VS Code)'))}</h2>
-  <p class="muted">{_escape(ui_text(locale, '先创建一个学习案例（CLI：soloscale case-create …），这里会把案例缺口变成可练习的编码任务。', 'Create a Learning case first (CLI: soloscale case-create …) to turn the case gap into a bounded coding task.'))}</p>
+  <p class="muted">{_escape(ui_text(locale, '先在下方生产就绪地图中创建学习案例，无需命令行；之后即可把案例缺口变成可练习、可回填掌握度的编码任务。', 'Create a Learning case from the Production Readiness Map below (no command line required); then turn the case gap into a bounded, testable practice task.'))}</p>
 </section>"""
     latest = max(cases, key=lambda case: case.created_at)
     exercises = [
@@ -5368,6 +5369,105 @@ def _practice_panel_html(data_root: Path, form: dict[str, str], locale: UILocale
 </section>"""
 
 
+def _production_readiness_map_html(
+    data_root: Path, repo_root: Path | None, form: dict[str, str], locale: UILocale
+) -> str:
+    """Surface the capability-domain x maturity map without inventing mastery."""
+
+    try:
+        cases = CasebookStore(data_root).list_cases()
+    except (OSError, ValueError):
+        cases = []
+    latest = max(cases, key=lambda case: case.created_at) if cases else None
+    has_case = latest is not None
+    exercises = (
+        [item for item in list_exercises(data_root) if item.case_id == latest.id]
+        if latest is not None
+        else []
+    )
+    has_project = repo_root is not None
+    has_ci = bool(
+        repo_root is not None
+        and (repo_root / ".github/workflows/ci.yml").is_file()
+        and not (repo_root / ".github/workflows/ci.yml").is_symlink()
+    )
+    domains = (
+        "AI Application",
+        "Software Engineering",
+        "Cloud / DevOps",
+        "Observability / Evaluation",
+        "System Design",
+        "Security / Enterprise",
+    )
+    maturities = (
+        "UNDERSTAND",
+        "BUILD",
+        "TEST",
+        "DEPLOY",
+        "OBSERVE",
+        "RECOVER",
+        "SECURE",
+        "EXPLAIN / DEFEND",
+    )
+    domain_rows = "".join(
+        f'''<div class="readiness-domain"><strong>{_escape(domain)}</strong><div class="maturity-row">{"".join(f'<span class="maturity-chip {"ready" if has_case or (dim in {"TEST", "DEPLOY"} and has_ci) else "needs"}">{_escape(dim)}</span>' for dim in maturities)}</div></div>'''
+        for domain in domains
+    )
+    if not has_project:
+        gap_type = ui_text(locale, "NO_EVIDENCE", "NO_EVIDENCE")
+        gap_title = ui_text(locale, "连接一个真实项目", "Connect a real project")
+        gap_note = ui_text(
+            locale,
+            "没有项目证据时无法生成有边界的练习；先在工作页选择本地 Git 项目。",
+            "A bounded practice cannot be generated without project evidence; choose a local Git project first.",
+        )
+    elif not has_ci:
+        gap_type = ui_text(locale, "NO_PRODUCTION_PROOF", "NO_PRODUCTION_PROOF")
+        gap_title = ui_text(locale, "把验证命令固化为 GitHub Actions CI", "Automate verification with GitHub Actions")
+        gap_note = ui_text(
+            locale,
+            "项目已在本地反复运行 pytest、ruff、mypy 与构建，但仍需把这条验证流水线作为生产证据自动化并讲清楚。",
+            "The project already runs pytest, Ruff, mypy, and build locally, but this verification loop still needs to be automated and explained as production evidence.",
+        )
+    elif latest is None:
+        gap_type = ui_text(locale, "UNDERSTANDING_GAP", "UNDERSTANDING_GAP")
+        gap_title = ui_text(locale, "创建第一个 CI/CD 学习案例", "Create the first CI/CD learning case")
+        gap_note = ui_text(
+            locale,
+            "仓库已有 CI workflow，但还没有把它沉淀为可练习、可复核的学习案例。",
+            "The repository already has a CI workflow, but it has not been turned into a practiceable, reviewable learning case yet.",
+        )
+    elif not exercises:
+        gap_type = ui_text(locale, "INTERVIEW_GAP", "INTERVIEW_GAP")
+        gap_title = ui_text(locale, "生成并完成一次 CI/CD 练习", "Generate and complete one CI/CD exercise")
+        gap_note = ui_text(
+            locale,
+            "已有案例；下一步是生成有边界的练习工作区并在 VS Code 中完成。",
+            "A case exists; the next step is to generate a bounded practice workspace and complete it in VS Code.",
+        )
+    else:
+        gap_type = ui_text(locale, "INTERVIEW_GAP", "INTERVIEW_GAP")
+        gap_title = ui_text(locale, "提交证据并复核掌握", "Submit evidence and review mastery")
+        gap_note = ui_text(
+            locale,
+            "练习工作区已生成；完成编码后提交结果，掌握等级仍需你确认，不会自动授予。",
+            "A practice workspace exists; after coding, submit your result. Mastery still requires your confirmation and is never auto-granted.",
+        )
+    if latest is not None:
+        action = f'''<form method="post" action="/learning/practice/create"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="case_id" value="{_escape(latest.id)}" /><input type="hidden" name="target_requirement" value="{_escape(form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT))}" /><input type="hidden" name="exercise_type" value="IMPLEMENT" /><input type="hidden" name="practice_language" value="python" /><input type="hidden" name="difficulty" value="2" /><button class="primary" type="submit">{_escape(ui_text(locale, "生成练习", "Generate practice"))}</button></form>'''
+    elif has_project:
+        action = f'''<form method="post" action="/learning/case/create"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="target_requirement" value="{_escape(form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT))}" /><button class="primary" type="submit">{_escape(ui_text(locale, "创建学习案例并继续", "Create learning case"))}</button></form>'''
+    else:
+        action = f'<a class="button-link" href="{ui_url("/work", locale)}">{_escape(ui_text(locale, "选择项目", "Choose project"))}</a>'
+    return f"""<section class="panel readiness-map" id="readiness-map">
+  <span class="kicker">{_escape(ui_text(locale, "生产就绪地图", "Production readiness map"))}</span>
+  <h2>{_escape(ui_text(locale, "能力域 × 工程成熟度", "Capability domain x engineering maturity"))}</h2>
+  <p class="muted">{_escape(ui_text(locale, "这里用定性状态标记证据，不伪造单一精确百分比；掌握证据仍需你复核。", "This map uses qualitative evidence states and never fabricates one precise mastery percentage; mastery still needs your review."))}</p>
+  <div class="readiness-domains">{domain_rows}</div>
+  <div class="highest-gap"><div><span class="status-badge">{_escape(gap_type)}</span><h3>{_escape(gap_title)}</h3><p>{_escape(gap_note)}</p></div>{action}</div>
+</section>"""
+
+
 def _render_practice_exercise_row(item: LearningExercise, locale: UILocale) -> str:
     actions: list[str] = []
     if item.status is not ExerciseStatus.COMPLETED:
@@ -5399,6 +5499,113 @@ def _render_practice_exercise_row(item: LearningExercise, locale: UILocale) -> s
   <p class="muted"><code>{_escape(item.workspace_path or '')}</code></p>
   <div class="practice-actions">{"".join(actions)}</div>
 </article>"""
+
+
+def _create_learning_case_ui(
+    fields: dict[str, str], data_root: Path, repo_root: Path | None
+) -> UIActionResult:
+    if repo_root is None:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            1,
+            "",
+            "这个练习需要一个已连接的代码项目。请先选择项目。",
+            0,
+        )
+    requirement = fields.get("target_requirement", "").strip()
+    if not requirement:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            1,
+            "",
+            "请填写目标 JD 要求。",
+            0,
+        )
+    evidence_candidates = (
+        repo_root / ".github/workflows/ci.yml",
+        repo_root / "pyproject.toml",
+        repo_root / "README.md",
+    )
+    evidence_file = next(
+        (path for path in evidence_candidates if path.is_file() and not path.is_symlink()),
+        None,
+    )
+    if evidence_file is None:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            1,
+            "",
+            "没有找到可归档的本地证据文件（CI workflow / pyproject / README）。",
+            0,
+        )
+    repository_name = repo_root.name
+    try:
+        from soloscale.learning_traceability import _repository_identity
+
+        repository_name = _repository_identity(repo_root).name
+    except Exception:
+        pass
+    store = CasebookStore(data_root)
+    case_id = "ci-cd-automation"
+    try:
+        store.load_case(case_id)
+    except CasebookError:
+        pass
+    else:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            0,
+            "CI/CD 学习案例已存在；现在可以在下方生成练习工作区。",
+            "",
+            0,
+        )
+    try:
+        store.create_case(
+            title="Automate SoloScale verification with GitHub Actions",
+            project=repository_name,
+            problem=(
+                "The repository already runs pytest, Ruff, mypy, and package build, "
+                "but the verification loop still needs to be understood and owned as "
+                "automated CI/CD."
+            ),
+            expected_behavior=(
+                "A GitHub Actions workflow runs lint, type-check, tests, and package "
+                "build on push and pull requests."
+            ),
+            actual_behavior=(
+                "A workflow file exists, but the operator still needs to practice "
+                "explaining, rebuilding, and defending it."
+            ),
+            root_cause=(
+                "Verification was historically orchestrated manually; CI automation "
+                "needs deliberate practice and ownership."
+            ),
+            resolution=(
+                "Complete a bounded exercise: read the workflow, rebuild a minimal "
+                "local version, run it, and record evidence."
+            ),
+            verification=["ruff check .", "mypy src tests", "pytest -q", "python -m build"],
+            concepts=["CI/CD", "GitHub Actions", "test automation", "verification gates"],
+            evidence_sources=[(EvidenceKind.CI, evidence_file)],
+            case_id=case_id,
+            repository=repository_name,
+        )
+    except (ValueError, OSError, KeyError, CasebookError) as exc:
+        return UIActionResult(
+            "learning-case", "create learning case", 1, "", str(exc), 0
+        )
+    return UIActionResult(
+        "learning-case",
+        "create learning case",
+        0,
+        f"学习案例已创建：{case_id}。现在可以在下方生成练习工作区。",
+        "",
+        0,
+    )
 
 
 def _create_practice_exercise_ui(fields: dict[str, str], data_root: Path) -> UIActionResult:
@@ -5729,7 +5936,10 @@ def _learning_page(
     <a class="button-link secondary" href="#exercise-trace">{_escape(ui_text(locale, '开始追踪', 'Start Trace'))}</a>
   </div>
 </section>
-{_learning_graph(run_dir, locale)}
+<details class="panel">
+  <summary>{_escape(ui_text(locale, '查看证据图（进阶）', 'View Evidence Graph (advanced)'))}</summary>
+  {_learning_graph(run_dir, locale)}
+</details>
 {backlink}
 <section class="panel">
   <h2>{_escape(ui_text(locale, '目标 JD 相关性', 'Target JD relevance'))}</h2>
@@ -5839,10 +6049,14 @@ def _learning_page(
   <article data-learning-capability="debug" data-state="{debug_state}"><span>DEBUG</span><strong>{_escape(capability_state_labels[debug_state])}</strong></article>
 </section>"""
     practice_panel = _practice_panel_html(data_root, form, locale)
+    readiness_map = _production_readiness_map_html(
+        data_root, repo_root, form, locale
+    )
     body = f"""
     {work_summary}
     {repository_notice}
     {capabilities}
+    {readiness_map}
     <form class="panel build-form" method="post" action="/learning/run">
       <input type="hidden" name="ui_locale" value="{locale}" />
       <label>{_escape(ui_text(locale, '当前目标 JD 要求', 'Current target-JD requirement'))}
@@ -5878,7 +6092,8 @@ def _learning_page(
 .learning-capabilities{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.learning-capabilities article{display:grid;gap:6px;border:1px solid var(--border);border-radius:13px;padding:14px;background:var(--surface-subtle)}.learning-capabilities span{font-size:.75rem;letter-spacing:.08em;color:var(--text-muted)}.learning-capabilities strong{font-size:.78rem;color:var(--brand)}.learning-capabilities [data-state="NEEDS_PROJECT_EVIDENCE"] strong,.learning-capabilities [data-state="NEEDS_CASE_EVIDENCE"] strong,.learning-capabilities [data-state="NEEDS_CASE_STAGE"] strong{color:var(--warning)}
 .status-grid,.truth-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.status-card,.truth-grid div{border:1px solid var(--border);border-radius:14px;padding:16px;background:var(--surface-subtle);display:grid;gap:7px}.status-card span,.truth-grid span{color:var(--text-muted);text-transform:uppercase;letter-spacing:.09em;font-size:.75rem}.status-card strong{font-size:1.15rem}.verified strong{color:var(--success)}.warning strong,.warning-text{color:var(--warning)}.action strong{color:var(--brand)}
 .hero-copy p:not(.eyebrow){max-width:820px;font-size:1.08rem;line-height:1.7}.graph-scroll{overflow:auto;background:#f7f9fc;border:1px solid var(--border);border-radius:12px}#learning-graph{width:1060px;display:block}.panel pre{background:#f7f9fc;color:#2c3548}.panel details summary,details.panel summary{cursor:pointer;font-size:1.05rem;font-weight:750}.hidden{display:none}.footnote span{color:var(--text-muted)}
-@media(max-width:760px){.use-my-work,.learning-capabilities,.status-grid,.truth-grid,.build-form{grid-template-columns:1fr}}
+.readiness-map{background:linear-gradient(145deg,#fff,var(--brand-soft))}.readiness-map h2{margin:7px 0}.readiness-map .muted{color:var(--text-muted)}.readiness-domains{display:grid;gap:12px;margin-top:16px}.readiness-domain{display:grid;gap:8px;padding:13px;border:1px solid var(--border);border-radius:13px;background:#fff}.readiness-domain>strong{font-size:13px}.maturity-row{display:flex;gap:6px;flex-wrap:wrap}.maturity-chip{padding:4px 8px;border-radius:999px;background:var(--surface-subtle);color:var(--text-muted);font-size:10px;font-weight:800}.maturity-chip.ready{background:var(--success-soft);color:var(--success)}.maturity-chip.needs{background:var(--warning-soft);color:var(--warning)}.highest-gap{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center;margin-top:18px;padding:16px;border:1px solid var(--brand);border-radius:14px;background:var(--brand-soft)}.highest-gap h3{margin:8px 0 5px}.highest-gap p{margin:0;color:var(--text-muted)}.highest-gap form,.highest-gap .button-link{align-self:center;white-space:nowrap}
+@media(max-width:760px){.use-my-work,.learning-capabilities,.status-grid,.truth-grid,.build-form,.highest-gap{grid-template-columns:1fr}.highest-gap form,.highest-gap .button-link{justify-self:start}}
 """,
     )
 
@@ -9304,6 +9519,19 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header("Location", ui_url("/creator/publish", self.ui_locale))
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if path == "/learning/case/create":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            case_form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(case_form)
+            self.latest_learning_form = dict(case_form)
+            self._send_learning_page(
+                _create_learning_case_ui(
+                    case_form,
+                    self.ui_data_root.absolute(),
+                    self.workspace_root,
+                )
+            )
             return
         if path == "/learning/practice/create":
             length = int(self.headers.get("Content-Length", "0") or 0)

@@ -31,6 +31,7 @@ from soloscale.local_ui import (
     UploadedFile,
     _ai_settings_page,
     _apply_ai_provider_preference,
+    _create_learning_case_ui,
     _create_resume_pdf_preview,
     _finalize_resume_preview,
     _heygen_settings_page,
@@ -2377,3 +2378,22 @@ def test_resume_workspace_rejects_symlinked_application_library(
     assert result.return_code == 1
     assert result.stderr == "application library save failed; inspect delivery.json"
     assert list(outside.iterdir()) == []
+
+
+def test_create_learning_case_ui_archives_real_ci_evidence(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    workflow = repo / ".github/workflows"
+    workflow.mkdir(parents=True)
+    (workflow / "ci.yml").write_text("name: CI\n", encoding="utf-8")
+    data_root = tmp_path / ".soloscale"
+    result = _create_learning_case_ui(
+        {"target_requirement": "Automate verification with GitHub Actions"},
+        data_root,
+        repo,
+    )
+    assert result is not None
+    assert result.return_code == 0
+    from soloscale.casebook_store import CasebookStore
+
+    cases = CasebookStore(data_root).list_cases()
+    assert [case.id for case in cases] == ["ci-cd-automation"]
