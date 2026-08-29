@@ -4758,7 +4758,7 @@ def _applications_section_html(
     except (OSError, ValueError):
         records = []
     if not records:
-        return ""
+        return f'''<section class="applications-overview" id="applications"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, "申请与机会", "Applications / Opportunities"))}</span><h2>{_escape(ui_text(locale, "还没有申请记录", "No applications yet"))}</h2><p>{_escape(ui_text(locale, "生成并保存第一份针对性简历后，这里会显示申请状态、面试就绪与下一步。简历草稿不会被误当作投递记录。", "After you generate and save your first tailored resume, this area will show application status, interview readiness, and next actions. Resume drafts are never mistaken for applications."))}</p></div></div><a class="text-link" href="{ui_url('/resume#resume-form', locale)}">{_escape(ui_text(locale, "生成第一份简历", "Generate your first resume"))} →</a></section>'''
     status_labels = {
         ApplicationStatus.DRAFT: ui_text(locale, "草稿", "Draft"),
         ApplicationStatus.READY_TO_APPLY: ui_text(locale, "可投递", "Ready to apply"),
