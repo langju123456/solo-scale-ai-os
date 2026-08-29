@@ -261,3 +261,49 @@ def test_list_exercises_roundtrip(tmp_path: Path) -> None:
 
     exercises = list_exercises(tmp_path / "data")
     assert [item.id for item in exercises] == [exercise.id]
+
+
+def test_ci_cd_case_generates_capability_specific_workflow_practice(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "ci evidence.txt"
+    source.write_bytes(b"ci evidence bytes")
+    data_root = tmp_path / "data"
+    store = CasebookStore(data_root)
+    case = store.create_case(
+        case_id="ci-cd-automation",
+        title="Automate SoloScale verification with GitHub Actions",
+        project="SoloScale AI OS",
+        problem="The repository runs verification locally but still needs owned CI/CD.",
+        expected_behavior="A GitHub Actions workflow runs lint, type-check, tests, and build.",
+        actual_behavior="The workflow exists but still needs deliberate practice.",
+        root_cause="Verification was historically orchestrated manually.",
+        resolution="Complete a bounded CI/CD workflow exercise and run local validation.",
+        verification=["ruff check .", "mypy src tests", "pytest -q", "python -m build"],
+        concepts=["CI/CD", "GitHub Actions", "test automation", "verification gates"],
+        repository="example/soloscale",
+        alternatives_considered=["Manual verification."],
+        trade_offs=["Automation adds pipeline maintenance."],
+        unknowns=["Cross-platform runner timing."],
+        evidence_sources=[(EvidenceKind.CI, source)],
+    )
+    exercise = generate_practice_exercise(
+        case=case,
+        jd_requirement=(
+            "Automate software verification with CI/CD: run lint, type-check, "
+            "tests, and build gates on push and pull requests."
+        ),
+        exercise_type=ExerciseType.IMPLEMENT,
+        practice_language=PracticeLanguage.PYTHON,
+    )
+    assert exercise.practice_language is PracticeLanguage.YAML
+    assert exercise.capability_domain == "CI_CD"
+    assert "GitHub Actions" in exercise.objective
+    assert ".github/workflows/ci.yml" in exercise.bounded_task
+
+    workspace = create_practice_workspace(exercise, data_root)
+    assert (workspace / ".github/workflows/ci.yml").is_file()
+    assert (workspace / "validate.py").is_file()
+    assert not (workspace / "starter.py").exists()
+    assert not (workspace / "test_task.py").exists()
+    assert "python validate.py" in (workspace / "README.md").read_text(encoding="utf-8")

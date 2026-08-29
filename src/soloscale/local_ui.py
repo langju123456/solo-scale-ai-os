@@ -36,7 +36,7 @@ from soloscale.application_record import (
     list_application_records,
     update_application_status,
 )
-from soloscale.casebook_models import EvidenceKind
+from soloscale.casebook_models import EvidenceKind, LearningCase
 from soloscale.casebook_store import CasebookError, CasebookStore
 from soloscale.content_canon import load_month_one_canon
 from soloscale.content_distribution import (
@@ -112,6 +112,7 @@ from soloscale.learning_practice import (
     ExerciseType,
     LearningExercise,
     PracticeLanguage,
+    capability_requirement,
     create_practice_workspace,
     generate_practice_exercise,
     ingest_practice_completion,
@@ -5467,6 +5468,21 @@ def _anchor_pack_html(pack: dict[str, object], locale: UILocale) -> str:
 """
 
 
+def _active_learning_case(data_root: Path) -> LearningCase | None:
+    try:
+        cases = CasebookStore(data_root).list_cases()
+    except (OSError, ValueError):
+        return None
+    return max(cases, key=lambda case: case.created_at) if cases else None
+
+
+def _learning_default_requirement(data_root: Path) -> str:
+    active = _active_learning_case(data_root)
+    if active is not None:
+        return capability_requirement(active)
+    return DEFAULT_TARGET_REQUIREMENT
+
+
 def _practice_panel_html(data_root: Path, form: dict[str, str], locale: UILocale) -> str:
     try:
         cases = CasebookStore(data_root).list_cases()
@@ -5482,7 +5498,7 @@ def _practice_panel_html(data_root: Path, form: dict[str, str], locale: UILocale
         item for item in list_exercises(data_root) if item.case_id == latest.id
     ]
     target_requirement = _escape(
-        form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT)
+        form.get("target_requirement", _learning_default_requirement(data_root))
     )
     type_options = "".join(
         f'<option value="{item.value}" {"selected" if item is ExerciseType.IMPLEMENT else ""}>{item.value}</option>'
@@ -5601,9 +5617,9 @@ def _production_readiness_map_html(
             "A practice workspace exists; after coding, submit your result. Mastery still requires your confirmation and is never auto-granted.",
         )
     if latest is not None:
-        action = f'''<form method="post" action="/learning/practice/create"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="case_id" value="{_escape(latest.id)}" /><input type="hidden" name="target_requirement" value="{_escape(form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT))}" /><input type="hidden" name="exercise_type" value="IMPLEMENT" /><input type="hidden" name="practice_language" value="python" /><input type="hidden" name="difficulty" value="2" /><button class="primary" type="submit">{_escape(ui_text(locale, "生成练习", "Generate practice"))}</button></form>'''
+        action = f'''<form method="post" action="/learning/practice/create"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="case_id" value="{_escape(latest.id)}" /><input type="hidden" name="target_requirement" value="{_escape(form.get("target_requirement", _learning_default_requirement(data_root)))}" /><input type="hidden" name="exercise_type" value="IMPLEMENT" /><input type="hidden" name="practice_language" value="python" /><input type="hidden" name="difficulty" value="2" /><button class="primary" type="submit">{_escape(ui_text(locale, "生成练习", "Generate practice"))}</button></form>'''
     elif has_project:
-        action = f'''<form method="post" action="/learning/case/create"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="target_requirement" value="{_escape(form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT))}" /><button class="primary" type="submit">{_escape(ui_text(locale, "创建学习案例并继续", "Create learning case"))}</button></form>'''
+        action = f'''<form method="post" action="/learning/case/create"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="target_requirement" value="{_escape(form.get("target_requirement", _learning_default_requirement(data_root)))}" /><button class="primary" type="submit">{_escape(ui_text(locale, "创建学习案例并继续", "Create learning case"))}</button></form>'''
     else:
         action = f'<a class="button-link" href="{ui_url("/work", locale)}">{_escape(ui_text(locale, "选择项目", "Choose project"))}</a>'
     return f"""<section class="panel readiness-map" id="readiness-map">
@@ -5905,7 +5921,9 @@ def _learning_page(
     if run_dir is not None and (run_dir.is_symlink() or not run_dir.is_dir()):
         run_dir = None
     response_saved_stage = form.get("response_saved_stage", "")
-    target_requirement = _escape(form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT))
+    target_requirement = _escape(
+        form.get("target_requirement", _learning_default_requirement(data_root))
+    )
     result_html = ""
     if result is not None:
         class_name = "success" if result.return_code == 0 else "error"
@@ -6199,8 +6217,22 @@ def _learning_page(
     readiness_map = _production_readiness_map_html(
         data_root, repo_root, form, locale
     )
+    active_case = _active_learning_case(data_root)
+    active_case_panel = ""
+    seed_case_note = ""
+    if active_case is not None and active_case.id != "conversation-rag-chunking-retrieval":
+        active_case_panel = f"""<section class="panel active-case">
+  <span class="kicker">{_escape(ui_text(locale, '当前学习案例', 'Active Learning Case'))}</span>
+  <h2>{_escape(active_case.title)}</h2>
+  <p>{_escape(active_case.problem)}</p>
+  <p class="muted">{_escape(", ".join(active_case.concepts))}</p>
+</section>"""
+        seed_case_note = f"""<section class="notice warning" role="status">
+  <strong>{_escape(ui_text(locale, '下方是独立的历史参考案例（Conversation RAG），不是当前活动案例。', 'The section below is a separate historical reference case (Conversation RAG), not the active case.'))}</strong>
+</section>"""
     body = f"""
     {work_summary}
+    {active_case_panel}
     {repository_notice}
     {capabilities}
     {readiness_map}
@@ -6212,6 +6244,7 @@ def _learning_page(
       {build_button}
     </form>
     {result_html}
+    {seed_case_note}
     {dashboard}
     {practice_panel}
     """

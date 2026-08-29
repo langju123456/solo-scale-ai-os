@@ -57,6 +57,7 @@ class PracticeLanguage(StrEnum):
     TYPESCRIPT = "typescript"
     SQL = "sql"
     BASH = "bash"
+    YAML = "yaml"
     GENERIC = "generic"
 
 
@@ -102,6 +103,7 @@ class LearningExercise(ContractModel):
     difficulty: int = Field(ge=1, le=5)
     practice_language: PracticeLanguage = PracticeLanguage.PYTHON
     mastery_capability: MasteryAction
+    capability_domain: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     status: ExerciseStatus = ExerciseStatus.GENERATED
     workspace_path: str | None = None
@@ -156,6 +158,160 @@ _EXERCISE_STAGE: dict[ExerciseType, PracticeStage] = {
 }
 
 
+def _capability_domain(case: LearningCase) -> str:
+    """Detect one practice capability domain from the case's durable facts."""
+
+    text = " ".join([case.title, case.problem, *case.concepts]).lower()
+    if any(
+        token in text
+        for token in (
+            "ci/cd",
+            "ci-cd",
+            "github actions",
+            "workflow",
+            "pipeline",
+            "build/release",
+            "deployment",
+            "automated testing",
+            "verification gates",
+        )
+    ):
+        return "CI_CD"
+    if any(
+        token in text
+        for token in ("rest api", "endpoint", "http", "validation", "serializer")
+    ):
+        return "REST_API"
+    if any(
+        token in text
+        for token in ("async", "job system", "queue", "retry", "idempotency")
+    ):
+        return "ASYNC_JOB"
+    if any(
+        token in text
+        for token in ("observability", "trace", "span", "instrumentation", "logging")
+    ):
+        return "OBSERVABILITY"
+    if any(
+        token in text
+        for token in ("security", "allowlist", "denial", "audit", "authentication")
+    ):
+        return "SECURITY"
+    if any(
+        token in text
+        for token in ("rag", "retrieval", "chunking", "embedding", "vector")
+    ):
+        return "RAG"
+    if any(
+        token in text
+        for token in ("dsa", "algorithm", "data structure")
+    ):
+        return "DSA"
+    if any(
+        token in text
+        for token in ("system design", "architecture", "trade-off")
+    ):
+        return "SYSTEM_DESIGN"
+    return "GENERAL"
+
+
+def capability_requirement(case: LearningCase) -> str:
+    """Return a capability-specific JD requirement for the case."""
+
+    requirements = {
+        "CI_CD": (
+            "Automate software verification with CI/CD: run lint, type-check, tests, "
+            "and build gates on push and pull requests."
+        ),
+        "REST_API": (
+            "Design and test a bounded REST API endpoint with validation and error "
+            "handling."
+        ),
+        "ASYNC_JOB": (
+            "Implement a bounded background job system with explicit state, retry, "
+            "and idempotency."
+        ),
+        "OBSERVABILITY": (
+            "Add trace, log, and span instrumentation to make one failure path "
+            "observable."
+        ),
+        "SECURITY": (
+            "Implement an allowlist/denial and audit-log test for one sensitive "
+            "boundary."
+        ),
+        "RAG": "Implement a bounded retrieval, chunking, and evaluation task.",
+        "DSA": "Solve a bounded algorithmic exercise with correctness tests.",
+        "SYSTEM_DESIGN": (
+            "Produce a structured architecture and trade-off artifact for one system "
+            "boundary."
+        ),
+    }
+    return requirements.get(
+        _capability_domain(case),
+        "Design and build context, memory, tooling, and retrieval systems for AI "
+        "products.",
+    )
+
+
+def _ci_cd_workspace_files(exercise: LearningExercise) -> dict[str, str]:
+    """Return a real CI/CD practice task, not a solve()->True toy."""
+
+    workflow = (
+        "name: SoloScale verification\n\n"
+        "on:\n"
+        "  push:\n"
+        "  pull_request:\n\n"
+        "jobs:\n"
+        "  verify:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      # TODO: set up the pinned Python runtime the repository expects.\n"
+        "      # TODO: install development dependencies in a reproducible way.\n"
+        "      # TODO: run the canonical lint, type-check, tests, and build gates.\n"
+        "      # TODO: add one intentional-failure check that fails without weakening the gate.\n"
+    )
+    validator = (
+        "#!/usr/bin/env python3\n"
+        "\"\"\"Local CI/CD acceptance checks for the practice workflow.\n\n"
+        "This validator does not grade your code; it verifies that the workflow\n"
+        "actually encodes the expected capability instead of merely existing.\n"
+        "\"\"\"\n"
+        "import pathlib\n"
+        "import sys\n\n\n"
+        "def main() -> int:\n"
+        "    path = pathlib.Path(\".github/workflows/ci.yml\")\n"
+        "    if not path.is_file():\n"
+        "        print(\"MISSING .github/workflows/ci.yml\")\n"
+        "        return 1\n"
+        "    text = path.read_text(encoding=\"utf-8\")\n"
+        "    required = [\"push\", \"pull_request\", \"runs-on\", \"pytest\", \"ruff\", \"mypy\"]\n"
+        "    missing = [token for token in required if token not in text]\n"
+        "    if missing:\n"
+        "        print(\"MISSING workflow tokens:\", \", \".join(missing))\n"
+        "        return 1\n"
+        "    print(\"CI/CD workflow encodes the expected verification gates.\")\n"
+        "    return 0\n\n\n"
+        "if __name__ == \"__main__\":\n"
+        "    raise SystemExit(main())\n"
+    )
+    task = (
+        "# CI/CD practice task\n\n"
+        "Complete `.github/workflows/ci.yml` so it automates SoloScale verification.\n\n"
+        "Required capabilities:\n"
+        "- triggers: push and pull_request\n"
+        "- a pinned Python runtime and reproducible dependency install\n"
+        "- the canonical gates: pytest, ruff, mypy, and package build\n"
+        "- one intentional failure/recovery scenario that does not weaken the gate\n\n"
+        "Verify locally with `python validate.py` and record your evidence.\n"
+    )
+    return {
+        ".github/workflows/ci.yml": workflow,
+        "validate.py": validator,
+        "task.md": task,
+    }
+
+
 def generate_practice_exercise(
     *,
     case: LearningCase,
@@ -175,6 +331,9 @@ def generate_practice_exercise(
         raise ValueError("difficulty must be between 1 and 5")
     normalized_type = ExerciseType(exercise_type)
     normalized_language = PracticeLanguage(practice_language)
+    domain = _capability_domain(case)
+    if normalized_type is ExerciseType.IMPLEMENT and domain == "CI_CD":
+        normalized_language = PracticeLanguage.YAML
     return LearningExercise(
         id=f"exercise-{uuid4().hex[:12]}",
         case_id=case.id,
@@ -183,12 +342,35 @@ def generate_practice_exercise(
         resume_claim=resume_claim.strip() if resume_claim else None,
         evidence_ids=[receipt.id for receipt in case.evidence],
         exercise_type=normalized_type,
-        objective=_build_objective(case, requirement, normalized_type),
-        bounded_task=_build_bounded_task(case, normalized_type, normalized_language),
-        acceptance_criteria=_build_acceptance_criteria(case, normalized_type),
+        objective=(
+            "Automate SoloScale verification with a GitHub Actions workflow that "
+            "runs lint, type-check, tests, and build gates."
+            if normalized_type is ExerciseType.IMPLEMENT and domain == "CI_CD"
+            else _build_objective(case, requirement, normalized_type)
+        ),
+        bounded_task=(
+            "Complete `.github/workflows/ci.yml` so it encodes a real CI/CD "
+            "verification pipeline with the expected triggers, a reproducible runtime, "
+            "the canonical pytest/Ruff/mypy/build gates, and one intentional "
+            "failure/recovery scenario. Verify locally with `python validate.py`."
+            if normalized_type is ExerciseType.IMPLEMENT and domain == "CI_CD"
+            else _build_bounded_task(case, normalized_type, normalized_language)
+        ),
+        acceptance_criteria=(
+            [
+                "The workflow file exists under .github/workflows/ci.yml.",
+                "The workflow encodes push and pull_request triggers.",
+                "The workflow runs pytest, ruff, mypy, and a package build.",
+                "The workflow includes an intentional failure/recovery scenario.",
+                "python validate.py passes against the completed workflow.",
+            ]
+            if normalized_type is ExerciseType.IMPLEMENT and domain == "CI_CD"
+            else _build_acceptance_criteria(case, normalized_type)
+        ),
         difficulty=difficulty,
         practice_language=normalized_language,
         mastery_capability=_EXERCISE_CAPABILITY[normalized_type],
+        capability_domain=domain,
     )
 
 
@@ -207,7 +389,10 @@ def create_practice_workspace(exercise: LearningExercise, data_root: Path) -> Pa
     workspace.mkdir(mode=_PRIVATE_DIRECTORY_MODE)
     try:
         _write_private(workspace / "README.md", _render_readme(exercise))
-        if exercise.practice_language is PracticeLanguage.PYTHON:
+        if exercise.capability_domain == "CI_CD":
+            for relative, content in _ci_cd_workspace_files(exercise).items():
+                _write_private(workspace / relative, content)
+        elif exercise.practice_language is PracticeLanguage.PYTHON:
             _write_private(workspace / "starter.py", _render_python_starter())
             _write_private(workspace / "test_task.py", _render_python_test())
         else:
@@ -487,11 +672,12 @@ def _build_acceptance_criteria(case: LearningCase, exercise_type: ExerciseType) 
 
 
 def _render_readme(exercise: LearningExercise) -> str:
-    language_run = (
-        "Run the test with `python -m pytest -q`."
-        if exercise.practice_language is PracticeLanguage.PYTHON
-        else "Follow task.md for the language-specific run/check instructions."
-    )
+    if exercise.capability_domain == "CI_CD":
+        language_run = "Verify your workflow locally with `python validate.py`."
+    elif exercise.practice_language is PracticeLanguage.PYTHON:
+        language_run = "Run the test with `python -m pytest -q`."
+    else:
+        language_run = "Follow task.md for the language-specific run/check instructions."
     return (
         f"# Practice Exercise — {exercise.id}\n\n"
         f"- Case: `{exercise.case_id}`\n"
