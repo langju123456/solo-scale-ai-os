@@ -511,6 +511,33 @@ def test_model_settings_save_persists_and_renders_explicit_confirmation(
     )
 
 
+def test_deepseek_settings_form_preserves_explicit_submit_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_for_tests()
+    monkeypatch.setattr(
+        "soloscale.local_ui.deepseek_api_key_is_configured", lambda: True
+    )
+    monkeypatch.setattr(
+        "soloscale.local_ui._ollama_readiness",
+        lambda preference: type("Readiness", (), {"ready": False})(),
+    )
+
+    detail = _ai_settings_page(
+        tmp_path, locale="en", detail="deepseek", desktop_mode=True
+    )
+
+    assert 'id="deepseek-settings"' in detail
+    assert (
+        'id="deepseek-settings-action" type="hidden" name="action" value="save"'
+        in detail
+    )
+    assert 'data-deepseek-action="save"' in detail
+    assert 'data-deepseek-action="test"' in detail
+    assert 'data-deepseek-action="use_default"' in detail
+    assert "action.value=requested" in detail
+
+
 def test_explicit_connection_success_persists_ready_and_renders_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

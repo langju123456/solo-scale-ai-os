@@ -6642,17 +6642,23 @@ if(remove) remove.addEventListener('click',()=>window.webkit.messageHandlers.sol
 <form id="deepseek-setup"><input type="hidden" id="deepseek-locale" value="{locale}" />
 <label>API Key<input id="deepseek-api-key" type="password" maxlength="512" autocomplete="new-password" value="" placeholder="sk-…"{save_disabled} /></label>
 <div class="button-row"><button id="save-deepseek-key" type="submit"{save_disabled}>{_escape(ui_text(locale, '保存并使用 DeepSeek', 'Save & use DeepSeek'))}</button>{delete_button}</div></form>
-<form method="post" action="/settings/ai/deepseek"><input type="hidden" name="ui_locale" value="{locale}" />
+<form id="deepseek-settings" method="post" action="/settings/ai/deepseek"><input type="hidden" name="ui_locale" value="{locale}" /><input id="deepseek-settings-action" type="hidden" name="action" value="save" />
 <label>{_escape(ui_text(locale, '模型', 'Model'))}</label>{model_options}
 <label>{_escape(ui_text(locale, '推理强度', 'Reasoning effort'))}<select id="deepseek-effort" name="deepseek_reasoning_effort">{effort_options}</select></label>
 <label class="check-row"><input type="checkbox" id="deepseek-thinking" name="deepseek_thinking" value="true" {thinking_checked} /><span><strong>{_escape(ui_text(locale, 'Thinking', 'Thinking'))}</strong><small>{_escape(ui_text(locale, '启用 / 禁用', 'Enabled / Disabled'))}</small></span></label>
-<div class="button-row"><button class="secondary" name="action" value="save" type="submit">{_escape(ui_text(locale, '保存模型设置', 'Save model settings'))}</button><button class="secondary" name="action" value="test" type="submit" {'disabled' if not deepseek_ready else ''}>{_escape(ui_text(locale, '测试连接', 'Test connection'))}</button><button class="secondary" name="action" value="use_default" type="submit" {'disabled' if not deepseek_ready else ''}>{_escape(ui_text(locale, '设为默认', 'Use as default'))}</button></div></form>
+<div class="button-row"><button class="secondary" data-deepseek-action="save" type="submit">{_escape(ui_text(locale, '保存模型设置', 'Save model settings'))}</button><button class="secondary" data-deepseek-action="test" type="submit" {'disabled' if not deepseek_ready else ''}>{_escape(ui_text(locale, '测试连接', 'Test connection'))}</button><button class="secondary" data-deepseek-action="use_default" type="submit" {'disabled' if not deepseek_ready else ''}>{_escape(ui_text(locale, '设为默认', 'Use as default'))}</button></div></form>
 <p id="deepseek-setup-status" role="status"></p>
 <details class="technical-details"><summary>{_escape(ui_text(locale, '高级信息', 'Advanced diagnostics'))}</summary>
 provider_id=deepseek · transport=responses · base_url={DEEPSEEK_BASE_URL} · model_id={_escape(preference.deepseek_model)} · context=1,000,000 · responses_api=yes · json_output=yes · tool_calling=yes · reasoning=low/high/max</details></section>"""
         current_url = "/settings/ai/deepseek"
         script = f"""
 const setup=document.getElementById('deepseek-setup');
+const settings=document.getElementById('deepseek-settings');
+if(settings) settings.addEventListener('submit',(event)=>{{
+  const action=document.getElementById('deepseek-settings-action');
+  const requested=event.submitter?.dataset?.deepseekAction;
+  if(action && requested) action.value=requested;
+}});
 if(setup) setup.addEventListener('submit',async(event)=>{{
   event.preventDefault();
   const status=document.getElementById('deepseek-setup-status');
