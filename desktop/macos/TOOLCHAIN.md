@@ -20,6 +20,12 @@ Build the app through the normal command:
 ./scripts/build_macos_app.sh
 ```
 
+This default developer build produces `SoloScale AI OS Dev.app`, captures branch and
+commit metadata from this exact worktree, and uses the distinct bundle identifier
+`local.soloscale.desktop.dev`. Use `SOLOSCALE_BUILD_KIND=production` only for an
+intentional production/release build; that path retains `SoloScale AI OS.app` and
+`local.soloscale.desktop`.
+
 The build script loads the same config, overrides ambient `DEVELOPER_DIR` and
 `SDKROOT`, then resolves Swift and the current macOS SDK through Xcode's `xcrun`. The
 preflight fails before compilation if Xcode drifts or any tool resolves outside that

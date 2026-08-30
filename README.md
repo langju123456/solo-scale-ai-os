@@ -156,8 +156,13 @@ uv pip install -e '.[dev,desktop]' -e packages/buildlog
 ./packaging/macos/build_backend_onedir.sh
 ./scripts/check_macos_toolchain.sh
 ./scripts/build_macos_app.sh
-open "desktop/macos/dist/SoloScale AI OS.app"
+open "desktop/macos/dist/SoloScale AI OS Dev.app"
 ```
+
+The canonical local build is stamped with its Git branch and short commit SHA and uses
+the development identity `local.soloscale.desktop.dev` / `SoloScale AI OS Dev`. An
+intentional production build must set `SOLOSCALE_BUILD_KIND=production`; this preserves
+the existing `local.soloscale.desktop` / `SoloScale AI OS` release identity.
 
 The Desktop build uses the pinned compiler and SDK declared in
 `desktop/macos/toolchain.env`; see `desktop/macos/TOOLCHAIN.md`. The preflight rejects

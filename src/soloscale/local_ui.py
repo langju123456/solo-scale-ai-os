@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -346,6 +346,41 @@ _DESKTOP_NONCE_RE = re.compile(r"[a-f0-9]{64}")
 _DESKTOP_BOOTSTRAP_PATH = "/__desktop/bootstrap"
 _DESKTOP_NONCE_HEADER = "X-SoloScale-Bootstrap-Nonce"
 _DESKTOP_PROOF_HEADER = "X-SoloScale-Bootstrap-Proof"
+
+
+@dataclass(frozen=True)
+class DesktopBuildIdentity:
+    app_version: str = "unknown"
+    build_number: str = "unknown"
+    build_kind: str = "unknown"
+    bundle_id: str = "unknown"
+    display_name: str = "unknown"
+    git_branch: str = "unknown"
+    git_commit: str = "unknown"
+    bundle_path: str = "unknown"
+
+
+def _desktop_build_identity(
+    environment: Mapping[str, str] | None = None,
+) -> DesktopBuildIdentity:
+    selected = os.environ if environment is None else environment
+
+    def value(key: str, *, maximum: int = 512) -> str:
+        raw = selected.get(key, "").strip()
+        if not raw or len(raw) > maximum or any(char in raw for char in "\x00\r\n"):
+            return "unknown"
+        return raw
+
+    return DesktopBuildIdentity(
+        app_version=value("SOLOSCALE_DESKTOP_APP_VERSION"),
+        build_number=value("SOLOSCALE_DESKTOP_BUILD_NUMBER"),
+        build_kind=value("SOLOSCALE_DESKTOP_BUILD_KIND"),
+        bundle_id=value("SOLOSCALE_DESKTOP_BUNDLE_ID"),
+        display_name=value("SOLOSCALE_DESKTOP_DISPLAY_NAME"),
+        git_branch=value("SOLOSCALE_DESKTOP_GIT_BRANCH"),
+        git_commit=value("SOLOSCALE_DESKTOP_GIT_COMMIT"),
+        bundle_path=value("SOLOSCALE_DESKTOP_BUNDLE_PATH", maximum=2048),
+    )
 
 
 @dataclass
@@ -6912,6 +6947,7 @@ def _page(
     form: dict[str, str],
     locale: UILocale = DEFAULT_UI_LOCALE,
     provider_notice: str | None = None,
+    build_identity: DesktopBuildIdentity | None = None,
 ) -> str:
     query = _escape(form.get("query", ""))
     source_kind = form.get("source_kind", "")
@@ -6923,6 +6959,7 @@ def _page(
         ModelProviderId.OLLAMA: ui_text(locale, "本地 AI", "Local AI"),
         ModelProviderId.OPENAI_COMPATIBLE: "OpenAI API",
     }[ai_preference.provider]
+    identity = build_identity or _desktop_build_identity()
     result_section = (
         f'<section class="card full result-wrap"><h2>{_escape(ui_text(locale, "最近一次运行", "Latest run"))}</h2>{_result_card(action_result, locale)}</section>'
         if action_result is not None
@@ -6985,6 +7022,20 @@ def _page(
       <h2>{_escape(ui_text(locale, '当前 AI 服务（只读诊断）', 'Current AI service (read-only diagnostic)'))}</h2>
       <p class="tool-description">{_escape(ui_text(locale, '显示当前默认服务与模型。连接、模型和密钥设置集中在独立页面。', 'Shows the current default service and model. Connection, model, and credential setup live on a dedicated page.'))}</p>
       <div class="provider-option"><span><strong>{_escape(ai_provider_name)}</strong><small>{_escape(ai_preference.model)}</small></span></div>
+    </section>
+
+    <section class="card full tool-card build-identity" data-build-kind="{_escape(identity.build_kind)}">
+      <span class="kicker">{_escape(ui_text(locale, '构建信息', 'Build identity'))}</span>
+      <h2>{_escape(identity.display_name)}</h2>
+      <p class="tool-description">{_escape(identity.app_version)} ({_escape(ui_text(locale, '构建', 'build'))} {_escape(identity.build_number)})</p>
+      <div class="provider-option"><span><strong>{_escape(ui_text(locale, '分支', 'Branch'))}</strong><small><code>{_escape(identity.git_branch)}</code></small></span></div>
+      <div class="provider-option"><span><strong>{_escape(ui_text(locale, '提交', 'Commit'))}</strong><small><code>{_escape(identity.git_commit)}</code></small></span></div>
+      <details class="technical-details">
+        <summary>{_escape(ui_text(locale, '高级构建诊断', 'Advanced build diagnostics'))}</summary>
+        <p>{_escape(ui_text(locale, '元数据来源', 'Metadata source'))}: <code>{_escape(ui_text(locale, '构建时写入 App bundle', 'embedded in the app bundle at build time'))}</code></p>
+        <p>{_escape(ui_text(locale, 'Bundle 标识', 'Bundle identifier'))}: <code>{_escape(identity.bundle_id)}</code></p>
+        <p>{_escape(ui_text(locale, 'Bundle 路径', 'Bundle path'))}: <code>{_escape(identity.bundle_path)}</code></p>
+      </details>
     </section>
 
     <aside class="notice full">{_escape(ui_text(locale, '简历生成在“找到机会”页面。这里的证据结果只用于核对，不会自动写进简历。', 'Resume generation lives on the Get the job page. Evidence results here are for verification and are never inserted into a resume automatically.'))}</aside>

@@ -56,6 +56,27 @@ private let releasesURL = URL(
     string: "https://github.com/langju123456/solo-scale-ai-os/releases/latest"
 )!
 
+private func bundleIdentityValue(_ key: String) -> String {
+    guard
+        let raw = Bundle.main.object(forInfoDictionaryKey: key) as? String,
+        !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else { return "unknown" }
+    return raw
+}
+
+private func desktopBuildEnvironment() -> [String: String] {
+    [
+        "SOLOSCALE_DESKTOP_APP_VERSION": bundleIdentityValue("CFBundleShortVersionString"),
+        "SOLOSCALE_DESKTOP_BUILD_NUMBER": bundleIdentityValue("CFBundleVersion"),
+        "SOLOSCALE_DESKTOP_BUILD_KIND": bundleIdentityValue("SoloScaleBuildKind"),
+        "SOLOSCALE_DESKTOP_BUNDLE_ID": Bundle.main.bundleIdentifier ?? "unknown",
+        "SOLOSCALE_DESKTOP_DISPLAY_NAME": bundleIdentityValue("CFBundleDisplayName"),
+        "SOLOSCALE_DESKTOP_GIT_BRANCH": bundleIdentityValue("SoloScaleGitBranch"),
+        "SOLOSCALE_DESKTOP_GIT_COMMIT": bundleIdentityValue("SoloScaleGitCommit"),
+        "SOLOSCALE_DESKTOP_BUNDLE_PATH": Bundle.main.bundlePath,
+    ]
+}
+
 private final class BootstrapRedirectBlocker: NSObject, URLSessionTaskDelegate {
     func urlSession(
         _ session: URLSession,
@@ -111,6 +132,7 @@ private final class BackendController: NSObject, ObservableObject {
                 "SOLOSCALE_DESKTOP_SESSION_TOKEN": token,
                 "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             ]
+            desktopEnvironment.merge(desktopBuildEnvironment()) { _, new in new }
             if let selectedExport = pendingChatGPTExport {
                 desktopEnvironment["SOLOSCALE_PENDING_CHATGPT_EXPORT"] = selectedExport.path
             }
