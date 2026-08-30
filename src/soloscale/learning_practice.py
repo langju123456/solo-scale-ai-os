@@ -518,9 +518,15 @@ def _evaluate_ci_cd_acceptance(workspace: Path) -> tuple[AttemptOutcome, str | N
             AttemptOutcome.NEEDS_WORK,
             "CI workflow validation failed — validate.py is missing",
         )
+    interpreter = _python_interpreter()
+    if interpreter is None:
+        return (
+            AttemptOutcome.NEEDS_WORK,
+            "CI workflow validation failed — no Python interpreter is available",
+        )
     try:
         completed = subprocess.run(
-            [sys.executable, str(validator)],
+            [interpreter, str(validator)],
             cwd=workspace,
             capture_output=True,
             text=True,
@@ -537,6 +543,20 @@ def _evaluate_ci_cd_acceptance(workspace: Path) -> tuple[AttemptOutcome, str | N
         reason = detail[0] if detail else f"exit code {completed.returncode}"
         return AttemptOutcome.NEEDS_WORK, f"CI workflow validation failed — {reason}"
     return AttemptOutcome.PASS, None
+
+
+def _python_interpreter() -> str | None:
+    """Resolve a CLI Python interpreter for running the generated validator.
+
+    Under a PyInstaller bundle ``sys.executable`` is the frozen application
+    binary, not Python. Source runs keep the active interpreter; packaged runs
+    fall back to ``python3`` on PATH (the validator only uses stdlib).
+    """
+
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    discovered = shutil.which("python3")
+    return discovered
 
 
 def ingest_practice_completion(
