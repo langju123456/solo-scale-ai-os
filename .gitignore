@@ -12,5 +12,8 @@ build/
 !.env.example
 .soloscale/
 private/
+client_secret_*.apps.googleusercontent.com.json
+**/integrations/youtube/client_secret.json
+**/integrations/youtube/tokens/*.json
 .DS_Store
 video_factory/node_modules/

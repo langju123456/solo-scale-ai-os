@@ -11,6 +11,7 @@ UILocale = Literal["zh-CN", "en"]
 DEFAULT_UI_LOCALE: UILocale = "zh-CN"
 SourceState = Literal[
     "READY",
+    "STALE",
     "PROCESSING",
     "AVAILABLE",
     "NOT_CONNECTED",
@@ -20,6 +21,7 @@ SourceState = Literal[
 
 _SOURCE_STATE_PRESENTATION: dict[SourceState, tuple[str, str, str]] = {
     "READY": ("✓", "已就绪", "Ready"),
+    "STALE": ("!", "需刷新", "Stale"),
     "PROCESSING": ("●", "处理中", "Processing"),
     "AVAILABLE": ("＋", "可添加", "Available"),
     "NOT_CONNECTED": ("○", "未连接", "Not connected"),
@@ -27,17 +29,78 @@ _SOURCE_STATE_PRESENTATION: dict[SourceState, tuple[str, str, str]] = {
     "NEEDS_ATTENTION": ("!", "需处理", "Needs attention"),
 }
 
+_UI_VALUE_PRESENTATION: dict[str, tuple[str, str]] = {
+    "UNKNOWN": ("未知", "Unknown"),
+    "ENGINEERING_VERIFIED": ("工程能力已验证", "Engineering verified"),
+    "VERIFIED_EVIDENCE": ("已验证证据", "Verified evidence"),
+    "APPROVED_CLAIM": ("已批准陈述", "Approved claim"),
+    "RAW_STATEMENT": ("原始陈述", "Raw statement"),
+    "DISTILLED_INSIGHT": ("提炼洞察", "Distilled insight"),
+    "DECISION": ("决策", "Decision"),
+    "IMPLEMENTED_CAPABILITY": ("已实现能力", "Implemented capability"),
+    "MASTERY_RECEIPT": ("掌握回执", "Mastery receipt"),
+    "personal_artifact": ("个人产物", "Personal artifact"),
+    "personal_context": ("个人背景", "Personal context"),
+    "external_knowledge": ("外部知识", "External knowledge"),
+    "outcome_receipt": ("结果回执", "Outcome receipt"),
+    "codex_session": ("Codex 对话", "Codex session"),
+    "chatgpt_export": ("ChatGPT 导出", "ChatGPT export"),
+    "buildlog_run": ("BuildLog 记录", "BuildLog run"),
+    "local_git": ("本地 Git", "Local Git"),
+    "succeeded": ("成功", "Succeeded"),
+    "failed": ("失败", "Failed"),
+    "L0 Seen": ("L0 · 已见过", "L0 · Seen"),
+    "L1 Explain": ("L1 · 能讲解", "L1 · Explain"),
+    "L2 Trace": ("L2 · 能追踪", "L2 · Trace"),
+    "L3 Rebuild": ("L3 · 能重建", "L3 · Rebuild"),
+    "L4 Debug": ("L4 · 能调试", "L4 · Debug"),
+    "L5 Defend": ("L5 · 能答辩", "L5 · Defend"),
+    "Explain": ("讲解", "Explain"),
+    "Trace": ("追踪", "Trace"),
+    "Rebuild": ("重建", "Rebuild"),
+    "Debug": ("调试", "Debug"),
+    "Defend": ("答辩", "Defend"),
+    "DRAFT": ("草稿", "Draft"),
+    "APPROVED": ("已批准", "Approved"),
+    "REJECTED": ("已拒绝", "Rejected"),
+    "PENDING": ("待处理", "Pending"),
+    "SUCCESS": ("已成功", "Success"),
+    "FAILED": ("失败", "Failed"),
+    "CANCELLED": ("已取消", "Cancelled"),
+    "TIMED_OUT": ("已超时", "Timed out"),
+    "STARTING": ("正在启动", "Starting"),
+    "WAITING": ("等待中", "Waiting"),
+    "WAITING_FOR_AUTHORIZATION": ("等待授权", "Waiting for authorization"),
+    "COMPLETING": ("正在完成", "Completing"),
+    "CONNECTED": ("已连接", "Connected"),
+    "ACTIVE": ("可用", "Active"),
+    "NOT_CONFIGURED": ("未配置", "Not configured"),
+    "REAUTH_REQUIRED": ("需要重新授权", "Reauthorization required"),
+    "REQUIRED_SETUP": ("需要设置", "Setup required"),
+    "MAPPED": ("已关联", "Mapped"),
+    "NEEDS_MAPPING": ("需要关联", "Needs mapping"),
+}
+
 _NAV_ITEMS: tuple[tuple[str, str, str, str], ...] = (
     ("home", "/", "首页", "Home"),
     ("resume", "/resume", "找到机会", "Get the job"),
     ("learning", "/learning", "面试准备", "Defend the job"),
-    ("content", "/content", "建立影响力", "Build visibility"),
+    ("content", "/creator", "建立影响力", "Build visibility"),
 )
 _MORE_ITEMS: tuple[tuple[str, str, str, str], ...] = (
     ("work", "/work", "我的工作资料", "Your work"),
     ("video", "/video", "创建视频", "Create video"),
-    ("publishing", "/publishing", "发布内容", "Publish content"),
+    ("publishing", "/creator/publish", "发布内容", "Publish content"),
     ("advanced", "/advanced", "设置与高级工具", "Settings & advanced"),
+)
+
+_CREATOR_ITEMS: tuple[tuple[str, str, str, str], ...] = (
+    ("overview", "/creator", "总览", "Overview"),
+    ("accounts", "/creator/accounts", "账号", "Accounts"),
+    ("stories", "/creator/stories", "故事库", "Story Bank"),
+    ("create", "/creator/create", "创作", "Create"),
+    ("publish", "/creator/publish", "发布队列", "Publish Queue"),
+    ("history", "/creator/history", "历史与成本", "History / Cost"),
 )
 
 
@@ -49,6 +112,23 @@ def normalize_ui_locale(value: str | None) -> UILocale:
 def ui_text(locale: UILocale, chinese: str, english: str) -> str:
     """Select already-authored interface copy without translating domain artifacts."""
     return chinese if locale == "zh-CN" else english
+
+
+def ui_bool(locale: UILocale, value: bool) -> str:
+    """Render a boolean as interface copy without changing its stored value."""
+
+    return ui_text(locale, "是" if value else "否", "Yes" if value else "No")
+
+
+def ui_display_value(locale: UILocale, value: object) -> str:
+    """Localize a known internal value while preserving unknown user/source content."""
+
+    if isinstance(value, bool):
+        return ui_bool(locale, value)
+    raw_value = getattr(value, "value", value)
+    key = str(raw_value)
+    copies = _UI_VALUE_PRESENTATION.get(key)
+    return ui_text(locale, *copies) if copies is not None else key
 
 
 def ui_url(path: str, locale: UILocale, **query: str) -> str:
@@ -70,10 +150,29 @@ def render_source_state(state: SourceState, locale: UILocale) -> str:
     css_state = state.casefold().replace("_", "-")
     return (
         f'<span class="source-state source-state-{css_state}" '
-        f'data-source-state="{state}" title="{state}" '
+        f'data-source-state="{state}" title="{html.escape(label, quote=True)}" '
         f'aria-label="{html.escape(label)}">'
         f'<span class="source-state-symbol" aria-hidden="true">{symbol}</span>'
         f"<span>{html.escape(label)}</span></span>"
+    )
+
+
+def render_creator_nav(*, active: str, locale: UILocale) -> str:
+    """Render the stable Creator workspace information architecture."""
+    links = []
+    for key, path, chinese, english in _CREATOR_ITEMS:
+        current = key == active
+        aria_current = ' aria-current="page"' if current else ""
+        links.append(
+            f'<a class="creator-link{" active" if current else ""}" '
+            f'href="{ui_url(path, locale)}"'
+            f"{aria_current}>"
+            f'{html.escape(ui_text(locale, chinese, english))}</a>'
+        )
+    return (
+        f'<nav class="creator-nav" aria-label="{html.escape(ui_text(locale, "创作者工作区", "Creator workspace"))}">'
+        + "".join(links)
+        + "</nav>"
     )
 
 
@@ -178,6 +277,12 @@ a { color:var(--brand); }
   box-shadow:var(--shadow-card); }
 .more-link { width:100%; }
 .locale-switch { border:1px solid var(--border); min-width:48px; justify-content:center; }
+.creator-nav { display:flex; gap:6px; margin:-18px 0 28px; padding:6px; overflow-x:auto;
+  border:1px solid var(--border); border-radius:15px; background:var(--surface-subtle); }
+.creator-link { min-height:40px; display:flex; align-items:center; flex:0 0 auto; padding:0 12px;
+  border-radius:10px; color:var(--text-muted); text-decoration:none; font-size:13px; font-weight:800; }
+.creator-link:hover,.creator-link.active { color:var(--brand); background:var(--surface);
+  box-shadow:0 1px 4px rgb(34 44 75 / 9%); }
 .app-hero { max-width:800px; margin:0 auto 34px; text-align:center; }
 .app-hero.compact { max-width:none; margin:0 0 24px; text-align:left; }
 .eyebrow,.kicker,.result-kicker { color:var(--brand); font-size:12px; font-weight:850;
@@ -227,7 +332,7 @@ button:hover,.primary:hover,.primary-button:hover,.button-link:hover { backgroun
 .source-state-symbol { min-width:12px; text-align:center; font-size:13px; line-height:1; }
 .source-state-ready { background:var(--success-soft); color:var(--success); }
 .source-state-processing,.source-state-available { background:var(--brand-soft); color:var(--brand); }
-.source-state-needs-attention { background:var(--warning-soft); color:var(--warning); }
+.source-state-stale,.source-state-needs-attention { background:var(--warning-soft); color:var(--warning); }
 pre,code { overflow-wrap:anywhere; }
 pre { white-space:pre-wrap; padding:16px; border:1px solid var(--border); border-radius:14px;
   background:#fafbfc; color:#2c3548; }

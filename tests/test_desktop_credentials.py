@@ -11,6 +11,8 @@ from soloscale.desktop_credentials import (
     _frame_for_tests,
     configure_desktop_credentials_from_stdin,
     configure_openai_credential_from_stdin,
+    github_access_token,
+    github_access_token_is_configured,
     heygen_api_key,
     heygen_api_key_is_configured,
     openai_api_key,
@@ -32,12 +34,15 @@ def test_desktop_credential_frame_supports_empty_and_process_memory_values() -> 
         {
             "schema_version": "1.0",
             "openai_api_key": "synthetic-openai-key",
+            "github_access_token": "synthetic-github-token",
             "heygen_api_key": "synthetic-heygen-key",
         },
         sort_keys=True,
     ).encode()
     configure_desktop_credentials_from_stdin(_frame_for_tests(envelope))
     assert openai_api_key() == "synthetic-openai-key"
+    assert github_access_token_is_configured() is True
+    assert github_access_token() == "synthetic-github-token"
     assert heygen_api_key_is_configured() is True
     assert heygen_api_key() == "synthetic-heygen-key"
     _clear_for_tests()

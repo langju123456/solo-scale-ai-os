@@ -137,5 +137,23 @@ class ContentRun(_StrictModel):
     editorial_provenance: list[EditorialProvenance] = Field(default_factory=list)
     network_used: bool = False
     model_used: bool = False
+    execution_state: Literal["AI_EXECUTED", "AI_NOT_EXECUTED"] = "AI_NOT_EXECUTED"
+    model_calls: int = Field(default=0, ge=0, le=8)
+    token_usage: dict[str, int] | None = None
+    latency_ms: int | None = Field(default=None, ge=0)
+    cost_usd: float | None = Field(default=None, ge=0)
+    fallback_used: bool = False
     publication_performed: Literal[False] = False
     limitations: list[str]
+
+    @model_validator(mode="after")
+    def execution_truth_is_consistent(self) -> ContentRun:
+        if self.execution_state == "AI_NOT_EXECUTED" and self.model_calls != 0:
+            raise ValueError("AI_NOT_EXECUTED requires model_calls == 0")
+        if self.execution_state == "AI_EXECUTED" and self.model_calls == 0:
+            raise ValueError("AI_EXECUTED requires at least one model call")
+        if self.model_calls == 0 and (
+            self.token_usage is not None or self.latency_ms is not None
+        ):
+            raise ValueError("model_calls == 0 cannot carry model performance metadata")
+        return self

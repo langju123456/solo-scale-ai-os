@@ -1,12 +1,14 @@
 import json
 import os
-from datetime import UTC, datetime
+import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from soloscale.content_models import ContentReviewDecision
 from soloscale.content_scan import scan_recent_work
 from soloscale.content_ui import ContentFormStatus, content_page, run_content_form
 from soloscale.content_workspace import load_content_run, save_content_review
+from soloscale.creator_production import CreatorProductionJob, CreatorProductionRequest
 from soloscale.media_quality import MediaQualityChecklist, save_media_quality_review
 
 
@@ -81,9 +83,9 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     assert f"/content/downloads/{result.run_id}/linkedin.md" in page
     assert f"/content/downloads/{result.run_id}/video-script.md" in page
     assert "已私有保存" in page
-    assert "Editorial provenance" in page
+    assert "编辑流程溯源" in page
     assert "deterministic-content-template-v1" in page
-    assert "Writer → Fresh Reviewer → Reviser" in page
+    assert "流程：撰写 → 独立复核 → 修订 → 人工发布确认。" in page
     assert "没有连接或操作你的社交账号" in page
     assert result.run_id in page
     assert _form()["topic"] in page
@@ -97,7 +99,7 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     assert "可复用人物素材 · 0" in page
     assert "新 Avatar 3" in page
     assert f'action="/content/review/{result.run_id}"' in page
-    assert "先批准这个统一内容包" in page
+    assert "/content/buildlog/" not in page
 
     rendering = content_page(
         data_root=data_root,
@@ -114,8 +116,7 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
         decision=ContentReviewDecision.APPROVED,
     )
     approved = content_page(data_root=data_root, run_id=result.run_id)
-    assert "已批准内容包，可以进入精确发布预览" in approved
-    assert f'action="/content/buildlog/{result.run_id}/linkedin"' in approved
+    assert f'action="/content/buildlog/{result.run_id}/linkedin"' not in approved
     assert "先生成 YouTube 与 Short 成片" in approved
 
     english = content_page(
@@ -152,6 +153,14 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
     legacy_package.write_text("{}", encoding="utf-8")
     legacy_page = content_page(data_root=data_root, run_id=result.run_id)
     assert "media-quality-review.json" not in legacy_page
+    assert (
+        f'href="/creator/publish?run_id={result.run_id}&lang=zh-CN"'
+        in legacy_page
+    )
+    assert f'data-approved-artifact="{result.run_id}"' in legacy_page
+    assert "将发布已审核版本" in legacy_page
+    assert "/content/buildlog/" not in legacy_page
+    assert 'name="verified_claims" required' in legacy_page
     legacy_package.unlink()
 
     save_media_quality_review(
@@ -169,8 +178,8 @@ def test_content_form_generates_preview_copy_and_downloads(tmp_path: Path) -> No
         ),
     )
     quality_approved = content_page(data_root=data_root, run_id=result.run_id)
-    assert "Human Media Quality" in quality_approved
-    assert "APPROVED · r1" in quality_approved
+    assert "人工媒体质量" in quality_approved
+    assert "已批准 · r1" in quality_approved
     assert f'action="/content/distribution/{result.run_id}"' in quality_approved
 
     rerendered = content_page(data_root=data_root, run_id=result.run_id)
@@ -250,3 +259,142 @@ def test_content_page_scans_metadata_and_prefills_selected_candidate(
     assert "14 unsupported job requirements" in page
     assert 'name="generation_mode" value="template"' in page
     assert str(tmp_path) not in page
+
+
+def test_creator_page_shares_canonical_work_project_context(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    project = tmp_path / "selected-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    (project / "feature.txt").write_text("verified feature", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "feature.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(project),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "feat: add verified local project evidence",
+        ],
+        check=True,
+    )
+
+    connected = content_page(
+        data_root=data_root,
+        repository_root=project,
+        workspace_view="create",
+        locale="zh-CN",
+    )
+    assert "1 个本地项目" in connected
+
+    disconnected = content_page(
+        data_root=data_root,
+        repository_root=None,
+        workspace_view="create",
+        locale="zh-CN",
+    )
+    assert "1 个本地项目" not in disconnected
+
+
+def test_creator_page_uses_singular_english_project_copy(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    project = tmp_path / "selected-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    (project / "feature.txt").write_text("verified feature", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "feature.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(project),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "feat: add verified local project evidence",
+        ],
+        check=True,
+    )
+
+    page = content_page(
+        data_root=data_root,
+        repository_root=project,
+        workspace_view="create",
+        locale="en",
+    )
+    assert "1 local project" in page
+    assert "1 local projects" not in page
+
+
+def test_template_job_displays_zero_model_calls_and_stable_elapsed(
+    tmp_path: Path,
+) -> None:
+    created = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
+    job = CreatorProductionJob(
+        job_id="creator-job-display",
+        content_project_id="project-display",
+        request=CreatorProductionRequest(
+            source_kind="STORY",
+            source_story_id="M1-13",
+            outputs=["ARTICLE"],
+            language="中文",
+            ai_editorial=False,
+        ),
+        phase="READY",
+        created_at=created.isoformat(),
+        updated_at=(created + timedelta(seconds=7)).isoformat(),
+        stage="Artifacts sealed",
+        provider="template",
+        model=None,
+        model_calls=0,
+    )
+    page = content_page(
+        data_root=tmp_path / ".soloscale",
+        creator_job=job,
+        workspace_view="create",
+        locale="zh-CN",
+    )
+    assert "模型调用: 0" in page
+    assert "已用时: 7s" in page
+
+
+def test_creator_job_error_cause_shows_actionable_voice_message(
+    tmp_path: Path,
+) -> None:
+    created = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
+    job = CreatorProductionJob(
+        job_id="creator-job-voice",
+        content_project_id="project-voice",
+        request=CreatorProductionRequest(
+            source_kind="STORY",
+            source_story_id="M1-13",
+            outputs=["VIDEO"],
+            language="中文",
+            ai_editorial=False,
+        ),
+        phase="FAILED",
+        created_at=created.isoformat(),
+        updated_at=created.isoformat(),
+        stage="Failed",
+        provider="template",
+        model=None,
+        model_calls=0,
+        error_code="CREATORVIDEOERROR",
+        error_cause="VOICE_NOT_CONFIGURED",
+    )
+    page = content_page(
+        data_root=tmp_path / ".soloscale",
+        creator_job=job,
+        workspace_view="create",
+        locale="zh-CN",
+    )
+    assert "未配置可用的语音服务" in page
+    assert "CREATORVIDEOERROR" not in page

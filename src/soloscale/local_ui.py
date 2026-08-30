@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from email import policy
@@ -28,15 +28,17 @@ from email.parser import BytesParser
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
-from soloscale.buildlog_handoff import (
-    BuildLogHandoffError,
-    Channel,
-    preview_for_buildlog,
-    publish_via_buildlog,
+from soloscale.application_record import (
+    ApplicationStatus,
+    list_application_records,
+    update_application_status,
 )
+from soloscale.casebook_models import EvidenceKind, LearningCase
+from soloscale.casebook_store import CasebookError, CasebookStore
+from soloscale.content_canon import load_month_one_canon
 from soloscale.content_distribution import (
     ContentDistributionError,
     prepare_distribution_package,
@@ -48,6 +50,7 @@ from soloscale.content_ui import (
     editorial_publishing_page,
     run_content_form,
     run_month_one_story,
+    run_story_candidate,
 )
 from soloscale.content_workspace import (
     ContentWorkspaceError,
@@ -56,9 +59,25 @@ from soloscale.content_workspace import (
     load_content_run,
     save_content_review,
 )
+from soloscale.creator_accounts import (
+    CreatorAccountError,
+    creator_accounts_page,
+    normalize_account,
+    save_creator_account,
+)
+from soloscale.creator_production import (
+    CreatorProductionError,
+    CreatorProductionJob,
+    CreatorProductionJobManager,
+    CreatorProductionRequest,
+    assign_artifact_to_account,
+)
+from soloscale.creator_workspace import creator_history_page, creator_overview_page
 from soloscale.desktop_credentials import (
     DesktopCredentialError,
     configure_desktop_credentials_from_stdin,
+    github_access_token,
+    github_access_token_is_configured,
     heygen_api_key_is_configured,
     openai_api_key,
     openai_api_key_is_configured,
@@ -70,19 +89,46 @@ from soloscale.editorial_publishing_handoff import (
     preview_editorial_day,
     publish_editorial_preview,
 )
-from soloscale.evidence_hub import EvidenceHubError
-from soloscale.evidence_ui import evidence_page, refresh_evidence_catalog
+from soloscale.evidence_hub import EvidenceHub, EvidenceHubError
+from soloscale.evidence_ui import (
+    ensure_local_project_evidence,
+    evidence_page,
+    refresh_evidence_catalog,
+)
+from soloscale.github_connect import (
+    GitHubConnectError,
+    GitHubConnectionState,
+    GitHubConnectionStore,
+    GitHubReadOnlyClient,
+)
 from soloscale.integration_status import connected_service_statuses
 from soloscale.knowledge_models import RetrievalHit
 from soloscale.knowledge_store import (
-    InvalidKnowledgeQueryError,
     KnowledgeStore,
     KnowledgeStoreError,
 )
+from soloscale.learning_practice import (
+    ExerciseStatus,
+    ExerciseType,
+    LearningExercise,
+    PracticeLanguage,
+    capability_requirement,
+    create_practice_workspace,
+    generate_practice_exercise,
+    ingest_practice_completion,
+    list_exercises,
+    load_exercise,
+    open_practice_workspace,
+    practice_workspace_root,
+    save_exercise,
+)
 from soloscale.learning_traceability import (
     DEFAULT_TARGET_REQUIREMENT,
+    LearningFixtureAnchorError,
     LearningTraceabilityError,
+    inspect_learning_project,
     load_interview_anchor_pack,
+    missing_learning_case_anchors,
     run_learning_traceability,
     save_learning_response,
 )
@@ -112,6 +158,17 @@ from soloscale.model_gateway import (
     ModelProviderId,
     model_gateway_for,
 )
+from soloscale.platform_accounts import (
+    PROVIDERS,
+    PlatformAccountError,
+    cancel_authorization_attempt,
+    complete_authorization_response,
+    disconnect_identity,
+    load_authorization_attempt,
+    load_developer_config,
+    save_developer_config,
+    start_authorization_attempt,
+)
 from soloscale.presenter_assets import (
     MAX_PRESENTER_ASSET_BYTES,
     PresenterAssetCategory,
@@ -130,11 +187,16 @@ from soloscale.resume_docx import (
     ResumeTemplateError,
     TailoredDocx,
     apply_resume_expert_review,
+    apply_resume_template_structure,
     extract_candidate_profile,
     read_template_paragraphs,
     request_resume_expert_review,
     tailor_resume_docx,
     tailor_resume_docx_with_gateway,
+)
+from soloscale.resume_evidence_pack import (
+    build_candidate_evidence_pack,
+    build_resume_evidence_retrieval_trace,
 )
 from soloscale.resume_gateway_boundary import (
     ExtractedResumeUpload,
@@ -151,10 +213,19 @@ from soloscale.resume_models import (
     InterviewDefenseRecord,
     ResumeClaimProvenance,
     ResumeClaimVerificationStatus,
+    ResumeExpertReviewResult,
     ResumeHiringSignalReceipt,
     ResumeMode,
     ResumeProvenanceReceipt,
     build_resume_atomic_facts,
+)
+from soloscale.resume_template_intake import (
+    ResumeTemplateReceipt,
+    detect_resume_language,
+    inspect_template_file,
+    inspect_template_html,
+    inspect_template_url,
+    template_metadata_from_receipt,
 )
 from soloscale.resume_workspace import (
     ResumeWorkspaceStorageError,
@@ -166,11 +237,19 @@ from soloscale.resume_workspace import (
 )
 from soloscale.resume_workspace import run_resume_workspace as execute_resume_workspace
 from soloscale.runtime_paths import resolve_runtime_paths, source_data_root
+from soloscale.story_mining import (
+    StoryCandidate,
+    StoryMiningError,
+    load_story_candidates,
+    mine_story_candidates,
+)
 from soloscale.ui_shell import (
     DEFAULT_UI_LOCALE,
     UILocale,
     normalize_ui_locale,
     render_app_shell,
+    ui_bool,
+    ui_display_value,
     ui_text,
     ui_url,
 )
@@ -180,6 +259,7 @@ from soloscale.video_factory import (
     creator_video_runtime_available,
     import_avatar_segment,
     prepare_heygen_handoff,
+    render_creator_video,
 )
 from soloscale.video_generation import (
     GoogleVeoClient,
@@ -198,14 +278,23 @@ from soloscale.video_story import (
     local_video_download_names,
 )
 from soloscale.work_ui import (
+    CodexImportJobManager,
     WorkContextError,
+    github_repositories_page,
     import_chatgpt_export,
     import_chatgpt_export_bytes,
-    import_codex_history,
     load_work_context,
+    preflight_work_sources,
+    refresh_selected_knowledge_sources,
+    refresh_work_source,
     render_use_my_work,
     render_work_context_strip,
     work_page,
+)
+from soloscale.youtube_publishing import (
+    YouTubePublishingError,
+    YouTubePublishingJobManager,
+    normalize_upload_request,
 )
 
 COMMAND_TIMEOUT_SECONDS = 120
@@ -290,8 +379,10 @@ class ResumeJobManager:
         files: dict[str, UploadedFile],
         data_root: Path,
         repo_root: Path,
+        evidence_repository_root: Path | None = None,
         gateway: ModelGateway | None,
         expert_gateway: ModelGateway | None = None,
+        template_receipt: ResumeTemplateReceipt | None = None,
         allow_persistent_storage: bool = False,
         initial_timings_ms: dict[str, int] | None = None,
     ) -> str:
@@ -313,8 +404,10 @@ class ResumeJobManager:
             dict(files),
             data_root,
             repo_root,
+            evidence_repository_root,
             gateway,
             expert_gateway,
+            template_receipt,
             allow_persistent_storage,
         )
         return job_id
@@ -355,8 +448,10 @@ class ResumeJobManager:
         files: dict[str, UploadedFile],
         data_root: Path,
         repo_root: Path,
+        evidence_repository_root: Path | None,
         gateway: ModelGateway | None,
         expert_gateway: ModelGateway | None,
+        template_receipt: ResumeTemplateReceipt | None,
         allow_persistent_storage: bool,
     ) -> None:
         def progress(phase: str) -> None:
@@ -371,8 +466,10 @@ class ResumeJobManager:
                 files,
                 data_root,
                 repo_root,
+                evidence_repository_root=evidence_repository_root,
                 gateway=gateway,
                 expert_gateway=expert_gateway,
+                template_receipt=template_receipt,
                 allow_persistent_storage=allow_persistent_storage,
                 create_preview=False,
                 progress=progress,
@@ -415,7 +512,7 @@ class ResumeJobManager:
                 job_id,
                 "COMPLETE",
                 result=completed,
-                preview_state="ready" if preview_created else "unavailable",
+                preview_state="ready" if preview_created else "needs_attention",
             )
             snapshot = self.get(job_id)
             if snapshot is not None:
@@ -730,6 +827,48 @@ def _gateway_from_preference(preference: AIProviderPreference) -> ModelGateway:
     return model_gateway_for(preference.provider)
 
 
+def _preference_provider_configured(preference: AIProviderPreference) -> bool:
+    if preference.provider is ModelProviderId.OLLAMA:
+        return _ollama_readiness(preference).ready
+    if preference.provider is ModelProviderId.OPENAI_COMPATIBLE:
+        return openai_api_key_is_configured()
+    return (
+        model_gateway_for(ModelProviderId.SOLOSCALE_HOSTED).descriptor.configuration_state
+        is GatewayConfigurationState.CONFIGURED
+    )
+
+
+def _creator_generation_mode(
+    preference: AIProviderPreference, form: dict[str, str], source_kind: str
+) -> str:
+    """Resolve one truthful generation mode for a Creator production request.
+
+    A Story/Canon action has no inline mode selector, so when the saved provider is
+    not configured we fall back to the deterministic template instead of showing a
+    confusing AI_NOT_EXECUTED with no durable package.
+    """
+
+    explicit = form.get("generation_mode", "").strip()
+    if explicit:
+        return explicit
+    if source_kind == "STORY" and not _preference_provider_configured(preference):
+        return "template"
+    return preference.provider.value
+
+
+def _creator_job_provider_metadata(
+    preference: AIProviderPreference, generation_mode: str
+) -> tuple[str | None, str | None]:
+    if generation_mode == "template":
+        return "template", None
+    if generation_mode == ModelProviderId.OLLAMA.value:
+        return ModelProviderId.OLLAMA.value, preference.ollama_model
+    if generation_mode == ModelProviderId.OPENAI_COMPATIBLE.value:
+        return ModelProviderId.OPENAI_COMPATIBLE.value, preference.openai_model
+    hosted_model = model_gateway_for(ModelProviderId.SOLOSCALE_HOSTED).descriptor.model
+    return ModelProviderId.SOLOSCALE_HOSTED.value, hosted_model
+
+
 def _ollama_cli_path() -> str | None:
     discovered = shutil.which("ollama")
     if discovered:
@@ -808,6 +947,10 @@ def _local_video_panel(
   {availability}
   <form method="post" action="/video/local/render">
     <input type="hidden" name="ui_locale" value="{locale}" />
+    <label>{_escape(ui_text(locale, '内容包 run_id（可选）', 'Content run ID (optional)'))}
+      <input name="content_run_id" placeholder="content-2026…" />
+    </label>
+    <p class="muted">{_escape(ui_text(locale, '填写后直接从该内容包渲染视频脚本与分镜，不再重新录入事实；留空则使用本地工程故事。', 'When filled, renders that content package video script and storyboard downstream without re-entering facts; empty keeps the local engineering story.'))}</p>
     <button class="primary"{disabled}>{_escape(ui_text(locale, "生成本地视频", "Render local video"))}</button>
   </form>
 </section>'''
@@ -869,9 +1012,24 @@ def _video_page(
     *,
     local_job: LocalVideoJobSnapshot | None = None,
     local_video_available: bool = False,
+    content_run_id: str | None = None,
+    content_data_root: Path | None = None,
 ) -> str:
     job = load_job(data_root, job_id) if job_id else None
     configuration = provider_status()
+    downstream_run = None
+    downstream_notice = ""
+    if content_run_id and content_data_root is not None:
+        try:
+            downstream_run = load_content_run(content_data_root, content_run_id)
+        except ContentWorkspaceError:
+            downstream_run = None
+    topic_value = ""
+    script_value = ""
+    if downstream_run is not None:
+        topic_value = downstream_run.brief.topic
+        script_value = downstream_run.drafts.video_script
+        downstream_notice = f'''<p class="notice" role="status">{_escape(ui_text(locale, '这是下游视频生产页；主题与分镜已从上游内容包带入，无需重新录入。', 'This is the downstream video production page; topic and storyboard are carried over from the upstream content package and do not need to be re-entered.'))} <a href="{ui_url('/creator/create', locale, run_id=content_run_id or '')}">{_escape(ui_text(locale, '打开上游内容包', 'Open upstream package'))} →</a></p>'''
     detail = ""
     if job:
         outgoing = html.escape(json.dumps(job.request.external_payload(), indent=2), quote=True)
@@ -911,15 +1069,17 @@ def _video_page(
 <section class="card">
   <div class="provider-row"><span>Google Vertex AI · Veo</span><span class="status-badge">{_escape(configuration)}</span></div>
   {message}
+  {downstream_notice}
   <form method="post" action="/video/prepare">
     <input type="hidden" name="ui_locale" value="{locale}" />
-    <label>{_escape(ui_text(locale, '主题', 'Topic'))}<input name="topic" required></label>
-    <label>{_escape(ui_text(locale, '脚本或视频设计文档', 'Script or video design document'))}<textarea name="script" required></textarea></label>
+    <input type="hidden" name="content_run_id" value="{_escape(content_run_id or '')}" />
+    <label>{_escape(ui_text(locale, '主题', 'Topic'))}<input name="topic" value="{_escape(topic_value)}" required></label>
+    <label>{_escape(ui_text(locale, '脚本或视频设计文档', 'Script or video design document'))}<textarea name="script" required>{_escape(script_value)}</textarea></label>
     <details>
       <summary>{_escape(ui_text(locale, '可选：证据与来源', 'Optional: evidence and source'))}</summary>
       <label>{_escape(ui_text(locale, '证据 ID（每行一个）', 'Evidence IDs (one per line)'))}<textarea name="evidence_ids"></textarea></label>
       <label>{_escape(ui_text(locale, '明确选择的证据摘录（每行一个）', 'Explicitly selected evidence excerpts (one per line)'))}<textarea name="evidence_excerpts"></textarea></label>
-      <label>SoloScale content run ID<input name="content_run_id"></label>
+      <label>SoloScale content run ID<input name="content_run_id" value="{_escape(content_run_id or '')}"></label>
     </details>
     <div class="video-settings">
       <label>{_escape(ui_text(locale, '平台', 'Platform'))}<input name="platform" value="Short video"></label>
@@ -1014,15 +1174,6 @@ def _desktop_bootstrap_response_proof(
         f"POST\n{_DESKTOP_BOOTSTRAP_PATH}\n200\n{url}\n{pid}\n{nonce}\n{cookie_hash}"
     ).encode()
     return hmac.new(token.encode(), payload, hashlib.sha256).hexdigest()
-
-
-def _is_supported_learning_repository(repository_root: Path) -> bool:
-    """Return true only for a real SoloScale Git checkout used by Learning traces."""
-    return (
-        (repository_root / ".git").exists()
-        and (repository_root / "pyproject.toml").is_file()
-        and (repository_root / "src" / "soloscale" / "knowledge_store.py").is_file()
-    )
 
 
 def _resolve_soloscale_command() -> tuple[list[str], dict[str, str]]:
@@ -1247,6 +1398,44 @@ def _new_resume_candidate_recorder(
     return path, record
 
 
+def _expert_review_candidate_artifact(
+    review: ResumeExpertReviewResult | None,
+    *,
+    status: Literal["PENDING_VALIDATION", "VALIDATED", "REJECTED"],
+    failure_code: str | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "candidate_kind": "RESUME_EXPERT_REVIEW_PATCH",
+        "status": status,
+        "submission_status": "NOT_FOR_SUBMISSION",
+        "label": (
+            "REJECTED / NOT FOR SUBMISSION"
+            if status == "REJECTED"
+            else "EXPERT PATCH / NOT FOR SUBMISSION"
+        ),
+        "structured_candidate": (
+            review.model_dump(mode="json") if review is not None else None
+        ),
+        "failure_code": failure_code,
+    }
+
+
+def _expert_review_failure_code(error: Exception) -> str:
+    if isinstance(error, ModelGatewayNotConfigured):
+        return "EXPERT_REVIEW_UNAVAILABLE"
+    if isinstance(error, ModelGatewayTransportError):
+        return "EXPERT_REVIEW_TRANSPORT_FAILED"
+    if isinstance(error, ModelGatewayInvalidResponse):
+        return "EXPERT_REVIEW_INVALID_RESPONSE"
+    message = str(error)
+    if "does not match the approved draft" in message:
+        return "EXPERT_PATCH_SOURCE_MISMATCH"
+    if "unsupported factual claims" in message:
+        return "EXPERT_PATCH_UNSUPPORTED_FACT"
+    return "EXPERT_PATCH_REVALIDATION_FAILED"
+
+
 def _find_soffice() -> str | None:
     candidates = [
         os.environ.get("SOLOSCALE_SOFFICE"),
@@ -1333,41 +1522,75 @@ def _user_resume_filename(
     )
 
 
-def _bisect_evidence_query(query: str) -> tuple[str, ...]:
-    """Split an invalid store query without dropping any JD content."""
-    words = query.split()
-    if len(words) > 1:
-        midpoint = len(words) // 2
-        return (" ".join(words[:midpoint]), " ".join(words[midpoint:]))
-    if len(query) > 1:
-        midpoint = len(query) // 2
-        return (query[:midpoint], query[midpoint:])
-    return ()
+def _resume_variant_filename(
+    filename: str,
+    output_locale: Literal["en-US", "zh-CN"],
+    *,
+    include_locale: bool,
+) -> str:
+    if not include_locale:
+        return filename
+    path = Path(filename)
+    return f"{path.stem}_{output_locale}{path.suffix}"
 
 
-def _search_evidence_query(store: KnowledgeStore, query: str) -> list[RetrievalHit]:
-    """Search a complete JD fragment, automatically batching store-safe queries."""
-    normalized = " ".join(query.split())
-    if not normalized:
-        return []
-    try:
-        return store.search(normalized, limit=3)
-    except InvalidKnowledgeQueryError:
-        parts = _bisect_evidence_query(normalized)
-        if not parts:
-            return []
-        hits: list[RetrievalHit] = []
-        for part in parts:
-            hits.extend(_search_evidence_query(store, part))
-        return hits
+_JOB_EVIDENCE_PRIORITY_TERMS = (
+    "python",
+    "rag",
+    "retrieval",
+    "reranking",
+    "embeddings",
+    "agentic",
+    "structured",
+    "evaluation",
+    "fastapi",
+    "flask",
+    "django",
+    "vertex",
+    "gcp",
+    "aws",
+    "postgresql",
+    "observability",
+    "monitoring",
+    "cicd",
+)
+_JOB_EVIDENCE_STOPWORDS = {
+    "and",
+    "the",
+    "with",
+    "using",
+    "experience",
+    "knowledge",
+    "understanding",
+    "applications",
+    "development",
+    "related",
+    "quality",
+}
+
+
+def _job_evidence_query(job_description: str) -> str:
+    """Build one bounded discovery query instead of scanning once per JD line."""
+
+    observed = list(
+        dict.fromkeys(
+            token.casefold()
+            for token in re.findall(r"[A-Za-z][A-Za-z0-9+#./-]{2,}", job_description)
+        )
+    )
+    selected = [term for term in _JOB_EVIDENCE_PRIORITY_TERMS if term in observed]
+    selected.extend(
+        token
+        for token in observed
+        if token not in selected and token not in _JOB_EVIDENCE_STOPWORDS
+    )
+    return " ".join(selected[:8])
 
 
 def _search_job_evidence(job_description: str, data_root: Path) -> list[RetrievalHit]:
     store = KnowledgeStore(data_root)
-    hits: list[RetrievalHit] = []
-    for requirement in job_description.splitlines():
-        hits.extend(_search_evidence_query(store, requirement))
-    return list({hit.chunk_id: hit for hit in hits}.values())
+    query = _job_evidence_query(job_description)
+    return store.search(query, limit=8) if query else []
 
 
 def _record_resume_event(
@@ -1674,20 +1897,58 @@ def _write_resume_expert_review_receipt(
     run_dir: Path,
     tailored: TailoredDocx,
 ) -> str | None:
-    if tailored.expert_review is None:
+    if not tailored.expert_review_attempted and tailored.expert_review is None:
         return None
     path = run_dir / "13_expert_review.json"
+    skipped_status = {
+        "EXPERT_PATCH_SOURCE_MISMATCH": "SKIPPED_DRAFT_MISMATCH",
+        "EXPERT_PATCH_UNSUPPORTED_FACT": "SKIPPED_UNSUPPORTED_FACT",
+        "EXPERT_PATCH_REVALIDATION_FAILED": "SKIPPED_REVALIDATION",
+        "EXPERT_REVIEW_UNAVAILABLE": "SKIPPED_UNAVAILABLE",
+        "EXPERT_REVIEW_TRANSPORT_FAILED": "SKIPPED_TRANSPORT",
+        "EXPERT_REVIEW_INVALID_RESPONSE": "SKIPPED_INVALID_RESPONSE",
+    }
     _write_private_json(
         path,
         {
             "schema_version": "1.0",
-            "status": "PATCHES_REVERIFIED",
+            "status": (
+                "PATCHES_REVERIFIED"
+                if tailored.expert_review is not None
+                else skipped_status.get(
+                    tailored.expert_review_skipped_code or "",
+                    "SKIPPED_REVALIDATION",
+                )
+            ),
             "provider": tailored.expert_provider,
             "model": tailored.expert_model,
             "patch_count": tailored.expert_rewrites,
-            "review": tailored.expert_review.model_dump(mode="json"),
+            "review": (
+                tailored.expert_review.model_dump(mode="json")
+                if tailored.expert_review is not None
+                else None
+            ),
+            "failure_code": tailored.expert_review_skipped_code,
+            "final_resume_sha256": tailored.output_sha256,
             "new_factual_claims_accepted": 0,
             "final_human_review_required": True,
+        },
+    )
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_resume_evidence_trace(run_dir: Path, tailored: TailoredDocx) -> str | None:
+    trace = tailored.evidence_retrieval_trace
+    if trace is None:
+        return None
+    path = run_dir / "14_resume_evidence_trace.json"
+    _write_private_json(
+        path,
+        {
+            "schema_version": "1.0",
+            "trace": trace.model_dump(mode="json"),
+            "raw_discovery_bodies_retained": False,
+            "raw_discovery_bodies_sent_to_model": False,
         },
     )
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1704,6 +1965,10 @@ def _save_request_scoped_resume_run(
     tailoring_instructions: str,
     approved_claims: list[dict[str, str]],
     create_preview: bool = True,
+    output_locale: Literal["en-US", "zh-CN"] = "en-US",
+    source_resume_locale: Literal["en-US", "zh-CN", "mixed", "unknown"] = "unknown",
+    resume_project_id: str | None = None,
+    template_receipt: ResumeTemplateReceipt | None = None,
 ) -> Path:
     """Persist only the generated result and body-free receipts for upload-first use."""
 
@@ -1718,7 +1983,9 @@ def _save_request_scoped_resume_run(
     run_dir.mkdir(mode=0o700)
     os.chmod(run_dir, 0o700)
     internal_docx = run_dir / "08_resume.docx"
+    docx_started = time.perf_counter()
     _write_private_bytes(internal_docx, tailored.content)
+    docx_render_ms = int((time.perf_counter() - docx_started) * 1000)
     provenance = _build_resume_provenance_receipt(
         run_id=run_id,
         job_description=job_description,
@@ -1730,6 +1997,7 @@ def _save_request_scoped_resume_run(
     provenance_sha256 = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
     provenance_summary = _resume_provenance_summary(provenance)
     expert_review_sha256 = _write_resume_expert_review_receipt(run_dir, tailored)
+    evidence_trace_sha256 = _write_resume_evidence_trace(run_dir, tailored)
     resume_text = "\n".join(
         paragraph.text
         for paragraph in read_template_paragraphs(tailored.content)
@@ -1739,6 +2007,7 @@ def _save_request_scoped_resume_run(
     coverage, gaps = _request_scoped_coverage(job_description, profile)
     pack = tailored.candidate_evidence_pack
     positioning = tailored.positioning_brief
+    retrieval_trace = tailored.evidence_retrieval_trace
     if pack is not None:
         _write_private_json(
             run_dir / "03_candidate_evidence_pack.json",
@@ -1752,6 +2021,11 @@ def _save_request_scoped_resume_run(
                 "candidate_evidence_fact_count": sum(
                     fact.source_kind == "CANDIDATE_EVIDENCE"
                     for fact in pack.atomic_facts
+                ),
+                "fact_admission": (
+                    pack.fact_admission.model_dump(mode="json")
+                    if pack.fact_admission is not None
+                    else None
                 ),
                 "sources": [
                     source.model_dump(mode="json") for source in pack.sources
@@ -1796,13 +2070,52 @@ def _save_request_scoped_resume_run(
         },
     )
     preview_pdf = run_dir / "10_resume_preview.pdf"
+    pdf_started = time.perf_counter()
     preview_created = (
         _create_resume_pdf_preview(internal_docx, preview_pdf)
         if create_preview
         else False
     )
+    pdf_render_ms = (
+        int((time.perf_counter() - pdf_started) * 1000) if create_preview else 0
+    )
+    pdf_status = (
+        "PDF_READY"
+        if preview_created
+        else "NEEDS_ATTENTION"
+        if create_preview
+        else "PENDING"
+    )
     user_metadata: dict[str, object] = {
         "schema_version": "1.0",
+        "resume_project_id": resume_project_id,
+        "source_resume_locale": source_resume_locale,
+        "target_locale": output_locale,
+        "output_locale": output_locale,
+        "composition_status": "CONTENT_READY",
+        "truth_status": "VERIFIED",
+        "docx_status": "DOCX_READY",
+        "docx_render_ms": docx_render_ms,
+        "pdf_status": pdf_status,
+        "pdf_render_ms": pdf_render_ms,
+        "pdf_layout_attempts": 1 if create_preview else 0,
+        "pdf_failure_reason": (
+            "LOCAL_PDF_RENDER_UNAVAILABLE_OR_FAILED"
+            if create_preview and not preview_created
+            else None
+        ),
+        "failure_classification": (
+            "DEGRADED"
+            if create_preview and not preview_created
+            else "RECOVERABLE"
+            if not create_preview
+            else None
+        ),
+        "fallback_used": bool(
+            tailored.role_strategy_fallback_applied
+            or tailored.rejected_rewrites
+            or tailored.expert_review_skipped_code
+        ),
         "retention": "request_scoped_sources_not_persisted",
         "template_source_format": source_format,
         "template_sha256": tailored.template_sha256,
@@ -1816,13 +2129,44 @@ def _save_request_scoped_resume_run(
         "synthesized_rewrites": tailored.synthesized_rewrites,
         "summary_rewritten": tailored.summary_rewritten,
         "rejected_rewrites": tailored.rejected_rewrites,
+        "role_strategy_fallback_applied": tailored.role_strategy_fallback_applied,
+        "role_strategy_fallback_code": tailored.role_strategy_fallback_code,
         "generation_mode": tailored.generation_mode,
         "provider": tailored.provider or "template",
         "model": tailored.model,
         "model_call_performed": tailored.role_strategy is not None,
         "model_call_profile": tailored.model_call_profile,
         "candidate_evidence_pack_sha256": pack.pack_sha256 if pack else None,
+        "evidence_retrieval_trace_sha256": evidence_trace_sha256,
         "candidate_evidence_fact_count": len(pack.atomic_facts) if pack else 0,
+        "evidence_retrieved_count": (
+            retrieval_trace.retrieved_count if retrieval_trace is not None else 0
+        ),
+        "evidence_admitted_count": (
+            retrieval_trace.admitted_count
+            if retrieval_trace is not None
+            else len(pack.atomic_facts) if pack else 0
+        ),
+        "evidence_sent_count": (
+            retrieval_trace.sent_count
+            if retrieval_trace is not None
+            else len(pack.atomic_facts) if pack else 0
+        ),
+        "evidence_requirements": (
+            [item.model_dump(mode="json") for item in retrieval_trace.requirements]
+            if retrieval_trace is not None
+            else []
+        ),
+        "evidence_source_summary": (
+            [item.model_dump(mode="json") for item in retrieval_trace.sources]
+            if retrieval_trace is not None
+            else []
+        ),
+        "evidence_adoption": (
+            [item.model_dump(mode="json") for item in retrieval_trace.adoption]
+            if retrieval_trace is not None
+            else []
+        ),
         "candidate_evidence_projects": (
             list(dict.fromkeys(source.project for source in pack.sources))
             if pack
@@ -1853,10 +2197,17 @@ def _save_request_scoped_resume_run(
         "resume_provenance_sha256": provenance_sha256,
         "claim_provenance": provenance_summary,
         "expert_review_performed": tailored.expert_review is not None,
+        "expert_review_attempted": tailored.expert_review_attempted,
+        "expert_review_skipped_code": tailored.expert_review_skipped_code,
         "expert_review_provider": tailored.expert_provider,
         "expert_review_model": tailored.expert_model,
         "expert_rewrites": tailored.expert_rewrites,
         "expert_review_sha256": expert_review_sha256,
+        "template_receipt": (
+            template_receipt.model_dump(mode="json")
+            if template_receipt is not None
+            else None
+        ),
     }
     _write_private_json(run_dir / "09_user_ui.json", user_metadata)
     job_sha256 = hashlib.sha256(job_description.encode("utf-8")).hexdigest()
@@ -1869,6 +2220,10 @@ def _save_request_scoped_resume_run(
             "schema_version": "1.0",
             "status": "REQUEST_SCOPED_DRAFT_READY",
             "run_id": run_id,
+            "resume_project_id": resume_project_id,
+            "source_resume_locale": source_resume_locale,
+            "target_locale": output_locale,
+            "output_locale": output_locale,
             "source_inputs_retained": False,
             "source_input_lifetime": "request_only",
             "job_description_sha256": job_sha256,
@@ -1877,6 +2232,8 @@ def _save_request_scoped_resume_run(
             "resume_provenance_sha256": provenance_sha256,
             "all_exported_claims_supported": True,
             "expert_review_performed": tailored.expert_review is not None,
+            "expert_review_attempted": tailored.expert_review_attempted,
+            "expert_review_skipped_code": tailored.expert_review_skipped_code,
             "expert_review_provider": tailored.expert_provider,
             "expert_review_model": tailored.expert_model,
             "expert_review_sha256": expert_review_sha256,
@@ -1886,6 +2243,13 @@ def _save_request_scoped_resume_run(
             "model_call_profile": tailored.model_call_profile,
             "final_human_review_required": True,
             "job_application_submitted": False,
+            "template_receipt_sha256": (
+                hashlib.sha256(
+                    template_receipt.model_dump_json().encode("utf-8")
+                ).hexdigest()
+                if template_receipt is not None
+                else None
+            ),
         },
     )
     artifacts = [
@@ -1905,22 +2269,40 @@ def _save_request_scoped_resume_run(
         artifacts.append("10_resume_preview.pdf")
     if expert_review_sha256 is not None:
         artifacts.append("13_expert_review.json")
+    if evidence_trace_sha256 is not None:
+        artifacts.append("14_resume_evidence_trace.json")
     _write_private_json(
         run_dir / "run.json",
         {
             "schema_version": "1.0",
             "run_id": run_id,
             "status": "DRAFT_REQUIRES_HUMAN_REVIEW",
+            "resume_project_id": resume_project_id,
+            "source_resume_locale": source_resume_locale,
+            "target_locale": output_locale,
+            "output_locale": output_locale,
+            "composition_status": "CONTENT_READY",
+            "truth_status": "VERIFIED",
+            "docx_status": "DOCX_READY",
+            "docx_render_ms": docx_render_ms,
+            "pdf_status": pdf_status,
             "retention": "request_scoped_sources_not_persisted",
             "artifact_paths": artifacts,
             "job_description_sha256": job_sha256,
             "candidate_profile_sha256": candidate_sha256,
             "claim_provenance": provenance_summary,
             "expert_review_performed": tailored.expert_review is not None,
+            "expert_review_attempted": tailored.expert_review_attempted,
+            "expert_review_skipped_code": tailored.expert_review_skipped_code,
             "model_call_profile": tailored.model_call_profile,
             "candidate_evidence_pack_sha256": pack.pack_sha256 if pack else None,
             "candidate_evidence_fact_count": len(pack.atomic_facts) if pack else 0,
             "positioning_role_title": None,
+            "template_receipt": (
+                template_receipt.model_dump(mode="json")
+                if template_receipt is not None
+                else None
+            ),
         },
     )
     return run_dir
@@ -1932,8 +2314,10 @@ def _run_user_resume(
     data_root: Path,
     repo_root: Path,
     *,
+    evidence_repository_root: Path | None = None,
     gateway: ModelGateway | None = None,
     expert_gateway: ModelGateway | None = None,
+    template_receipt: ResumeTemplateReceipt | None = None,
     allow_persistent_storage: bool = False,
     create_preview: bool = True,
     progress: Callable[[str], None] | None = None,
@@ -1942,6 +2326,7 @@ def _run_user_resume(
     """Run the local upload → evidence → workspace → DOCX flow without a subprocess."""
     started = time.perf_counter()
     candidate_artifact_path: Path | None = None
+    discovery_hits: list[RetrievalHit] = []
     upload = files.get("resume_template")
     if progress is not None:
         progress("PREPARING")
@@ -1985,6 +2370,33 @@ def _run_user_resume(
             "AI generation mode is invalid.",
             0,
         )
+    output_language = form.get("resume_output_language", "en-US").strip()
+    if output_language not in {"en-US", "zh-CN", "both"}:
+        return UIActionResult(
+            "tailored-resume",
+            "resume generation",
+            2,
+            "",
+            "Resume output language is invalid.",
+            0,
+        )
+    output_locales: tuple[Literal["en-US", "zh-CN"], ...] = (
+        ("en-US", "zh-CN")
+        if output_language == "both"
+        else (cast(Literal["en-US", "zh-CN"], output_language),)
+    )
+    # Safe offline mode preserves source claim wording by design. Locale-specific
+    # editorial composition is an AI capability; this is not a source/target
+    # language-matching rule.
+    if generation_mode == "template" and output_language != "en-US":
+        return UIActionResult(
+            "tailored-resume",
+            "resume generation",
+            2,
+            "",
+            "Natural Chinese Resume output requires an AI provider; safe offline mode does not mechanically translate Resume claims.",
+            0,
+        )
     expert_review_mode = form.get("expert_review_mode", "local").strip()
     if generation_mode == "template":
         expert_review_mode = "local"
@@ -1995,6 +2407,15 @@ def _run_user_resume(
             2,
             "",
             "Expert review mode is invalid.",
+            0,
+        )
+    if output_language == "both" and expert_review_mode == "openai_sol":
+        return UIActionResult(
+            "tailored-resume",
+            "resume expert review",
+            2,
+            "",
+            "Generate bilingual base resumes first; optional expert review is available one locale at a time.",
             0,
         )
     if expert_review_mode == "openai_sol":
@@ -2058,6 +2479,7 @@ def _run_user_resume(
             )
         extracted = extract_selected_resume_files(selected_files)
         resume_upload = extracted[ResumeUploadRole.RESUME]
+        source_resume_locale = detect_resume_language([resume_upload.text])
         _record_resume_event(data_root, ResumeFunnelEventType.RESUME_UPLOAD_COMPLETED)
         pasted_jd = form.get("job_description", "").strip()
         uploaded_jd = extracted.get(ResumeUploadRole.JOB_DESCRIPTION)
@@ -2072,6 +2494,22 @@ def _run_user_resume(
             if resume_upload.source_format == "docx"
             else normalize_text_resume_to_docx(resume_upload.text)
         )
+        template_preview_id = form.get("resume_template_preview_id", "").strip()
+        if template_preview_id:
+            if form.get("approve_layout_template") != "yes":
+                raise ResumeUploadError(
+                    "Review and approve the detected template structure before generation"
+                )
+            if (
+                template_receipt is None
+                or template_receipt.preview_id != template_preview_id
+            ):
+                raise ResumeUploadError(
+                    "The selected template preview is unavailable; read the template again"
+                )
+            template_bytes = apply_resume_template_structure(
+                template_bytes, template_receipt.detected_sections
+            )
         profile_started = time.perf_counter()
         profile = extract_candidate_profile(template_bytes)
         if timing is not None:
@@ -2079,6 +2517,42 @@ def _run_user_resume(
                 "profile_extract_ms",
                 int((time.perf_counter() - profile_started) * 1000),
             )
+        candidate_evidence_pack = None
+        if generation_mode != "template":
+            if progress is not None:
+                progress("RETRIEVING")
+            retrieval_started = time.perf_counter()
+            if evidence_repository_root is not None:
+                ensure_local_project_evidence(
+                    data_root,
+                    repository_root=evidence_repository_root,
+                    timing=timing,
+                )
+            elif timing is not None:
+                timing("freshness_check_ms", 0)
+                timing("local_git_refresh_ms", 0)
+            if timing is not None:
+                timing("knowledge_sync_ms", 0)
+            lexical_started = time.perf_counter()
+            discovery_hits = _search_job_evidence(job_description, data_root)
+            if timing is not None:
+                timing(
+                    "lexical_search_ms",
+                    int((time.perf_counter() - lexical_started) * 1000),
+                )
+            candidate_evidence_pack = build_candidate_evidence_pack(
+                profile,
+                data_root=data_root,
+                repository_root=evidence_repository_root,
+                job_description=job_description,
+                repository_snapshot_is_current=evidence_repository_root is not None,
+                timing=timing,
+            )
+            if timing is not None:
+                timing(
+                    "retrieval_ms",
+                    int((time.perf_counter() - retrieval_started) * 1000),
+                )
         if progress is not None:
             progress("GENERATING")
         support_upload: ExtractedResumeUpload | None = extracted.get(ResumeUploadRole.SUPPORT)
@@ -2093,26 +2567,59 @@ def _run_user_resume(
         )
         _record_resume_event(data_root, ResumeFunnelEventType.GENERATION_STARTED)
         generation_started = time.perf_counter()
+        tailored_variants: list[
+            tuple[Literal["en-US", "zh-CN"], TailoredDocx]
+        ] = []
         if generation_mode == "template":
             selected_gateway = None
-            tailored = tailor_resume_docx(template_bytes, relevance_text)
+            tailored_variants.append(
+                ("en-US", tailor_resume_docx(template_bytes, relevance_text))
+            )
         else:
             selected_gateway = gateway or model_gateway_for(
                 generation_mode,
                 model=form.get("provider_model", "qwen3:8b"),
             )
-            candidate_artifact_path, candidate_recorder = (
-                _new_resume_candidate_recorder(data_root)
+            assert candidate_evidence_pack is not None
+            gateway_template_metadata = (
+                template_metadata_from_receipt(template_receipt)
+                if template_receipt is not None
+                else resume_upload.template_metadata
             )
-            tailored = tailor_resume_docx_with_gateway(
-                template_bytes,
-                job_description,
-                gateway=selected_gateway,
-                tailoring_instructions=tailoring_instructions,
-                template_metadata=resume_upload.template_metadata,
-                support_upload=support_upload,
-                candidate_recorder=candidate_recorder,
-            )
+            for output_locale in output_locales:
+                candidate_artifact_path, candidate_recorder = (
+                    _new_resume_candidate_recorder(data_root)
+                )
+                localized = tailor_resume_docx_with_gateway(
+                    template_bytes,
+                    job_description,
+                    gateway=selected_gateway,
+                    tailoring_instructions=tailoring_instructions,
+                    template_metadata=gateway_template_metadata,
+                    support_upload=support_upload,
+                    candidate_recorder=candidate_recorder,
+                    candidate_evidence_pack=candidate_evidence_pack,
+                    output_locale=output_locale,
+                )
+                # The gateway receives only verified atomic facts. Body-free local
+                # discovery lineage is attached after that boundary completes.
+                tailored_variants.append(
+                    (
+                        output_locale,
+                        replace(
+                            localized,
+                            evidence_retrieval_trace=(
+                                build_resume_evidence_retrieval_trace(
+                                    job_description=job_description,
+                                    facts=candidate_evidence_pack.atomic_facts,
+                                    knowledge_hits=discovery_hits,
+                                    adoption=list(localized.evidence_adoption),
+                                )
+                            ),
+                        ),
+                    )
+                )
+        tailored = tailored_variants[0][1]
         if timing is not None:
             timing(
                 "model_generation_ms",
@@ -2139,32 +2646,71 @@ def _run_user_resume(
                 progress("EXPERT_REVIEW")
             expert_started = time.perf_counter()
             selected_expert_gateway = cast(ModelGateway, expert_gateway)
-            expert_review = request_resume_expert_review(
-                tailored,
-                profile=profile,
-                gateway=selected_expert_gateway,
+            _expert_candidate_artifact_path, expert_candidate_recorder = (
+                _new_resume_candidate_recorder(data_root)
             )
+            expert_review: ResumeExpertReviewResult | None = None
+            try:
+                expert_review = request_resume_expert_review(
+                    tailored,
+                    profile=profile,
+                    gateway=selected_expert_gateway,
+                )
+                expert_candidate_recorder(
+                    _expert_review_candidate_artifact(
+                        expert_review,
+                        status="PENDING_VALIDATION",
+                    )
+                )
+                if progress is not None:
+                    progress("REVERIFYING")
+                reverification_started = time.perf_counter()
+                tailored = apply_resume_expert_review(
+                    tailored,
+                    profile=profile,
+                    job_description=job_description,
+                    review=expert_review,
+                    expert_provider=selected_expert_gateway.descriptor.provider.value,
+                    expert_model=selected_expert_gateway.descriptor.model,
+                )
+                expert_candidate_recorder(
+                    _expert_review_candidate_artifact(
+                        expert_review,
+                        status="VALIDATED",
+                    )
+                )
+                if timing is not None:
+                    timing(
+                        "reverification_ms",
+                        int((time.perf_counter() - reverification_started) * 1000),
+                    )
+            except (
+                ModelGatewayNotConfigured,
+                ModelGatewayTransportError,
+                ModelGatewayInvalidResponse,
+                ResumeTemplateError,
+            ) as error:
+                failure_code = _expert_review_failure_code(error)
+                expert_candidate_recorder(
+                    _expert_review_candidate_artifact(
+                        expert_review,
+                        status="REJECTED",
+                        failure_code=failure_code,
+                    )
+                )
+                tailored = replace(
+                    tailored,
+                    expert_review_attempted=True,
+                    expert_review_skipped_code=failure_code,
+                    expert_provider=selected_expert_gateway.descriptor.provider.value,
+                    expert_model=selected_expert_gateway.descriptor.model,
+                )
             if timing is not None:
                 timing(
                     "expert_review_ms",
                     int((time.perf_counter() - expert_started) * 1000),
                 )
-            if progress is not None:
-                progress("REVERIFYING")
-            reverification_started = time.perf_counter()
-            tailored = apply_resume_expert_review(
-                tailored,
-                profile=profile,
-                job_description=job_description,
-                review=expert_review,
-                expert_provider=selected_expert_gateway.descriptor.provider.value,
-                expert_model=selected_expert_gateway.descriptor.model,
-            )
-            if timing is not None:
-                timing(
-                    "reverification_ms",
-                    int((time.perf_counter() - reverification_started) * 1000),
-                )
+            tailored_variants[0] = (tailored_variants[0][0], tailored)
         output_name = _user_resume_filename(
             profile,
             form.get("company_name", "").strip() or None,
@@ -2172,37 +2718,58 @@ def _run_user_resume(
             job_description,
         )
         if not allow_persistent_storage:
-            if timing is not None:
+            if timing is not None and generation_mode == "template":
                 timing("retrieval_ms", 0)
             if progress is not None:
                 progress("EXPORTING")
             docx_started = time.perf_counter()
-            run_dir = _save_request_scoped_resume_run(
-                data_root=data_root,
-                job_description=job_description,
-                profile=profile,
-                tailored=tailored,
-                output_name=output_name,
-                source_format=resume_upload.source_format,
-                tailoring_instructions=tailoring_instructions,
-                approved_claims=approved_claims,
-                create_preview=create_preview,
-            )
-            _record_resume_event(
-                data_root,
-                ResumeFunnelEventType.GENERATION_COMPLETED,
-                run_id=run_dir.name,
-            )
+            resume_project_id = f"resume-project-{uuid4().hex[:12]}"
+            run_dirs: list[Path] = []
+            for output_locale, variant in tailored_variants:
+                variant_name = _resume_variant_filename(
+                    output_name,
+                    output_locale,
+                    include_locale=len(tailored_variants) > 1,
+                )
+                run_dir = _save_request_scoped_resume_run(
+                    data_root=data_root,
+                    job_description=job_description,
+                    profile=profile,
+                    tailored=variant,
+                    output_name=variant_name,
+                    source_format=resume_upload.source_format,
+                    tailoring_instructions=tailoring_instructions,
+                    approved_claims=approved_claims,
+                    create_preview=create_preview,
+                    output_locale=output_locale,
+                    source_resume_locale=source_resume_locale,
+                    resume_project_id=resume_project_id,
+                    template_receipt=template_receipt,
+                )
+                run_dirs.append(run_dir)
+                _record_resume_event(
+                    data_root,
+                    ResumeFunnelEventType.GENERATION_COMPLETED,
+                    run_id=run_dir.name,
+                )
             if timing is not None:
                 timing("docx_ms", int((time.perf_counter() - docx_started) * 1000))
             elapsed_ms = int((time.perf_counter() - started) * 1000)
+            workspace_lines = [f"Resume workspace: {run_dirs[0]}"]
+            workspace_lines.extend(
+                f"Resume variant workspace: {value}" for value in run_dirs[1:]
+            )
             return UIActionResult(
                 "tailored-resume",
                 "request-scoped resume generation",
                 0,
-                f"Resume workspace: {run_dir}",
+                "\n".join(workspace_lines),
                 "",
                 elapsed_ms,
+            )
+        if len(tailored_variants) > 1:
+            raise ResumeUploadError(
+                "Bilingual output is available in the private Desktop draft flow"
             )
         library_root = (
             Path(
@@ -2212,15 +2779,17 @@ def _run_user_resume(
             .expanduser()
             .absolute()
         )
-        if progress is not None:
-            progress("RETRIEVING")
-        retrieval_started = time.perf_counter()
-        evidence_hits = _search_job_evidence(job_description, data_root)
-        if timing is not None:
-            timing(
-                "retrieval_ms",
-                int((time.perf_counter() - retrieval_started) * 1000),
-            )
+        evidence_hits = discovery_hits
+        if generation_mode == "template":
+            if progress is not None:
+                progress("RETRIEVING")
+            retrieval_started = time.perf_counter()
+            evidence_hits = _search_job_evidence(job_description, data_root)
+            if timing is not None:
+                timing(
+                    "retrieval_ms",
+                    int((time.perf_counter() - retrieval_started) * 1000),
+                )
         if progress is not None:
             progress("EXPORTING")
         docx_started = time.perf_counter()
@@ -2238,7 +2807,13 @@ def _run_user_resume(
             application_resume_bytes=tailored.content,
             application_resume_filename=output_name,
             application_resume_metadata={
+                "output_locale": tailored.output_locale,
                 "template_source_format": resume_upload.source_format,
+                "source_parse_trace": (
+                    resume_upload.source_parse_trace.model_dump_json()
+                    if resume_upload.source_parse_trace is not None
+                    else ""
+                ),
                 "template_sha256": tailored.template_sha256,
                 "claims_preserved": tailored.claims_preserved,
                 "source_paragraph_count": tailored.source_paragraph_count,
@@ -2248,6 +2823,12 @@ def _run_user_resume(
                 "synthesized_rewrites": tailored.synthesized_rewrites,
                 "summary_rewritten": tailored.summary_rewritten,
                 "rejected_rewrites": tailored.rejected_rewrites,
+                "role_strategy_fallback_applied": (
+                    tailored.role_strategy_fallback_applied
+                ),
+                "role_strategy_fallback_code": (
+                    tailored.role_strategy_fallback_code or ""
+                ),
                 "generation_mode": tailored.generation_mode,
                 "provider": tailored.provider or "template",
                 "model": tailored.model or "none",
@@ -2257,6 +2838,29 @@ def _run_user_resume(
                 "tailoring_instructions_sha256": hashlib.sha256(
                     tailoring_instructions.encode("utf-8")
                 ).hexdigest(),
+                "template_receipt_preview_id": (
+                    template_receipt.preview_id if template_receipt is not None else ""
+                ),
+                "template_receipt_source_type": (
+                    template_receipt.source_type.value
+                    if template_receipt is not None
+                    else ""
+                ),
+                "template_receipt_source_sha256": (
+                    template_receipt.source_sha256
+                    if template_receipt is not None
+                    else ""
+                ),
+                "template_receipt_source_url": (
+                    template_receipt.source_url or ""
+                    if template_receipt is not None
+                    else ""
+                ),
+                "template_receipt_sections_json": (
+                    json.dumps(template_receipt.detected_sections, ensure_ascii=False)
+                    if template_receipt is not None
+                    else ""
+                ),
             },
             mode=ResumeMode.LOCAL_ONLY,
         )
@@ -2285,6 +2889,7 @@ def _run_user_resume(
         provenance_sha256 = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
         provenance_summary = _resume_provenance_summary(provenance)
         expert_review_sha256 = _write_resume_expert_review_receipt(run_dir, tailored)
+        evidence_trace_sha256 = _write_resume_evidence_trace(run_dir, tailored)
         verification_path = run_dir / "07_verification.json"
         verification_payload = _load_json_file(verification_path) or {}
         verification_payload["claim_provenance"] = provenance_summary
@@ -2292,14 +2897,58 @@ def _run_user_resume(
         preview_pdf = run_dir / "10_resume_preview.pdf"
         if create_preview and progress is not None:
             progress("PREVIEWING")
+        pdf_started = time.perf_counter()
         preview_created = (
             _create_resume_pdf_preview(internal_docx, preview_pdf)
             if create_preview
             else False
         )
+        pdf_render_ms = (
+            int((time.perf_counter() - pdf_started) * 1000) if create_preview else 0
+        )
+        pdf_status = (
+            "PDF_READY"
+            if preview_created
+            else "NEEDS_ATTENTION"
+            if create_preview
+            else "PENDING"
+        )
+        docx_render_ms = int((time.perf_counter() - docx_started) * 1000)
         user_metadata: dict[str, object] = {
             "schema_version": "1.0",
+            "source_resume_locale": source_resume_locale,
+            "target_locale": tailored.output_locale,
+            "output_locale": tailored.output_locale,
+            "composition_status": "CONTENT_READY",
+            "truth_status": "VERIFIED",
+            "docx_status": "DOCX_READY",
+            "docx_render_ms": docx_render_ms,
+            "pdf_status": pdf_status,
+            "pdf_render_ms": pdf_render_ms,
+            "pdf_layout_attempts": 1 if create_preview else 0,
+            "pdf_failure_reason": (
+                "LOCAL_PDF_RENDER_UNAVAILABLE_OR_FAILED"
+                if create_preview and not preview_created
+                else None
+            ),
+            "failure_classification": (
+                "DEGRADED"
+                if create_preview and not preview_created
+                else "RECOVERABLE"
+                if not create_preview
+                else None
+            ),
+            "fallback_used": bool(
+                tailored.role_strategy_fallback_applied
+                or tailored.rejected_rewrites
+                or tailored.expert_review_skipped_code
+            ),
             "template_source_format": resume_upload.source_format,
+            "source_parse_trace": (
+                resume_upload.source_parse_trace.model_dump(mode="json")
+                if resume_upload.source_parse_trace is not None
+                else None
+            ),
             "template_sha256": tailored.template_sha256,
             "output_filename": output_name,
             "output_sha256": tailored.output_sha256,
@@ -2311,11 +2960,67 @@ def _run_user_resume(
             "synthesized_rewrites": tailored.synthesized_rewrites,
             "summary_rewritten": tailored.summary_rewritten,
             "rejected_rewrites": tailored.rejected_rewrites,
+            "role_strategy_fallback_applied": tailored.role_strategy_fallback_applied,
+            "role_strategy_fallback_code": tailored.role_strategy_fallback_code,
             "generation_mode": tailored.generation_mode,
             "provider": tailored.provider or "template",
             "model": tailored.model,
             "model_call_performed": tailored.role_strategy is not None,
             "model_call_profile": tailored.model_call_profile,
+            "candidate_evidence_pack_sha256": (
+                candidate_evidence_pack.pack_sha256
+                if candidate_evidence_pack is not None
+                else None
+            ),
+            "candidate_evidence_fact_count": (
+                len(candidate_evidence_pack.atomic_facts)
+                if candidate_evidence_pack is not None
+                else 0
+            ),
+            "evidence_retrieval_trace_sha256": evidence_trace_sha256,
+            "evidence_retrieved_count": (
+                tailored.evidence_retrieval_trace.retrieved_count
+                if tailored.evidence_retrieval_trace is not None
+                else 0
+            ),
+            "evidence_admitted_count": (
+                tailored.evidence_retrieval_trace.admitted_count
+                if tailored.evidence_retrieval_trace is not None
+                else len(candidate_evidence_pack.atomic_facts)
+                if candidate_evidence_pack is not None
+                else 0
+            ),
+            "evidence_sent_count": (
+                tailored.evidence_retrieval_trace.sent_count
+                if tailored.evidence_retrieval_trace is not None
+                else len(candidate_evidence_pack.atomic_facts)
+                if candidate_evidence_pack is not None
+                else 0
+            ),
+            "evidence_requirements": (
+                [
+                    item.model_dump(mode="json")
+                    for item in tailored.evidence_retrieval_trace.requirements
+                ]
+                if tailored.evidence_retrieval_trace is not None
+                else []
+            ),
+            "evidence_source_summary": (
+                [
+                    item.model_dump(mode="json")
+                    for item in tailored.evidence_retrieval_trace.sources
+                ]
+                if tailored.evidence_retrieval_trace is not None
+                else []
+            ),
+            "evidence_adoption": (
+                [
+                    item.model_dump(mode="json")
+                    for item in tailored.evidence_retrieval_trace.adoption
+                ]
+                if tailored.evidence_retrieval_trace is not None
+                else []
+            ),
             "model_gap_quotes": (
                 tailored.role_strategy.unsupported_requirements
                 if tailored.role_strategy is not None
@@ -2343,10 +3048,17 @@ def _run_user_resume(
             "resume_provenance_sha256": provenance_sha256,
             "claim_provenance": provenance_summary,
             "expert_review_performed": tailored.expert_review is not None,
+            "expert_review_attempted": tailored.expert_review_attempted,
+            "expert_review_skipped_code": tailored.expert_review_skipped_code,
             "expert_review_provider": tailored.expert_provider,
             "expert_review_model": tailored.expert_model,
             "expert_rewrites": tailored.expert_rewrites,
             "expert_review_sha256": expert_review_sha256,
+            "template_receipt": (
+                template_receipt.model_dump(mode="json")
+                if template_receipt is not None
+                else None
+            ),
         }
         _write_private_json(run_dir / "09_user_ui.json", user_metadata)
         if tailored.role_strategy is not None:
@@ -2366,6 +3078,8 @@ def _run_user_resume(
             "resume_provenance_sha256": provenance_sha256,
             "all_exported_claims_supported": True,
             "expert_review_performed": tailored.expert_review is not None,
+            "expert_review_attempted": tailored.expert_review_attempted,
+            "expert_review_skipped_code": tailored.expert_review_skipped_code,
             "expert_review_provider": tailored.expert_provider,
             "expert_review_model": tailored.expert_model,
             "expert_review_sha256": expert_review_sha256,
@@ -2396,6 +3110,11 @@ def _run_user_resume(
         route["docx_sha256"] = tailored.output_sha256
         route["resume_provenance_sha256"] = provenance_sha256
         route["preview_generated"] = preview_created
+        route["composition_status"] = "CONTENT_READY"
+        route["truth_status"] = "VERIFIED"
+        route["docx_status"] = "DOCX_READY"
+        route["docx_render_ms"] = docx_render_ms
+        route["pdf_status"] = pdf_status
         route["model_call_profile"] = tailored.model_call_profile
         artifact_paths = run_payload.get("artifact_paths")
         if not isinstance(artifact_paths, list):
@@ -2410,6 +3129,8 @@ def _run_user_resume(
             output_artifacts.append("11_role_strategy.json")
         if expert_review_sha256 is not None:
             output_artifacts.append("13_expert_review.json")
+        if evidence_trace_sha256 is not None:
+            output_artifacts.append("14_resume_evidence_trace.json")
         if preview_created:
             output_artifacts.append("10_resume_preview.pdf")
         for name in output_artifacts:
@@ -2479,6 +3200,7 @@ def _run_user_resume(
         )
     except (
         KnowledgeStoreError,
+        EvidenceHubError,
         OSError,
         ResumeUploadError,
         ValueError,
@@ -2500,63 +3222,88 @@ def _run_user_resume(
 
 
 def _resume_result_run_dir(data_root: Path, result: UIActionResult) -> Path | None:
-    raw_run_dir = _workspace_path(result.stdout)
-    if raw_run_dir is None or _RUN_ID_RE.fullmatch(raw_run_dir.name) is None:
-        return None
+    run_dirs = _resume_result_run_dirs(data_root, result)
+    return run_dirs[0] if run_dirs else None
+
+
+def _resume_result_run_dirs(data_root: Path, result: UIActionResult) -> list[Path]:
+    valid: list[Path] = []
     runs_root = data_root.expanduser().absolute() / "resume-runs"
-    expected = runs_root / raw_run_dir.name
-    try:
-        _reject_symlink_ancestry(expected)
-        if (
-            raw_run_dir.expanduser().resolve() != expected.resolve()
-            or expected.parent != runs_root
-            or not expected.is_dir()
-        ):
-            return None
-    except OSError:
-        return None
-    return expected
+    for raw_run_dir in _workspace_paths(result.stdout):
+        if _RUN_ID_RE.fullmatch(raw_run_dir.name) is None:
+            continue
+        expected = runs_root / raw_run_dir.name
+        try:
+            _reject_symlink_ancestry(expected)
+            if (
+                raw_run_dir.expanduser().resolve() != expected.resolve()
+                or expected.parent != runs_root
+                or not expected.is_dir()
+            ):
+                continue
+        except OSError:
+            continue
+        valid.append(expected)
+    return valid
 
 
 def _finalize_resume_preview(data_root: Path, result: UIActionResult) -> bool:
     """Render and register a PDF after the downloadable DOCX is already ready."""
 
-    run_dir = _resume_result_run_dir(data_root, result)
-    if run_dir is None:
+    run_dirs = _resume_result_run_dirs(data_root, result)
+    if not run_dirs:
         return False
-    source = _resume_run_artifact(data_root, run_dir.name, "08_resume.docx")
-    if source is None:
-        return False
-    target = run_dir / "10_resume_preview.pdf"
-    if target.is_symlink():
-        return False
-    created = _create_resume_pdf_preview(source, target)
-
-    metadata_path = run_dir / "09_user_ui.json"
-    metadata = _load_json_file(metadata_path)
-    if metadata is not None:
-        metadata["preview_generated"] = created
-        metadata["preview_url"] = (
-            f"/previews/{run_dir.name}/resume.pdf" if created else ""
+    all_created = True
+    for run_dir in run_dirs:
+        source = _resume_run_artifact(data_root, run_dir.name, "08_resume.docx")
+        target = run_dir / "10_resume_preview.pdf"
+        pdf_started = time.perf_counter()
+        created = bool(
+            source is not None
+            and not target.is_symlink()
+            and _create_resume_pdf_preview(source, target)
         )
-        _write_private_json(metadata_path, metadata)
+        pdf_render_ms = int((time.perf_counter() - pdf_started) * 1000)
 
-    run_path = run_dir / "run.json"
-    run_payload = _load_json_file(run_path)
-    if run_payload is not None:
-        route = run_payload.get("route")
-        if not isinstance(route, dict):
-            route = {}
-            run_payload["route"] = route
-        route["preview_generated"] = created
-        artifacts = run_payload.get("artifact_paths")
-        if not isinstance(artifacts, list):
-            artifacts = []
-            run_payload["artifact_paths"] = artifacts
-        if created and "10_resume_preview.pdf" not in artifacts:
-            artifacts.append("10_resume_preview.pdf")
-        _write_private_json(run_path, run_payload)
-    return created
+        metadata_path = run_dir / "09_user_ui.json"
+        metadata = _load_json_file(metadata_path)
+        if metadata is not None:
+            metadata["preview_generated"] = created
+            metadata["preview_url"] = (
+                f"/previews/{run_dir.name}/resume.pdf" if created else ""
+            )
+            metadata["pdf_status"] = "PDF_READY" if created else "NEEDS_ATTENTION"
+            metadata["pdf_render_ms"] = pdf_render_ms
+            previous_attempts = metadata.get("pdf_layout_attempts", 0)
+            metadata["pdf_layout_attempts"] = (
+                previous_attempts + 1 if isinstance(previous_attempts, int) else 1
+            )
+            metadata["pdf_failure_reason"] = (
+                None if created else "LOCAL_PDF_RENDER_UNAVAILABLE_OR_FAILED"
+            )
+            metadata["failure_classification"] = None if created else "DEGRADED"
+            _write_private_json(metadata_path, metadata)
+
+        run_path = run_dir / "run.json"
+        run_payload = _load_json_file(run_path)
+        if run_payload is not None:
+            route = run_payload.get("route")
+            if not isinstance(route, dict):
+                route = {}
+                run_payload["route"] = route
+            route["preview_generated"] = created
+            route["pdf_status"] = "PDF_READY" if created else "NEEDS_ATTENTION"
+            route["pdf_render_ms"] = pdf_render_ms
+            route["failure_classification"] = None if created else "DEGRADED"
+            artifacts = run_payload.get("artifact_paths")
+            if not isinstance(artifacts, list):
+                artifacts = []
+                run_payload["artifact_paths"] = artifacts
+            if created and "10_resume_preview.pdf" not in artifacts:
+                artifacts.append("10_resume_preview.pdf")
+            _write_private_json(run_path, run_payload)
+        all_created = all_created and created
+    return all_created
 
 
 def _persist_resume_job_timings(
@@ -2592,19 +3339,36 @@ def _run_learning_workspace(
     start = time.perf_counter()
     requirement = form.get("target_requirement", "").strip()
     try:
+        preflight = preflight_work_sources(data_root, workspace_root=repo_root)
+        local_git = next(
+            (source for source in preflight.sources if source.kind == "local_git"),
+            None,
+        )
+        if local_git is not None and local_git.action_required:
+            refresh_work_source(data_root, "local_git", workspace_root=repo_root)
         run = run_learning_traceability(
             data_root=data_root,
             repository_root=repo_root,
             target_requirement=requirement,
         )
-    except (LearningTraceabilityError, OSError, ValueError) as exc:
+    except LearningFixtureAnchorError:
         elapsed_ms = int((time.perf_counter() - start) * 1000)
         return UIActionResult(
             "learning-traceability",
             "local deterministic traceability build",
             1,
             "",
-            str(exc),
+            "这个项目没有找到此练习需要的代码锚点。你可以选择其他项目或创建新的学习案例。",
+            elapsed_ms,
+        )
+    except (LearningTraceabilityError, EvidenceHubError, OSError, ValueError):
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        return UIActionResult(
+            "learning-traceability",
+            "local deterministic traceability build",
+            1,
+            "",
+            "当前学习案例无法建立。请检查已选择项目后重试。",
             elapsed_ms,
         )
     elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -2735,6 +3499,30 @@ def _parse_submission(
     return FormSubmission(fields=fields, files=files)
 
 
+def _prepare_resume_template_preview(
+    submission: FormSubmission,
+) -> ResumeTemplateReceipt:
+    upload = submission.files.get("layout_template_file")
+    pasted_html = submission.fields.get("layout_template_html", "").strip()
+    source_url = submission.fields.get("layout_template_url", "").strip()
+    selected = sum(
+        (
+            bool(upload is not None and upload.content),
+            bool(pasted_html),
+            bool(source_url),
+        )
+    )
+    if selected != 1:
+        raise ResumeUploadError("Choose exactly one template source: file, URL, or HTML")
+    if upload is not None and upload.content:
+        receipt = inspect_template_file(upload.filename, upload.content)
+    elif pasted_html:
+        receipt = inspect_template_html(pasted_html)
+    else:
+        receipt = inspect_template_url(source_url)
+    return receipt
+
+
 def _build_control_tower_path(data_root: Path) -> Path:
     return (data_root / "control-tower" / "index.html").resolve()
 
@@ -2771,19 +3559,44 @@ def _run_action(form: dict[str, str], data_root: Path, repo_root: Path) -> UIAct
     if action == "knowledge-sync":
         include_codex = form.get("include_codex") == "on"
         codex_home = form.get("codex_home", "").strip()
-        chatgpt_exports = _split_path_list(form.get("chatgpt_exports", ""))
-        buildlog_roots = _split_path_list(form.get("buildlog_roots", ""))
-
-        command = ["knowledge-sync", "--data-root", str(data_root)]
-        if not include_codex:
-            command.append("--no-codex")
-        if codex_home:
-            command += ["--codex-home", codex_home]
-        for export_path in chatgpt_exports:
-            command += ["--chatgpt-export", export_path]
-        for buildlog_root in buildlog_roots:
-            command += ["--buildlog-root", buildlog_root]
-        return _run_command(command, repo_root)
+        chatgpt_exports = [
+            Path(value).expanduser()
+            for value in _split_path_list(form.get("chatgpt_exports", ""))
+        ]
+        buildlog_roots = [
+            Path(value).expanduser()
+            for value in _split_path_list(form.get("buildlog_roots", ""))
+        ]
+        started = time.perf_counter()
+        try:
+            refreshed = refresh_selected_knowledge_sources(
+                data_root,
+                include_codex=include_codex,
+                codex_home=Path(codex_home).expanduser() if codex_home else None,
+                chatgpt_exports=chatgpt_exports,
+                buildlog_roots=buildlog_roots,
+            )
+        except (OSError, ValueError, WorkContextError) as exc:
+            return UIActionResult(
+                name="knowledge-sync",
+                command="in-process knowledge refresh",
+                return_code=1,
+                stdout="",
+                stderr=str(exc),
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+            )
+        return UIActionResult(
+            name="knowledge-sync",
+            command="in-process knowledge refresh",
+            return_code=0 if refreshed.failed == 0 or refreshed.imported + refreshed.updated + refreshed.skipped else 1,
+            stdout=(
+                f"Discovered {refreshed.discovered}; imported {refreshed.imported}; "
+                f"updated {refreshed.updated}; unchanged {refreshed.skipped}; "
+                f"failed {refreshed.failed}."
+            ),
+            stderr="",
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+        )
     if action == "evidence-agent":
         question = form.get("question", "").strip()
         if not question:
@@ -2822,6 +3635,35 @@ def _run_action(form: dict[str, str], data_root: Path, repo_root: Path) -> UIAct
     return None
 
 
+def _human_duration(locale: UILocale, elapsed_ms: int) -> str:
+    """Render a primary duration without leaking raw adapter latency."""
+
+    seconds = max(0, int(elapsed_ms)) / 1000
+    if seconds < 1:
+        return ui_text(locale, f"{max(0, int(elapsed_ms))} 毫秒", f"{max(0, int(elapsed_ms))} ms")
+    return ui_text(locale, f"{seconds:.1f} 秒", f"{seconds:.1f}s")
+
+
+def _human_ai_service_label(
+    locale: UILocale, provider: str, model: str | None = None
+) -> str:
+    """Map internal provider vocabulary to human product truth."""
+
+    provider_key = (provider or "").strip().lower()
+    model_label = (model or "").strip()
+    if provider_key in {"openai_compatible", "openai", "openai_sol"}:
+        base = ui_text(locale, "OpenAI 兼容服务", "OpenAI-compatible service")
+    elif provider_key == "ollama":
+        base = ui_text(locale, "本地 Ollama", "Local Ollama")
+    elif provider_key == "soloscale_hosted":
+        base = ui_text(locale, "SoloScale 托管 AI", "SoloScale Hosted AI")
+    elif provider_key == "template":
+        return ui_text(locale, "安全离线模板", "Safe offline template")
+    else:
+        base = ui_text(locale, "已配置服务", "Configured service")
+    return f"{base} · {model_label}" if model_label else base
+
+
 def _result_card(
     result: UIActionResult | None, locale: UILocale = DEFAULT_UI_LOCALE
 ) -> str:
@@ -2848,7 +3690,7 @@ def _result_card(
   <p>{_escape(body)}</p>
   <details class="technical-details">
     <summary>{_escape(ui_text(locale, '查看技术详情', 'View technical details'))}</summary>
-    <p>{_escape(ui_text(locale, '耗时', 'Duration'))}: {result.elapsed_ms}ms</p>
+    <p>{_escape(ui_text(locale, '耗时', 'Duration'))}: {_escape(_human_duration(locale, result.elapsed_ms))}</p>
     <p>{_escape(ui_text(locale, '命令', 'Command'))}: <code>{_escape(result.command)}</code></p>
   </details>
   {workspace}
@@ -2984,11 +3826,19 @@ def _resume_graph(raw_stdout: str) -> str:
 
 
 def _workspace_path(raw_stdout: str) -> Path | None:
-    prefix = "Resume workspace: "
-    path_text = next(
-        (line[len(prefix) :] for line in raw_stdout.splitlines() if line.startswith(prefix)), ""
-    )
-    return Path(path_text) if path_text else None
+    paths = _workspace_paths(raw_stdout)
+    return paths[0] if paths else None
+
+
+def _workspace_paths(raw_stdout: str) -> list[Path]:
+    prefixes = ("Resume workspace: ", "Resume variant workspace: ")
+    values: list[Path] = []
+    for line in raw_stdout.splitlines():
+        for prefix in prefixes:
+            if line.startswith(prefix):
+                values.append(Path(line[len(prefix) :]))
+                break
+    return values
 
 
 def _resume_provenance_panel(
@@ -3149,6 +3999,14 @@ def _resume_job_panel(
         ("post_response_ms", "提交后返回", "POST response"),
         ("profile_extract_ms", "解析简历", "Profile extract"),
         ("retrieval_ms", "本地检索", "Evidence retrieval"),
+        ("freshness_check_ms", "证据新鲜度检查", "Freshness check"),
+        ("local_git_refresh_ms", "本地 Git 刷新", "Local Git refresh"),
+        ("knowledge_sync_ms", "资料同步", "Knowledge sync"),
+        ("requirement_extraction_ms", "提取 JD 要求", "Requirement extraction"),
+        ("lexical_search_ms", "关键词检索", "Lexical search"),
+        ("fusion_ms", "证据融合排序", "Evidence fusion"),
+        ("evidence_admission_ms", "事实准入", "Evidence admission"),
+        ("candidate_pack_build_ms", "构建证据包", "Candidate pack build"),
         ("model_generation_ms", "模型生成", "Model generation"),
         ("verification_ms", "本地验证", "Local verification"),
         ("expert_review_ms", "专家审阅", "Expert review"),
@@ -3226,9 +4084,17 @@ def _user_result_card(
             "生成失败，请检查输入后重试。",
             "Generation failed. Check the input and try again.",
         )
+        source_unreadable = "PDF content expands beyond the safety limit" in message
+        failure_heading = ui_text(
+            locale,
+            "输入文件无法安全读取" if source_unreadable else "这次没有生成简历",
+            "The input file could not be read safely"
+            if source_unreadable
+            else "No resume was generated this time",
+        )
         return f"""<section class="result-card error-state" role="alert">
   <span class="result-kicker">{_escape(ui_text(locale, '需要处理', 'Needs attention'))}</span>
-  <h2>{_escape(ui_text(locale, '这次没有生成简历', 'No resume was generated this time'))}</h2>
+  <h2>{_escape(failure_heading)}</h2>
   <p>{_escape(message)}</p>
 </section>"""
 
@@ -3245,6 +4111,35 @@ def _user_result_card(
     verification = _load_json_file(run_dir / "07_verification.json") or {}
     gaps_payload = _load_json_file(run_dir / "05_gaps.json") or {}
     user_metadata = _load_json_file(run_dir / "09_user_ui.json") or {}
+    variant_cards: list[str] = []
+    for variant_dir in _workspace_paths(result.stdout)[1:]:
+        if (
+            _RUN_ID_RE.fullmatch(variant_dir.name) is None
+            or variant_dir.parent != run_dir.parent
+            or variant_dir.is_symlink()
+        ):
+            continue
+        variant_metadata = _load_json_file(variant_dir / "09_user_ui.json") or {}
+        variant_locale = str(variant_metadata.get("output_locale", ""))
+        variant_download = str(variant_metadata.get("download_url", ""))
+        variant_preview = str(variant_metadata.get("preview_url", ""))
+        variant_pdf_status = str(variant_metadata.get("pdf_status", "PENDING"))
+        variant_name = str(
+            variant_metadata.get("output_filename", "Tailored Resume.docx")
+        )
+        if variant_locale not in {"en-US", "zh-CN"} or not variant_download:
+            continue
+        preview_link = (
+            f'<a href="{_escape(variant_preview)}" target="_blank" rel="noopener">PDF</a>'
+            if variant_preview
+            else f'<span>{_escape(ui_text(locale, "PDF 待处理", "PDF needs attention") if variant_pdf_status == "NEEDS_ATTENTION" else ui_text(locale, "PDF 生成中", "PDF pending"))}</span>'
+        )
+        variant_cards.append(
+            '<article class="resume-variant-card">'
+            f'<strong>{_escape(variant_locale)}</strong>'
+            f'<a class="secondary-button download" href="{_escape(variant_download)}" download title="{_escape(variant_name)}">DOCX</a>'
+            f'{preview_link}</article>'
+        )
     request_scoped = (
         user_metadata.get("retention") == "request_scoped_sources_not_persisted"
     )
@@ -3281,7 +4176,9 @@ def _user_result_card(
         gap_html = f"<li>{_escape(ui_text(locale, '没有发现明确的未覆盖项。', 'No explicit uncovered requirement was found.'))}</li>"
     download_url = str(user_metadata.get("download_url", ""))
     preview_url = str(user_metadata.get("preview_url", ""))
+    pdf_status = str(user_metadata.get("pdf_status", "PENDING"))
     output_name = str(user_metadata.get("output_filename", "Tailored Resume.docx"))
+    output_locale = str(user_metadata.get("output_locale", "en-US"))
     internal_path = str(user_metadata.get("internal_docx", run_dir / "08_resume.docx"))
     external_path = str(user_metadata.get("external_docx", ""))
     project_count = user_metadata.get("project_blocks_reordered", 0)
@@ -3291,6 +4188,80 @@ def _user_result_card(
     summary_rewritten = user_metadata.get("summary_rewritten") is True
     rejected_count = user_metadata.get("rejected_rewrites", 0)
     evidence_fact_count = user_metadata.get("candidate_evidence_fact_count", 0)
+    retrieved_count = user_metadata.get("evidence_retrieved_count", 0)
+    admitted_count = user_metadata.get("evidence_admitted_count", evidence_fact_count)
+    requirement_rows = user_metadata.get("evidence_requirements", [])
+    if not isinstance(requirement_rows, list):
+        requirement_rows = []
+    requirement_rows = [item for item in requirement_rows if isinstance(item, dict)]
+    if requirement_rows:
+        coverage = {
+            "total": len(requirement_rows),
+            "lexical_candidate_strong": sum(
+                item.get("status") == "STRONG" for item in requirement_rows
+            ),
+            "lexical_candidate_partial": sum(
+                item.get("status") == "MEDIUM" for item in requirement_rows
+            ),
+            "no_lexical_candidate": sum(
+                item.get("status") == "GAP" for item in requirement_rows
+            ),
+        }
+    requirement_coverage_html = "".join(
+        (
+            "<details><summary>"
+            f"{_escape(str(item.get('requirement_id', 'Requirement')))} · "
+            f"{_escape(str(item.get('status', 'GAP')))}</summary>"
+            f"<p>{_escape(', '.join(str(value) for value in item.get('matched_fact_ids', [])) or ui_text(locale, '暂无已验证事实', 'No verified fact yet'))}</p></details>"
+        )
+        for item in requirement_rows
+    )
+    source_rows = user_metadata.get("evidence_source_summary", [])
+    if not isinstance(source_rows, list):
+        source_rows = []
+    source_summary_html = "".join(
+        (
+            "<li><strong>"
+            f"{_escape(str(item.get('source_type', '')).replace('_', ' ').title())}"
+            "</strong> · "
+            f"{_escape(str(item.get('state', 'UNAVAILABLE')))} · "
+            f"{_escape(str(item.get('retrieved_count', 0)))} {_escape(ui_text(locale, '条检索', 'retrieved'))} · "
+            f"{_escape(str(item.get('sent_count', 0)))} {_escape(ui_text(locale, '条发送', 'sent'))}</li>"
+        )
+        for item in source_rows
+        if isinstance(item, dict)
+    )
+    adoption_rows = user_metadata.get("evidence_adoption", [])
+    if not isinstance(adoption_rows, list):
+        adoption_rows = []
+    adoption_html = "".join(
+        "<li><code>"
+        f"{_escape(str(item.get('fact_id', 'FACT')))}</code> · "
+        + " → ".join(
+            stage
+            for stage, active in (
+                ("RETRIEVED", item.get("retrieved") is True),
+                ("ADMITTED", item.get("admitted") is True),
+                ("SENT", item.get("sent_to_model") is True),
+                ("PROPOSED", item.get("proposed") is True),
+                ("ACCEPTED", item.get("accepted") is True),
+                ("RENDERED", item.get("rendered") is True),
+            )
+            if active
+        )
+        + (
+            " · REJECTED: "
+            + _escape(
+                ", ".join(str(code) for code in item.get("rejection_rule_codes", []))
+            )
+            if item.get("rejection_rule_codes")
+            else ""
+        )
+        + "</li>"
+        for item in adoption_rows
+        if isinstance(item, dict)
+        and (item.get("proposed") is True or item.get("rejection_rule_codes"))
+    )
     evidence_projects = user_metadata.get("candidate_evidence_projects", [])
     if not isinstance(evidence_projects, list):
         evidence_projects = []
@@ -3302,6 +4273,9 @@ def _user_result_card(
     )
     generation_mode = str(user_metadata.get("generation_mode", "template"))
     provider = str(user_metadata.get("provider", "template"))
+    ai_service_label = _human_ai_service_label(
+        locale, provider, str(user_metadata.get("model") or "")
+    )
     if generation_mode == "ai":
         result_summary = ui_text(
             locale,
@@ -3310,9 +4284,15 @@ def _user_result_card(
         )
         privacy_note = ui_text(
             locale,
-            f"本次使用 {provider}。提交了 JD、已批准简历事实与 {evidence_fact_count} 条紧凑候选证据事实；原始对话、项目文件和未选资料未发送。",
-            f"This run used {provider}. It submitted the JD, approved resume facts, and {evidence_fact_count} compact candidate-evidence facts. Raw conversations, project files, and unselected material were not sent.",
+            f"AI 服务：{ai_service_label}。本地检索到 {retrieved_count} 条资料线索，最终只准入并提交 {admitted_count} 条已验证事实；原始对话、项目文件和未选资料未发送。",
+            f"AI service: {ai_service_label}. Local retrieval found {retrieved_count} discovery clues; only {admitted_count} verified facts were admitted and sent. Raw conversations, project files, and unselected material were not sent.",
         )
+        if user_metadata.get("role_strategy_fallback_applied") is True:
+            result_summary += ui_text(
+                locale,
+                " AI 提出的部分岗位定位缺少足够证据，SoloScale 已自动使用安全定位继续生成。",
+                " Some AI positioning lacked sufficient evidence, so SoloScale continued with a deterministic safe strategy.",
+            )
         if user_metadata.get("expert_review_performed") is True:
             expert_rewrites = user_metadata.get("expert_rewrites", 0)
             result_summary += ui_text(
@@ -3324,6 +4304,12 @@ def _user_result_card(
                 locale,
                 " 专家审阅只接收 JD 信号、支持片段和当前草稿。",
                 " Expert review received only JD signals, supporting fragments, and the current draft.",
+            )
+        elif user_metadata.get("expert_review_attempted") is True:
+            result_summary += ui_text(
+                locale,
+                " 基础简历已成功生成；专家优化未通过版本或事实校验，因此没有应用，安全版本已保留。",
+                " The base resume succeeded. Expert optimization did not pass draft or fact validation, so it was skipped and the safe version was preserved.",
             )
     else:
         result_summary = ui_text(
@@ -3376,10 +4362,18 @@ def _user_result_card(
                 "The DOCX is ready to download. The PDF preview is still rendering, and this page will update automatically.",
             )
         else:
-            preview_note = ui_text(
-                locale,
-                "本机未找到 DOCX 渲染器，当前显示内容预览；最终版式保留上传模板。",
-                "No local DOCX renderer was found, so this is a content preview. The final file keeps the uploaded layout.",
+            preview_note = (
+                ui_text(
+                    locale,
+                    "简历已经生成并可下载 DOCX。PDF 预览未完成；你可以继续使用 DOCX，稍后再处理 PDF 排版。",
+                    "The resume and DOCX are ready. PDF preview did not complete; you can use the DOCX now and address PDF layout later.",
+                )
+                if pdf_status == "NEEDS_ATTENTION"
+                else ui_text(
+                    locale,
+                    "本机未找到 DOCX 渲染器，当前显示内容预览；最终版式保留上传模板。",
+                    "No local DOCX renderer was found, so this is a content preview. The final file keeps the uploaded layout.",
+                )
             )
     saved_locations = (
         f'<p><strong>SoloScale 私有运行：</strong><code>{_escape(internal_path)}</code></p>'
@@ -3398,7 +4392,9 @@ def _user_result_card(
     defense = (
         ""
         if request_scoped
-        else _interview_defense_panel(data_root=run_dir.parents[1], run_id=run_dir.name)
+        else _interview_defense_panel(
+            data_root=run_dir.parents[1], run_id=run_dir.name, locale=locale
+        )
     )
     provenance_panel = _resume_provenance_panel(run_dir, locale)
     job_running = resume_job is not None and resume_job.phase not in {
@@ -3423,18 +4419,32 @@ def _user_result_card(
     return f"""<section class="result-card success-state" aria-live="polite">
   <div class="result-header">
     <div>
-      <span class="result-kicker">{_escape(result_kicker)} · {display_elapsed_ms} ms</span>
+      <span class="result-kicker">{_escape(result_kicker)} · {_escape(_human_duration(locale, display_elapsed_ms))}</span>
       <h2>{_escape(result_heading)}</h2>
       <p>{_escape(result_summary)}</p>
     </div>
     {download}
   </div>
+  <p class="privacy-note"><strong>{_escape(ui_text(locale, '输出语言', 'Output language'))}:</strong> {_escape(output_locale)}</p>
+  {f'<div class="resume-variant-downloads">{"".join(variant_cards)}</div>' if variant_cards else ''}
   <div class="metrics" aria-label="{_escape(ui_text(locale, '覆盖情况', 'Coverage'))}">
     <div><strong>{_escape(str(coverage.get("total", 0)))}</strong><span>{_escape(ui_text(locale, '岗位要求', 'Requirements'))}</span></div>
     <div><strong>{_escape(str(coverage.get("lexical_candidate_strong", 0)))}</strong><span>{_escape(ui_text(locale, '强证据候选', 'Strong candidates'))}</span></div>
     <div><strong>{_escape(str(coverage.get("lexical_candidate_partial", 0)))}</strong><span>{_escape(ui_text(locale, '部分证据候选', 'Partial candidates'))}</span></div>
     <div><strong>{_escape(str(coverage.get("no_lexical_candidate", 0)))}</strong><span>{_escape(ui_text(locale, '待补证', 'Needs evidence'))}</span></div>
   </div>
+  <details>
+    <summary>{_escape(ui_text(locale, '查看本次证据来源', 'Evidence for this resume'))}</summary>
+    <ul class="gap-list">{source_summary_html}</ul>
+  </details>
+  <details>
+    <summary>{_escape(ui_text(locale, '查看 JD 要求覆盖', 'View JD requirement coverage'))}</summary>
+    {requirement_coverage_html}
+  </details>
+  <details>
+    <summary>{_escape(ui_text(locale, '查看证据采用轨迹', 'View evidence adoption trace'))}</summary>
+    <ul class="gap-list">{adoption_html or f'<li>{_escape(ui_text(locale, "本次没有模型采用轨迹。", "No model adoption trace is available for this run."))}</li>'}</ul>
+  </details>
   <p class="privacy-note"><strong>{_escape(ui_text(locale, 'JD 定位', 'JD positioning'))}:</strong> {_escape(positioning_role)} · <strong>{_escape(ui_text(locale, '候选证据包', 'Candidate Evidence Pack'))}:</strong> {_escape(str(evidence_fact_count))} {_escape(ui_text(locale, '条事实', 'facts'))}{(' · ' + _escape(', '.join(str(item) for item in evidence_projects))) if evidence_projects else ''}</p>
   <div class="result-grid">
     <div>
@@ -3511,14 +4521,20 @@ def _validated_record_anchor_pack(
     return pack
 
 
-def _interview_defense_panel(*, data_root: Path, run_id: str, repo_root: Path | None = None) -> str:
+def _interview_defense_panel(
+    *,
+    data_root: Path,
+    run_id: str,
+    repo_root: Path | None = None,
+    locale: UILocale = DEFAULT_UI_LOCALE,
+) -> str:
     repo_root = repo_root or _repo_root()
     try:
         records = load_interview_defense_records(data_root=data_root, run_id=run_id)
     except (ResumeWorkspaceStorageError, ValueError):
         return (
-            '<section class="interview-defense"><h3>Interview Defense</h3>'
-            "<p>Unavailable.</p></section>"
+            f'<section class="interview-defense"><h3>{_escape(ui_text(locale, "面试答辩", "Interview Defense"))}</h3>'
+            f'<p>{_escape(ui_text(locale, "暂不可用。", "Unavailable."))}</p></section>'
         )
     available = _available_learning_anchor_pack(data_root, repo_root)
     rows: list[str] = []
@@ -3534,50 +4550,62 @@ def _interview_defense_panel(*, data_root: Path, run_id: str, repo_root: Path | 
                 )
             except (LearningTraceabilityError, OSError, ValueError):
                 display_status = "NEEDS_MAPPING"
-                action = "映射已失效；请修复原始 Learning run，或重新生成这次简历后再关联。"
-            else:
-                href = (
-                    "/learning?"
-                    + urllib.parse.urlencode(
-                        {
-                            "run_id": record.mapping.learning_run_id,
-                            "resume_run_id": run_id,
-                            "bullet_id": record.bullet_id,
-                        }
+                action = _escape(
+                    ui_text(
+                        locale,
+                        "关联已失效；请修复原始学习记录，或重新生成这次简历后再关联。",
+                        "The mapping is stale. Repair the original Learning run or regenerate this resume before mapping again.",
                     )
-                    + "#interview-defense"
                 )
-                action = f'<a href="{_escape(href)}">Interview Defense →</a>'
+            else:
+                href = ui_url(
+                    "/learning#interview-defense",
+                    locale,
+                    run_id=record.mapping.learning_run_id,
+                    resume_run_id=run_id,
+                    bullet_id=record.bullet_id,
+                )
+                action = f'<a href="{_escape(href)}">{_escape(ui_text(locale, "面试答辩", "Interview Defense"))} →</a>'
         elif available is not None:
             learning_run, _pack = available
             action = f"""<form method="post" action="/resume/interview-defense/map">
+  <input type="hidden" name="ui_locale" value="{locale}" />
   <input type="hidden" name="resume_run_id" value="{_escape(run_id)}" />
   <input type="hidden" name="bullet_id" value="{_escape(record.bullet_id)}" />
   <input type="hidden" name="learning_run_id" value="{_escape(learning_run)}" />
-  <button type="submit">确认关联 Conversation RAG 锚点</button>
+  <button type="submit">{_escape(ui_text(locale, '确认关联对话式 RAG 锚点', 'Confirm Conversation RAG anchors'))}</button>
 </form>"""
         else:
-            action = '<a href="/learning">先建立 Learning 黄金案例。</a>'
+            action = f'<a href="{ui_url("/learning", locale)}">{_escape(ui_text(locale, "先建立学习黄金案例。", "Build the Learning golden case first."))}</a>'
         rows.append(
             f"<li><code>{_escape(record.bullet_id)}</code> · "
-            f"{_escape(display_status)}<br />"
+            f"{_escape(ui_display_value(locale, display_status))}<br />"
             f"{_escape(record.bullet_text)}<br />{action}</li>"
         )
     if available is None:
-        availability = "当前没有可用的 Conversation RAG Learning run。"
+        availability = ui_text(
+            locale,
+            "当前没有可用的对话式 RAG 学习记录。",
+            "No Conversation RAG Learning run is currently available.",
+        )
     else:
         learning_run, pack = available
         project = pack.get("project")
         if not isinstance(project, dict):
-            availability = "当前没有可用的 Conversation RAG Learning run。"
+            availability = ui_text(
+                locale,
+                "当前没有可用的对话式 RAG 学习记录。",
+                "No Conversation RAG Learning run is currently available.",
+            )
         else:
             availability = (
-                "待你确认关联："
+                ui_text(locale, "待你确认关联：", "Awaiting your mapping confirmation: ")
+                +
                 f"{learning_run} · {project.get('repository')} · "
                 f"{project.get('branch')} · {project.get('commit')}"
             )
     return (
-        '<section class="interview-defense"><h3>Interview Defense</h3>'
+        f'<section class="interview-defense"><h3>{_escape(ui_text(locale, "面试答辩", "Interview Defense"))}</h3>'
         f"<p>{_escape(availability)}</p><ul>{''.join(rows)}</ul></section>"
     )
 
@@ -3678,14 +4706,14 @@ def _home_activity_html(
                 f'''<article class="activity-card"><span class="activity-state">{_escape(state_copy)}</span>
                 <strong>{_escape(ui_text(locale, '最近内容包', 'Recent content bundle'))}</strong>
                 <p>{_escape(ui_text(locale, '统一内容包已私有保存；发布仍需要你的最终确认。', 'The unified bundle is saved privately; publication still requires your final confirmation.'))}</p>
-                <a href="{_escape(ui_url('/content', locale, run_id=content_dir.name))}">{_escape(action_copy)} →</a></article>'''
+                <a href="{_escape(ui_url('/creator/create', locale, run_id=content_dir.name))}">{_escape(action_copy)} →</a></article>'''
             )
 
     cards.append(
         f'''<article class="activity-card"><span class="activity-state">{_escape(ui_text(locale, '本地', 'Local'))}</span>
         <strong>{_escape(ui_text(locale, '扫描我最近做的事', 'Scan my recent work'))}</strong>
         <p>{_escape(ui_text(locale, '只读取已有本地回执和元数据，不调用模型。', 'Uses existing local receipts and metadata without a model call.'))}</p>
-        <a href="{_escape(ui_url('/content', locale, scan_range='today'))}">{_escape(ui_text(locale, '扫描今天', 'Scan today'))} →</a></article>'''
+        <a href="{_escape(ui_url('/creator/create', locale, scan_range='today'))}">{_escape(ui_text(locale, '扫描今天', 'Scan today'))} →</a></article>'''
     )
     return f'''<section class="today-activity" aria-label="{_escape(ui_text(locale, '最近工作', 'Recent work'))}">
     <span class="kicker">{_escape(ui_text(locale, '继续上次工作', 'Continue where you left off'))}</span>
@@ -3728,7 +4756,7 @@ def _home_page(
     <span class="outcome-action">{_escape(ui_text(locale, '开始面试准备', 'Prepare for an interview'))}<span aria-hidden="true">→</span></span>
   </article>
   <article class="outcome-card visibility-card">
-    <a class="outcome-hitbox" href="{ui_url('/content', locale)}" aria-label="{_escape(ui_text(locale, '把工作变成内容', 'Turn my work into content'))}"></a>
+    <a class="outcome-hitbox" href="{ui_url('/creator', locale)}" aria-label="{_escape(ui_text(locale, '把工作变成内容', 'Turn my work into content'))}"></a>
     <span class="outcome-number">03</span>
     <span class="kicker">{_escape(ui_text(locale, '建立影响力', 'Build visibility'))}</span>
     <h2>{_escape(ui_text(locale, '把真实工作变成可信的公开内容', 'Turn real work into credible public content'))}</h2>
@@ -3736,7 +4764,7 @@ def _home_page(
     <span class="outcome-action">{_escape(ui_text(locale, '把工作变成内容', 'Turn my work into content'))}<span aria-hidden="true">→</span></span>
     <div class="secondary-actions">
       <a href="{ui_url('/video', locale)}">{_escape(ui_text(locale, '创建视频', 'Create video'))}</a>
-      <a href="{ui_url('/publishing', locale)}">{_escape(ui_text(locale, '发布已审核内容', 'Publish approved content'))}</a>
+      <a href="{ui_url('/creator/publish', locale)}">{_escape(ui_text(locale, '发布已审核内容', 'Publish approved content'))}</a>
     </div>
   </article>
 </section>
@@ -3760,8 +4788,67 @@ def _home_page(
         body=body,
         extra_css="""
 .work-context-strip{display:grid;grid-template-columns:minmax(230px,.8fr) minmax(260px,1.2fr) auto;gap:18px;align-items:center;margin-bottom:20px;padding:17px 20px;border:1px solid #d9e2dc;border-radius:17px;background:linear-gradient(110deg,rgba(255,255,255,.96),rgba(239,248,244,.92));box-shadow:0 10px 28px rgb(35 45 70 / 6%)}.work-context-strip>div{display:grid;gap:4px}.work-context-strip strong{font-size:14px}.work-context-strip p{margin:0;color:var(--text-muted)}.work-context-strip a{display:flex;align-items:center;gap:10px;white-space:nowrap;font-weight:850;text-decoration:none}.outcome-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;align-items:stretch}.outcome-card{position:relative;overflow:hidden;display:flex;flex-direction:column;min-height:360px;padding:26px;border:1px solid #fff;border-radius:var(--radius-xl);box-shadow:var(--shadow-card);background:linear-gradient(160deg,#fff 0%,#f7f8ff 100%);cursor:pointer;transition:transform .16s ease,box-shadow .16s ease}.outcome-card:hover,.outcome-card:focus-within{transform:translateY(-3px);box-shadow:0 20px 52px rgb(35 45 70 / 13%),0 1px 2px rgb(35 45 70 / 6%)}.outcome-card::after{content:"";position:absolute;width:150px;height:150px;border-radius:50%;right:-55px;top:-55px;background:rgb(64 86 180 / 8%)}.outcome-hitbox{position:absolute;inset:0;z-index:2;border-radius:inherit}.outcome-hitbox:focus-visible{outline:3px solid var(--focus);outline-offset:-4px}.defend-card{background:linear-gradient(160deg,#fff 0%,#f2faf6 100%)}.defend-card::after{background:rgb(24 119 92 / 9%)}.visibility-card{background:linear-gradient(160deg,#fff 0%,#fbf6ff 100%)}.visibility-card::after{background:rgb(114 87 173 / 9%)}.outcome-number{color:var(--text-muted);font-size:12px;font-weight:850;letter-spacing:.12em}.outcome-card .kicker{margin-top:28px}.outcome-card h2{margin:10px 0 11px;font-size:25px;line-height:1.2;letter-spacing:-.035em}.outcome-card p{margin:0 0 24px;color:var(--text-muted)}.outcome-action{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:auto;padding:13px 15px;border-radius:13px;background:var(--brand);color:#fff;text-decoration:none;font-weight:850}.defend-card .outcome-action{background:var(--success)}.visibility-card .outcome-action{background:var(--brand-secondary)}.secondary-actions{position:relative;z-index:3;display:flex;gap:12px;flex-wrap:wrap;margin-top:13px}.secondary-actions a{font-size:12px;font-weight:750;text-decoration:none}.today-activity{margin-top:22px;padding:22px;border:1px solid var(--border);border-radius:20px;background:rgb(255 255 255 / 76%)}.today-activity h2{margin:5px 0 14px}.activity-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.activity-card{display:grid;gap:8px;padding:16px;border:1px solid var(--border);border-radius:15px;background:#fff}.activity-card strong{font-size:15px}.activity-card p{margin:0;color:var(--text-muted);font-size:13px}.activity-card a{justify-self:start;font-size:13px;font-weight:850;text-decoration:none}.activity-state{justify-self:start;padding:4px 8px;border-radius:999px;background:var(--success-soft);color:var(--success);font-size:11px;font-weight:850}.home-promise{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:22px;padding:16px 20px;border:1px solid var(--border);border-radius:16px;background:rgb(255 255 255 / 72%);color:var(--text-muted)}.home-promise strong{color:var(--text)}
+.work-context-strip .context-note{color:var(--text-muted);font-size:12px}
 @media(max-width:940px){.work-context-strip{grid-template-columns:1fr}.outcome-grid,.activity-grid{grid-template-columns:1fr}.outcome-card{min-height:280px}.home-promise{align-items:flex-start;flex-direction:column}}""",
     )
+
+
+def _applications_section_html(
+    resume_library_root: Path, *, locale: UILocale
+) -> str:
+    try:
+        records = list_application_records(resume_library_root)
+    except (OSError, ValueError):
+        records = []
+    if not records:
+        return f'''<section class="applications-overview" id="applications"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, "申请与机会", "Applications / Opportunities"))}</span><h2>{_escape(ui_text(locale, "还没有申请记录", "No applications yet"))}</h2><p>{_escape(ui_text(locale, "生成并保存第一份针对性简历后，这里会显示申请状态、面试就绪与下一步。简历草稿不会被误当作投递记录。", "After you generate and save your first tailored resume, this area will show application status, interview readiness, and next actions. Resume drafts are never mistaken for applications."))}</p></div></div><a class="text-link" href="{ui_url('/resume#resume-form', locale)}">{_escape(ui_text(locale, "生成第一份简历", "Generate your first resume"))} →</a></section>'''
+    status_labels = {
+        ApplicationStatus.DRAFT: ui_text(locale, "草稿", "Draft"),
+        ApplicationStatus.READY_TO_APPLY: ui_text(locale, "可投递", "Ready to apply"),
+        ApplicationStatus.APPLIED: ui_text(locale, "已投递", "Applied"),
+        ApplicationStatus.INTERVIEW: ui_text(locale, "面试中", "Interview"),
+        ApplicationStatus.OFFER: ui_text(locale, "Offer", "Offer"),
+        ApplicationStatus.REJECTED: ui_text(locale, "未通过", "Rejected"),
+        ApplicationStatus.WITHDRAWN: ui_text(locale, "已撤回", "Withdrawn"),
+    }
+    cards: list[str] = []
+    for record in records:
+        status_options = "".join(
+            f'<option value="{status.value}" {"selected" if status is record.status else ""}>{_escape(status_labels[status])}</option>'
+            for status in ApplicationStatus
+        )
+        company = _escape(record.company or ui_text(locale, "未记录公司", "Company not recorded"))
+        role = _escape(record.role or ui_text(locale, "未记录职位", "Role not recorded"))
+        resume_action = (
+            f'<a class="text-link" href="{ui_url(f"/downloads/{record.soloscale_run_id}/resume.docx", locale)}">{_escape(ui_text(locale, "打开简历", "Open resume"))} →</a>'
+            if record.soloscale_run_id
+            else ""
+        )
+        interview = (
+            ui_text(locale, "是", "Yes")
+            if record.interview_ready is True
+            else ui_text(locale, "否", "No")
+            if record.interview_ready is False
+            else ui_text(locale, "未评估", "Not assessed")
+        )
+        next_action = _escape(record.next_action or ui_text(locale, "下一步由你决定", "Next action is yours to decide"))
+        cards.append(
+            f'''<article class="application-card"><div><span class="status-badge">{_escape(status_labels[record.status])}</span><h3>{role} · {company}</h3><p>{_escape(record.job_id or ui_text(locale, "无 JD 标识", "No JD identity"))}{(" · " + _escape(record.source_url)) if record.source_url else ""}</p><div class="application-truth"><span>{_escape(ui_text(locale, "面试就绪", "Interview ready"))}: <strong>{interview}</strong></span><span>{_escape(ui_text(locale, "下一步", "Next action"))}: <strong>{next_action}</strong></span></div></div><div class="application-actions">{resume_action}<form method="post" action="/applications/status"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="resume_library_root" value="{_escape(str(resume_library_root))}" /><input type="hidden" name="directory_name" value="{_escape(record.directory_name)}" /><select name="status">{status_options}</select><input name="note" placeholder="{_escape(ui_text(locale, "备注（可选）", "Note (optional)"))}" /><input name="next_action" placeholder="{_escape(ui_text(locale, "下一步（可选）", "Next action (optional)"))}" /><button type="submit">{_escape(ui_text(locale, "更新状态", "Update status"))}</button></form><a class="text-link" href="{ui_url('/learning', locale)}">{_escape(ui_text(locale, "准备面试 / 练习缺口", "Prepare interview / practice gap"))} →</a></div></article>'''
+        )
+    return f'''<section class="applications-overview" id="applications"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, "申请与机会", "Applications / Opportunities"))}</span><h2>{_escape(ui_text(locale, "追踪每一次申请，而不是把简历草稿误当作投递记录。", "Track each application instead of mistaking resume drafts for applications."))}</h2><p>{_escape(ui_text(locale, "状态只在你记录真实外部结果后更新；SoloScale 不会替你发明投递或 Offer。", "Status updates only after you record a real external result; SoloScale never invents an application or offer."))}</p></div></div><div class="application-list">{''.join(cards)}</div></section>'''
+
+
+def _localized_file_input(
+    *,
+    name: str,
+    accept: str,
+    required: bool,
+    locale: UILocale,
+    button_label: str,
+    placeholder: str,
+) -> str:
+    required_attr = " required" if required else ""
+    return f'''<span class="file-control"><input class="file-native" type="file" name="{_escape(name)}" accept="{_escape(accept)}"{required_attr} data-file-placeholder="{_escape(placeholder)}" /><span class="file-button" aria-hidden="true">{_escape(button_label)}</span><span class="file-name" data-file-name-for="{_escape(name)}">{_escape(placeholder)}</span></span>'''
 
 
 def _user_page(
@@ -3771,7 +4858,9 @@ def _user_page(
     locale: UILocale = DEFAULT_UI_LOCALE,
     *,
     desktop_mode: bool = False,
+    workspace_root: Path | None = None,
     resume_job: ResumeJobSnapshot | None = None,
+    template_receipt: ResumeTemplateReceipt | None = None,
 ) -> str:
     job_description = _escape(form.get("job_description", ""))
     company_name = _escape(form.get("company_name", ""))
@@ -3814,47 +4903,114 @@ def _user_page(
         else "workspace"
     )
     work_summary = render_use_my_work(
-        load_work_context(data_root),
+        load_work_context(data_root, workspace_root=workspace_root),
         locale,
         boundary=ui_text(
             locale,
             "本次简历仍只使用你确认的模板经历作为事实；其他资料只帮助发现相关项目，不会自动新增经历。",
             "This resume still treats only your approved template experience as fact. Other work can help discovery, but never adds claims automatically.",
         ),
+        return_path="/resume",
     )
+    template_preview_id = form.get("resume_template_preview_id", "").strip()
+    if (
+        template_receipt is not None
+        and template_preview_id
+        and template_receipt.preview_id != template_preview_id
+    ):
+        template_receipt = None
+    template_error = form.get("template_preview_error", "").strip()
+    if template_receipt is not None:
+        section_labels = {
+            "SUMMARY": ui_text(locale, "个人简介", "Summary"),
+            "PROJECT HIGHLIGHTS": ui_text(locale, "项目经历", "Projects"),
+            "EDUCATION": ui_text(locale, "教育经历", "Education"),
+            "TECHNICAL SKILLS": ui_text(locale, "技术技能", "Technical skills"),
+            "WORK EXPERIENCE": ui_text(locale, "工作经历", "Work experience"),
+        }
+        detected_sections = "".join(
+            f'<li>✓ {_escape(section_labels.get(item, item))}</li>'
+            for item in template_receipt.detected_sections
+        )
+        template_preview = f"""<section class="template-preview success-state">
+          <span class="status-badge">{_escape(ui_text(locale, '模板已识别', 'Template detected'))}</span>
+          <h3>{_escape(ui_text(locale, '请确认结构后再生成', 'Confirm the structure before generating'))}</h3>
+          <ul>{detected_sections}</ul>
+          <p>{_escape(ui_text(locale, '模板只控制栏目顺序；其中的姓名、公司、数字和正文不会成为你的候选事实。', 'The template controls section order only. Names, companies, metrics, and body copy from it never become candidate facts.'))}</p>
+        </section>"""
+    else:
+        template_preview = ""
+    template_error_html = (
+        f'<p class="template-error" role="alert">{_escape(template_error)}</p>'
+        if template_error
+        else ""
+    )
+    language_value = form.get("resume_output_language", "en-US")
+    if language_value not in {"en-US", "zh-CN", "both"}:
+        language_value = "en-US"
     job_panel = _resume_job_panel(resume_job, locale) if resume_job is not None else ""
-    body = f"""{work_summary}{job_panel}<div class="{workspace_class}">
+    applications_section = _applications_section_html(
+        resume_library_root, locale=locale
+    )
+    body = f"""{work_summary}{applications_section}{job_panel}<div class="{workspace_class}">
       <section class="input-card">
         <span class="result-kicker">{_escape(ui_text(locale, '输入', 'Input'))}</span>
         <h2>{_escape(ui_text(locale, '简历 + Job Description', 'Resume + Job Description'))}</h2>
         <p>{_escape(ui_text(locale, 'AI 只能排序、压缩和改写你批准的事实，不能新增经历；生成后请做最后一次人工检查。', 'AI may rank, compress, and rewrite only the facts you approve. It cannot add experience, and you complete the final review.'))}</p>
+        <details class="template-intake" {'open' if template_receipt is not None or template_error else ''}>
+          <summary>{_escape(ui_text(locale, '更换简历结构模板（可选）', 'Change layout template (optional)'))}</summary>
+          <p>{_escape(ui_text(locale, '先读取模板，再确认使用。支持 DOCX、HTML/HTM、TXT/MD；PDF 仅在结构可可靠识别时接受。', 'Read and confirm a template first. DOCX, HTML/HTM, TXT/MD are supported; PDF is accepted only when its structure is reliable.'))}</p>
+          {template_error_html}
+          <form method="post" action="/resume/template-preview" enctype="multipart/form-data">
+            <input type="hidden" name="ui_locale" value="{locale}" />
+            <label>{_escape(ui_text(locale, '上传模板文件', 'Upload template file'))}
+              {_localized_file_input(name="layout_template_file", accept=".docx,.html,.htm,.pdf,.txt,.md", required=False, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
+            </label>
+            <label>{_escape(ui_text(locale, '或模板网页 URL', 'Or template webpage URL'))}
+              <input type="url" name="layout_template_url" placeholder="https://example.com/resume-template" />
+            </label>
+            <label>{_escape(ui_text(locale, '或粘贴 HTML', 'Or paste HTML'))}
+              <textarea name="layout_template_html" maxlength="1048576" placeholder="&lt;html&gt;…&lt;/html&gt;"></textarea>
+            </label>
+            <button class="secondary-button" type="submit">{_escape(ui_text(locale, '读取并预览模板', 'Read and preview template'))}</button>
+          </form>
+          {template_preview}
+        </details>
         <form id="resume-form" method="post" action="/generate" enctype="multipart/form-data">
           <input type="hidden" name="ui_locale" value="{locale}" />
           <input type="hidden" name="provider_model" value="{provider_model}" />
+          <input type="hidden" name="resume_template_preview_id" value="{_escape(template_receipt.preview_id if template_receipt is not None else '')}" />
+          <label>{_escape(ui_text(locale, '输出语言', 'Output language'))}
+            <select name="resume_output_language">
+              <option value="en-US" {'selected' if language_value == 'en-US' else ''}>English (en-US)</option>
+              <option value="zh-CN" {'selected' if language_value == 'zh-CN' else ''}>中文 (zh-CN)</option>
+              <option value="both" {'selected' if language_value == 'both' else ''}>{_escape(ui_text(locale, '英文 + 中文', 'English + Chinese'))}</option>
+            </select>
+            <span class="hint">{_escape(ui_text(locale, '双语会分别完成两次语言编辑；两版共享同一套 FACT IDs 和事实边界。', 'Both performs two locale-specific editorial passes. The variants share the same FACT IDs and truth boundary.'))}</span>
+          </label>
+          {f'<label><input type="checkbox" name="approve_layout_template" value="yes" required />{_escape(ui_text(locale, "我已预览并确认使用这个结构模板；模板正文不会作为我的经历。", "I reviewed and approve this structure template. Its body copy is not my experience."))}</label>' if template_receipt is not None else ''}
           <label>{_escape(ui_text(locale, '现有简历', 'Current resume'))}
             <span class="hint">{_escape(ui_text(locale, '支持 PDF、DOCX、TXT、MD；每个文件最大 5 MB。DOCX 会保留原版式，其他格式会生成简洁 Word 版。', 'PDF, DOCX, TXT, and MD are supported, up to 5 MB each. DOCX keeps its layout; other formats produce a clean Word version.'))}</span>
-            <input
-              type="file" name="resume_template" accept=".pdf,.docx,.txt,.md" required
-            />
+            {_localized_file_input(name="resume_template", accept=".pdf,.docx,.txt,.md", required=True, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
           </label>
-          <label>Job Description
+          <label>{_escape(ui_text(locale, '职位描述（JD）', 'Job Description'))}
             <span class="hint">{_escape(ui_text(locale, '粘贴完整 JD，或在下方上传一个文件；两者选一个。', 'Paste the complete JD, or upload one file below. Choose one method.'))}</span>
             <textarea
               name="job_description"
-              placeholder="Paste the full job description here…"
+              placeholder="{_escape(ui_text(locale, '在此粘贴完整职位描述…', 'Paste the full job description here…'))}"
             >{job_description}</textarea>
           </label>
           <label>{_escape(ui_text(locale, '或者上传 JD（可选）', 'Or upload the JD (optional)'))}
-            <input type="file" name="job_description_file" accept=".pdf,.docx,.txt,.md" />
+            {_localized_file_input(name="job_description_file", accept=".pdf,.docx,.txt,.md", required=False, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
           </label>
           <label>{_escape(ui_text(locale, '补充材料（可选，最多一份）', 'Supporting document (optional, one file)'))}
             <span class="hint">{_escape(ui_text(locale, '只提取与本次简历相关的摘要；不会上传原始文件、文件名或本地路径。', 'Only a task-relevant summary is prepared. The raw file, filename, and local path never enter the gateway payload.'))}</span>
-            <input type="file" name="support_document" accept=".pdf,.docx,.txt,.md" />
+            {_localized_file_input(name="support_document", accept=".pdf,.docx,.txt,.md", required=False, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
           </label>
           <label>{_escape(ui_text(locale, '针对性说明（可选）', 'Tailoring instructions (optional)'))}
             <span class="hint">{_escape(ui_text(locale, '例如：突出 RAG、后端工程和产品交付。说明只影响已有内容的排序，不会新增经历。', 'For example: prioritize RAG, backend engineering, and product delivery. Instructions only affect ordering and never add experience.'))}</span>
             <textarea name="tailoring_instructions" maxlength="1200"
-              placeholder="Prioritize relevant existing projects and skills…"
+              placeholder="{_escape(ui_text(locale, '优先突出相关的已有项目与技能…', 'Prioritize relevant existing projects and skills…'))}"
             >{tailoring_instructions}</textarea>
           </label>
           <div class="metadata">
@@ -3918,6 +5074,12 @@ def _user_page(
     }};
     document.querySelectorAll('input[name="expert_review_mode"]').forEach((item)=>item.addEventListener('change',syncExpertApproval));
     syncExpertApproval();
+    document.querySelectorAll('input.file-native[type="file"]').forEach((input)=>{{
+      const name=document.querySelector(`[data-file-name-for="${{input.name}}"]`);
+      const update=()=>{{ if(name) name.textContent = input.files && input.files.length ? Array.from(input.files).map(f=>f.name).join(', ') : (input.dataset.filePlaceholder || ''); }};
+      input.addEventListener('change',update);
+      update();
+    }});
     if(resumeForm) resumeForm.addEventListener('submit',()=>{{
       const progress=document.getElementById('progress');
       const button=document.getElementById('generate-button');
@@ -3946,13 +5108,16 @@ def _user_page(
 .workspace{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:22px}.workspace.has-result{grid-template-columns:minmax(320px,.72fr) minmax(0,1.28fr)}
 .input-card h2,.result-card h2{margin:7px 0 8px;font-size:25px;letter-spacing:-.025em}.input-card>p,.result-card p{color:var(--text-muted)}
 .input-card form{gap:18px;margin-top:24px}.input-card textarea{min-height:220px}.input-card input[type=file]{padding:18px;border-style:dashed;background:#fafbff}
+.template-intake{margin:18px 0;padding:14px 16px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.template-intake>summary{cursor:pointer;font-weight:850}.template-intake>p{margin:10px 0 0;color:var(--text-muted);font-size:12px}.template-intake form{margin-top:14px}.template-intake textarea{min-height:120px}.template-preview{margin-top:14px;padding:14px;border:1px solid #badbcd;border-radius:12px;background:var(--success-soft)}.template-preview h3{margin:7px 0}.template-preview ul{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0;padding:0;list-style:none}.template-preview li{padding:5px 8px;border-radius:999px;background:#fff;font-size:11px;font-weight:750}.template-error{color:var(--danger);font-weight:750}.resume-variant-card{display:flex;align-items:center;gap:9px;margin-top:10px;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--surface-subtle)}.resume-variant-card strong{margin-right:auto}
 .metadata{display:grid;grid-template-columns:1fr 1fr;gap:12px}#progress{display:none;padding:14px;border-radius:13px;background:var(--brand-soft);color:var(--brand)}#progress.visible{display:block}
 .error-state{border-color:#efc7c4}.result-header{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}.download{flex:0 0 auto;margin-top:4px}
 .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:22px 0}.metrics div{padding:12px;border:1px solid var(--border);border-radius:13px;text-align:center}.metrics strong{display:block;font-size:24px}.metrics span{display:block;color:var(--text-muted);font-size:11px;margin-top:3px}
 .result-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(180px,.55fr);gap:18px}.preview-heading{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:10px}.preview-heading h3{margin:0}.preview-link{font-size:12px;font-weight:700;text-decoration:none}
 .resume-pdf-shell{height:680px;overflow:hidden;border:1px solid var(--border);border-radius:14px;background:#dfe3ea}.resume-pdf-preview{width:100%;height:100%;border:0;background:white}.preview-note{margin:9px 0 0;font-size:12px}.resume-preview{max-height:450px;overflow:auto}.gap-list{padding-left:20px;color:var(--text-muted);font-size:13px}.result-card details{margin-top:18px;border-top:1px solid var(--border);padding-top:15px;font-size:13px}.result-card summary{cursor:pointer;font-weight:700}code{word-break:break-all}
 .resume-provenance>p{color:var(--text-muted)}.provenance-summary{display:flex;align-items:baseline;gap:7px;margin:12px 0}.provenance-summary strong{font-size:26px;color:var(--success)}.provenance-claims{display:grid;gap:9px}.provenance-claim{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:12px;border:1px solid var(--border);border-radius:12px;background:#f8fbf9}.provenance-claim strong{font-size:13px;line-height:1.45}.provenance-claim p{margin:6px 0 0;color:var(--text-muted);font-size:11px}.provenance-claim .status-badge{flex:none;padding:5px 8px;border-radius:999px;background:#e5f5ed;color:#166044;font-size:10px;font-weight:800}
-@media(max-width:900px){.use-my-work,.workspace,.workspace.has-result,.result-grid{grid-template-columns:1fr}.resume-job-steps{grid-template-columns:repeat(3,1fr)}.job-timings ul{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.metadata,.metrics{grid-template-columns:1fr 1fr}.result-header,.resume-job-header,.resume-job-actions{display:block}.download{display:block;margin-top:16px}.resume-pdf-shell{height:560px}.resume-job-steps,.job-timings ul{grid-template-columns:1fr 1fr}}
+.applications-overview{margin-bottom:20px;padding:20px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.applications-overview h2{margin:7px 0}.applications-overview p{color:var(--text-muted)}.application-list{display:grid;gap:12px;margin-top:16px}.application-card{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:start;padding:16px;border:1px solid var(--border);border-radius:15px;background:#fff}.application-card h3{margin:7px 0 5px}.application-card p{margin:0;color:var(--text-muted);font-size:12px}.application-truth{display:grid;gap:4px;margin-top:10px;font-size:12px;color:var(--text-muted)}.application-truth strong{color:var(--text)}.application-actions{display:grid;gap:10px;align-items:start}.application-actions form{display:grid;grid-template-columns:auto 1fr 1fr auto;gap:7px}.application-actions input,.application-actions select{min-width:0}.application-actions button{white-space:nowrap}
+.file-control{position:relative;display:inline-flex;align-items:center;gap:10px;min-width:220px;padding:10px 12px;border:1px dashed var(--border);border-radius:12px;background:#fafbff}.file-native{position:absolute;inset:0;opacity:0;width:100%;height:100%;cursor:pointer;z-index:2}.file-button{padding:7px 11px;border-radius:9px;background:var(--brand);color:#fff;font-weight:800;font-size:12px;pointer-events:none}.file-name{color:var(--text-muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px}.file-control:focus-within{outline:3px solid var(--focus);outline-offset:2px}
+@media(max-width:900px){.use-my-work,.workspace,.workspace.has-result,.result-grid,.application-card{grid-template-columns:1fr}.resume-job-steps{grid-template-columns:repeat(3,1fr)}.job-timings ul{grid-template-columns:repeat(2,1fr)}.application-actions form{grid-template-columns:1fr}}@media(max-width:560px){.metadata,.metrics{grid-template-columns:1fr 1fr}.result-header,.resume-job-header,.resume-job-actions{display:block}.download{display:block;margin-top:16px}.resume-pdf-shell{height:560px}.resume-job-steps,.job-timings ul{grid-template-columns:1fr 1fr}}
 """,
     )
 
@@ -3975,31 +5140,51 @@ def _latest_learning_run(data_root: Path) -> Path | None:
     return candidates[-1] if candidates else None
 
 
-def _learning_graph(run_dir: Path) -> str:
+def _learning_graph(run_dir: Path, locale: UILocale) -> str:
     graph = _load_json_file(run_dir / "04_evidence_graph.json")
     if graph is None:
-        return '<p class="error">Graph artifact is unavailable.</p>'
+        return f'<p class="error">{_escape(ui_text(locale, "证据图暂不可用。", "Graph artifact is unavailable."))}</p>'
     nodes = graph.get("nodes", [])
     edges = graph.get("edges", [])
     if not isinstance(nodes, list) or not isinstance(edges, list):
-        return '<p class="error">Graph artifact has an invalid shape.</p>'
+        return f'<p class="error">{_escape(ui_text(locale, "证据图格式无效。", "Graph artifact has an invalid shape."))}</p>'
     node_json = json.dumps(nodes, ensure_ascii=True).replace("</", "<\\/")
     edge_json = json.dumps(edges, ensure_ascii=True).replace("</", "<\\/")
     run_id = json.dumps(run_dir.name)
+    locale_json = json.dumps(locale)
+    kind_labels = json.dumps(
+        {
+            "CONCEPT": ui_text(locale, "概念", "Concept"),
+            "CODE": ui_text(locale, "代码", "Code"),
+            "TEST": ui_text(locale, "测试", "Test"),
+            "DECISION": ui_text(locale, "决策", "Decision"),
+        },
+        ensure_ascii=False,
+    )
+    truth_labels = json.dumps(
+        {
+            value: ui_display_value(locale, value)
+            for value in ("UNKNOWN", "ENGINEERING_VERIFIED", "VERIFIED_EVIDENCE", "APPROVED_CLAIM")
+        },
+        ensure_ascii=False,
+    )
     return f"""<section class="panel graph-panel">
-  <h2>Interactive evidence graph</h2>
-  <p class="muted">Click a node for its evidence neighborhood. Double-click to focus it.</p>
+  <h2>{_escape(ui_text(locale, "交互式证据图", "Interactive evidence graph"))}</h2>
+  <p class="muted">{_escape(ui_text(locale, "单击节点查看关联证据，双击聚焦。", "Click a node for its evidence neighborhood. Double-click to focus it."))}</p>
   <div class="graph-scroll"><svg id="learning-graph" role="img"></svg></div>
   <div class="detail-grid">
-    <pre id="learning-node-detail">Select a Concept, Code, Test, or Decision node.</pre>
+    <pre id="learning-node-detail">{_escape(ui_text(locale, "请选择概念、代码、测试或决策节点。", "Select a Concept, Code, Test, or Decision node."))}</pre>
     <p><a id="learning-source-link" class="button-link hidden" target="_blank"
-      rel="noopener">Open grounded local source</a></p>
+      rel="noopener">{_escape(ui_text(locale, "打开有依据的本地源码", "Open grounded local source"))}</a></p>
   </div>
   <script>
   (function(){{
     const nodes={node_json};
     const edges={edge_json};
     const runId={run_id};
+    const locale={locale_json};
+    const kindLabels={kind_labels};
+    const truthLabels={truth_labels};
     const svg=document.getElementById('learning-graph');
     const detail=document.getElementById('learning-node-detail');
     const sourceLink=document.getElementById('learning-source-link');
@@ -4044,16 +5229,16 @@ def _learning_graph(run_dir: Path) -> str:
     function inspect(node){{
       detail.textContent=JSON.stringify({{
         id:node.id,
-        kind:node.kind,
+        kind:kindLabels[node.kind]||node.kind,
         label:node.label,
-        truth_stage:node.truth_stage,
+        truth_stage:truthLabels[node.truth_stage]||node.truth_stage,
         detail:node.detail,
         related:related(node.id),
         traceability:traceability(node.id),
       }},null,2);
       if(node.kind==='CODE'||node.kind==='TEST'){{
         sourceLink.href='/learning/source?run_id='+encodeURIComponent(runId)
-          +'&anchor_id='+encodeURIComponent(node.id);
+          +'&anchor_id='+encodeURIComponent(node.id)+'&lang='+encodeURIComponent(locale);
         sourceLink.classList.remove('hidden');
       }}else{{
         sourceLink.classList.add('hidden');
@@ -4093,7 +5278,7 @@ def _learning_graph(run_dir: Path) -> str:
         kind.setAttribute('text-anchor','middle');
         kind.setAttribute('fill','#bfdbfe');
         kind.setAttribute('font-size','10');
-        kind.textContent=node.kind;
+        kind.textContent=kindLabels[node.kind]||node.kind;
         label.setAttribute('x',node.x);
         label.setAttribute('y',node.y+12);
         label.setAttribute('text-anchor','middle');
@@ -4172,9 +5357,9 @@ def _learning_source_excerpt(
     return title, numbered
 
 
-def _learning_list(value: object) -> str:
+def _learning_list(value: object, locale: UILocale) -> str:
     if not isinstance(value, list):
-        return "<li>Not available.</li>"
+        return f"<li>{_escape(ui_text(locale, '暂无内容。', 'Not available.'))}</li>"
     return "".join(f"<li>{_escape(str(item))}</li>" for item in value)
 
 
@@ -4255,7 +5440,7 @@ def _anchor_pack_text(bullet: str, pack: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-def _anchor_pack_html(pack: dict[str, object]) -> str:
+def _anchor_pack_html(pack: dict[str, object], locale: UILocale) -> str:
     project, keywords, reasoning, code, tests = _anchor_pack_parts(pack)
 
     def rows(items: list[dict[str, object]], kind: str) -> str:
@@ -4275,22 +5460,455 @@ def _anchor_pack_html(pack: dict[str, object]) -> str:
 
     project_text = f"{project['repository']} · {project['branch']} · {project['commit']}"
     return f"""
-<p><strong>Project</strong><br /><code>{_escape(project_text)}</code></p>
-<p><strong>Keywords</strong><br />{_escape(", ".join(keywords))}</p>
-<details open><summary>Reasoning anchors</summary><ul>{rows(reasoning, "reasoning")}</ul></details>
-<details><summary>Code anchors</summary><ul>{rows(code, "code")}</ul></details>
-<details><summary>Test anchors</summary><ul>{rows(tests, "tests")}</ul></details>
+<p><strong>{_escape(ui_text(locale, '项目', 'Project'))}</strong><br /><code>{_escape(project_text)}</code></p>
+<p><strong>{_escape(ui_text(locale, '关键词', 'Keywords'))}</strong><br />{_escape(", ".join(keywords))}</p>
+<details open><summary>{_escape(ui_text(locale, '推理锚点', 'Reasoning anchors'))}</summary><ul>{rows(reasoning, "reasoning")}</ul></details>
+<details><summary>{_escape(ui_text(locale, '代码锚点', 'Code anchors'))}</summary><ul>{rows(code, "code")}</ul></details>
+<details><summary>{_escape(ui_text(locale, '测试锚点', 'Test anchors'))}</summary><ul>{rows(tests, "tests")}</ul></details>
 """
+
+
+def _active_learning_case(data_root: Path) -> LearningCase | None:
+    try:
+        cases = CasebookStore(data_root).list_cases()
+    except (OSError, ValueError):
+        return None
+    return max(cases, key=lambda case: case.created_at) if cases else None
+
+
+def _learning_default_requirement(data_root: Path) -> str:
+    active = _active_learning_case(data_root)
+    if active is not None:
+        return capability_requirement(active)
+    return DEFAULT_TARGET_REQUIREMENT
+
+
+def _practice_panel_html(data_root: Path, form: dict[str, str], locale: UILocale) -> str:
+    try:
+        cases = CasebookStore(data_root).list_cases()
+    except (OSError, ValueError):
+        cases = []
+    if not cases:
+        return f"""<section class="panel practice-panel" id="practice">
+  <h2>{_escape(ui_text(locale, '编码练习（VS Code）', 'Coding practice (VS Code)'))}</h2>
+  <p class="muted">{_escape(ui_text(locale, '先在下方生产就绪地图中创建学习案例，无需命令行；之后即可把案例缺口变成可练习、可回填掌握度的编码任务。', 'Create a Learning case from the Production Readiness Map below (no command line required); then turn the case gap into a bounded, testable practice task.'))}</p>
+</section>"""
+    latest = max(cases, key=lambda case: case.created_at)
+    exercises = [
+        item for item in list_exercises(data_root) if item.case_id == latest.id
+    ]
+    target_requirement = _escape(
+        form.get("target_requirement", _learning_default_requirement(data_root))
+    )
+    type_options = "".join(
+        f'<option value="{item.value}" {"selected" if item is ExerciseType.IMPLEMENT else ""}>{item.value}</option>'
+        for item in ExerciseType
+    )
+    language_options = "".join(
+        f'<option value="{item.value}" {"selected" if item is PracticeLanguage.PYTHON else ""}>{item.value}</option>'
+        for item in PracticeLanguage
+    )
+    exercise_rows = "".join(
+        _render_practice_exercise_row(item, locale) for item in exercises
+    )
+    return f"""<section class="panel practice-panel" id="practice">
+  <h2>{_escape(ui_text(locale, '编码练习（VS Code）', 'Coding practice (VS Code)'))}</h2>
+  <p class="muted">{_escape(ui_text(locale, '把案例缺口变成有边界、可测试、可回填掌握度的练习任务。', 'Turn the case gap into a bounded, testable task that feeds back into mastery.'))}</p>
+  <form class="practice-create" method="post" action="/learning/practice/create">
+    <input type="hidden" name="ui_locale" value="{locale}" />
+    <input type="hidden" name="case_id" value="{_escape(latest.id)}" />
+    <label>{_escape(ui_text(locale, 'JD 要求', 'JD requirement'))}
+      <input name="target_requirement" value="{target_requirement}" required />
+    </label>
+    <label>{_escape(ui_text(locale, '类型', 'Type'))}<select name="exercise_type">{type_options}</select></label>
+    <label>{_escape(ui_text(locale, '语言', 'Language'))}<select name="practice_language">{language_options}</select></label>
+    <label>{_escape(ui_text(locale, '难度', 'Difficulty'))}<select name="difficulty">
+      <option value="1">1</option><option value="2" selected>2</option><option value="3">3</option>
+      <option value="4">4</option><option value="5">5</option>
+    </select></label>
+    <button type="submit">{_escape(ui_text(locale, '生成练习工作区', 'Create practice workspace'))}</button>
+  </form>
+  <div class="practice-list">{exercise_rows}</div>
+</section>"""
+
+
+def _production_readiness_map_html(
+    data_root: Path, repo_root: Path | None, form: dict[str, str], locale: UILocale
+) -> str:
+    """Surface the capability-domain x maturity map without inventing mastery."""
+
+    try:
+        cases = CasebookStore(data_root).list_cases()
+    except (OSError, ValueError):
+        cases = []
+    latest = max(cases, key=lambda case: case.created_at) if cases else None
+    has_case = latest is not None
+    exercises = (
+        [item for item in list_exercises(data_root) if item.case_id == latest.id]
+        if latest is not None
+        else []
+    )
+    has_project = repo_root is not None
+    has_ci = bool(
+        repo_root is not None
+        and (repo_root / ".github/workflows/ci.yml").is_file()
+        and not (repo_root / ".github/workflows/ci.yml").is_symlink()
+    )
+    domains = (
+        "AI Application",
+        "Software Engineering",
+        "Cloud / DevOps",
+        "Observability / Evaluation",
+        "System Design",
+        "Security / Enterprise",
+    )
+    maturities = (
+        "UNDERSTAND",
+        "BUILD",
+        "TEST",
+        "DEPLOY",
+        "OBSERVE",
+        "RECOVER",
+        "SECURE",
+        "EXPLAIN / DEFEND",
+    )
+    domain_rows = "".join(
+        f'''<div class="readiness-domain"><strong>{_escape(domain)}</strong><div class="maturity-row">{"".join(f'<span class="maturity-chip {"ready" if has_case or (dim in {"TEST", "DEPLOY"} and has_ci) else "needs"}">{_escape(dim)}</span>' for dim in maturities)}</div></div>'''
+        for domain in domains
+    )
+    if not has_project:
+        gap_type = ui_text(locale, "NO_EVIDENCE", "NO_EVIDENCE")
+        gap_title = ui_text(locale, "连接一个真实项目", "Connect a real project")
+        gap_note = ui_text(
+            locale,
+            "没有项目证据时无法生成有边界的练习；先在工作页选择本地 Git 项目。",
+            "A bounded practice cannot be generated without project evidence; choose a local Git project first.",
+        )
+    elif not has_ci:
+        gap_type = ui_text(locale, "NO_PRODUCTION_PROOF", "NO_PRODUCTION_PROOF")
+        gap_title = ui_text(locale, "把验证命令固化为 GitHub Actions CI", "Automate verification with GitHub Actions")
+        gap_note = ui_text(
+            locale,
+            "项目已在本地反复运行 pytest、ruff、mypy 与构建，但仍需把这条验证流水线作为生产证据自动化并讲清楚。",
+            "The project already runs pytest, Ruff, mypy, and build locally, but this verification loop still needs to be automated and explained as production evidence.",
+        )
+    elif latest is None:
+        gap_type = ui_text(locale, "UNDERSTANDING_GAP", "UNDERSTANDING_GAP")
+        gap_title = ui_text(locale, "创建第一个 CI/CD 学习案例", "Create the first CI/CD learning case")
+        gap_note = ui_text(
+            locale,
+            "仓库已有 CI workflow，但还没有把它沉淀为可练习、可复核的学习案例。",
+            "The repository already has a CI workflow, but it has not been turned into a practiceable, reviewable learning case yet.",
+        )
+    elif not exercises:
+        gap_type = ui_text(locale, "INTERVIEW_GAP", "INTERVIEW_GAP")
+        gap_title = ui_text(locale, "生成并完成一次 CI/CD 练习", "Generate and complete one CI/CD exercise")
+        gap_note = ui_text(
+            locale,
+            "已有案例；下一步是生成有边界的练习工作区并在 VS Code 中完成。",
+            "A case exists; the next step is to generate a bounded practice workspace and complete it in VS Code.",
+        )
+    else:
+        gap_type = ui_text(locale, "INTERVIEW_GAP", "INTERVIEW_GAP")
+        gap_title = ui_text(locale, "提交证据并复核掌握", "Submit evidence and review mastery")
+        gap_note = ui_text(
+            locale,
+            "练习工作区已生成；完成编码后提交结果，掌握等级仍需你确认，不会自动授予。",
+            "A practice workspace exists; after coding, submit your result. Mastery still requires your confirmation and is never auto-granted.",
+        )
+    if latest is not None:
+        action = f'''<form method="post" action="/learning/practice/create"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="case_id" value="{_escape(latest.id)}" /><input type="hidden" name="target_requirement" value="{_escape(form.get("target_requirement", _learning_default_requirement(data_root)))}" /><input type="hidden" name="exercise_type" value="IMPLEMENT" /><input type="hidden" name="practice_language" value="python" /><input type="hidden" name="difficulty" value="2" /><button class="primary" type="submit">{_escape(ui_text(locale, "生成练习", "Generate practice"))}</button></form>'''
+    elif has_project:
+        action = f'''<form method="post" action="/learning/case/create"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="target_requirement" value="{_escape(form.get("target_requirement", _learning_default_requirement(data_root)))}" /><button class="primary" type="submit">{_escape(ui_text(locale, "创建学习案例并继续", "Create learning case"))}</button></form>'''
+    else:
+        action = f'<a class="button-link" href="{ui_url("/work", locale)}">{_escape(ui_text(locale, "选择项目", "Choose project"))}</a>'
+    return f"""<section class="panel readiness-map" id="readiness-map">
+  <span class="kicker">{_escape(ui_text(locale, "生产就绪地图", "Production readiness map"))}</span>
+  <h2>{_escape(ui_text(locale, "能力域 × 工程成熟度", "Capability domain x engineering maturity"))}</h2>
+  <p class="muted">{_escape(ui_text(locale, "这里用定性状态标记证据，不伪造单一精确百分比；掌握证据仍需你复核。", "This map uses qualitative evidence states and never fabricates one precise mastery percentage; mastery still needs your review."))}</p>
+  <div class="readiness-domains">{domain_rows}</div>
+  <div class="highest-gap"><div><span class="status-badge">{_escape(gap_type)}</span><h3>{_escape(gap_title)}</h3><p>{_escape(gap_note)}</p></div>{action}</div>
+</section>"""
+
+
+def _render_practice_exercise_row(item: LearningExercise, locale: UILocale) -> str:
+    actions: list[str] = []
+    if item.status is not ExerciseStatus.COMPLETED:
+        actions.append(
+            f"""<form method="post" action="/learning/practice/open">
+  <input type="hidden" name="exercise_id" value="{_escape(item.id)}" />
+  <button type="submit">{_escape(ui_text(locale, '在 VS Code 中打开', 'Open in VS Code'))}</button>
+</form>"""
+        )
+        actions.append(
+            f"""<form class="practice-complete" method="post" action="/learning/practice/complete" enctype="multipart/form-data">
+  <input type="hidden" name="exercise_id" value="{_escape(item.id)}" />
+  <label>{_escape(ui_text(locale, '证据文件（完成状态由练习的验收条件决定）', 'Evidence file (completion is decided by the exercise acceptance criteria)'))}
+    <input type="file" name="evidence" accept=".py,.md,.txt,.ts,.sql,.sh,.json,.log" />
+  </label>
+  <label>{_escape(ui_text(locale, '通过', 'Passed'))}<input type="number" name="tests_passed" value="0" min="0" /></label>
+  <label>{_escape(ui_text(locale, '失败', 'Failed'))}<input type="number" name="tests_failed" value="0" min="0" /></label>
+  <label>{_escape(ui_text(locale, '说明（未完成时必填）', 'Note (required when not passing)'))}
+    <textarea name="note" rows="2"></textarea>
+  </label>
+  <button type="submit">{_escape(ui_text(locale, '提交练习结果', 'Submit practice result'))}</button>
+</form>"""
+        )
+    return f"""<article class="practice-item">
+  <h3>{_escape(item.exercise_type.value)} · <code>{_escape(item.id)}</code></h3>
+  <p class="muted">{_escape(ui_text(locale, '状态', 'Status'))} <strong>{_escape(item.status.value)}</strong>
+    · {_escape(ui_text(locale, '语言', 'Language'))} {_escape(item.practice_language.value)}
+    · {_escape(ui_text(locale, '难度', 'Difficulty'))} {item.difficulty}/5</p>
+  <p class="muted"><code>{_escape(item.workspace_path or '')}</code></p>
+  <div class="practice-actions">{"".join(actions)}</div>
+</article>"""
+
+
+def _create_learning_case_ui(
+    fields: dict[str, str], data_root: Path, repo_root: Path | None
+) -> UIActionResult:
+    if repo_root is None:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            1,
+            "",
+            "这个练习需要一个已连接的代码项目。请先选择项目。",
+            0,
+        )
+    requirement = fields.get("target_requirement", "").strip()
+    if not requirement:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            1,
+            "",
+            "请填写目标 JD 要求。",
+            0,
+        )
+    evidence_candidates = (
+        repo_root / ".github/workflows/ci.yml",
+        repo_root / "pyproject.toml",
+        repo_root / "README.md",
+    )
+    evidence_file = next(
+        (path for path in evidence_candidates if path.is_file() and not path.is_symlink()),
+        None,
+    )
+    if evidence_file is None:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            1,
+            "",
+            "没有找到可归档的本地证据文件（CI workflow / pyproject / README）。",
+            0,
+        )
+    repository_name = repo_root.name
+    try:
+        from soloscale.learning_traceability import _repository_identity
+
+        repository_name = _repository_identity(repo_root).name
+    except Exception:
+        pass
+    store = CasebookStore(data_root)
+    case_id = "ci-cd-automation"
+    try:
+        store.load_case(case_id)
+    except CasebookError:
+        pass
+    else:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            0,
+            "CI/CD 学习案例已存在；现在可以在下方生成练习工作区。",
+            "",
+            0,
+        )
+    try:
+        store.create_case(
+            title="Automate SoloScale verification with GitHub Actions",
+            project=repository_name,
+            problem=(
+                "The repository already runs pytest, Ruff, mypy, and package build, "
+                "but the verification loop still needs to be understood and owned as "
+                "automated CI/CD."
+            ),
+            expected_behavior=(
+                "A GitHub Actions workflow runs lint, type-check, tests, and package "
+                "build on push and pull requests."
+            ),
+            actual_behavior=(
+                "A workflow file exists, but the operator still needs to practice "
+                "explaining, rebuilding, and defending it."
+            ),
+            root_cause=(
+                "Verification was historically orchestrated manually; CI automation "
+                "needs deliberate practice and ownership."
+            ),
+            resolution=(
+                "Complete a bounded exercise: read the workflow, rebuild a minimal "
+                "local version, run it, and record evidence."
+            ),
+            verification=["ruff check .", "mypy src tests", "pytest -q", "python -m build"],
+            concepts=["CI/CD", "GitHub Actions", "test automation", "verification gates"],
+            evidence_sources=[(EvidenceKind.CI, evidence_file)],
+            case_id=case_id,
+            repository=repository_name,
+        )
+    except (ValueError, OSError, KeyError, CasebookError) as exc:
+        return UIActionResult(
+            "learning-case", "create learning case", 1, "", str(exc), 0
+        )
+    return UIActionResult(
+        "learning-case",
+        "create learning case",
+        0,
+        f"学习案例已创建：{case_id}。现在可以在下方生成练习工作区。",
+        "",
+        0,
+    )
+
+
+def _create_practice_exercise_ui(fields: dict[str, str], data_root: Path) -> UIActionResult:
+    case_id = fields.get("case_id", "").strip()
+    requirement = fields.get("target_requirement", "").strip()
+    if not case_id or not requirement:
+        return UIActionResult(
+            "learning-practice",
+            "create practice workspace",
+            1,
+            "",
+            "请选择学习案例并填写 JD 要求。",
+            0,
+        )
+    try:
+        store = CasebookStore(data_root)
+        case = store.load_case(case_id)
+        exercise = generate_practice_exercise(
+            case=case,
+            jd_requirement=requirement,
+            exercise_type=ExerciseType(fields.get("exercise_type", "IMPLEMENT")),
+            difficulty=int(fields.get("difficulty", "2") or "2"),
+            practice_language=PracticeLanguage(fields.get("practice_language", "python")),
+        )
+        workspace = create_practice_workspace(exercise, data_root)
+    except (ValueError, OSError, KeyError) as exc:
+        return UIActionResult("learning-practice", "create practice workspace", 1, "", str(exc), 0)
+    return UIActionResult(
+        "learning-practice",
+        "create practice workspace",
+        0,
+        f"练习工作区已创建（USER_PRACTICE_REQUIRED）：{workspace}",
+        "",
+        0,
+    )
+
+
+def _open_practice_exercise_ui(fields: dict[str, str], data_root: Path) -> UIActionResult:
+    exercise_id = fields.get("exercise_id", "").strip()
+    if not exercise_id:
+        return UIActionResult("learning-practice", "open practice workspace", 1, "", "缺少练习 ID。", 0)
+    try:
+        exercise = load_exercise(exercise_id, data_root)
+        if not exercise.workspace_path:
+            raise ValueError("exercise has no practice workspace yet")
+        workspace = Path(exercise.workspace_path)
+        opened = open_practice_workspace(workspace)
+        if opened:
+            save_exercise(
+                exercise.model_copy(update={"status": ExerciseStatus.OPENED}),
+                data_root,
+            )
+    except (ValueError, OSError) as exc:
+        return UIActionResult("learning-practice", "open practice workspace", 1, "", str(exc), 0)
+    message = (
+        f"已在 VS Code 打开：{workspace}"
+        if opened
+        else f"未检测到 code CLI，请手动打开：{workspace}"
+    )
+    return UIActionResult(
+        "learning-practice",
+        "open practice workspace",
+        0 if opened else 1,
+        message,
+        "",
+        0,
+    )
+
+
+def _complete_practice_exercise_ui(
+    fields: dict[str, str],
+    files: dict[str, UploadedFile],
+    data_root: Path,
+) -> UIActionResult:
+    exercise_id = fields.get("exercise_id", "").strip()
+    if not exercise_id:
+        return UIActionResult("learning-practice", "complete practice", 1, "", "缺少练习 ID。", 0)
+    evidence = files.get("evidence")
+    try:
+        exercise = load_exercise(exercise_id, data_root)
+        store = CasebookStore(data_root)
+        temporary: Path | None = None
+        evidence_path: Path | None = None
+        if evidence is not None and evidence.content:
+            uploads = practice_workspace_root(data_root)
+            uploads.mkdir(mode=0o700, parents=True, exist_ok=True)
+            suffix = Path(evidence.filename).suffix or ".bin"
+            temporary = uploads / f".upload-{uuid4().hex}{suffix}"
+            temporary.write_bytes(evidence.content)
+            temporary.chmod(0o600)
+            evidence_path = temporary
+        try:
+            receipt, result = ingest_practice_completion(
+                store=store,
+                exercise=exercise,
+                evidence_path=evidence_path,
+                tests_passed=int(fields.get("tests_passed", "0") or "0"),
+                tests_failed=int(fields.get("tests_failed", "0") or "0"),
+                note=fields.get("note", "") or None,
+            )
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    except (ValueError, OSError) as exc:
+        return UIActionResult("learning-practice", "complete practice", 1, "", str(exc), 0)
+    outcome = "PASS" if receipt.completed else "NEEDS_WORK"
+    before = receipt.mastery_before.value if receipt.mastery_before else "L0 Seen"
+    after = receipt.mastery_after.value if receipt.mastery_after else "L0 Seen"
+    next_action = result.mastery.next_stage.value if result.mastery.next_stage else "COMPLETE"
+    ready = "是" if receipt.interview_ready else "否"
+    return UIActionResult(
+        "learning-practice",
+        "complete practice",
+        0 if receipt.completed else 1,
+        (
+            f"已记录 {outcome}。掌握：{before} → {after}；"
+            f"面试就绪：{ready}；下一步：{next_action}"
+        ),
+        "",
+        0,
+    )
 
 
 def _learning_page(
     data_root: Path,
-    repo_root: Path,
+    repo_root: Path | None,
     form: dict[str, str],
     result: UIActionResult | None = None,
     locale: UILocale = DEFAULT_UI_LOCALE,
 ) -> str:
-    learning_repository_available = _is_supported_learning_repository(repo_root)
+    project_binding = None
+    fixture_missing_anchors: tuple[str, ...] = ()
+    if repo_root is not None:
+        try:
+            project_binding = inspect_learning_project(repo_root)
+            fixture_missing_anchors = missing_learning_case_anchors(repo_root)
+        except (LearningTraceabilityError, OSError, ValueError):
+            project_binding = None
+    project_available = project_binding is not None
+    fixture_available = project_available and not fixture_missing_anchors
     requested_run_id = form.get("run_id", "")
     if requested_run_id:
         run_dir = (
@@ -4303,7 +5921,9 @@ def _learning_page(
     if run_dir is not None and (run_dir.is_symlink() or not run_dir.is_dir()):
         run_dir = None
     response_saved_stage = form.get("response_saved_stage", "")
-    target_requirement = _escape(form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT))
+    target_requirement = _escape(
+        form.get("target_requirement", _learning_default_requirement(data_root))
+    )
     result_html = ""
     if result is not None:
         class_name = "success" if result.return_code == 0 else "error"
@@ -4325,12 +5945,27 @@ def _learning_page(
             if path_text:
                 run_dir = Path(path_text)
     dashboard = ""
+    project_matches_run = False
     if run_dir is not None:
         case = _load_json_file(run_dir / "01_case.json") or {}
         mastery = _load_json_file(run_dir / "06_mastery.json") or {}
         learning_plan = _load_json_file(run_dir / "07_learning_plan.json") or {}
         claim = _load_json_file(run_dir / "09_claim_eligibility.json") or {}
         run = _load_json_file(run_dir / "run.json") or {}
+        run_project_source_id = run.get("project_source_id")
+        project_matches_run = bool(
+            project_binding is not None
+            and (
+                (
+                    isinstance(run_project_source_id, str)
+                    and run_project_source_id == project_binding.project_source_id
+                )
+                or (
+                    not isinstance(run_project_source_id, str)
+                    and run.get("repository") == project_binding.repository
+                )
+            )
+        )
         architecture = learning_plan.get("architecture_walkthrough_5_minutes", [])
         deep_dive = learning_plan.get("technical_deep_dive_15_minutes", {})
         decisions = learning_plan.get("decisions_and_trade_offs", [])
@@ -4338,30 +5973,65 @@ def _learning_page(
         exercises = learning_plan.get("exercises", {})
         explain = exercises.get("Explain", {}) if isinstance(exercises, dict) else {}
         trace = exercises.get("Trace", {}) if isinstance(exercises, dict) else {}
-        engineering_state = _escape(str(case.get("engineering_state", "UNKNOWN")))
-        mastery_level = _escape(str(mastery.get("level", "UNKNOWN")))
-        mastery_ready = _escape(str(mastery.get("interview_ready", False)))
-        next_action = _escape(str(mastery.get("next_action", "UNKNOWN")))
-        engineering_truth = _escape(str(claim.get("engineering_truth_stage", "UNKNOWN")))
-        interview_ready = _escape(str(claim.get("interview_ready", False)))
-        resume_eligible = _escape(str(claim.get("resume_eligible", False)))
+        engineering_state = _escape(
+            ui_display_value(locale, case.get("engineering_state", "UNKNOWN"))
+        )
+        mastery_level = _escape(ui_display_value(locale, mastery.get("level", "UNKNOWN")))
+        mastery_ready = _escape(ui_bool(locale, mastery.get("interview_ready") is True))
+        next_action = _escape(
+            ui_display_value(locale, mastery.get("next_action", "UNKNOWN"))
+        )
+        engineering_truth = _escape(
+            ui_display_value(locale, claim.get("engineering_truth_stage", "UNKNOWN"))
+        )
+        interview_ready = _escape(ui_bool(locale, claim.get("interview_ready") is True))
+        resume_eligible = _escape(ui_bool(locale, claim.get("resume_eligible") is True))
         explain_saved = (
-            '<p class="saved-response" role="status">Explain response saved privately. '
-            "Review is still required; mastery was not advanced.</p>"
+            f'<p class="saved-response" role="status">{_escape(ui_text(locale, "讲解回答已私有保存。仍需人工复核，掌握等级没有自动提升。", "Explain response saved privately. Review is still required; mastery was not advanced."))}</p>'
             if response_saved_stage == "explain"
             else ""
         )
         trace_saved = (
-            '<p class="saved-response" role="status">Trace response saved privately. '
-            "Review is still required; mastery was not advanced.</p>"
+            f'<p class="saved-response" role="status">{_escape(ui_text(locale, "追踪回答已私有保存。仍需人工复核，掌握等级没有自动提升。", "Trace response saved privately. Review is still required; mastery was not advanced."))}</p>'
             if response_saved_stage == "trace"
             else ""
+        )
+        trace_exercise = (
+            f"""<section id="exercise-trace" class="panel exercise">
+  <p class="eyebrow">{_escape(ui_text(locale, 'L2 · 追踪练习', 'L2 · Trace exercise'))}</p>
+  <h2>{_escape(ui_text(locale, '沿着真实符号追踪', 'Follow the real symbols'))}</h2>
+  <p>{_escape(str(trace.get('prompt', ui_text(locale, '暂无内容。', 'Not available.'))))}</p>
+  <p class="muted">{_escape(ui_text(locale, '使用图中的代码和测试节点打开有限的本地摘录。', "Use the graph's Code and Test nodes to open bounded local excerpts."))}</p>
+  <form class="response-form" method="post" action="/learning/respond#exercise-trace">
+    <input type="hidden" name="ui_locale" value="{locale}" />
+    <input type="hidden" name="run_id" value="{_escape(run_dir.name)}" />
+    <input type="hidden" name="stage" value="Trace" />
+    <input type="hidden" name="target_requirement" value="{target_requirement}" />
+    <label for="learning-trace-response">{_escape(ui_text(locale, '你的追踪回答', 'Your Trace response'))}</label>
+    <textarea id="learning-trace-response" name="response" rows="8" maxlength="20000" required
+      placeholder="{_escape(ui_text(locale, '追踪已记录的符号与测试，并指出仍然未知的部分。', 'Trace the recorded symbols and tests. Name any remaining unknowns.'))}"></textarea>
+    <button type="submit">{_escape(ui_text(locale, '私有保存追踪回答', 'Save private Trace response'))}</button>
+  </form>
+  {trace_saved}
+  <p class="muted">{_escape(ui_text(locale, '回答会在本地保存为待复核；提交不会自动提升掌握等级。', 'Saved locally as pending review. Submission never advances mastery.'))}</p>
+</section>"""
+            if project_matches_run
+            else f"""<section id="exercise-trace" class="panel exercise needs-project">
+  <p class="eyebrow">{_escape(ui_text(locale, 'L2 · 追踪练习', 'L2 · Trace exercise'))}</p>
+  <h2>{_escape(ui_text(locale, '需要项目证据', 'Project evidence required'))}</h2>
+  <p>{_escape(ui_text(locale, '这个练习需要一个已连接的代码项目。讲解练习仍然可用。', 'This exercise needs a connected code project. Explain remains available.'))}</p>
+  <a class="button-link" href="{ui_url('/work', locale)}">{_escape(ui_text(locale, '选择项目', 'Choose project'))}</a>
+</section>"""
         )
         backlink = ""
         resume_run_id = form.get("resume_run_id", "")
         bullet_id = form.get("bullet_id", "")
         if resume_run_id or bullet_id:
             try:
+                if repo_root is None:
+                    raise LearningTraceabilityError(
+                        "selected project evidence is unavailable"
+                    )
                 records = load_interview_defense_records(data_root=data_root, run_id=resume_run_id)
                 linked = next(item for item in records if item.bullet_id == bullet_id)
                 pack = _validated_record_anchor_pack(
@@ -4374,21 +6044,20 @@ def _learning_page(
                     "</", "<\\/"
                 )
                 backlink = f"""<section id="interview-defense" class="panel">
-  <h2>Interview Defense anchors</h2>
+  <h2>{_escape(ui_text(locale, '面试答辩锚点', 'Interview Defense anchors'))}</h2>
   <p><strong>{_escape(linked.bullet_id)}</strong> · {_escape(linked.bullet_text)}</p>
-  <p>Exact Learning run: <code>{_escape(run_dir.name)}</code></p>
-  {_anchor_pack_html(pack)}
-  <p class="muted">这些锚点用于定位真实实现，不证明作者身份、掌握程度、语义支持、
-  测试执行或简历资格。</p>
-  <button id="copy-anchor-pack" type="button">复制锚点包</button>
+  <p>{_escape(ui_text(locale, '精确学习记录：', 'Exact Learning run:'))} <code>{_escape(run_dir.name)}</code></p>
+  {_anchor_pack_html(pack, locale)}
+  <p class="muted">{_escape(ui_text(locale, '这些锚点用于定位真实实现，不证明作者身份、掌握程度、语义支持、测试执行或简历资格。', 'These anchors locate real implementation; they do not prove authorship, mastery, semantic support, test execution, or resume eligibility.'))}</p>
+  <button id="copy-anchor-pack" type="button">{_escape(ui_text(locale, '复制锚点包', 'Copy anchor pack'))}</button>
   <span id="copy-anchor-status" class="muted"></span>
   <script>
     document.getElementById('copy-anchor-pack').addEventListener('click',async()=>{{
       try{{
         await navigator.clipboard.writeText({pack_json});
-        document.getElementById('copy-anchor-status').textContent=' 已复制';
+        document.getElementById('copy-anchor-status').textContent={json.dumps(' 已复制' if locale == 'zh-CN' else ' Copied')};
       }}catch(_error){{
-        document.getElementById('copy-anchor-status').textContent=' 复制不可用';
+        document.getElementById('copy-anchor-status').textContent={json.dumps(' 复制不可用' if locale == 'zh-CN' else ' Copy unavailable')};
       }}
     }});
   </script>
@@ -4402,97 +6071,86 @@ def _learning_page(
             ):
                 backlink = (
                     '<section id="interview-defense" class="panel error">'
-                    "<p>Interview Defense mapping is unavailable.</p></section>"
+                    f'<p>{_escape(ui_text(locale, "面试答辩关联暂不可用。", "Interview Defense mapping is unavailable."))}</p></section>'
                 )
         dashboard = f"""
 <section class="status-grid">
   <article class="status-card verified">
-    <span>Engineering</span><strong>{engineering_state}</strong>
-    <small>Real code + committed test definitions</small>
+    <span>{_escape(ui_text(locale, '工程状态', 'Engineering'))}</span><strong>{engineering_state}</strong>
+    <small>{_escape(ui_text(locale, '真实代码 + 已提交的测试定义', 'Real code + committed test definitions'))}</small>
   </article>
   <article class="status-card warning">
-    <span>Human mastery</span><strong>{mastery_level}</strong>
-    <small>Interview ready: {mastery_ready}</small>
+    <span>{_escape(ui_text(locale, '个人掌握', 'Human mastery'))}</span><strong>{mastery_level}</strong>
+    <small>{_escape(ui_text(locale, '面试就绪：', 'Interview ready:'))} {mastery_ready}</small>
   </article>
   <article class="status-card action">
-    <span>Exact next action</span><strong>{next_action}</strong>
-    <small>No automatic promotion</small>
+    <span>{_escape(ui_text(locale, '明确下一步', 'Exact next action'))}</span><strong>{next_action}</strong>
+    <small>{_escape(ui_text(locale, '不会自动升级', 'No automatic promotion'))}</small>
+  </article>
+  <article class="status-card">
+    <span>{_escape(ui_text(locale, '练习语言', 'Practice language'))}</span><strong>English</strong>
+    <small>{_escape(ui_text(locale, '独立于界面语言', 'Independent of UI locale'))}</small>
   </article>
 </section>
 <section class="panel hero-copy">
-  <p class="eyebrow">30-second explanation</p>
-  <h2>Conversation RAG · Chunking + Retrieval</h2>
-  <p>{_escape(str(learning_plan.get("plain_language_30_seconds", "Not available.")))}</p>
+  <p class="eyebrow">{_escape(ui_text(locale, '30 秒讲解', '30-second explanation'))}</p>
+  <h2>{_escape(ui_text(locale, '对话式 RAG · 分块与检索', 'Conversation RAG · Chunking + Retrieval'))}</h2>
+  <p>{_escape(str(learning_plan.get("plain_language_30_seconds", ui_text(locale, "暂无内容。", "Not available."))))}</p>
   <div class="button-row">
-    <a class="button-link" href="#exercise-explain">Start Explain</a>
-    <a class="button-link secondary" href="#exercise-trace">Start Trace</a>
+    <a class="button-link" href="#exercise-explain">{_escape(ui_text(locale, '开始讲解', 'Start Explain'))}</a>
+    <a class="button-link secondary" href="#exercise-trace">{_escape(ui_text(locale, '开始追踪', 'Start Trace'))}</a>
   </div>
 </section>
-{_learning_graph(run_dir)}
+<details class="panel">
+  <summary>{_escape(ui_text(locale, '查看证据图（进阶）', 'View Evidence Graph (advanced)'))}</summary>
+  {_learning_graph(run_dir, locale)}
+</details>
 {backlink}
 <section class="panel">
-  <h2>Target JD relevance</h2>
-  <p>{_escape(str(claim.get("target_requirement", "Not available.")))}</p>
+  <h2>{_escape(ui_text(locale, '目标 JD 相关性', 'Target JD relevance'))}</h2>
+  <p>{_escape(str(claim.get("target_requirement", ui_text(locale, "暂无内容。", "Not available."))))}</p>
   <div class="truth-grid">
-    <div><span>Engineering truth</span><strong>{engineering_truth}</strong></div>
-    <div><span>Interview ready</span><strong>{interview_ready}</strong></div>
-    <div><span>Resume eligible</span><strong>{resume_eligible}</strong></div>
+    <div><span>{_escape(ui_text(locale, '工程事实', 'Engineering truth'))}</span><strong>{engineering_truth}</strong></div>
+    <div><span>{_escape(ui_text(locale, '面试就绪', 'Interview ready'))}</span><strong>{interview_ready}</strong></div>
+    <div><span>{_escape(ui_text(locale, '简历可用', 'Resume eligible'))}</span><strong>{resume_eligible}</strong></div>
   </div>
-  <p class="warning-text">{_escape(str(claim.get("rationale", "Not available.")))}</p>
+  <p class="warning-text">{_escape(str(claim.get("rationale", ui_text(locale, "暂无内容。", "Not available."))))}</p>
 </section>
 <details class="panel" open>
-  <summary>Architecture · 5 minutes</summary>
-  <ol>{_learning_list(architecture)}</ol>
+  <summary>{_escape(ui_text(locale, '架构讲解 · 5 分钟', 'Architecture · 5 minutes'))}</summary>
+  <ol>{_learning_list(architecture, locale)}</ol>
 </details>
 <details class="panel">
-  <summary>Code, evidence, and 15-minute deep dive</summary>
+  <summary>{_escape(ui_text(locale, '代码、证据与 15 分钟深挖', 'Code, evidence, and 15-minute deep dive'))}</summary>
   <pre>{_escape(json.dumps(deep_dive, ensure_ascii=False, indent=2))}</pre>
-  <h3>Decisions and trade-offs</h3><ul>{_learning_list(decisions)}</ul>
-  <h3>Known failures and unknowns</h3><ul>{_learning_list(unknowns)}</ul>
+  <h3>{_escape(ui_text(locale, '决策与权衡', 'Decisions and trade-offs'))}</h3><ul>{_learning_list(decisions, locale)}</ul>
+  <h3>{_escape(ui_text(locale, '已知失败与未知项', 'Known failures and unknowns'))}</h3><ul>{_learning_list(unknowns, locale)}</ul>
 </details>
 <section id="exercise-explain" class="panel exercise">
-  <p class="eyebrow">L1 · Explain exercise</p>
-  <h2>Start without an answer key</h2>
-  <p>{_escape(str(explain.get("prompt", "Not available.")))}</p>
-  <p class="muted">Completion requires a user-authored receipt;
-    opening this card does not pass L1.</p>
+  <p class="eyebrow">{_escape(ui_text(locale, 'L1 · 讲解练习', 'L1 · Explain exercise'))}</p>
+  <h2>{_escape(ui_text(locale, '先独立回答，不看标准答案', 'Start without an answer key'))}</h2>
+  <p>{_escape(str(explain.get("prompt", ui_text(locale, "暂无内容。", "Not available."))))}</p>
+  <p class="muted">{_escape(ui_text(locale, '完成需要你自己写下回答回执；仅打开此卡片不代表通过 L1。', 'Completion requires a user-authored receipt; opening this card does not pass L1.'))}</p>
   <form class="response-form" method="post"
     action="/learning/respond#exercise-explain">
+    <input type="hidden" name="ui_locale" value="{locale}" />
     <input type="hidden" name="run_id" value="{_escape(run_dir.name)}" />
     <input type="hidden" name="stage" value="Explain" />
     <input type="hidden" name="target_requirement" value="{target_requirement}" />
-    <label for="learning-explain-response">Your Explain response</label>
+    <label for="learning-explain-response">{_escape(ui_text(locale, '你的讲解回答', 'Your Explain response'))}</label>
     <textarea id="learning-explain-response" name="response" rows="8" maxlength="20000"
       required
-      placeholder="Explain it. Include one trade-off and one truth boundary."></textarea>
-    <button type="submit">Save private Explain response</button>
+      placeholder="{_escape(ui_text(locale, '请讲清楚它，并包含一个权衡和一个事实边界。', 'Explain it. Include one trade-off and one truth boundary.'))}"></textarea>
+    <button type="submit">{_escape(ui_text(locale, '私有保存讲解回答', 'Save private Explain response'))}</button>
   </form>
   {explain_saved}
-  <p class="muted">Saved locally as pending review. Submission never advances mastery.</p>
+  <p class="muted">{_escape(ui_text(locale, '回答会在本地保存为待复核；提交不会自动提升掌握等级。', 'Saved locally as pending review. Submission never advances mastery.'))}</p>
 </section>
-<section id="exercise-trace" class="panel exercise">
-  <p class="eyebrow">L2 · Trace exercise</p>
-  <h2>Follow the real symbols</h2>
-  <p>{_escape(str(trace.get("prompt", "Not available.")))}</p>
-  <p class="muted">Use the graph's Code and Test nodes to open bounded local excerpts.</p>
-  <form class="response-form" method="post"
-    action="/learning/respond#exercise-trace">
-    <input type="hidden" name="run_id" value="{_escape(run_dir.name)}" />
-    <input type="hidden" name="stage" value="Trace" />
-    <input type="hidden" name="target_requirement" value="{target_requirement}" />
-    <label for="learning-trace-response">Your Trace response</label>
-    <textarea id="learning-trace-response" name="response" rows="8" maxlength="20000"
-      required
-      placeholder="Trace the recorded symbols and tests. Name any remaining unknowns."></textarea>
-    <button type="submit">Save private Trace response</button>
-  </form>
-  {trace_saved}
-  <p class="muted">Saved locally as pending review. Submission never advances mastery.</p>
-</section>
+{trace_exercise}
 <section class="panel footnote">
-  <strong>Private run</strong> <code>{_escape(str(run_dir))}</code><br />
-  <span>Branch {_escape(str(run.get("branch", "")))} ·
-    commit {_escape(str(run.get("commit", "")))}</span>
+  <strong>{_escape(ui_text(locale, '私有记录', 'Private run'))}</strong> <code>{_escape(str(run_dir))}</code><br />
+  <span>{_escape(ui_text(locale, '分支', 'Branch'))} {_escape(str(run.get("branch", "")))} ·
+    {_escape(ui_text(locale, '提交', 'commit'))} {_escape(str(run.get("commit", "")))}</span>
 </section>
 """
     else:
@@ -4504,20 +6162,25 @@ def _learning_page(
 </section>
 """
     repository_notice = ""
-    if not learning_repository_available:
+    if not project_available:
         repository_notice = f"""<section class="notice warning" role="status">
-  <strong>{_escape(ui_text(locale, '需要连接 SoloScale 源码目录', 'Connect a SoloScale source checkout'))}</strong>
-  <p>{_escape(ui_text(locale, 'Learning 会引用真实代码、测试和 Git commit，因此不能在安装包里伪造项目证据。点击下方按钮选择本机 SoloScale Git checkout；简历、内容和视频仍可正常使用。', 'Learning cites real code, tests, and a Git commit, so the installed app never fabricates project evidence. Use the button below to choose a local SoloScale Git checkout; Resume, Content, and Video remain available.'))}</p>
+  <strong>{_escape(ui_text(locale, '这个练习需要一个已连接的代码项目。', 'This exercise needs a connected code project.'))}</strong>
+  <p>{_escape(ui_text(locale, '选择一个本地 Git 项目以启用代码级追踪和调试；已有证据支持的讲解练习仍可继续。', 'Choose a local Git project to enable code-level Trace and Debug practice. Explain remains available when an existing case has enough evidence.'))}</p>
+</section>"""
+    elif not fixture_available:
+        repository_notice = f"""<section class="notice warning" role="status">
+  <strong>{_escape(ui_text(locale, '当前项目已连接，但不适用于这个示例练习。', 'The current project is connected but does not match this seed exercise.'))}</strong>
+  <p>{_escape(ui_text(locale, '这个项目没有找到此练习需要的代码锚点。你可以选择其他项目或创建新的学习案例。', 'This project does not contain the code anchors required by this exercise. Choose another project or create a new Learning case.'))}</p>
 </section>"""
     build_button = (
         f'<button type="submit">{_escape(ui_text(locale, "创建 / 刷新学习案例", "Build / refresh learning case"))}</button>'
-        if learning_repository_available
-        else f'<a class="button-link" href="soloscale://choose-source-checkout">{_escape(ui_text(locale, "选择源码目录", "Choose source checkout"))}</a>'
+        if fixture_available
+        else f'<a class="button-link" href="{ui_url("/work", locale)}">{_escape(ui_text(locale, "选择项目", "Choose project"))}</a>'
     )
     work_summary = render_use_my_work(
         load_work_context(
             data_root,
-            workspace_root=repo_root if learning_repository_available else None,
+            workspace_root=repo_root if project_available else None,
         ),
         locale,
         boundary=ui_text(
@@ -4526,9 +6189,53 @@ def _learning_page(
             "Interview practice uses only project, code, and test anchors explicitly recorded for the current case. Your mastery still requires your own work.",
         ),
     )
+    explain_state = "AVAILABLE" if run_dir is not None else "NEEDS_CASE_EVIDENCE"
+    trace_state = "AVAILABLE" if run_dir is not None and project_matches_run else "NEEDS_PROJECT_EVIDENCE"
+    debug_state = (
+        "NEEDS_CASE_STAGE"
+        if run_dir is not None and project_matches_run
+        else "NEEDS_PROJECT_EVIDENCE"
+    )
+    capability_state_labels = {
+        "AVAILABLE": ui_text(locale, "可用", "Available"),
+        "NEEDS_PROJECT_EVIDENCE": ui_text(
+            locale, "需要项目证据", "Needs project evidence"
+        ),
+        "NEEDS_CASE_EVIDENCE": ui_text(
+            locale, "需要案例证据", "Needs case evidence"
+        ),
+        "NEEDS_CASE_STAGE": ui_text(
+            locale, "当前案例尚未开放", "Not available in this case yet"
+        ),
+    }
+    capabilities = f"""<section class="learning-capabilities" aria-label="{_escape(ui_text(locale, '练习能力', 'Exercise capabilities'))}">
+  <article data-learning-capability="explain" data-state="{explain_state}"><span>EXPLAIN</span><strong>{_escape(capability_state_labels[explain_state])}</strong></article>
+  <article data-learning-capability="trace" data-state="{trace_state}"><span>TRACE</span><strong>{_escape(capability_state_labels[trace_state])}</strong></article>
+  <article data-learning-capability="debug" data-state="{debug_state}"><span>DEBUG</span><strong>{_escape(capability_state_labels[debug_state])}</strong></article>
+</section>"""
+    practice_panel = _practice_panel_html(data_root, form, locale)
+    readiness_map = _production_readiness_map_html(
+        data_root, repo_root, form, locale
+    )
+    active_case = _active_learning_case(data_root)
+    active_case_panel = ""
+    seed_case_note = ""
+    if active_case is not None and active_case.id != "conversation-rag-chunking-retrieval":
+        active_case_panel = f"""<section class="panel active-case">
+  <span class="kicker">{_escape(ui_text(locale, '当前学习案例', 'Active Learning Case'))}</span>
+  <h2>{_escape(active_case.title)}</h2>
+  <p>{_escape(active_case.problem)}</p>
+  <p class="muted">{_escape(", ".join(active_case.concepts))}</p>
+</section>"""
+        seed_case_note = f"""<section class="notice warning" role="status">
+  <strong>{_escape(ui_text(locale, '下方是独立的历史参考案例（Conversation RAG），不是当前活动案例。', 'The section below is a separate historical reference case (Conversation RAG), not the active case.'))}</strong>
+</section>"""
     body = f"""
     {work_summary}
+    {active_case_panel}
     {repository_notice}
+    {capabilities}
+    {readiness_map}
     <form class="panel build-form" method="post" action="/learning/run">
       <input type="hidden" name="ui_locale" value="{locale}" />
       <label>{_escape(ui_text(locale, '当前目标 JD 要求', 'Current target-JD requirement'))}
@@ -4537,12 +6244,21 @@ def _learning_page(
       {build_button}
     </form>
     {result_html}
+    {seed_case_note}
     {dashboard}
+    {practice_panel}
     """
+    learning_current_url = ui_url(
+        "/learning",
+        locale,
+        run_id=run_dir.name if run_dir is not None else "",
+        resume_run_id=form.get("resume_run_id", ""),
+        bullet_id=form.get("bullet_id", ""),
+    )
     return render_app_shell(
         active="learning",
         locale=locale,
-        current_url="/learning",
+        current_url=learning_current_url,
         title=f"SoloScale · {ui_text(locale, '学习工作台', 'Learning Workspace')}",
         eyebrow=ui_text(locale, "学习工作台", "Learning workspace"),
         heading=ui_text(locale, "看清自己会什么，也知道下一步练什么。", "See what you can explain—and what to practice next."),
@@ -4553,9 +6269,11 @@ def _learning_page(
 .use-my-work{display:grid;grid-template-columns:minmax(260px,.75fr) 1fr auto;gap:16px;align-items:center;padding:15px 18px;border:1px solid #d9e2dc;border-radius:15px;background:linear-gradient(110deg,#fff,#f1f8f5)}.use-my-work>div{display:grid;gap:3px}.use-my-work strong{font-size:13px}.use-my-work p{margin:0;color:var(--text-muted);font-size:13px}.use-my-work a{font-weight:800;text-decoration:none;white-space:nowrap}
 .button-link{display:inline-flex;align-items:center;min-height:44px;border-radius:13px;padding:11px 15px;background:var(--brand);color:white;font-weight:800;text-decoration:none}.button-link.secondary{background:var(--success)}.button-row{display:flex;gap:10px;flex-wrap:wrap}
 .saved-response{border-left:3px solid var(--success);padding:9px 12px;background:var(--success-soft);color:var(--success);border-radius:8px}
+.learning-capabilities{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.learning-capabilities article{display:grid;gap:6px;border:1px solid var(--border);border-radius:13px;padding:14px;background:var(--surface-subtle)}.learning-capabilities span{font-size:.75rem;letter-spacing:.08em;color:var(--text-muted)}.learning-capabilities strong{font-size:.78rem;color:var(--brand)}.learning-capabilities [data-state="NEEDS_PROJECT_EVIDENCE"] strong,.learning-capabilities [data-state="NEEDS_CASE_EVIDENCE"] strong,.learning-capabilities [data-state="NEEDS_CASE_STAGE"] strong{color:var(--warning)}
 .status-grid,.truth-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.status-card,.truth-grid div{border:1px solid var(--border);border-radius:14px;padding:16px;background:var(--surface-subtle);display:grid;gap:7px}.status-card span,.truth-grid span{color:var(--text-muted);text-transform:uppercase;letter-spacing:.09em;font-size:.75rem}.status-card strong{font-size:1.15rem}.verified strong{color:var(--success)}.warning strong,.warning-text{color:var(--warning)}.action strong{color:var(--brand)}
 .hero-copy p:not(.eyebrow){max-width:820px;font-size:1.08rem;line-height:1.7}.graph-scroll{overflow:auto;background:#f7f9fc;border:1px solid var(--border);border-radius:12px}#learning-graph{width:1060px;display:block}.panel pre{background:#f7f9fc;color:#2c3548}.panel details summary,details.panel summary{cursor:pointer;font-size:1.05rem;font-weight:750}.hidden{display:none}.footnote span{color:var(--text-muted)}
-@media(max-width:760px){.use-my-work,.status-grid,.truth-grid,.build-form{grid-template-columns:1fr}}
+.readiness-map{background:linear-gradient(145deg,#fff,var(--brand-soft))}.readiness-map h2{margin:7px 0}.readiness-map .muted{color:var(--text-muted)}.readiness-domains{display:grid;gap:12px;margin-top:16px}.readiness-domain{display:grid;gap:8px;padding:13px;border:1px solid var(--border);border-radius:13px;background:#fff}.readiness-domain>strong{font-size:13px}.maturity-row{display:flex;gap:6px;flex-wrap:wrap}.maturity-chip{padding:4px 8px;border-radius:999px;background:var(--surface-subtle);color:var(--text-muted);font-size:10px;font-weight:800}.maturity-chip.ready{background:var(--success-soft);color:var(--success)}.maturity-chip.needs{background:var(--warning-soft);color:var(--warning)}.highest-gap{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center;margin-top:18px;padding:16px;border:1px solid var(--brand);border-radius:14px;background:var(--brand-soft)}.highest-gap h3{margin:8px 0 5px}.highest-gap p{margin:0;color:var(--text-muted)}.highest-gap form,.highest-gap .button-link{align-self:center;white-space:nowrap}
+@media(max-width:760px){.use-my-work,.learning-capabilities,.status-grid,.truth-grid,.build-form,.highest-gap{grid-template-columns:1fr}.highest-gap form,.highest-gap .button-link{justify-self:start}}
 """,
     )
 
@@ -4567,7 +6285,7 @@ def _control_tower_section(
     if not exists:
         return f'<p class="tool-state">{_escape(ui_text(locale, "还没有工程概览。生成后可以在这里查看。", "No engineering overview yet. Generate one to view it here."))}</p>'
     return (
-        '<p class="tool-state"><a href="/control-tower">'
+        f'<p class="tool-state"><a href="{ui_url("/control-tower", locale)}">'
         + _escape(ui_text(locale, "打开工程概览", "Open engineering overview"))
         + "</a></p>"
     )
@@ -4653,13 +6371,13 @@ def _ai_settings_page(
             ),
             "LinkedIn": ui_text(
                 locale,
-                "由 BuildLog 管理授权、精确预览、去重和发布回执。",
-                "BuildLog owns authorization, exact preview, duplicate checks, and receipts.",
+                "已审核 Artifact 经发布队列绑定精确账号后执行；BuildLog 只提供历史与回执投影。",
+                "Approved artifacts run through the Publish Queue against an exact account; BuildLog provides history and receipt projection only.",
             ),
             "X": ui_text(
                 locale,
-                "由 BuildLog 管理授权、单帖或 Thread 发布和回执。",
-                "BuildLog owns authorization, post or thread publishing, and receipts.",
+                "单帖或 Thread 由发布队列选择精确 ChannelAccount；BuildLog 保留溯源与回执投影。",
+                "Posts and threads use the Publish Queue with an exact ChannelAccount; BuildLog retains provenance and receipt projection.",
             ),
             "YouTube": ui_text(
                 locale,
@@ -4934,11 +6652,8 @@ def _page(
     locale: UILocale = DEFAULT_UI_LOCALE,
     provider_notice: str | None = None,
 ) -> str:
-    includes = form.get("include_codex") == "on"
     query = _escape(form.get("query", ""))
-    question = _escape(form.get("question", ""))
     source_kind = form.get("source_kind", "")
-    model = _escape(form.get("model", "qwen3:8b"))
     ai_preference = _load_ai_provider_preference(data_root)
     ai_provider_name = {
         ModelProviderId.SOLOSCALE_HOSTED: ui_text(
@@ -4947,25 +6662,6 @@ def _page(
         ModelProviderId.OLLAMA: ui_text(locale, "本地 AI", "Local AI"),
         ModelProviderId.OPENAI_COMPATIBLE: "OpenAI API",
     }[ai_preference.provider]
-    ollama_url = _escape(form.get("ollama_url", "http://127.0.0.1:11434"))
-    agent_source_kind = form.get("agent_source_kind", "")
-    resume_job_description = _escape(form.get("job_description", ""))
-    candidate_name = _escape(form.get("candidate_name", ""))
-    candidate_headline = _escape(form.get("candidate_headline", ""))
-    candidate_summary = _escape(form.get("candidate_summary", ""))
-    candidate_skills = _escape(form.get("candidate_skills", ""))
-    candidate_base_resume = _escape(form.get("candidate_base_resume", ""))
-    company_name = _escape(form.get("company_name", ""))
-    company_url = _escape(form.get("company_url", ""))
-    job_title = _escape(form.get("job_title", ""))
-    job_id = _escape(form.get("job_id", ""))
-    resume_library_root = _escape(
-        form.get(
-            "resume_library_root",
-            str(Path.home() / "Documents" / "Resume Applications"),
-        )
-    )
-    resume_mode = form.get("resume_mode", ResumeMode.LOCAL_ONLY.value)
     result_section = (
         f'<section class="card full result-wrap"><h2>{_escape(ui_text(locale, "最近一次运行", "Latest run"))}</h2>{_result_card(action_result, locale)}</section>'
         if action_result is not None
@@ -4999,33 +6695,6 @@ def _page(
     </section>
 
     <section class="card full tool-card">
-      <span class="kicker">{_escape(ui_text(locale, '资料同步', 'Knowledge refresh'))}</span>
-      <h2>{_escape(ui_text(locale, '刷新本地资料索引', 'Refresh the local knowledge index'))}</h2>
-      <p class="tool-description">{_escape(ui_text(locale, '需要生成简历或内容前，手动刷新一次即可；它不是后台监控器。', 'Refresh before creating a resume or content. This is an explicit action, not a background watcher.'))}</p>
-      <form method="post" action="/run">
-        <input type="hidden" name="action" value="knowledge-sync" />
-        <label class="check-row">
-          <input type="checkbox" name="include_codex" {"checked" if includes else ""} />
-          <span><strong>{_escape(ui_text(locale, '包含 Codex 对话记录', 'Include Codex conversation records'))}</strong>
-          <small>{_escape(ui_text(locale, '关闭后，本次刷新不会读取 Codex 来源。', 'When off, this refresh skips Codex sources.'))}</small></span>
-        </label>
-        <details class="technical-details source-settings">
-          <summary>{_escape(ui_text(locale, '选择其他资料来源（可选）', 'Choose other sources (optional)'))}</summary>
-          <label>{_escape(ui_text(locale, 'Codex 数据目录', 'Codex data directory'))}
-            <input name="codex_home" value="{_escape(form.get("codex_home", ""))}" />
-          </label>
-          <label>{_escape(ui_text(locale, 'ChatGPT 导出文件（每行或逗号分隔）', 'ChatGPT export files (one per line or comma-separated)'))}
-            <textarea name="chatgpt_exports" rows="2">{_escape(form.get("chatgpt_exports", ""))}</textarea>
-          </label>
-          <label>{_escape(ui_text(locale, 'BuildLog 项目目录（每行或逗号分隔）', 'BuildLog project directories (one per line or comma-separated)'))}
-            <textarea name="buildlog_roots" rows="2">{_escape(form.get("buildlog_roots", ""))}</textarea>
-          </label>
-        </details>
-        <button type="submit">{_escape(ui_text(locale, '刷新索引', 'Refresh index'))}</button>
-      </form>
-    </section>
-
-    <section class="card full tool-card">
       <span class="kicker">{_escape(ui_text(locale, '本地搜索', 'Local search'))}</span>
       <h2>{_escape(ui_text(locale, '搜索本地证据', 'Search local evidence'))}</h2>
       <p class="tool-description">{_escape(ui_text(locale, '按关键词检查系统目前能找到哪些资料。', 'Check which local records the system can find for a keyword.'))}</p>
@@ -5050,87 +6719,14 @@ def _page(
       </form>
     </section>
 
-    <section id="ai-providers" class="card full tool-card provider-settings">
+    <section class="card full tool-card provider-settings">
       <span class="kicker">{_escape(ui_text(locale, 'AI 服务', 'AI service'))}</span>
-      <h2>{_escape(ui_text(locale, '一个默认选择，贯穿所有工作流', 'One default choice across every workflow'))}</h2>
-      <p class="tool-description">{_escape(ui_text(locale, '简历和内容会自动使用同一个默认服务；连接、模型和密钥设置集中在独立页面。', 'Resume and Content automatically use the same default service. Connection, model, and credential setup live on one dedicated page.'))}</p>
-      {f'<p class="notice success" role="status">{_escape(provider_notice)}</p>' if provider_notice else ''}
+      <h2>{_escape(ui_text(locale, '当前 AI 服务（只读诊断）', 'Current AI service (read-only diagnostic)'))}</h2>
+      <p class="tool-description">{_escape(ui_text(locale, '显示当前默认服务与模型。连接、模型和密钥设置集中在独立页面。', 'Shows the current default service and model. Connection, model, and credential setup live on a dedicated page.'))}</p>
       <div class="provider-option"><span><strong>{_escape(ai_provider_name)}</strong><small>{_escape(ai_preference.model)}</small></span></div>
-      <a class="button-link" href="{ui_url('/settings/ai', locale)}">{_escape(ui_text(locale, '管理 AI 服务', 'Manage AI service'))}</a>
-    </section>
-
-    <section class="card full tool-card">
-      <span class="kicker">{_escape(ui_text(locale, '本地模型', 'Local model'))}</span>
-      <h2>{_escape(ui_text(locale, '用本地模型整理证据', 'Organize evidence with a local model'))}</h2>
-      <p class="tool-description">{_escape(ui_text(locale, '适合核对 JD 或准备面试；结果仍需你人工确认。', 'Useful for JD checks or interview preparation. You still review every result.'))}</p>
-      <form method="post" action="/run">
-        <input type="hidden" name="action" value="evidence-agent" />
-        <label>{_escape(ui_text(locale, '问题', 'Question'))}
-          <textarea name="question" rows="3">{question}</textarea>
-        </label>
-        <details class="technical-details source-settings">
-          <summary>{_escape(ui_text(locale, '模型设置', 'Model settings'))}</summary>
-          <label>{_escape(ui_text(locale, '模型', 'Model'))}<input name="model" value="{model}" /></label>
-          <label>Ollama URL<input name="ollama_url" value="{ollama_url}" /></label>
-          <label>{_escape(ui_text(locale, '资料类型（可选）', 'Source type (optional)'))}
-            <select name="agent_source_kind">
-              <option value="" {"selected" if agent_source_kind == "" else ""}>{_escape(ui_text(locale, '全部来源', 'All sources'))}</option>
-              <option value="codex_session" {"selected" if agent_source_kind == "codex_session" else ""}>Codex</option>
-              <option value="buildlog_run" {"selected" if agent_source_kind == "buildlog_run" else ""}>BuildLog</option>
-              <option value="chatgpt_export" {"selected" if agent_source_kind == "chatgpt_export" else ""}>ChatGPT export</option>
-            </select>
-          </label>
-        </details>
-        <button type="submit">{_escape(ui_text(locale, '运行证据问答', 'Run evidence assistant'))}</button>
-      </form>
     </section>
 
     <aside class="notice full">{_escape(ui_text(locale, '简历生成在“找到机会”页面。这里的证据结果只用于核对，不会自动写进简历。', 'Resume generation lives on the Get the job page. Evidence results here are for verification and are never inserted into a resume automatically.'))}</aside>
-
-    <details class="card full legacy-tool">
-      <summary>{_escape(ui_text(locale, '旧版简历工程工作区', 'Legacy resume engineering workspace'))}</summary>
-      <p class="tool-description">{_escape(ui_text(locale, '仅用于调试底层证据图。日常生成请使用“找到机会”页面。', 'For debugging the underlying evidence graph only. Use Get the job for normal generation.'))}</p>
-      <form method="post" action="/run">
-        <input type="hidden" name="action" value="resume-workspace" />
-        <label>Job Description
-          <textarea name="job_description" rows="7">{resume_job_description}</textarea>
-        </label>
-        <label>{_escape(ui_text(locale, '公司名称（可选）', 'Company name (optional)'))}<input name="company_name" value="{company_name}" /></label>
-        <label>{_escape(ui_text(locale, '岗位名称', 'Job title'))}<input name="job_title" value="{job_title}" /></label>
-        <label>Job ID<input name="job_id" value="{job_id}" /></label>
-        <label>Job URL<input name="company_url" value="{company_url}" /></label>
-        <label>{_escape(ui_text(locale, '简历保存目录', 'Resume library directory'))}
-          <input name="resume_library_root" value="{resume_library_root}" />
-        </label>
-        <label>{_escape(ui_text(locale, '姓名（可选）', 'Candidate name (optional)'))}
-          <input name="candidate_name" value="{candidate_name}" />
-        </label>
-        <label>{_escape(ui_text(locale, '职业标题（可选）', 'Headline (optional)'))}
-          <input name="candidate_headline" value="{candidate_headline}" />
-        </label>
-        <label>{_escape(ui_text(locale, '职业简介（可选）', 'Professional summary (optional)'))}
-          <textarea name="candidate_summary" rows="2">{candidate_summary}</textarea>
-        </label>
-        <label>{_escape(ui_text(locale, '技能（逗号分隔）', 'Skills (comma-separated)'))}
-          <input name="candidate_skills" value="{candidate_skills}" />
-        </label>
-        <label>{_escape(ui_text(locale, '已有简历要点（每行一条）', 'Existing resume bullets (one per line)'))}
-          <textarea
-            name="candidate_base_resume"
-            rows="5">{candidate_base_resume}</textarea>
-        </label>
-        <label>{_escape(ui_text(locale, '运行方式', 'Mode'))}
-          <select name="resume_mode">
-            <option value="local-only"
-              {"selected" if resume_mode == "local-only" else ""}>{_escape(ui_text(locale, '仅本地', 'Local only'))}</option>
-            <option value="hybrid"
-              {"selected" if resume_mode == "hybrid" else ""}
-            >{_escape(ui_text(locale, '混合研究（需要外部 provider）', 'Hybrid research (provider required)'))}</option>
-          </select>
-        </label>
-        <button type="submit">{_escape(ui_text(locale, '生成工程工作区', 'Generate engineering workspace'))}</button>
-      </form>
-    </details>
     {result_section}
   </div>"""
     locale_json = json.dumps(locale)
@@ -5140,8 +6736,8 @@ def _page(
         current_url="/advanced",
         title=f"SoloScale · {ui_text(locale, '高级工具', 'Advanced Tools')}",
         eyebrow=ui_text(locale, "高级工具", "Advanced tools"),
-        heading=ui_text(locale, "偶尔需要的工具，集中放在这里。", "Power tools, out of the way until you need them."),
-        description=ui_text(locale, "知识同步、证据检索和运行维护不会打扰日常产品流程。", "Knowledge sync, evidence search, and runtime maintenance stay outside your everyday product flow."),
+        heading=ui_text(locale, "只读诊断工具，集中放在这里。", "Read-only diagnostics, together in one place."),
+        description=ui_text(locale, "资料刷新与生成都在各自的工作页面；这里只保留检查、搜索与运行状态。", "Refreshing and generation live on their own pages. This page keeps checks, search, and runtime status only."),
         body=body,
         compact_hero=True,
         script=f"""
@@ -5189,6 +6785,10 @@ def _serve_resume_download(
     *,
     desktop_mode: bool = False,
 ) -> None:
+    # WKWebView owns the user download destination in Desktop mode. Returning a
+    # second HTML confirmation body from a link marked `download` made WebKit save
+    # that HTML as an additional fake DOCX download.
+    del desktop_mode
     target = _resume_run_artifact(data_root, run_id, "08_resume.docx")
     if target is None:
         handler.send_error(404, "Resume not found")
@@ -5198,51 +6798,6 @@ def _serve_resume_download(
     filename = str(metadata.get("output_filename", "Tailored_Resume.docx"))
     safe_ascii = _safe_filename_component(Path(filename).stem, "Tailored_Resume") + ".docx"
     content = target.read_bytes()
-    if desktop_mode:
-        downloads = Path.home() / "Downloads"
-        _reject_symlink_ancestry(downloads)
-        if downloads.is_symlink() or not downloads.is_dir():
-            handler.send_error(500, "Downloads folder is unavailable")
-            return
-        destination = downloads / safe_ascii
-        if destination.exists():
-            destination = downloads / (
-                f"{Path(safe_ascii).stem}-{uuid4().hex[:12]}.docx"
-            )
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            file_descriptor = os.open(destination, flags, 0o600)
-            with os.fdopen(file_descriptor, "wb") as output:
-                output.write(content)
-                output.flush()
-                os.fsync(output.fileno())
-        except OSError:
-            destination.unlink(missing_ok=True)
-            handler.send_error(500, "Resume could not be saved to Downloads")
-            return
-        metadata["external_docx"] = str(destination)
-        _write_private_json(run_dir / "09_user_ui.json", metadata)
-        _record_resume_event(
-            data_root,
-            ResumeFunnelEventType.RESUME_EXPORTED,
-            run_id=run_id,
-        )
-        locale = getattr(handler, "ui_locale", DEFAULT_UI_LOCALE)
-        body = f"""<!doctype html><html lang="{_escape(locale)}"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{_escape(ui_text(locale, '简历已保存', 'Resume saved'))}</title></head><body>
-<main><h1>{_escape(ui_text(locale, '简历已保存到 Downloads', 'Resume saved to Downloads'))}</h1>
-<p>{_escape(str(destination))}</p>
-<p><a href="{_escape(ui_url('/', locale))}">{_escape(ui_text(locale, '返回首页', 'Return home'))}</a></p>
-</main></body></html>""".encode()
-        handler.send_response(200)
-        handler.send_header("Content-Type", "text/html; charset=utf-8")
-        handler.send_header("Content-Length", str(len(body)))
-        handler.send_header("Cache-Control", "private, no-store")
-        handler.send_header("X-Content-Type-Options", "nosniff")
-        handler.end_headers()
-        handler.wfile.write(body)
-        return
     _record_resume_event(data_root, ResumeFunnelEventType.RESUME_EXPORTED, run_id=run_id)
     handler.send_response(200)
     handler.send_header("Content-Type", _DOCX_CONTENT_TYPE)
@@ -5276,12 +6831,15 @@ def _serve_resume_preview(handler: BaseHTTPRequestHandler, data_root: Path, run_
 def _serve_learning_source(
     handler: BaseHTTPRequestHandler,
     data_root: Path,
-    repo_root: Path,
+    repo_root: Path | None,
+    locale: UILocale,
 ) -> None:
     query = urllib.parse.parse_qs(urllib.parse.urlsplit(handler.path).query)
     run_id = query.get("run_id", [""])[0]
     anchor_id = query.get("anchor_id", [""])[0]
     try:
+        if repo_root is None:
+            raise ValueError("select a connected project to open code evidence")
         title, excerpt = _learning_source_excerpt(
             data_root,
             repo_root,
@@ -5291,14 +6849,14 @@ def _serve_learning_source(
     except (OSError, UnicodeDecodeError, ValueError) as exc:
         handler.send_error(404, str(exc))
         return
-    document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8" />
+    document = f"""<!doctype html><html lang="{locale}"><head><meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <title>{_escape(title)}</title><style>
 body{{margin:0;padding:24px;background:#07111f;color:#e5edf7;font-family:ui-monospace,monospace}}
 a{{color:#93c5fd}} pre{{white-space:pre;overflow:auto;background:#111827;border:1px solid #334155;
 border-radius:12px;padding:18px;line-height:1.55}}</style></head><body>
-<p><a href="/learning">← Learning Control Tower</a></p><h1>{_escape(title)}</h1>
-<p>Read-only bounded excerpt from a recorded anchor.</p>
+<p><a href="{ui_url('/learning', locale)}">← {_escape(ui_text(locale, '学习工作台', 'Learning Workspace'))}</a></p><h1>{_escape(title)}</h1>
+<p>{_escape(ui_text(locale, '来自已记录锚点的只读有限摘录。', 'Read-only bounded excerpt from a recorded anchor.'))}</p>
 <pre>{_escape(excerpt)}</pre></body></html>"""
     body = document.encode("utf-8")
     handler.send_response(200)
@@ -5325,9 +6883,13 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
     latest_user_form: dict[str, str] = {}
     latest_learning_form: dict[str, str] = {}
     latest_content_form: dict[str, str] = {}
+    latest_resume_template_receipt: ResumeTemplateReceipt | None = None
     resume_job_manager: ResumeJobManager | None = None
     video_story_job_manager: LocalVideoJobManager | None = None
     creator_video_job_manager: CreatorVideoJobManager | None = None
+    codex_import_job_manager: CodexImportJobManager | None = None
+    youtube_job_manager: YouTubePublishingJobManager | None = None
+    creator_production_job_manager: CreatorProductionJobManager | None = None
 
     def log_message(self, format: str, *args: object) -> None:
         if self.desktop_session_token is not None:
@@ -5567,6 +7129,48 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_creator_accounts_page(
+        self,
+        notice: str | None = None,
+        *,
+        youtube_job_id: str | None = None,
+        auth_platform: str | None = None,
+        auth_attempt_id: str | None = None,
+    ) -> None:
+        manager = self.youtube_job_manager
+        youtube_job = (
+            manager.get(self.ui_data_root.absolute(), youtube_job_id)
+            if manager is not None and youtube_job_id
+            else None
+        )
+        auth_attempt = None
+        if (
+            auth_platform in {"x", "linkedin", "douyin"}
+            and auth_attempt_id
+        ):
+            try:
+                auth_attempt = load_authorization_attempt(
+                    self.ui_data_root.absolute(),
+                    cast(Any, auth_platform),
+                    auth_attempt_id,
+                )
+            except PlatformAccountError:
+                auth_attempt = None
+        body = creator_accounts_page(
+            self.ui_data_root.absolute(),
+            locale=self.ui_locale,
+            notice=notice,
+            youtube_job=youtube_job,
+            auth_attempt=auth_attempt,
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_user_page(
         self,
         result: UIActionResult | None,
@@ -5580,7 +7184,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.latest_user_form,
             self.ui_locale,
             desktop_mode=self.desktop_session_token is not None,
+            workspace_root=self.workspace_root,
             resume_job=resume_job,
+            template_receipt=self.latest_resume_template_receipt,
         )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -5607,7 +7213,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         if response_saved_stage is not None:
             display_form["response_saved_stage"] = response_saved_stage
         page = _learning_page(
-            data_root, self.repo_root, display_form, result, self.ui_locale
+            data_root, self.workspace_root, display_form, result, self.ui_locale
         )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -5626,6 +7232,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         notice: str | None = None,
         scan_range: str | None = None,
         candidate_id: str | None = None,
+        workspace_view: Literal["all", "stories", "create"] = "all",
+        canon_story_id: str | None = None,
+        canon_format: str | None = None,
+        creator_job: CreatorProductionJob | None = None,
     ) -> None:
         video_snapshot = (
             self.creator_video_job_manager.get(run_id)
@@ -5652,6 +7262,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             candidate_id=candidate_id,
             creator_video_phase=(video_snapshot.phase if video_snapshot else None),
             creator_video_error=(video_snapshot.error if video_snapshot else None),
+            workspace_view=workspace_view,
+            canon_story_id=canon_story_id,
+            canon_format=canon_format,
+            creator_job=creator_job,
         )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -5676,10 +7290,34 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         values = query or {}
         notice_code = values.get("notice", [""])[0]
         error_code = values.get("error", [""])[0]
+        return_path = values.get("return_path", [""])[0]
+        if (
+            not return_path
+            or not return_path.startswith("/")
+            or return_path.startswith("//")
+        ):
+            return_path = "/"
         try:
             added = max(0, int(values.get("added", ["0"])[0]))
         except ValueError:
             added = 0
+        codex_job = None
+        manager = self.codex_import_job_manager
+        requested_job_id = values.get("codex_job", [""])[0]
+        if manager is not None:
+            codex_job = (
+                manager.get(self.ui_data_root.absolute(), requested_job_id)
+                if requested_job_id
+                else manager.latest(self.ui_data_root.absolute())
+            )
+        if codex_job is not None and requested_job_id:
+            if codex_job.phase == "READY":
+                notice_code = (
+                    "codex-partial" if codex_job.failed else "codex-added"
+                )
+                added = codex_job.imported + codex_job.updated
+            elif codex_job.phase == "FAILED":
+                error_code = "codex-import-failed"
         notices = {
             "project-connected": ui_text(
                 self.ui_locale,
@@ -5696,6 +7334,11 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 f"Codex 资料已添加：{added} 份新增或更新记录。",
                 f"Codex work added: {added} new or updated records.",
             ),
+            "codex-partial": ui_text(
+                self.ui_locale,
+                f"Codex 资料已更新：{added} 份新增或更新记录；个别会话需要重试。",
+                f"Codex work updated: {added} new or updated records; some sessions need attention.",
+            ),
             "chatgpt-added": ui_text(
                 self.ui_locale,
                 f"ChatGPT 资料已添加：{added} 份新增或更新记录。",
@@ -5705,6 +7348,21 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.ui_locale,
                 "已更新你明确选择的工作资料。",
                 "Your explicitly selected work has been refreshed.",
+            ),
+            "github-disconnected": ui_text(
+                self.ui_locale,
+                "GitHub 已断开；Keychain 中的访问令牌和本地仓库选择已移除。",
+                "GitHub is disconnected. Its Keychain token and local repository selection were removed.",
+            ),
+            "github-selection-saved": ui_text(
+                self.ui_locale,
+                "GitHub 仓库选择已保存。现在可以手动刷新只读证据。",
+                "Your GitHub repository selection is saved. You can now refresh read-only Evidence.",
+            ),
+            "github-refreshed": ui_text(
+                self.ui_locale,
+                "已从所选 GitHub 仓库更新只读元数据。",
+                "Read-only metadata was refreshed from the selected GitHub repositories.",
             ),
         }
         errors = {
@@ -5738,15 +7396,102 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 "选择的导出文件超过 256 MB 限制。",
                 "The selected export exceeds the 256 MB limit.",
             ),
+            "github-not-connected": ui_text(
+                self.ui_locale,
+                "请先通过 Desktop App 连接 GitHub。",
+                "Connect GitHub through the Desktop App first.",
+            ),
+            "github-read-failed": ui_text(
+                self.ui_locale,
+                "GitHub 只读数据未能加载；现有本地证据保持不变。",
+                "GitHub read-only data could not be loaded; existing local Evidence is unchanged.",
+            ),
+            "github-selection-invalid": ui_text(
+                self.ui_locale,
+                "仓库选择无效或超过 20 个，未保存更改。",
+                "The repository selection is invalid or exceeds 20; no change was saved.",
+            ),
         }
         body = work_page(
             data_root=self.ui_data_root.absolute(),
             workspace_root=self.workspace_root,
             locale=self.ui_locale,
             desktop_mode=self.desktop_session_token is not None,
+            github_token_configured=github_access_token_is_configured(),
+            github_connect_available=(
+                self.desktop_session_token is not None
+                and os.environ.get("SOLOSCALE_GITHUB_CONNECT_AVAILABLE") == "1"
+            ),
             chatgpt_export_selected=self.pending_chatgpt_export is not None,
+            codex_job=codex_job,
             notice=notices.get(notice_code),
             error=errors.get(error_code),
+            return_path=return_path,
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_github_repositories_page(
+        self, query: dict[str, list[str]] | None = None
+    ) -> None:
+        token = github_access_token()
+        if token is None or self.desktop_session_token is None:
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url("/work", self.ui_locale, error="github-not-connected"),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        store = GitHubConnectionStore(self.ui_data_root.absolute())
+        saved_notice: str | None = None
+        state: GitHubConnectionState | None = None
+        try:
+            account_id, account_login, repositories = GitHubReadOnlyClient(
+                token
+            ).discover()
+            state = store.save_inventory(
+                account_id=account_id,
+                account_login=account_login,
+                repositories=repositories,
+            )
+        except (GitHubConnectError, OSError, ValueError):
+            try:
+                state = store.load()
+            except (GitHubConnectError, OSError, ValueError):
+                state = None
+            if state is None:
+                self.send_response(303)
+                self.send_header(
+                    "Location",
+                    ui_url("/work", self.ui_locale, error="github-read-failed"),
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            saved_notice = ui_text(
+                self.ui_locale,
+                "GitHub 当前无法刷新；正在显示上次保存的仓库列表。",
+                "GitHub could not refresh now; showing the last saved repository list.",
+            )
+        if (query or {}).get("notice", [""])[0] == "selection-saved":
+            saved_notice = ui_text(
+                self.ui_locale,
+                "仓库选择已保存。",
+                "Repository selection saved.",
+            )
+        if state is None:
+            raise RuntimeError("GitHub repository state is unavailable")
+        body = github_repositories_page(
+            state,
+            locale=self.ui_locale,
+            notice=saved_notice,
         ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -5761,6 +7506,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         job_id: str | None = None,
         error: str | None = None,
         local_job_id: str | None = None,
+        content_run_id: str | None = None,
     ) -> None:
         local_job = None
         manager = self.video_story_job_manager
@@ -5782,6 +7528,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.ui_locale,
                 local_job=local_job,
                 local_video_available=local_available,
+                content_run_id=content_run_id,
+                content_data_root=self.ui_data_root.absolute(),
             )
         except VideoGenerationError:
             page = _video_page(
@@ -5795,6 +7543,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.ui_locale,
                 local_job=local_job,
                 local_video_available=local_available,
+                content_run_id=content_run_id,
+                content_data_root=self.ui_data_root.absolute(),
             )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -5834,8 +7584,53 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         if path in {"/", ""}:
             self._send_home_page()
             return
+        codex_import_job_match = re.fullmatch(
+            r"/work/import-codex/jobs/(codex-import-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{10})",
+            path,
+        )
+        if codex_import_job_match is not None:
+            manager = self.codex_import_job_manager
+            snapshot = (
+                manager.get(
+                    self.ui_data_root.absolute(),
+                    codex_import_job_match.group(1),
+                )
+                if manager is not None
+                else None
+            )
+            if snapshot is None:
+                self.send_error(404, "Codex import job not found")
+                return
+            body = json.dumps(
+                {
+                    "job_id": snapshot.job_id,
+                    "phase": snapshot.phase,
+                    "total": snapshot.total,
+                    "processed": snapshot.processed,
+                    "running": snapshot.running,
+                    "imported": snapshot.imported,
+                    "updated": snapshot.updated,
+                    "skipped": snapshot.skipped,
+                    "failed": snapshot.failed,
+                    "failure_codes": list(snapshot.failure_codes),
+                    "created_at": snapshot.created_at,
+                    "updated_at": snapshot.updated_at,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/work":
             self._send_work_page(query)
+            return
+        if path == "/work/github":
+            self._send_github_repositories_page(query)
             return
         resume_job_match = re.fullmatch(
             r"/resume/jobs/(resume-job-[a-f0-9]{12})", path
@@ -5847,6 +7642,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             _apply_ai_provider_preference(
                 self.latest_user_form, self.ui_data_root.absolute()
             )
+            preview_id = query.get("template_preview", [""])[0]
+            if preview_id:
+                self.latest_user_form["resume_template_preview_id"] = preview_id
+                self.latest_user_form.pop("template_preview_error", None)
             self._send_user_page(None)
             return
         ai_settings_detail = {
@@ -5898,6 +7697,105 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 None, saved_stage if saved_stage in {"explain", "trace"} else None
             )
             return
+        if path == "/creator":
+            body = creator_overview_page(
+                self.ui_data_root.absolute(), locale=self.ui_locale
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/creator/stories":
+            mining_notice = query.get("mining_notice", [""])[0]
+            notice = None
+            if mining_notice == "ok":
+                notice = ui_text(
+                    self.ui_locale,
+                    "已从最新工作生成候选故事（确定性草稿，未调用模型）。",
+                    "Generated candidate stories from recent work (deterministic drafts; no model call).",
+                )
+            elif mining_notice == "empty":
+                notice = ui_text(
+                    self.ui_locale,
+                    "扫描完成，没有发现新的可用故事。",
+                    "Scan complete; no new usable stories were found.",
+                )
+            elif mining_notice == "error":
+                notice = ui_text(
+                    self.ui_locale,
+                    "故事挖掘未能完成；请检查已批准的工作证据后重试。",
+                    "Story mining could not complete; check approved work evidence and try again.",
+                )
+            self._send_content_page(workspace_view="stories", notice=notice)
+            return
+        if path == "/creator/create":
+            _apply_ai_provider_preference(
+                self.latest_content_form, self.ui_data_root.absolute()
+            )
+            creator_job_id = query.get("creator_job", [""])[0]
+            production_manager = self.creator_production_job_manager
+            creator_job = (
+                production_manager.get(
+                    self.ui_data_root.absolute(), creator_job_id
+                )
+                if production_manager is not None and creator_job_id
+                else None
+            )
+            self._send_content_page(
+                run_id=query.get("run_id", [""])[0] or None,
+                scan_range=query.get("scan_range", [None])[0],
+                candidate_id=query.get("candidate_id", [None])[0],
+                workspace_view="create",
+                canon_story_id=query.get("canon_story_id", [None])[0],
+                canon_format=query.get("canon_format", [None])[0],
+                creator_job=creator_job,
+            )
+            return
+        if path == "/creator/publish":
+            youtube_manager = self.youtube_job_manager
+            requested_youtube_job = query.get("youtube_job", [""])[0]
+            youtube_job = (
+                youtube_manager.get(
+                    self.ui_data_root.absolute(), requested_youtube_job
+                )
+                if youtube_manager is not None and requested_youtube_job
+                else youtube_manager.latest(
+                    self.ui_data_root.absolute(), kind="upload"
+                )
+                if youtube_manager is not None
+                else None
+            )
+            body = editorial_publishing_page(
+                data_root=self.ui_data_root.absolute(),
+                locale=self.ui_locale,
+                creator_mode=True,
+                youtube_job=youtube_job,
+                selected_run_id=query.get("run_id", [""])[0] or None,
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/creator/history":
+            body = creator_history_page(
+                self.ui_data_root.absolute(), locale=self.ui_locale
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if path == "/content":
             _apply_ai_provider_preference(
                 self.latest_content_form, self.ui_data_root.absolute()
@@ -5910,8 +7808,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 "saved": ui_text(self.ui_locale, "修改已保存。", "Edits saved."),
                 "approved": ui_text(
                     self.ui_locale,
-                    "内容包已批准；仍需在 BuildLog 精确预览中输入 PUBLISH 才会发布。",
-                    "Bundle approved. Publication still requires PUBLISH in the exact BuildLog preview.",
+                    "内容包已批准；仍需在发布队列的精确预览中输入 PUBLISH 才会发布。",
+                    "Bundle approved. Publication still requires PUBLISH in the exact Publish Queue preview.",
                 ),
                 "rejected": ui_text(
                     self.ui_locale, "内容包已拒绝；没有发布。", "Bundle rejected; nothing was published."
@@ -5936,7 +7834,86 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 notice=review_notice or reference_notice,
                 scan_range=query.get("scan_range", [None])[0],
                 candidate_id=query.get("candidate_id", [None])[0],
+                workspace_view="create",
             )
+            return
+        if path == "/creator/accounts":
+            account_notice = {
+                "saved": ui_text(
+                    self.ui_locale, "账号入口已保存。", "Account entry saved."
+                ),
+                "invalid": ui_text(
+                    self.ui_locale,
+                    "无法保存；请检查网址和状态。",
+                    "Could not save. Check the URLs and status.",
+                ),
+                "configured": ui_text(
+                    self.ui_locale,
+                    "开发者应用配置已保存在本机；密钥不会回显。",
+                    "Developer integration saved locally; secrets are not displayed.",
+                ),
+                "config-invalid": ui_text(
+                    self.ui_locale,
+                    "开发者应用配置无效或不完整。",
+                    "Developer integration configuration is invalid or incomplete.",
+                ),
+                "disconnected": ui_text(
+                    self.ui_locale,
+                    "账号连接已从本机移除。",
+                    "The local account connection was removed.",
+                ),
+                "connected": ui_text(
+                    self.ui_locale,
+                    "账号身份已验证并安全保存在本机。",
+                    "The account identity was verified and saved locally.",
+                ),
+            }.get(query.get("account", [""])[0])
+            self._send_creator_accounts_page(
+                account_notice,
+                youtube_job_id=query.get("youtube_job", [""])[0] or None,
+                auth_platform=query.get("auth_platform", [""])[0] or None,
+                auth_attempt_id=query.get("auth_attempt", [""])[0] or None,
+            )
+            return
+        youtube_job_match = re.fullmatch(
+            r"/creator/youtube/jobs/(youtube-(?:auth|upload)-[a-f0-9]{12})",
+            path,
+        )
+        if youtube_job_match is not None:
+            manager = self.youtube_job_manager
+            snapshot = (
+                manager.get(
+                    self.ui_data_root.absolute(), youtube_job_match.group(1)
+                )
+                if manager is not None
+                else None
+            )
+            if snapshot is None:
+                self.send_error(404, "YouTube job not found")
+                return
+            body = json.dumps(
+                {
+                    "job_id": snapshot.job_id,
+                    "kind": snapshot.kind,
+                    "phase": snapshot.phase,
+                    "progress_percent": snapshot.progress_percent,
+                    "channel_id": snapshot.channel_id,
+                    "run_id": snapshot.run_id,
+                    "video_id": snapshot.video_id,
+                    "video_url": snapshot.video_url,
+                    "error_code": snapshot.error_code,
+                    "error_message": snapshot.error_message,
+                    "updated_at": snapshot.updated_at,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
             return
         if path == "/evidence":
             self._send_evidence_page()
@@ -5945,18 +7922,21 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self._send_video_page(
                 query.get("job_id", [None])[0],
                 local_job_id=query.get("local_job_id", [None])[0],
+                content_run_id=query.get("content_run_id", [None])[0],
             )
             return
         if path == "/publishing":
-            body = editorial_publishing_page(
-                data_root=self.ui_data_root.absolute(), locale=self.ui_locale
-            ).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/publish",
+                    self.ui_locale,
+                    run_id=query.get("run_id", [""])[0],
+                ),
+            )
+            self.send_header("Content-Length", "0")
             self.end_headers()
-            self.wfile.write(body)
             return
         editorial_image_match = re.fullmatch(
             r"/publishing/editorial/(linkedin|x)/image", path
@@ -6062,7 +8042,12 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
         if path == "/learning/source":
-            _serve_learning_source(self, self.ui_data_root.absolute(), self.repo_root)
+            _serve_learning_source(
+                self,
+                self.ui_data_root.absolute(),
+                self.workspace_root,
+                self.ui_locale,
+            )
             return
         if path == "/control-tower":
             _serve_control_tower(self, self.ui_data_root.absolute())
@@ -6092,6 +8077,283 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         if not self._desktop_session_allowed():
             return
         resume_post_started = time.perf_counter() if path == "/generate" else None
+        if path == "/creator/accounts/youtube/connect":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "YouTube connection request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            manager = self.youtube_job_manager
+            try:
+                if manager is None:
+                    raise YouTubePublishingError(
+                        "YouTube background worker is unavailable",
+                        code="WORKER_UNAVAILABLE",
+                    )
+                job = manager.start_connect(data_root=self.ui_data_root.absolute())
+            except (OSError, YouTubePublishingError) as exc:
+                self._send_creator_accounts_page(str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/accounts",
+                    self.ui_locale,
+                    youtube_job=job.job_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/accounts/youtube/cancel":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "YouTube cancellation request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            manager = self.youtube_job_manager
+            try:
+                if manager is None:
+                    raise YouTubePublishingError(
+                        "YouTube background worker is unavailable",
+                        code="WORKER_UNAVAILABLE",
+                    )
+                job_id = form.get("job_id", "")
+                job = manager.cancel_connect(
+                    data_root=self.ui_data_root.absolute(),
+                    job_id=job_id,
+                )
+            except (OSError, YouTubePublishingError) as exc:
+                self._send_creator_accounts_page(str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/accounts",
+                    self.ui_locale,
+                    youtube_job=job.job_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/accounts/configure":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 16 * 1024:
+                self.send_error(413, "Developer configuration request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            platform = form.get("platform", "")
+            outcome = "config-invalid"
+            try:
+                if platform not in {"x", "linkedin", "douyin", "xiaohongshu"}:
+                    raise PlatformAccountError("Unsupported platform")
+                selected_platform = cast(Any, platform)
+                existing = load_developer_config(
+                    self.ui_data_root.absolute(), selected_platform
+                )
+                values: dict[str, str] = {}
+                for field in PROVIDERS[selected_platform].required_fields:
+                    submitted = form.get(field, "").strip()
+                    if submitted:
+                        values[field] = submitted
+                    elif existing.source == "local" and existing.values.get(field):
+                        values[field] = existing.values[field]
+                save_developer_config(
+                    self.ui_data_root.absolute(), selected_platform, values
+                )
+                outcome = "configured"
+            except (OSError, PlatformAccountError):
+                outcome = "config-invalid"
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url("/creator/accounts", self.ui_locale, account=outcome),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        provider_connect = re.fullmatch(
+            r"/creator/accounts/(x|linkedin|douyin)/connect", path
+        )
+        if provider_connect is not None:
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "Connection request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            platform = cast(Any, provider_connect.group(1))
+            try:
+                attempt = start_authorization_attempt(
+                    self.ui_data_root.absolute(), platform
+                )
+            except PlatformAccountError as exc:
+                self._send_creator_accounts_page(str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/accounts",
+                    self.ui_locale,
+                    auth_platform=attempt.platform,
+                    auth_attempt=attempt.attempt_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/accounts/auth/cancel":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "Cancellation request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            platform = form.get("platform", "")
+            attempt_id = form.get("attempt_id", "")
+            try:
+                if platform not in {"x", "linkedin", "douyin"}:
+                    raise PlatformAccountError("Unsupported platform")
+                attempt = cancel_authorization_attempt(
+                    self.ui_data_root.absolute(), cast(Any, platform), attempt_id
+                )
+            except PlatformAccountError as exc:
+                self._send_creator_accounts_page(str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/accounts",
+                    self.ui_locale,
+                    auth_platform=attempt.platform,
+                    auth_attempt=attempt.attempt_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/accounts/auth/complete":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 16 * 1024:
+                self.send_error(413, "Authorization response is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            platform = form.get("platform", "")
+            attempt_id = form.get("attempt_id", "")
+            try:
+                if platform not in {"x", "linkedin", "douyin"}:
+                    raise PlatformAccountError("Unsupported platform")
+                complete_authorization_response(
+                    self.ui_data_root.absolute(),
+                    cast(Any, platform),
+                    attempt_id,
+                    form.get("authorization_response", ""),
+                )
+            except PlatformAccountError as exc:
+                self._send_creator_accounts_page(
+                    str(exc),
+                    auth_platform=platform,
+                    auth_attempt_id=attempt_id,
+                )
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url("/creator/accounts", self.ui_locale, account="connected"),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/accounts/disconnect":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "Disconnect request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            platform = form.get("platform", "")
+            try:
+                if platform not in {"x", "linkedin", "douyin", "xiaohongshu"}:
+                    raise PlatformAccountError("Unsupported platform")
+                disconnect_identity(
+                    self.ui_data_root.absolute(),
+                    cast(Any, platform),
+                    form.get("external_account_id", ""),
+                )
+            except PlatformAccountError as exc:
+                self._send_creator_accounts_page(str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location", ui_url("/creator/accounts", self.ui_locale, account="disconnected")
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/accounts/save":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 16 * 1024:
+                self.send_error(413, "Account settings request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            forbidden = {"token", "secret", "password", "api_key", "oauth"}
+            outcome = "invalid"
+            if not forbidden.intersection(form) and form.get("platform") == "independent_site":
+                try:
+                    account = normalize_account(
+                        platform=form.get("platform", ""),
+                        display_name=form.get("display_name", ""),
+                        handle=form.get("handle", ""),
+                        profile_url=form.get("profile_url", ""),
+                        admin_url=form.get("admin_url", ""),
+                        status=form.get("status", "NOT_CONFIGURED"),
+                    )
+                    save_creator_account(self.ui_data_root.absolute(), account)
+                    outcome = "saved"
+                except (CreatorAccountError, OSError):
+                    outcome = "invalid"
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url("/creator/accounts", self.ui_locale, account=outcome),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path == "/settings/ai-provider":
             try:
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -6127,7 +8389,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "Credentials are not accepted by this endpoint")
                 return
             outcome = "invalid"
-            if form.get("action") == "save_profile":
+            action = form.get("action")
+            if action == "save_profile":
                 values = {
                     "heygen_avatar_group_id": form.get("avatar_group_id", "").strip(),
                     "heygen_avatar_look_id": form.get("avatar_look_id", "").strip(),
@@ -6393,8 +8656,13 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 )
             else:
                 try:
-                    codex_result = import_codex_history(
-                        self.ui_data_root.absolute()
+                    manager = self.codex_import_job_manager
+                    if manager is None:
+                        raise WorkContextError(
+                            "Codex background import is unavailable."
+                        )
+                    job_id = manager.submit(
+                        data_root=self.ui_data_root.absolute(),
                     )
                 except (WorkContextError, OSError, ValueError):
                     location = ui_url(
@@ -6404,8 +8672,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     location = ui_url(
                         "/work",
                         self.ui_locale,
-                        notice="codex-added",
-                        added=str(codex_result.imported + codex_result.updated),
+                        codex_job=job_id,
                     )
             self.send_response(303)
             self.send_header("Location", location)
@@ -6493,9 +8760,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             form = _parse_form(self.rfile.read(length)) if length else {}
             self._adopt_ui_locale(form)
             try:
-                receipt = refresh_evidence_catalog(
+                refresh_work_source(
                     self.ui_data_root.absolute(),
-                    repository_root=self.workspace_root,
+                    "local_git",
+                    workspace_root=self.workspace_root,
                 )
             except (EvidenceHubError, OSError, ValueError):
                 location = ui_url(
@@ -6505,11 +8773,90 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 location = ui_url(
                     "/work",
                     self.ui_locale,
-                    **(
-                        {"notice": "refreshed"}
-                        if receipt.status.value == "succeeded"
-                        else {"error": "refresh-failed"}
-                    ),
+                    notice="refreshed",
+                )
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/work/github/select":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 64 * 1024:
+                self.send_error(413, "GitHub selection request is too large")
+                return
+            try:
+                values = urllib.parse.parse_qs(
+                    self.rfile.read(length).decode("utf-8"),
+                    keep_blank_values=False,
+                    strict_parsing=False,
+                )
+                self._adopt_ui_locale(
+                    {key: items[0] for key, items in values.items() if items}
+                )
+                repository_ids = [
+                    int(value) for value in values.get("repository", [])
+                ]
+                if any(repository_id <= 0 for repository_id in repository_ids):
+                    raise ValueError("GitHub repository selection is invalid")
+                GitHubConnectionStore(
+                    self.ui_data_root.absolute()
+                ).save_selection(repository_ids)
+            except (GitHubConnectError, UnicodeError, ValueError):
+                location = ui_url(
+                    "/work", self.ui_locale, error="github-selection-invalid"
+                )
+            else:
+                location = ui_url(
+                    "/work/github", self.ui_locale, notice="selection-saved"
+                )
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/work/github/refresh":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            if length < 0 or length > 8 * 1024:
+                self.send_error(413, "GitHub refresh request is too large")
+                return
+            form = _parse_form(self.rfile.read(length)) if length else {}
+            self._adopt_ui_locale(form)
+            token = github_access_token()
+            store = GitHubConnectionStore(self.ui_data_root.absolute())
+            try:
+                if token is None or self.desktop_session_token is None:
+                    raise GitHubConnectError("GitHub is not connected")
+                state = store.load()
+                if state is None or not state.selected_repositories:
+                    raise GitHubConnectError("Select at least one GitHub repository")
+                source, items = GitHubReadOnlyClient(token).evidence_snapshot(
+                    account_id=state.account_id,
+                    account_login=state.account_login,
+                    repositories=state.selected_repositories,
+                )
+                receipt = EvidenceHub(
+                    self.ui_data_root.absolute()
+                ).sync_source(source, items=items)
+                if receipt.status.value != "succeeded":
+                    raise EvidenceHubError("GitHub Evidence refresh failed")
+                store.mark_evidence_refresh(receipt_id=receipt.receipt_id)
+            except (EvidenceHubError, GitHubConnectError, OSError, ValueError):
+                try:
+                    store.mark_evidence_refresh(
+                        receipt_id=None, error_code="github_read_failed"
+                    )
+                except (GitHubConnectError, OSError, ValueError):
+                    pass
+                location = ui_url(
+                    "/work", self.ui_locale, error="github-read-failed"
+                )
+            else:
+                location = ui_url(
+                    "/work", self.ui_locale, notice="github-refreshed"
                 )
             self.send_response(303)
             self.send_header("Location", location)
@@ -6555,10 +8902,12 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             if video_story_manager is None:
                 self.send_error(503, "Local video worker is unavailable")
                 return
+            content_run_id = form.get("content_run_id", "").strip() or None
             try:
                 job_id = video_story_manager.submit(
                     data_root=self.ui_data_root.absolute(),
                     repository_root=self.repo_root,
+                    content_run_id=content_run_id,
                 )
             except (OSError, ResumeWorkspaceStorageError, VideoStoryError) as exc:
                 self._send_video_page(error=str(exc))
@@ -6602,6 +8951,187 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         canon_generate_match = re.fullmatch(r"/content/canon/(M1-[0-9]{2})", path)
+        if path == "/creator/stories/mine":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if length < 0 or length > MAX_UPLOAD_BYTES:
+                self.send_error(413, "Story mining request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            data_root = self.ui_data_root.absolute()
+            try:
+                hub = EvidenceHub(data_root)
+                recent = hub.recent_evidence(limit=50)
+            except (EvidenceHubError, OSError, ValueError):
+                recent = []
+            approved = [
+                item
+                for item in recent
+                if item.verification_status in {"verified", "approved"}
+                or item.trust_state in {"verified", "approved"}
+            ]
+            existing_ids = [
+                story.story_id for story in load_month_one_canon().stories
+            ] + [candidate.candidate_id for candidate in load_story_candidates(data_root)]
+            mined: tuple[StoryCandidate, ...] = ()
+            mining_notice = "empty"
+            try:
+                mined = mine_story_candidates(
+                    data_root,
+                    evidence=approved,
+                    existing_story_ids=existing_ids,
+                    limit=5,
+                )
+                mining_notice = "ok" if mined else "empty"
+            except StoryMiningError:
+                mining_notice = "error"
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/stories",
+                    self.ui_locale,
+                    mining_notice=mining_notice,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/creator/production/start":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if length < 0 or length > MAX_UPLOAD_BYTES:
+                self.send_error(413, "Creator production request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            manager = self.creator_production_job_manager
+            if manager is None:
+                self.send_error(503, "Creator production is unavailable")
+                return
+            action = form.get("production_action", "article")
+            outputs: list[Literal["ARTICLE", "VIDEO"]]
+            add_to_queue = action == "queue"
+            if action == "article":
+                outputs = ["ARTICLE"]
+            elif action == "video":
+                outputs = ["VIDEO"]
+            elif action == "queue":
+                outputs = ["ARTICLE", "VIDEO"]
+            else:
+                self.send_error(400, "Creator production action is invalid")
+                return
+            source_kind = form.get("source_kind", "")
+            language: Literal["English", "中文"] = (
+                "中文" if form.get("language") == "中文" else "English"
+            )
+            preference = _load_ai_provider_preference(self.ui_data_root.absolute())
+            generation_mode = _creator_generation_mode(preference, form, source_kind)
+            ai_editorial = generation_mode != "template"
+            gateway = _gateway_from_preference(preference) if ai_editorial else None
+            provider, model = _creator_job_provider_metadata(preference, generation_mode)
+            data_root = self.ui_data_root.absolute()
+            if source_kind == "STORY":
+                story_id = form.get("source_story_id", "")
+                if re.fullmatch(
+                    r"(?:M1-[0-9]{2}|story-candidate-[a-f0-9]{12})", story_id
+                ) is None:
+                    self.send_error(400, "Creator story is invalid")
+                    return
+                if story_id.startswith("story-candidate-"):
+
+                    def runner() -> str:
+                        result = run_story_candidate(
+                            story_id,
+                            data_root,
+                            language=language,
+                            gateway=gateway,
+                        )
+                        if result.run_id is None:
+                            if ai_editorial:
+                                raise CreatorProductionError("AI_NOT_EXECUTED")
+                            raise CreatorProductionError(
+                                result.error or "Content generation failed"
+                            )
+                        return result.run_id
+                else:
+
+                    def runner() -> str:
+                        result = run_month_one_story(
+                            story_id,
+                            data_root,
+                            language=language,
+                            gateway=gateway,
+                        )
+                        if result.run_id is None:
+                            if ai_editorial:
+                                raise CreatorProductionError("AI_NOT_EXECUTED")
+                            raise CreatorProductionError(
+                                result.error or "Content generation failed"
+                            )
+                        return result.run_id
+
+                source_story_id: str | None = story_id
+            elif source_kind == "CREATE":
+                self.latest_content_form = dict(form)
+                if ai_editorial:
+                    _apply_ai_provider_preference(form, data_root)
+
+                def runner() -> str:
+                    result = run_content_form(form, data_root, gateway=gateway)
+                    if result.run_id is None:
+                        if ai_editorial:
+                            raise CreatorProductionError("AI_NOT_EXECUTED")
+                        raise CreatorProductionError(result.error or "Content generation failed")
+                    return result.run_id
+
+                source_story_id = None
+            else:
+                self.send_error(400, "Creator production source is invalid")
+                return
+            request = CreatorProductionRequest(
+                source_kind=cast(Literal["STORY", "CREATE"], source_kind),
+                source_story_id=source_story_id,
+                outputs=outputs,
+                language=language,
+                ai_editorial=ai_editorial,
+                add_to_queue=add_to_queue,
+            )
+            job = manager.submit(
+                data_root=data_root,
+                request=request,
+                runner=runner,
+                renderer=(
+                    lambda run_id: render_creator_video(
+                        data_root=data_root,
+                        run_id=run_id,
+                        repository_root=self.creator_video_root,
+                    )
+                )
+                if "VIDEO" in outputs
+                else None,
+                provider=provider,
+                model=model,
+            )
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/create",
+                    self.ui_locale,
+                    creator_job=job.job_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path == "/content/reference-video":
             try:
                 length = int(self.headers.get("Content-Length", "0") or 0)
@@ -6692,6 +9222,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 return
             self.latest_content_form = _parse_form(self.rfile.read(length))
             self._adopt_ui_locale(self.latest_content_form)
+            creator_view = self.latest_content_form.get("creator_view") == "create"
             content_gateway: ModelGateway | None = None
             if self.latest_content_form.get("generation_mode") != "template":
                 _apply_ai_provider_preference(
@@ -6706,13 +9237,16 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 gateway=content_gateway,
             )
             if content_result.run_id is None:
-                self._send_content_page(result=content_result)
+                self._send_content_page(
+                    result=content_result,
+                    workspace_view="create" if creator_view else "all",
+                )
                 return
             self.send_response(303)
             self.send_header(
                 "Location",
                 ui_url(
-                    "/content#results",
+                    "/creator/create#results" if creator_view else "/content#results",
                     self.ui_locale,
                     run_id=content_result.run_id,
                 ),
@@ -7037,6 +9571,48 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if path == "/creator/publish/queue":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 16 * 1024:
+                self.send_error(413, "Publish Queue request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            try:
+                item = assign_artifact_to_account(
+                    data_root=self.ui_data_root.absolute(),
+                    artifact_id=form.get("artifact_id", ""),
+                    channel_account_id=form.get("channel_account_id", ""),
+                )
+            except (CreatorProductionError, OSError) as exc:
+                body = editorial_publishing_page(
+                    data_root=self.ui_data_root.absolute(),
+                    error=str(exc),
+                    locale=self.ui_locale,
+                    creator_mode=True,
+                ).encode("utf-8")
+                self.send_response(422)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/publish",
+                    self.ui_locale,
+                    queue_item=item.queue_item_id,
+                ),
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if path == "/publishing/editorial/preview":
             length = int(self.headers.get("Content-Length", "0") or 0)
             form = _parse_form(self.rfile.read(length))
@@ -7054,7 +9630,65 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.send_error(422, "Editorial package preview failed")
                 return
             self.send_response(303)
-            self.send_header("Location", ui_url("/publishing", self.ui_locale))
+            self.send_header("Location", ui_url("/creator/publish", self.ui_locale))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/publishing/youtube/upload":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                length = -1
+            if length < 0 or length > 16 * 1024:
+                self.send_error(413, "YouTube upload request is too large")
+                return
+            form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(form)
+            manager = self.youtube_job_manager
+            try:
+                if form.get("confirmation") != "UPLOAD":
+                    raise YouTubePublishingError(
+                        "Type UPLOAD to authorize this exact external upload",
+                        code="UPLOAD_CONFIRMATION_REQUIRED",
+                    )
+                if manager is None:
+                    raise YouTubePublishingError(
+                        "YouTube background worker is unavailable",
+                        code="WORKER_UNAVAILABLE",
+                    )
+                request = normalize_upload_request(
+                    run_id=form.get("run_id", ""),
+                    channel_id=form.get("channel_id", ""),
+                    title=form.get("title", ""),
+                    description=form.get("description", ""),
+                    tags=form.get("tags", ""),
+                    privacy_status=form.get("privacy_status", "private"),
+                )
+                job = manager.start_upload(
+                    data_root=self.ui_data_root.absolute(), request=request
+                )
+            except (OSError, YouTubePublishingError) as exc:
+                body = editorial_publishing_page(
+                    data_root=self.ui_data_root.absolute(),
+                    error=str(exc),
+                    locale=self.ui_locale,
+                    creator_mode=True,
+                ).encode("utf-8")
+                self.send_response(422)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "private, no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location",
+                ui_url(
+                    "/creator/publish", self.ui_locale, youtube_job=job.job_id
+                ),
+            )
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -7073,59 +9707,109 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.send_error(422, "Editorial publication failed")
                 return
             self.send_response(303)
-            self.send_header("Location", ui_url("/publishing", self.ui_locale))
+            self.send_header("Location", ui_url("/creator/publish", self.ui_locale))
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        buildlog_match = re.fullmatch(
-            r"/content/buildlog/(content-[^/]+)/(linkedin|x)(/publish)?", path
-        )
-        if buildlog_match is not None:
-            run_id, channel, publish_path = buildlog_match.groups()
-            if channel not in {"linkedin", "x"}:
-                self.send_error(404)
-                return
-            channel = cast(Channel, channel)
+        if path == "/applications/status":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            application_form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(application_form)
+            library_value = application_form.get("resume_library_root", "").strip()
+            library_root = Path(
+                library_value
+                or (
+                    self.ui_data_root.absolute() / "resume-applications"
+                    if self.desktop_session_token is not None
+                    else Path.home() / "Documents" / "Resume Applications"
+                )
+            )
+            directory_name = application_form.get("directory_name", "").strip()
             try:
-                if publish_path:
-                    length = int(self.headers.get("Content-Length", "0") or 0)
-                    publish_form = _parse_form(self.rfile.read(length))
-                    self._adopt_ui_locale(publish_form)
-                    publish_via_buildlog(
-                        data_root=self.ui_data_root.absolute(),
-                        run_id=run_id,
-                        channel=channel,
-                        confirmation=publish_form.get("confirmation", ""),
-                    )
-                    query = {"run_id": run_id, "buildlog": "published"}
-                else:
-                    preview_for_buildlog(
-                        data_root=self.ui_data_root.absolute(),
-                        run_id=run_id,
-                        channel=channel,
-                    )
-                    query = {"run_id": run_id, "buildlog": "previewed"}
-            except (
-                BuildLogHandoffError,
-                ContentWorkspaceError,
-                OSError,
-                subprocess.TimeoutExpired,
-            ):
-                self.send_error(422, "BuildLog handoff failed")
+                status = ApplicationStatus(application_form.get("status", "").strip())
+                application_dir = library_root / "applications" / directory_name
+                if not application_dir.is_dir() or application_dir.is_symlink():
+                    raise ValueError("application directory not found")
+                update_application_status(
+                    application_dir=application_dir,
+                    status=status,
+                    note=application_form.get("note", ""),
+                    next_action=application_form.get("next_action", ""),
+                )
+            except (OSError, ValueError) as exc:
+                self.send_error(422, str(exc))
                 return
             self.send_response(303)
             self.send_header(
-                "Location", ui_url("/content#results", self.ui_locale, **query)
+                "Location", ui_url("/resume#applications", self.ui_locale)
             )
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if path == "/learning/case/create":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            case_form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(case_form)
+            self.latest_learning_form = dict(case_form)
+            self._send_learning_page(
+                _create_learning_case_ui(
+                    case_form,
+                    self.ui_data_root.absolute(),
+                    self.workspace_root,
+                )
+            )
+            return
+        if path == "/learning/practice/create":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            practice_form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(practice_form)
+            self.latest_learning_form = dict(practice_form)
+            self._send_learning_page(
+                _create_practice_exercise_ui(
+                    practice_form, self.ui_data_root.absolute()
+                )
+            )
+            return
+        if path == "/learning/practice/open":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            practice_form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(practice_form)
+            self.latest_learning_form = dict(practice_form)
+            self._send_learning_page(
+                _open_practice_exercise_ui(
+                    practice_form, self.ui_data_root.absolute()
+                )
+            )
+            return
+        if path == "/learning/practice/complete":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            body = self.rfile.read(length)
+            try:
+                practice_submission = _parse_submission(
+                    body, self.headers.get("Content-Type", "")
+                )
+            except (UnicodeError, ValueError) as exc:
+                result = UIActionResult(
+                    "learning-practice", "complete practice", 1, "", str(exc), 0
+                )
+                self._send_learning_page(result)
+                return
+            self._adopt_ui_locale(practice_submission.fields)
+            self.latest_learning_form = dict(practice_submission.fields)
+            self._send_learning_page(
+                _complete_practice_exercise_ui(
+                    practice_submission.fields,
+                    practice_submission.files,
+                    self.ui_data_root.absolute(),
+                )
+            )
             return
         if path == "/learning/run":
             length = int(self.headers.get("Content-Length", "0") or 0)
             body = self.rfile.read(length)
             self.latest_learning_form = _parse_form(body)
             self._adopt_ui_locale(self.latest_learning_form)
-            if not _is_supported_learning_repository(self.repo_root):
+            if self.workspace_root is None:
                 self._send_learning_page(
                     UIActionResult(
                         "learning-traceability",
@@ -7134,8 +9818,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                         "",
                         ui_text(
                             self.ui_locale,
-                            "请先从 SoloScale AI OS 菜单选择本地 SoloScale Git checkout。",
-                            "Choose a local SoloScale Git checkout from the SoloScale AI OS menu first.",
+                            "这个练习需要一个已连接的代码项目。请先选择项目。",
+                            "This exercise needs a connected code project. Choose a project first.",
                         ),
                         0,
                     )
@@ -7143,7 +9827,9 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 return
             self._send_learning_page(
                 _run_learning_workspace(
-                    self.latest_learning_form, self.ui_data_root.absolute(), self.repo_root
+                    self.latest_learning_form,
+                    self.ui_data_root.absolute(),
+                    self.workspace_root,
                 )
             )
             return
@@ -7177,9 +9863,11 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             mapping_form = _parse_form(self.rfile.read(length))
             self._adopt_ui_locale(mapping_form)
             try:
+                if self.workspace_root is None:
+                    raise ValueError("select a connected project first")
                 map_interview_defense_bullet(
                     data_root=self.ui_data_root.absolute(),
-                    repository_root=self.repo_root,
+                    repository_root=self.workspace_root,
                     resume_run_id=mapping_form.get("resume_run_id", ""),
                     bullet_id=mapping_form.get("bullet_id", ""),
                     learning_run_id=mapping_form.get("learning_run_id", ""),
@@ -7199,6 +9887,41 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 ),
             )
             self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/resume/template-preview":
+            try:
+                length = int(self.headers.get("Content-Length", "0") or 0)
+            except ValueError:
+                self.send_error(400, "Invalid Content-Length")
+                return
+            if length < 0 or length > MAX_UPLOAD_BYTES:
+                self.send_error(413, "Upload is too large")
+                return
+            body = self.rfile.read(length)
+            try:
+                submission = _parse_submission(
+                    body, self.headers.get("Content-Type", "")
+                )
+                self._adopt_ui_locale(submission.fields)
+                template_preview_receipt = _prepare_resume_template_preview(submission)
+            except (OSError, UnicodeError, ValueError) as exc:
+                self.latest_user_form["template_preview_error"] = str(exc)
+                location = ui_url("/resume", self.ui_locale)
+            else:
+                self.latest_resume_template_receipt = template_preview_receipt
+                self.latest_user_form["resume_template_preview_id"] = (
+                    template_preview_receipt.preview_id
+                )
+                self.latest_user_form.pop("template_preview_error", None)
+                location = ui_url(
+                    f"/resume?template_preview={template_preview_receipt.preview_id}",
+                    self.ui_locale,
+                )
+            self.send_response(303)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
         if path not in {"/run", "/generate"}:
@@ -7254,8 +9977,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     files=submission.files,
                     data_root=data_root,
                     repo_root=self.repo_root,
+                    evidence_repository_root=self.workspace_root,
                     gateway=resume_gateway,
                     expert_gateway=expert_gateway,
+                    template_receipt=self.latest_resume_template_receipt,
                     initial_timings_ms={"post_response_ms": post_response_ms},
                 )
             except RuntimeError:
@@ -7267,6 +9992,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     "generation_mode",
                     "provider_model",
                     "expert_review_mode",
+                    "resume_output_language",
+                    "resume_template_preview_id",
                 )
             }
             self.latest_user_form["ui_locale"] = self.ui_locale
@@ -7357,6 +10084,12 @@ def main() -> None:
     handler.video_story_job_manager = video_story_job_manager
     creator_video_job_manager = CreatorVideoJobManager()
     handler.creator_video_job_manager = creator_video_job_manager
+    codex_import_job_manager = CodexImportJobManager()
+    handler.codex_import_job_manager = codex_import_job_manager
+    youtube_job_manager = YouTubePublishingJobManager()
+    handler.youtube_job_manager = youtube_job_manager
+    creator_production_job_manager = CreatorProductionJobManager()
+    handler.creator_production_job_manager = creator_production_job_manager
 
     server = HTTPServer((args.host, args.port), handler)
     raw_host, port = server.server_address[:2]
@@ -7402,6 +10135,12 @@ def main() -> None:
         handler.video_story_job_manager = None
         creator_video_job_manager.shutdown()
         handler.creator_video_job_manager = None
+        codex_import_job_manager.shutdown()
+        handler.codex_import_job_manager = None
+        youtube_job_manager.shutdown()
+        handler.youtube_job_manager = None
+        creator_production_job_manager.shutdown()
+        handler.creator_production_job_manager = None
         if readiness_path is not None:
             try:
                 readiness_path.unlink()

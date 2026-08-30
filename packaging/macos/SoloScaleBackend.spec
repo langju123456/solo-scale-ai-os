@@ -2,11 +2,14 @@
 # This template packages only tracked application resources. It never discovers user data.
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 ROOT = Path(SPECPATH).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "packages" / "buildlog" / "src"))
 
 
 def tracked_files(*prefixes):
@@ -38,11 +41,27 @@ datas.append(
         "buildlog/web_static",
     )
 )
+excluded_untracked_web_modules = {"soloscale.app_web", "soloscale.resume_web"}
+youtube_hidden_imports = [
+    "google.auth.exceptions",
+    "google.auth.transport.requests",
+    "google.oauth2.credentials",
+    "google_auth_httplib2",
+    "google_auth_oauthlib.flow",
+    "googleapiclient.discovery",
+    "googleapiclient.errors",
+    "googleapiclient.http",
+    "httplib2",
+]
 a = Analysis(
     [str(ROOT / "src" / "soloscale" / "local_ui.py")],
     pathex=[str(ROOT / "src"), str(ROOT / "packages" / "buildlog" / "src")],
     datas=datas,
-    hiddenimports=collect_submodules("soloscale") + collect_submodules("buildlog"),
+    hiddenimports=collect_submodules(
+        "soloscale", filter=lambda name: name not in excluded_untracked_web_modules
+    )
+    + collect_submodules("buildlog")
+    + youtube_hidden_imports,
     excludes=["node", "playwright", "selenium"],
 )
 pyz = PYZ(a.pure)

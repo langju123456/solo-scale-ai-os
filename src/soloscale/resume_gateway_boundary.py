@@ -17,17 +17,23 @@ import zipfile
 import zlib
 from dataclasses import dataclass
 from enum import StrEnum
+from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import ClassVar, Literal
 from xml.etree import ElementTree
 
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
 
 from soloscale.models import ContractModel, utc_now
-from soloscale.resume_evidence_pack import build_jd_positioning_brief
+from soloscale.resume_evidence_pack import (
+    build_composition_evidence_plan,
+    build_jd_positioning_brief,
+)
 from soloscale.resume_models import (
     CandidateEvidencePack,
     CandidateProfile,
+    CompositionEvidencePlan,
     JDPositioningBrief,
     ResumeAtomicFact,
     RoleStrategy,
@@ -39,10 +45,11 @@ MAX_RESUME_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_RESUME_UPLOAD_FILES = 3
 _MAX_EXTRACTED_TEXT = 250_000
 _MAX_PDF_DECOMPRESSED_BYTES = 8 * 1024 * 1024
+_MAX_PDF_OBJECT_HEADER_BYTES = 64 * 1024
 _DOCX_DOCUMENT = "word/document.xml"
 _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _W = f"{{{_W_NS}}}"
-_ALLOWED_SUFFIXES = {".docx", ".pdf", ".txt", ".md"}
+_ALLOWED_SUFFIXES = {".docx", ".pdf", ".txt", ".md", ".html", ".htm"}
 _SECTION_HEADINGS = {
     "SUMMARY",
     "PROJECT HIGHLIGHTS",
@@ -62,6 +69,18 @@ _HEADING_ALIASES = {
     "EXPERIENCE": "WORK EXPERIENCE",
     "PROFESSIONAL EXPERIENCE": "WORK EXPERIENCE",
     "WORK EXPERIENCE": "WORK EXPERIENCE",
+    "个人简介": "SUMMARY",
+    "职业概述": "SUMMARY",
+    "个人总结": "SUMMARY",
+    "项目": "PROJECT HIGHLIGHTS",
+    "项目经历": "PROJECT HIGHLIGHTS",
+    "教育": "EDUCATION",
+    "教育经历": "EDUCATION",
+    "技能": "TECHNICAL SKILLS",
+    "技术技能": "TECHNICAL SKILLS",
+    "专业技能": "TECHNICAL SKILLS",
+    "经历": "WORK EXPERIENCE",
+    "工作经历": "WORK EXPERIENCE",
 }
 _PRIVATE_PATH_RE = re.compile(
     r"(?:(?:/Users|/home)/[^\s,;]+|[A-Za-z]:\\[^\r\n,;]+)", re.IGNORECASE
@@ -118,10 +137,111 @@ class ResumeUploadError(ValueError):
     """A selected file is outside the explicitly authorized upload boundary."""
 
 
+class PDFExtractionTrace(ContractModel):
+    """Body-free observability for the canonical PDF extraction policy."""
+
+    primary_extractor: Literal["bounded_stream"] = "bounded_stream"
+    primary_quality: Literal["USABLE", "UNRELIABLE"]
+    fallback_used: bool
+    fallback_extractor: Literal["pypdf"] | None = None
+    fallback_quality: Literal["NOT_USED", "USABLE", "UNRELIABLE"]
+    extracted_chars: int = Field(ge=0, le=_MAX_EXTRACTED_TEXT)
+    replacement_chars: int = Field(ge=0, le=_MAX_EXTRACTED_TEXT)
+    meaningful_line_ratio: float = Field(ge=0.0, le=1.0)
+    source_parse_status: Literal["USABLE", "SOURCE_PARSE_UNRELIABLE_TEXT"]
+
+
+class ResumeSourceParseError(ResumeUploadError):
+    """The selected source cannot produce trustworthy natural-language text."""
+
+    code: ClassVar[str] = "SOURCE_PARSE_UNRELIABLE_TEXT"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        trace: PDFExtractionTrace | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.trace = trace
+
+
 class ResumeUploadRole(StrEnum):
     RESUME = "resume"
     JOB_DESCRIPTION = "job_description"
     SUPPORT = "support"
+
+
+class _VisibleHTMLTextParser(HTMLParser):
+    """Extract bounded visible text while ignoring executable/hidden HTML bodies."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._blocked_depth = 0
+        self._heading_tag: str | None = None
+        self._heading_parts: list[str] = []
+        self.headings: list[str] = []
+        self.parts: list[str] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        del attrs
+        lowered = tag.casefold()
+        if lowered in {"script", "style", "noscript", "template", "svg"}:
+            self._blocked_depth += 1
+        elif self._blocked_depth == 0 and lowered in {
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+        }:
+            self._heading_tag = lowered
+            self._heading_parts = []
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.casefold()
+        if lowered in {"script", "style", "noscript", "template", "svg"}:
+            self._blocked_depth = max(0, self._blocked_depth - 1)
+            return
+        if self._blocked_depth == 0 and lowered == self._heading_tag:
+            heading = " ".join("".join(self._heading_parts).split())
+            if heading:
+                self.headings.append(heading)
+            self._heading_tag = None
+            self._heading_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._blocked_depth:
+            return
+        value = " ".join(data.split())
+        if value:
+            self.parts.append(value)
+            if self._heading_tag is not None:
+                self._heading_parts.append(value)
+
+
+def _text_template_metadata(
+    source_format: Literal["txt", "md", "html"],
+    text: str,
+    *,
+    heading_names: list[str] | None = None,
+) -> ResumeTemplateMetadata:
+    candidates = heading_names or [line.strip() for line in text.splitlines() if line.strip()]
+    sections: list[str] = []
+    accepted_headings: list[str] = []
+    for candidate in candidates:
+        canonical = _HEADING_ALIASES.get(" ".join(candidate.upper().rstrip(":：").split()))
+        if canonical is not None and canonical not in sections:
+            sections.append(canonical)
+            accepted_headings.append(candidate)
+    return ResumeTemplateMetadata(
+        source_format=source_format,
+        section_order=sections,
+        heading_names=accepted_headings,
+    )
 
 
 @dataclass(frozen=True)
@@ -137,7 +257,7 @@ class SelectedResumeFile:
 class ResumeTemplateMetadata(ContractModel):
     """Strict metadata allowlist; private Office and filesystem metadata is absent."""
 
-    source_format: Literal["docx", "pdf", "txt", "md"]
+    source_format: Literal["docx", "pdf", "txt", "md", "html"]
     section_order: list[str] = Field(default_factory=list, max_length=20)
     heading_names: list[str] = Field(default_factory=list, max_length=30)
     style_ids: list[str] = Field(default_factory=list, max_length=40)
@@ -150,10 +270,11 @@ class ResumeTemplateMetadata(ContractModel):
 
 class ExtractedResumeUpload(ContractModel):
     role: ResumeUploadRole
-    source_format: Literal["docx", "pdf", "txt", "md"]
+    source_format: Literal["docx", "pdf", "txt", "md", "html"]
     content_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     text: str = Field(min_length=1, max_length=_MAX_EXTRACTED_TEXT)
     template_metadata: ResumeTemplateMetadata
+    source_parse_trace: PDFExtractionTrace | None = None
 
 
 class GatewayResumeEntry(ContractModel):
@@ -169,7 +290,7 @@ class GatewayCandidateProfile(ContractModel):
 
 
 class GatewaySupportSummary(ContractModel):
-    source_format: Literal["docx", "pdf", "txt", "md"]
+    source_format: Literal["docx", "pdf", "txt", "md", "html"]
     summary: str = Field(min_length=1, max_length=4_000)
 
 
@@ -191,9 +312,11 @@ class GatewayPayload(ContractModel):
 
     feature_type: Literal["resume_tailoring"] = "resume_tailoring"
     request_id: str = Field(pattern=r"^resume-request-[a-f0-9]{24}$")
+    output_locale: Literal["en-US", "zh-CN"] = "en-US"
     job_description: str = Field(min_length=1, max_length=_MAX_EXTRACTED_TEXT)
     tailoring_instructions: str = Field(default="", max_length=1_200)
     positioning_brief: JDPositioningBrief
+    composition_evidence_plan: CompositionEvidencePlan
     candidate_profile: GatewayCandidateProfile
     support_context: list[GatewaySupportSummary] = Field(default_factory=list, max_length=1)
     template_metadata: ResumeTemplateMetadata
@@ -224,7 +347,7 @@ def _safe_suffix(filename: str) -> str:
         raise ResumeUploadError("The selected file has an invalid name")
     suffix = Path(basename).suffix.casefold()
     if suffix not in _ALLOWED_SUFFIXES:
-        raise ResumeUploadError("Only PDF, DOCX, TXT, and MD files are accepted")
+        raise ResumeUploadError("Only PDF, DOCX, TXT, MD, HTML, and HTM files are accepted")
     return suffix
 
 
@@ -244,7 +367,7 @@ def _reject_disguised_file(content: bytes, suffix: str) -> None:
         raise ResumeUploadError("The selected PDF is not a readable PDF file")
     if suffix == ".docx" and not content.startswith(b"PK"):
         raise ResumeUploadError("The selected DOCX is not a readable Word file")
-    if suffix in {".txt", ".md"} and (
+    if suffix in {".txt", ".md", ".html", ".htm"} and (
         content.startswith(b"PK") or content.startswith(b"%PDF-")
     ):
         raise ResumeUploadError("The selected text file has a mismatched file type")
@@ -423,15 +546,65 @@ def _decode_pdf_literal(value: bytes) -> str:
     return output.decode("utf-8", errors="replace")
 
 
-def _pdf_text(content: bytes) -> tuple[str, int | None]:
+def _pdf_stream_data(
+    content: bytes,
+    match: re.Match[bytes],
+    dictionary: bytes,
+) -> bytes:
+    """Return exact stream bytes when a direct PDF /Length is available."""
+
+    length_matches = list(
+        re.finditer(rb"/Length\s+(-?\d+)(?:\s+(\d+)\s+R)?", dictionary)
+    )
+    if len(length_matches) != 1 or length_matches[0].group(2) is not None:
+        return match.group(1)
+    direct_length = int(length_matches[0].group(1))
+    if direct_length < 0:
+        raise ResumeUploadError("PDF stream has an invalid declared length")
+    start = match.start(1)
+    end = start + direct_length
+    if end > len(content):
+        raise ResumeUploadError("PDF stream has an invalid declared length")
+    if re.match(rb"\r?\nendstream\b", content[end : end + 12]) is None:
+        raise ResumeUploadError("PDF stream has an invalid declared boundary")
+    return content[start:end]
+
+
+def _pdf_stream_dictionary(content: bytes, match: re.Match[bytes]) -> bytes:
+    """Return the bounded dictionary/header for the stream's current PDF object."""
+
+    stream_start = match.start()
+    lower_bound = max(0, stream_start - _MAX_PDF_OBJECT_HEADER_BYTES)
+    previous_endobj = content.rfind(b"endobj", lower_bound, stream_start)
+    object_start = (
+        previous_endobj + len(b"endobj")
+        if previous_endobj >= 0
+        else lower_bound
+    )
+    return content[object_start:stream_start]
+
+
+@dataclass(frozen=True)
+class _PDFTextQuality:
+    usable: bool
+    extracted_chars: int
+    replacement_chars: int
+    meaningful_line_ratio: float
+
+
+class _PDFFallbackExtractionError(Exception):
+    """The bounded fallback could not recover a complete text result."""
+
+
+def _primary_pdf_text(content: bytes) -> tuple[str, int | None]:
     if b"/Encrypt" in content:
         raise ResumeUploadError("Password-protected PDF files are not accepted")
     page_count = len(re.findall(rb"/Type\s*/Page\b", content)) or None
     segments: list[bytes] = []
     extracted_bytes = 0
     for match in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", content, re.DOTALL):
-        stream = match.group(1)
-        dictionary = content[max(0, match.start() - 400) : match.start()]
+        dictionary = _pdf_stream_dictionary(content, match)
+        stream = _pdf_stream_data(content, match, dictionary)
         if b"/FlateDecode" in dictionary:
             try:
                 decompressor = zlib.decompressobj()
@@ -481,7 +654,190 @@ def _pdf_text(content: bytes) -> tuple[str, int | None]:
         raise ResumeUploadError(
             "The PDF has no extractable text; image-only PDFs and OCR are not supported"
         )
+    if len(text) > _MAX_EXTRACTED_TEXT:
+        raise ResumeUploadError("Extracted text exceeds the bounded processing limit")
     return text, page_count
+
+
+def _pdf_text_quality(text: str) -> _PDFTextQuality:
+    """Evaluate every PDF extractor with the same canonical quality contract."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    characters = [character for character in text if not character.isspace()]
+    if not lines or not characters:
+        return _PDFTextQuality(
+            usable=False,
+            extracted_chars=len(text),
+            replacement_chars=text.count("\ufffd"),
+            meaningful_line_ratio=0.0,
+        )
+
+    replacement_chars = text.count("\ufffd")
+    replacement_ratio = replacement_chars / len(characters)
+    printable_ratio = sum(character.isprintable() for character in characters) / len(
+        characters
+    )
+    textual_ratio = sum(character.isalnum() for character in characters) / len(
+        characters
+    )
+    meaningful_lines = sum(
+        len(line) >= 3 and sum(character.isalnum() for character in line) >= 2
+        for line in lines
+    )
+    short_line_ratio = sum(len(line) <= 2 for line in lines) / len(lines)
+    wordlike_sequences = re.findall(r"[^\W_]{3,}", text, flags=re.UNICODE)
+
+    fragmented = (
+        len(lines) >= 4
+        and short_line_ratio >= 0.90
+        and meaningful_lines == 0
+    )
+    replacement_corruption = replacement_ratio >= 0.08
+    nontextual = printable_ratio < 0.90 or textual_ratio < 0.35
+    no_natural_language = meaningful_lines == 0 and not wordlike_sequences
+
+    usable = not (
+        (fragmented and (replacement_corruption or no_natural_language))
+        or (replacement_corruption and nontextual)
+        or (len(lines) >= 4 and nontextual and no_natural_language)
+    )
+    return _PDFTextQuality(
+        usable=usable,
+        extracted_chars=len(text),
+        replacement_chars=replacement_chars,
+        meaningful_line_ratio=meaningful_lines / len(lines),
+    )
+
+
+def _pdf_extracted_text_is_usable(text: str) -> bool:
+    """Reject clear glyph-fragment output before it becomes Resume structure."""
+
+    return _pdf_text_quality(text).usable
+
+
+def _pypdf_text(content: bytes) -> tuple[str, int]:
+    """Recover one bounded complete extraction with pypdf; never merge outputs."""
+
+    try:
+        reader = PdfReader(
+            io.BytesIO(content),
+            strict=True,
+            root_object_recovery_limit=1_000,
+        )
+        if reader.is_encrypted:
+            raise ResumeUploadError("Password-protected PDF files are not accepted")
+        page_count = len(reader.pages)
+        if page_count == 0:
+            raise _PDFFallbackExtractionError("PDF contains no pages")
+        if page_count > 100:
+            raise ResumeUploadError("PDF page count exceeds the bounded processing limit")
+
+        values: list[str] = []
+        decoded_bytes = 0
+        extracted_chars = 0
+        for page in reader.pages:
+            contents = page.get_contents()
+            if contents is not None:
+                decoded_bytes += len(contents.get_data())
+                if decoded_bytes > _MAX_PDF_DECOMPRESSED_BYTES:
+                    raise ResumeUploadError(
+                        "PDF content expands beyond the safety limit"
+                    )
+            page_text = page.extract_text() or ""
+            extracted_chars += len(page_text)
+            if extracted_chars > _MAX_EXTRACTED_TEXT:
+                raise ResumeUploadError(
+                    "Extracted text exceeds the bounded processing limit"
+                )
+            if page_text.strip():
+                values.append(page_text.strip())
+    except ResumeUploadError:
+        raise
+    except Exception as exc:
+        raise _PDFFallbackExtractionError from exc
+
+    text = "\n".join(values).strip()
+    if not text:
+        raise _PDFFallbackExtractionError("PDF contains no extractable text")
+    return text, page_count
+
+
+def _pdf_extraction_trace(
+    *,
+    primary_quality: _PDFTextQuality,
+    fallback_used: bool,
+    fallback_quality: _PDFTextQuality | None,
+    source_parse_status: Literal["USABLE", "SOURCE_PARSE_UNRELIABLE_TEXT"],
+) -> PDFExtractionTrace:
+    selected_quality = fallback_quality or primary_quality
+    return PDFExtractionTrace(
+        primary_quality="USABLE" if primary_quality.usable else "UNRELIABLE",
+        fallback_used=fallback_used,
+        fallback_extractor="pypdf" if fallback_used else None,
+        fallback_quality=(
+            "USABLE"
+            if fallback_quality is not None and fallback_quality.usable
+            else "UNRELIABLE"
+            if fallback_used
+            else "NOT_USED"
+        ),
+        extracted_chars=selected_quality.extracted_chars,
+        replacement_chars=selected_quality.replacement_chars,
+        meaningful_line_ratio=selected_quality.meaningful_line_ratio,
+        source_parse_status=source_parse_status,
+    )
+
+
+def _pdf_text(content: bytes) -> tuple[str, int | None, PDFExtractionTrace]:
+    primary_text, primary_page_count = _primary_pdf_text(content)
+    primary_quality = _pdf_text_quality(primary_text)
+    if primary_quality.usable:
+        return (
+            primary_text,
+            primary_page_count,
+            _pdf_extraction_trace(
+                primary_quality=primary_quality,
+                fallback_used=False,
+                fallback_quality=None,
+                source_parse_status="USABLE",
+            ),
+        )
+
+    fallback_text: str | None = None
+    fallback_page_count: int | None = None
+    fallback_quality: _PDFTextQuality | None = None
+    try:
+        fallback_text, fallback_page_count = _pypdf_text(content)
+        fallback_quality = _pdf_text_quality(fallback_text)
+    except _PDFFallbackExtractionError:
+        pass
+
+    if (
+        fallback_text is not None
+        and fallback_page_count is not None
+        and fallback_quality is not None
+        and fallback_quality.usable
+    ):
+        return (
+            fallback_text,
+            fallback_page_count,
+            _pdf_extraction_trace(
+                primary_quality=primary_quality,
+                fallback_used=True,
+                fallback_quality=fallback_quality,
+                source_parse_status="USABLE",
+            ),
+        )
+
+    trace = _pdf_extraction_trace(
+        primary_quality=primary_quality,
+        fallback_used=True,
+        fallback_quality=fallback_quality,
+        source_parse_status="SOURCE_PARSE_UNRELIABLE_TEXT",
+    )
+    raise ResumeSourceParseError(
+        "无法可靠读取此 PDF 中的文字。请改用 DOCX，或使用可复制文本的 PDF。",
+        trace=trace,
+    )
 
 
 def extract_selected_resume_file(item: SelectedResumeFile) -> ExtractedResumeUpload:
@@ -490,22 +846,38 @@ def extract_selected_resume_file(item: SelectedResumeFile) -> ExtractedResumeUpl
     _reject_disguised_file(item.content, suffix)
     if len(item.content) > MAX_RESUME_FILE_BYTES:
         raise ResumeUploadError("Each selected file must be 5 MB or smaller")
+    source_parse_trace: PDFExtractionTrace | None = None
     if suffix == ".docx":
         text, metadata = _docx_text_and_metadata(item.content)
-        source_format: Literal["docx", "pdf", "txt", "md"] = "docx"
+        source_format: Literal["docx", "pdf", "txt", "md", "html"] = "docx"
     elif suffix == ".pdf":
-        text, page_count = _pdf_text(item.content)
+        text, page_count, source_parse_trace = _pdf_text(item.content)
         source_format = "pdf"
         metadata = ResumeTemplateMetadata(source_format="pdf", page_count=page_count)
     else:
         if b"\x00" in item.content:
             raise ResumeUploadError("The selected text file is not valid UTF-8 text")
         try:
-            text = item.content.decode("utf-8").strip()
+            decoded = item.content.decode("utf-8").strip()
         except UnicodeDecodeError as exc:
             raise ResumeUploadError("The selected text file is not valid UTF-8 text") from exc
-        source_format = "md" if suffix == ".md" else "txt"
-        metadata = ResumeTemplateMetadata(source_format=source_format)
+        source_format = (
+            "html" if suffix in {".html", ".htm"} else "md" if suffix == ".md" else "txt"
+        )
+        if source_format == "html":
+            parser = _VisibleHTMLTextParser()
+            try:
+                parser.feed(decoded)
+                parser.close()
+            except (AssertionError, ValueError) as exc:
+                raise ResumeUploadError("The selected HTML file is malformed") from exc
+            text = "\n".join(parser.parts).strip()
+            metadata = _text_template_metadata(
+                "html", text, heading_names=parser.headings
+            )
+        else:
+            text = decoded
+            metadata = _text_template_metadata(source_format, text)
     text = text.strip()
     if not text:
         raise ResumeUploadError("The selected file contains no extractable text")
@@ -517,6 +889,7 @@ def extract_selected_resume_file(item: SelectedResumeFile) -> ExtractedResumeUpl
         content_sha256=hashlib.sha256(item.content).hexdigest(),
         text=text,
         template_metadata=metadata,
+        source_parse_trace=source_parse_trace,
     )
 
 
@@ -531,9 +904,25 @@ def _canonical_heading(line: str) -> str | None:
     return _HEADING_ALIASES.get(" ".join(line.upper().rstrip(":").split()))
 
 
+def _xml_10_safe_text(text: str) -> str:
+    """Remove control characters that XML 1.0 cannot represent."""
+
+    return "".join(
+        character
+        for character in text
+        if (
+            ord(character) in {0x09, 0x0A, 0x0D}
+            or 0x20 <= ord(character) <= 0xD7FF
+            or 0xE000 <= ord(character) <= 0xFFFD
+            or 0x10000 <= ord(character) <= 0x10FFFF
+        )
+    )
+
+
 def normalize_text_resume_to_docx(text: str) -> bytes:
     """Create a minimal valid DOCX when the explicitly selected resume is not DOCX."""
 
+    text = _xml_10_safe_text(text)
     raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not raw_lines:
         raise ResumeUploadError("The selected resume contains no text")
@@ -768,6 +1157,7 @@ def prepare_resume_gateway_payload(
     request_id: str | None = None,
     output_schema: type[BaseModel] = RoleStrategy,
     candidate_evidence_pack: CandidateEvidencePack | None = None,
+    output_locale: Literal["en-US", "zh-CN"] = "en-US",
 ) -> PreparedGatewayPayload:
     """Build the sole typed payload after deterministic direct-identifier removal."""
 
@@ -836,6 +1226,8 @@ def prepare_resume_gateway_payload(
                     if fact.metric
                     else None
                 ),
+                allowed_numbers=fact.allowed_numbers,
+                source_refs=fact.source_refs,
                 text=sanitized_text,
                 source_sha256=fact.source_sha256,
                 fact_sha256=hashlib.sha256(
@@ -859,9 +1251,13 @@ def prepare_resume_gateway_payload(
     ).hexdigest()
     payload = GatewayPayload(
         request_id=request_id or f"resume-request-{secrets.token_hex(12)}",
+        output_locale=output_locale,
         job_description=sanitized_job,
         tailoring_instructions=sanitized_instructions,
         positioning_brief=build_jd_positioning_brief(
+            sanitized_job, sanitized_facts
+        ),
+        composition_evidence_plan=build_composition_evidence_plan(
             sanitized_job, sanitized_facts
         ),
         candidate_profile=GatewayCandidateProfile(

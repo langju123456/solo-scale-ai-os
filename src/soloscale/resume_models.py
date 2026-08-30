@@ -7,7 +7,7 @@ import re
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from soloscale.models import ContractModel, utc_now
 
@@ -78,6 +78,47 @@ class CandidateProfile(ContractModel):
 _ATOMIC_FACT_SPLIT_RE = re.compile(r"(?:[.;；]\s+|\s+[—–]\s+)")
 
 
+class ResumeAtomicFactQuarantineReason(StrEnum):
+    LOW_INFORMATION = "LOW_INFORMATION"
+    STRUCTURAL_FRAGMENT = "STRUCTURAL_FRAGMENT"
+    INVALID_TEXT = "INVALID_TEXT"
+    INVALID_PROVENANCE = "INVALID_PROVENANCE"
+    OTHER = "OTHER"
+
+
+class ResumeAtomicFactAdmissionTrace(ContractModel):
+    """Body-free counts for request-local candidate fact admission."""
+
+    candidate_facts_total: int = Field(ge=0)
+    candidate_facts_admitted: int = Field(ge=0)
+    candidate_facts_quarantined: int = Field(ge=0)
+    quarantine_reason_counts: dict[ResumeAtomicFactQuarantineReason, int] = Field(
+        default_factory=dict
+    )
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> ResumeAtomicFactAdmissionTrace:
+        if any(count < 0 for count in self.quarantine_reason_counts.values()):
+            raise ValueError("atomic fact quarantine counts must be non-negative")
+        if self.candidate_facts_total != (
+            self.candidate_facts_admitted + self.candidate_facts_quarantined
+        ):
+            raise ValueError("atomic fact admission counts must balance")
+        if self.candidate_facts_quarantined != sum(
+            self.quarantine_reason_counts.values()
+        ):
+            raise ValueError("atomic fact quarantine reasons must match the total")
+        return self
+
+
+class ResumeAtomicFactAdmissionError(ValueError):
+    """No truth-safe candidate facts survived individual admission."""
+
+    def __init__(self, trace: ResumeAtomicFactAdmissionTrace) -> None:
+        super().__init__("Candidate Evidence Pack contains no usable approved atomic facts")
+        self.trace = trace
+
+
 class ResumeAtomicFact(ContractModel):
     """One immutable fact identity derived from an approved profile entry."""
 
@@ -90,6 +131,8 @@ class ResumeAtomicFact(ContractModel):
     project: str | None = Field(default=None, max_length=120)
     capability_tags: list[str] = Field(default_factory=list, max_length=12)
     metric: str | None = Field(default=None, max_length=300)
+    allowed_numbers: list[str] = Field(default_factory=list, max_length=16)
+    source_refs: list[str] = Field(default_factory=list, max_length=12)
     text: str = Field(min_length=3, max_length=1_500)
     source_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     fact_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
@@ -102,12 +145,57 @@ class ResumeAtomicFact(ContractModel):
             raise ValueError("fact_sha256 must bind the fact ID, source, and text")
         return self
 
+    @field_validator("allowed_numbers", "source_refs")
+    @classmethod
+    def validate_unique_metadata(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("atomic fact metadata identities must be unique")
+        return values
 
-def build_resume_atomic_facts(profile: CandidateProfile) -> list[ResumeAtomicFact]:
-    """Derive deterministic request-local fact IDs from approved resume bullets."""
+
+def _candidate_fact_prevalidation_reason(
+    text: str,
+) -> ResumeAtomicFactQuarantineReason | None:
+    if "\ufffd" in text or any(
+        ord(character) < 0x20 and character not in {"\t", "\n", "\r"}
+        for character in text
+    ):
+        return ResumeAtomicFactQuarantineReason.INVALID_TEXT
+    if not any(character.isalnum() for character in text):
+        return ResumeAtomicFactQuarantineReason.STRUCTURAL_FRAGMENT
+    if len(text) < 3:
+        return ResumeAtomicFactQuarantineReason.LOW_INFORMATION
+    return None
+
+
+def _candidate_fact_validation_reason(
+    error: ValidationError,
+) -> ResumeAtomicFactQuarantineReason:
+    provenance_fields = {
+        "fact_id",
+        "profile_entry_id",
+        "evidence_id",
+        "source_sha256",
+        "fact_sha256",
+    }
+    if any(
+        validation_error.get("loc")
+        and validation_error["loc"][0] in provenance_fields
+        for validation_error in error.errors()
+    ):
+        return ResumeAtomicFactQuarantineReason.INVALID_PROVENANCE
+    return ResumeAtomicFactQuarantineReason.OTHER
+
+
+def admit_resume_atomic_facts(
+    profile: CandidateProfile,
+) -> tuple[list[ResumeAtomicFact], ResumeAtomicFactAdmissionTrace]:
+    """Admit approved facts independently and quarantine only invalid fragments."""
 
     entries = profile.experience_bullets + profile.project_bullets
     facts: list[ResumeAtomicFact] = []
+    total = 0
+    quarantine_reason_counts: dict[ResumeAtomicFactQuarantineReason, int] = {}
     for entry_index, source_text in enumerate(entries, start=1):
         profile_entry_id = f"PROFILE-{entry_index:02d}"
         source_sha256 = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
@@ -117,9 +205,16 @@ def build_resume_atomic_facts(profile: CandidateProfile) -> list[ResumeAtomicFac
             if fragment.strip(" \t\n,.;；")
         ] or [source_text]
         for fact_index, fragment in enumerate(fragments[:12], start=1):
+            total += 1
+            prevalidation_reason = _candidate_fact_prevalidation_reason(fragment)
+            if prevalidation_reason is not None:
+                quarantine_reason_counts[prevalidation_reason] = (
+                    quarantine_reason_counts.get(prevalidation_reason, 0) + 1
+                )
+                continue
             fact_id = f"FACT-{profile_entry_id}-{fact_index:02d}"
-            facts.append(
-                ResumeAtomicFact(
+            try:
+                fact = ResumeAtomicFact(
                     fact_id=fact_id,
                     profile_entry_id=profile_entry_id,
                     evidence_id=profile_entry_id,
@@ -130,7 +225,28 @@ def build_resume_atomic_facts(profile: CandidateProfile) -> list[ResumeAtomicFac
                         f"{fact_id}\0{profile_entry_id}\0{fragment}".encode()
                     ).hexdigest(),
                 )
-            )
+            except ValidationError as exc:
+                reason = _candidate_fact_validation_reason(exc)
+                quarantine_reason_counts[reason] = (
+                    quarantine_reason_counts.get(reason, 0) + 1
+                )
+                continue
+            facts.append(fact)
+    trace = ResumeAtomicFactAdmissionTrace(
+        candidate_facts_total=total,
+        candidate_facts_admitted=len(facts),
+        candidate_facts_quarantined=total - len(facts),
+        quarantine_reason_counts=quarantine_reason_counts,
+    )
+    if not facts:
+        raise ResumeAtomicFactAdmissionError(trace)
+    return facts, trace
+
+
+def build_resume_atomic_facts(profile: CandidateProfile) -> list[ResumeAtomicFact]:
+    """Derive deterministic request-local fact IDs from approved resume bullets."""
+
+    facts, _trace = admit_resume_atomic_facts(profile)
     return facts
 
 
@@ -206,12 +322,192 @@ class CandidateEvidenceSource(ContractModel):
     source_refs: list[str] = Field(default_factory=list, max_length=12)
 
 
+class ResumeEvidenceRetrievalHit(ContractModel):
+    """Body-free trace for one local-knowledge retrieval result."""
+
+    retrieval_id: str = Field(pattern=r"^[a-f0-9]{64}$")
+    source_kind: Literal["codex_session", "chatgpt_export", "buildlog_run"]
+    chunk_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    document_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    score: float = Field(ge=0)
+    disposition: Literal["DISCOVERY_ONLY"] = "DISCOVERY_ONLY"
+    requirement_ids: list[str] = Field(default_factory=list, max_length=8)
+    matched_fact_ids: list[str] = Field(default_factory=list, max_length=12)
+
+    @field_validator("requirement_ids", "matched_fact_ids")
+    @classmethod
+    def validate_unique_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("retrieval identities must be unique")
+        return values
+
+
+class ResumeRequirementCoverage(ContractModel):
+    """Body-safe requirement coverage derived from exact JD spans."""
+
+    requirement_id: str = Field(pattern=r"^REQ-\d{2}$")
+    requirement_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    status: Literal["STRONG", "MEDIUM", "GAP"]
+    matched_fact_ids: list[str] = Field(default_factory=list, max_length=12)
+
+    @field_validator("matched_fact_ids")
+    @classmethod
+    def validate_unique_fact_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("requirement fact identities must be unique")
+        return values
+
+
+class ResumeEvidenceSourceSummary(ContractModel):
+    """Count-only source participation summary for the Resume UI."""
+
+    source_type: Literal[
+        "EXISTING_RESUME",
+        "LOCAL_GIT",
+        "GITHUB",
+        "BUILDLOG",
+        "CODEX",
+        "CHATGPT",
+        "CONTENT_CANON",
+        "LEARNING",
+        "RESUME_HISTORY",
+    ]
+    state: Literal["MATCHED", "NO_MATCH", "UNAVAILABLE"]
+    retrieved_count: int = Field(ge=0)
+    admitted_count: int = Field(ge=0)
+    context_only_count: int = Field(ge=0)
+    sent_count: int = Field(ge=0)
+
+
+class CompositionRequirementPlan(ContractModel):
+    """Deterministic fact allocation for one exact JD requirement."""
+
+    requirement_id: str = Field(pattern=r"^REQ-\d{2}$")
+    requirement_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    primary_fact_ids: list[str] = Field(default_factory=list, max_length=4)
+    secondary_fact_ids: list[str] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_fact_allocation(self) -> CompositionRequirementPlan:
+        combined = [*self.primary_fact_ids, *self.secondary_fact_ids]
+        if len(combined) != len(set(combined)):
+            raise ValueError("composition facts must be unique per requirement")
+        return self
+
+
+class CompositionEvidencePlan(ContractModel):
+    """Read-only evidence plan that keeps model composition JD-relevant."""
+
+    job_description_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    requirements: list[CompositionRequirementPlan] = Field(
+        default_factory=list, max_length=8
+    )
+    prioritized_fact_ids: list[str] = Field(default_factory=list, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_plan(self) -> CompositionEvidencePlan:
+        requirement_ids = [item.requirement_id for item in self.requirements]
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise ValueError("composition requirement identities must be unique")
+        allocated = [
+            fact_id
+            for item in self.requirements
+            for fact_id in (*item.primary_fact_ids, *item.secondary_fact_ids)
+        ]
+        if len(self.prioritized_fact_ids) != len(set(self.prioritized_fact_ids)):
+            raise ValueError("prioritized composition facts must be unique")
+        if not set(allocated) <= set(self.prioritized_fact_ids):
+            raise ValueError("allocated facts must be present in composition priority")
+        return self
+
+
+class ResumeEvidenceAdoptionTrace(ContractModel):
+    """Body-free lifecycle for one fact considered by Resume composition."""
+
+    fact_id: str = Field(
+        pattern=r"^FACT-(?:PROFILE-\d{2}|EVIDENCE-[A-Z0-9-]+)-\d{2}$"
+    )
+    retrieved: bool = True
+    admitted: bool
+    sent_to_model: bool
+    proposed: bool = False
+    accepted: bool = False
+    rendered: bool = False
+    rejection_rule_codes: list[str] = Field(default_factory=list, max_length=16)
+
+    @model_validator(mode="after")
+    def validate_lifecycle(self) -> ResumeEvidenceAdoptionTrace:
+        if self.sent_to_model and not self.admitted:
+            raise ValueError("sent facts must be admitted")
+        if self.proposed and not self.sent_to_model:
+            raise ValueError("proposed facts must have been sent")
+        if self.accepted and not self.proposed:
+            raise ValueError("accepted facts must have been proposed")
+        if self.rendered and not self.accepted:
+            raise ValueError("rendered facts must have been accepted")
+        if len(self.rejection_rule_codes) != len(set(self.rejection_rule_codes)):
+            raise ValueError("adoption rejection rules must be unique")
+        return self
+
+
+class ResumeEvidenceRetrievalTrace(ContractModel):
+    """Explain how local context selected verified facts without authorizing claims."""
+
+    job_description_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    source_counts: dict[str, int] = Field(default_factory=dict)
+    hits: list[ResumeEvidenceRetrievalHit] = Field(default_factory=list, max_length=32)
+    requirements: list[ResumeRequirementCoverage] = Field(
+        default_factory=list, max_length=8
+    )
+    sources: list[ResumeEvidenceSourceSummary] = Field(
+        default_factory=list, max_length=9
+    )
+    retrieved_count: int = Field(ge=0)
+    admitted_count: int = Field(ge=0)
+    sent_count: int = Field(ge=0)
+    admitted_fact_ids: list[str] = Field(default_factory=list, max_length=960)
+    sent_fact_ids: list[str] = Field(default_factory=list, max_length=960)
+    adoption: list[ResumeEvidenceAdoptionTrace] = Field(
+        default_factory=list, max_length=960
+    )
+
+    @model_validator(mode="after")
+    def validate_trace(self) -> ResumeEvidenceRetrievalTrace:
+        if any(count < 0 for count in self.source_counts.values()):
+            raise ValueError("retrieval source counts must be non-negative")
+        retrieval_ids = [hit.retrieval_id for hit in self.hits]
+        if len(retrieval_ids) != len(set(retrieval_ids)):
+            raise ValueError("retrieval identities must be unique")
+        if len(self.admitted_fact_ids) != len(set(self.admitted_fact_ids)):
+            raise ValueError("admitted fact identities must be unique")
+        if len(self.sent_fact_ids) != len(set(self.sent_fact_ids)):
+            raise ValueError("sent fact identities must be unique")
+        if not set(self.sent_fact_ids) <= set(self.admitted_fact_ids):
+            raise ValueError("sent facts must be admitted first")
+        if self.admitted_count != len(self.admitted_fact_ids):
+            raise ValueError("admitted count must match admitted fact identities")
+        if self.sent_count != len(self.sent_fact_ids):
+            raise ValueError("sent count must match sent fact identities")
+        requirement_ids = [item.requirement_id for item in self.requirements]
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise ValueError("requirement identities must be unique")
+        source_types = [item.source_type for item in self.sources]
+        if len(source_types) != len(set(source_types)):
+            raise ValueError("evidence source summaries must be unique")
+        adoption_ids = [item.fact_id for item in self.adoption]
+        if len(adoption_ids) != len(set(adoption_ids)):
+            raise ValueError("evidence adoption facts must be unique")
+        return self
+
+
 class CandidateEvidencePack(ContractModel):
     """High-density truth context used in addition to the uploaded Resume."""
 
     schema_version: Literal["1.0"] = "1.0"  # type: ignore[assignment]
     sources: list[CandidateEvidenceSource] = Field(default_factory=list, max_length=32)
     atomic_facts: list[ResumeAtomicFact] = Field(min_length=1, max_length=960)
+    fact_admission: ResumeAtomicFactAdmissionTrace | None = None
+    composition_plan: CompositionEvidencePlan | None = None
     pack_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
     @model_validator(mode="after")
@@ -229,6 +525,16 @@ class CandidateEvidencePack(ContractModel):
         }
         if any(fact.evidence_id not in allowed_evidence_ids for fact in self.atomic_facts):
             raise ValueError("candidate evidence fact references an unknown source")
+        if self.fact_admission is not None:
+            profile_fact_count = sum(
+                fact.source_kind == "PROFILE_ENTRY" for fact in self.atomic_facts
+            )
+            if self.fact_admission.candidate_facts_admitted != profile_fact_count:
+                raise ValueError("atomic fact admission trace must match profile facts")
+        if self.composition_plan is not None and not set(
+            self.composition_plan.prioritized_fact_ids
+        ) <= set(fact_ids):
+            raise ValueError("composition plan references an unknown candidate fact")
         return self
 
 

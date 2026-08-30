@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Literal
 
 from soloscale.content_canon import CanonicalStory, StoryReadiness, load_month_one_canon
 from soloscale.content_models import ClaimStatus, ContentBrief, ContentClaim
+from soloscale.story_mining import StoryMiningError, load_story_candidate
 
 
 class ContentCanonError(ValueError):
@@ -89,4 +91,60 @@ def content_brief_from_month_one_story(
             "readiness": story.status.value,
             "primary_format": story.primary_format,
         },
+    )
+
+
+def content_brief_from_story_candidate(
+    data_root: Path,
+    candidate_id: str,
+    *,
+    language: Literal["English", "中文"] = "中文",
+) -> ContentBrief:
+    """Turn one mined Story Bank candidate into the same grounded brief contract."""
+
+    try:
+        candidate = load_story_candidate(data_root, candidate_id)
+    except StoryMiningError as exc:
+        raise ContentCanonError(str(exc)) from exc
+    claims = [
+        ContentClaim(
+            id=f"CLAIM-{index:02d}",
+            text=summary,
+            status=ClaimStatus.OBSERVED,
+            receipt=f"story-candidate:{candidate.candidate_id}#evidence:{evidence_id}",
+            limits=(
+                "Keep the claim inside the mined evidence summary; do not add new facts."
+            ),
+        )
+        for index, (evidence_id, summary) in enumerate(
+            zip(
+                candidate.source_evidence_ids,
+                candidate.evidence_summaries,
+                strict=True,
+            ),
+            start=1,
+        )
+    ]
+    topic = (
+        candidate.working_title_cn
+        if language == "中文"
+        else candidate.working_title_en
+    )
+    return ContentBrief(
+        topic=topic,
+        audience=(
+            "正在用 AI 构建真实产品的工程师和独立开发者"
+            if language == "中文"
+            else "AI engineers and solo builders shipping real products"
+        ),
+        language=language,
+        call_to_action=(
+            "如果你也遇到过类似的工程取舍，欢迎分享你的做法。"
+            if language == "中文"
+            else "Share a similar engineering trade-off you have faced."
+        ),
+        source_label=f"Story Bank candidate · {candidate.candidate_id}",
+        claims=claims,
+        evidence_gaps=[],
+        evidence_filters={"story_candidate_id": candidate.candidate_id},
     )

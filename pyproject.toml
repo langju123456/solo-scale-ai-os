@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soloscale-ai-os"
-version = "0.2.0"
+version = "0.4.1"
 description = "Human-controlled AI workflow, evidence, and private retrieval system"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,7 +13,12 @@ dependencies = [
   "typer>=0.12,<1",
   "rich>=13.7,<16",
   "google-genai>=1.0,<2",
+  "google-api-python-client>=2.190,<3",
+  "google-auth>=2.40,<3",
+  "google-auth-httplib2>=0.2,<1",
+  "google-auth-oauthlib>=1.2,<2",
   "Pillow>=12,<13",
+  "pypdf>=6.10,<7",
 ]
 
 [project.optional-dependencies]

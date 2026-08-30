@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from soloscale.editorial_workspace import validate_public_editorial_text
+from soloscale.platform_accounts import (
+    PlatformAccountError,
+    require_publish_account_reference,
+)
 from soloscale.resume_workspace import (
     ResumeWorkspaceStorageError,
     _atomic_private_write,
@@ -98,6 +102,16 @@ def publish_editorial_preview(
     required = ("plan_id", "plan_hash", "account_reference")
     if any(not isinstance(preview.get(key), str) or not preview[key] for key in required):
         raise EditorialPublishingError("Editorial preview is incomplete; preview the channel again")
+    try:
+        require_publish_account_reference(
+            data_root,
+            channel,
+            cast(str, preview["account_reference"]),
+        )
+    except PlatformAccountError as exc:
+        raise EditorialPublishingError(
+            "Editorial preview account does not match an eligible connected account"
+        ) from exc
     try:
         result = _gateway(data_root, channel).publish(
             cast(str, preview["plan_id"]),

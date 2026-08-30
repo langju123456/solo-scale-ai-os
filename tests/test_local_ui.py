@@ -1,11 +1,14 @@
 import hashlib
+import http.client
 import io
 import json
 import os
 import subprocess
 import threading
 import time
+import urllib.parse
 import zipfile
+from http.server import HTTPServer
 from pathlib import Path
 from typing import Literal, TypeVar
 
@@ -15,17 +18,21 @@ from pydantic import BaseModel
 from soloscale.content_models import ContentReviewDecision
 from soloscale.content_ui import run_content_form
 from soloscale.content_workspace import save_content_review
+from soloscale.conversation_intake import parse_codex_session
+from soloscale.evidence_hub import EvidenceHub
 from soloscale.knowledge_models import ContentRole, RetrievalHit, SourceKind
-from soloscale.knowledge_store import InvalidKnowledgeQueryError
 from soloscale.learning_traceability import run_learning_traceability
 from soloscale.local_ui import (
     OllamaReadiness,
     ResumeJobManager,
     ResumeJobSnapshot,
+    SoloScaleLocalUIHandler,
     UIActionResult,
     UploadedFile,
     _ai_settings_page,
+    _applications_section_html,
     _apply_ai_provider_preference,
+    _create_learning_case_ui,
     _create_resume_pdf_preview,
     _finalize_resume_preview,
     _heygen_settings_page,
@@ -38,12 +45,15 @@ from soloscale.local_ui import (
     _result_card,
     _resume_graph,
     _run_action,
+    _run_learning_workspace,
     _run_user_resume,
     _save_ai_provider_preference,
     _search_job_evidence,
+    _serve_resume_download,
     _split_path_list,
     _user_page,
     _workspace_path,
+    _workspace_paths,
     _write_private_bytes,
     _write_private_json,
 )
@@ -55,10 +65,12 @@ from soloscale.model_gateway import (
 )
 from soloscale.resume_docx import read_template_paragraphs
 from soloscale.resume_models import CandidateProfile
+from soloscale.resume_template_intake import inspect_template_html
 from soloscale.resume_workspace import (
     map_interview_defense_bullet,
     run_resume_workspace,
 )
+from soloscale.work_ui import CodexImportJobManager
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -284,13 +296,44 @@ class RecordingResumeGateway:
             }
             unsupported = []
             guidance = "Lead with customer delivery and requirements translation."
+        output_locale = request_payload.get("output_locale", "en-US")
+        role_summary = "JD-conditioned strategy for the selected role."
+        if output_locale == "zh-CN":
+            translations = {
+                "PROFILE-01": "围绕 customer-facing 场景改进智能体可靠性与需求转化。",
+                "PROFILE-02": "面向 Ardent Mills 与 Kangni 完成需求转化和协作。",
+                "PROFILE-03": "快速构建 SoloScale 全栈生成式 AI 工作流，覆盖 RAG 与 agents。",
+                "PROFILE-04": "设计 BuildLog 架构，支持 AI-assisted 开发与 evals。",
+            }
+            rewrites = translations
+            if synthesis_target == "PROFILE-01":
+                rewrites["PROFILE-01"] = (
+                    "围绕 customer-facing 场景完成需求转化，并与 Ardent Mills "
+                    "及 Kangni 协作改进智能体可靠性。"
+                )
+            elif synthesis_target == "PROFILE-03":
+                rewrites["PROFILE-03"] = (
+                    "快速构建 SoloScale 全栈生成式 AI 工作流，并以 BuildLog "
+                    "支持 RAG、agents 与 AI-assisted 开发。"
+                )
+            if summary_rewrite is not None:
+                summary_rewrite = {
+                    "text": rewrites[synthesis_target or "PROFILE-01"],
+                    "source_fact_ids": [
+                        fact_id
+                        for source_id in synthesis_sources
+                        for fact_id in fact_ids_by_source[source_id]
+                    ],
+                }
+            role_summary = "面向目标岗位、受事实约束的简历策略。"
+            guidance = "使用自然中文重组已批准事实，不增加经历。"
         skill_ids = {
             "Customer delivery, requirements, stakeholders": "SKILL-01",
             "Python, RAG, agents, evals": "SKILL-02",
         }
         return schema.model_validate(
             {
-                "role_summary": "JD-conditioned strategy for the selected role.",
+                "role_summary": role_summary,
                 "evidence_priority": priority,
                 "skill_priority": [skill_ids[item] for item in skills],
                 "bullet_rewrites": {
@@ -330,9 +373,15 @@ class RecordingExpertReviewGateway:
         base_url="https://api.openai.com/v1/chat/completions",
     )
 
-    def __init__(self, *, propose_new_fact: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        propose_new_fact: bool = False,
+        stale_patch: bool = False,
+    ) -> None:
         self.requests: list[dict[str, object]] = []
         self.propose_new_fact = propose_new_fact
+        self.stale_patch = stale_patch
 
     def complete(
         self,
@@ -355,9 +404,11 @@ class RecordingExpertReviewGateway:
                 "patches": [
                     {
                         "profile_entry_id": "PROFILE-03",
-                        "before_sha256": hashlib.sha256(
-                            before.encode("utf-8")
-                        ).hexdigest(),
+                        "before_sha256": (
+                            "0" * 64
+                            if self.stale_patch
+                            else hashlib.sha256(before.encode("utf-8")).hexdigest()
+                        ),
                         "after": (
                             "Integrated SoloScale full-stack GenAI workflows with RAG "
                             "and agents and BuildLog architecture for AI-assisted "
@@ -425,9 +476,9 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
     assert "建立影响力" in home
     assert 'href="/resume?lang=zh-CN"' in home
     assert 'href="/learning?lang=zh-CN"' in home
-    assert 'href="/content?lang=zh-CN"' in home
+    assert 'href="/creator?lang=zh-CN"' in home
     assert 'href="/video?lang=zh-CN"' in home
-    assert 'href="/publishing?lang=zh-CN"' in home
+    assert 'href="/creator/publish?lang=zh-CN"' in home
     assert 'href="/work?lang=zh-CN"' in home
     assert home.count('class="outcome-hitbox"') == 3
     assert 'id="page-progress"' in home
@@ -467,6 +518,12 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
     assert 'name="support_document"' in page
     assert 'name="job_description"' in page
     assert 'name="tailoring_instructions"' in page
+    assert 'action="/resume/template-preview"' in page
+    assert 'name="layout_template_file"' in page
+    assert 'name="layout_template_url"' in page
+    assert 'name="layout_template_html"' in page
+    assert 'name="resume_output_language"' in page
+    assert '<option value="both"' in page
     assert 'name="approve_resume_processing"' in page
     assert 'name="retention_mode"' not in page
     assert 'name="approve_candidate_claims"' not in page
@@ -476,9 +533,9 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
     assert 'href="/?lang=zh-CN"' in page
     assert 'href="/resume?lang=zh-CN"' in page
     assert 'href="/advanced?lang=zh-CN"' in page
-    assert 'href="/content?lang=zh-CN"' in page
+    assert 'href="/creator?lang=zh-CN"' in page
     assert 'href="/learning?lang=zh-CN"' in page
-    assert 'href="/publishing?lang=zh-CN"' in page
+    assert 'href="/creator/publish?lang=zh-CN"' in page
     assert 'href="/work?lang=zh-CN"' in page
     assert "使用我的工作资料" in page
     assert "knowledge-sync" not in page
@@ -488,7 +545,7 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
     english = _user_page(None, tmp_path / ".soloscale", {}, "en")
     assert '<html lang="en">' in english
     assert "Turn your real experience into a resume for this role." in english
-    assert 'href="/content?lang=en"' in english
+    assert 'href="/creator?lang=en"' in english
     assert 'name="ui_locale" value="en"' in english
     english_home = _home_page("en", data_root=tmp_path / ".soloscale")
     assert "What do you want to accomplish today?" in english_home
@@ -500,28 +557,55 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
 
 def test_advanced_page_is_bilingual_and_hides_command_language(tmp_path: Path) -> None:
     page = _page(None, tmp_path / ".soloscale", {})
-    assert "刷新本地资料索引" in page
-    assert "包含 Codex 对话记录" in page
-    assert "旧版简历工程工作区" in page
-    assert 'id="ai-providers"' in page
+    assert "检查资料库状态" in page
+    assert "更新工程概览" in page
+    assert "搜索本地证据" in page
+    assert "当前 AI 服务（只读诊断）" in page
     assert "SoloScale 托管 AI" in page
-    assert 'href="/settings/ai?lang=zh-CN"' in page
-    assert "管理 AI 服务" in page
+    assert "刷新本地资料索引" not in page
+    assert "包含 Codex 对话记录" not in page
+    assert "旧版简历工程工作区" not in page
+    assert "运行证据问答" not in page
+    assert 'id="ai-providers"' not in page
+    assert 'href="/settings/ai?lang=zh-CN"' not in page
+    assert "管理 AI 服务" not in page
     assert 'action="/settings/ai-provider"' not in page
     assert "用于下一次内容生成" not in page
     assert "用于下一次简历生成" not in page
-    assert 'class="check-row"' in page
-    assert 'input[type="checkbox"]' in page
+    assert 'class="check-row"' not in page
+    assert '<input type="checkbox"' not in page
     assert "Run knowledge-sync" not in page
     assert "--no-codex" not in page
     assert "未匹配到动作" not in page
 
     english = _page(None, tmp_path / ".soloscale", {}, "en")
     assert '<html lang="en">' in english
-    assert "Refresh the local knowledge index" in english
-    assert "Include Codex conversation records" in english
-    assert "Legacy resume engineering workspace" in english
+    assert "Check knowledge status" in english
+    assert "Search local evidence" in english
+    assert "Current AI service (read-only diagnostic)" in english
+    assert "Refresh the local knowledge index" not in english
+    assert "Legacy resume engineering workspace" not in english
     assert "Run knowledge-status" not in english
+
+
+def test_packaged_knowledge_refresh_runs_in_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fail_subprocess(*_args: object, **_kwargs: object) -> UIActionResult:
+        raise AssertionError("packaged knowledge refresh must not launch the backend as Python")
+
+    monkeypatch.setattr("soloscale.local_ui._run_command", fail_subprocess)
+
+    result = _run_action(
+        {"action": "knowledge-sync"},
+        tmp_path / "data",
+        tmp_path,
+    )
+
+    assert result is not None
+    assert result.return_code == 0
+    assert result.command == "in-process knowledge refresh"
+    assert "Discovered 0" in result.stdout
 
 
 def test_ai_provider_preference_is_shared_and_persists_privately(tmp_path: Path) -> None:
@@ -632,8 +716,8 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
         run_id=resume.run_id,
         repo_root=REPOSITORY_ROOT,
     )
-    assert "NEEDS_MAPPING" in before_learning
-    assert "Interview Defense →" not in before_learning
+    assert "需要关联" in before_learning
+    assert "面试答辩 →" not in before_learning
 
     selected = run_learning_traceability(
         data_root=data_root,
@@ -648,10 +732,10 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
         run_id=resume.run_id,
         repo_root=REPOSITORY_ROOT,
     )
-    assert "确认关联 Conversation RAG 锚点" in before_mapping
+    assert "确认关联对话式 RAG 锚点" in before_mapping
     assert max(selected.run_id, newer.run_id) in before_mapping
     assert _expected_repository_ref() in before_mapping
-    assert "Interview Defense →" not in before_mapping
+    assert "面试答辩 →" not in before_mapping
 
     map_interview_defense_bullet(
         data_root=data_root,
@@ -665,7 +749,7 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
         run_id=resume.run_id,
         repo_root=REPOSITORY_ROOT,
     )
-    assert "Interview Defense →" in mapped_panel
+    assert "面试答辩 →" in mapped_panel
     assert selected.run_id in mapped_panel
     assert "#interview-defense" in mapped_panel
 
@@ -680,13 +764,15 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
         },
     )
     assert 'id="interview-defense"' in page
-    assert f"Exact Learning run: <code>{selected.run_id}</code>" in page
-    assert "Reasoning anchors" in page
-    assert "Code anchors" in page
-    assert "Test anchors" in page
+    assert f"精确学习记录： <code>{selected.run_id}</code>" in page
+    assert "推理锚点" in page
+    assert "代码锚点" in page
+    assert "测试锚点" in page
+    assert "练习语言" in page
+    assert "独立于界面语言" in page
     assert "src/soloscale/knowledge_store.py" in page
     assert "复制锚点包" in page
-    assert "do not prove authorship" in page
+    assert "不证明作者身份" in page
     assert len(list((data_root / "learning-runs").iterdir())) == run_count
 
     anchors_path = data_root / "learning-runs" / selected.run_id / "03_code_anchors.json"
@@ -698,9 +784,9 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
         run_id=resume.run_id,
         repo_root=REPOSITORY_ROOT,
     )
-    assert "NEEDS_MAPPING" in stale_panel
-    assert "Interview Defense →" not in stale_panel
-    assert "映射已失效" in stale_panel
+    assert "需要关联" in stale_panel
+    assert "面试答辩 →" not in stale_panel
+    assert "关联已失效" in stale_panel
 
     invalid = _learning_page(
         data_root,
@@ -709,13 +795,68 @@ def test_interview_defense_ui_requires_explicit_mapping_and_opens_exact_run(
     )
     assert "Interactive evidence graph" not in invalid
 
-    packaged_resources = tmp_path / "packaged-resources"
-    packaged_resources.mkdir()
-    unavailable = _learning_page(data_root, packaged_resources, {})
-    assert "需要连接 SoloScale 源码目录" in unavailable
-    assert "选择源码目录" in unavailable
-    assert 'href="soloscale://choose-source-checkout"' in unavailable
-    assert "<button disabled" not in unavailable
+    no_project = _learning_page(data_root, None, {"run_id": selected.run_id})
+    assert "这个练习需要一个已连接的代码项目" in no_project
+    assert 'href="/work?lang=zh-CN"' in no_project
+    assert 'data-learning-capability="explain" data-state="AVAILABLE"' in no_project
+    assert (
+        'data-learning-capability="trace" data-state="NEEDS_PROJECT_EVIDENCE"'
+        in no_project
+    )
+    assert (
+        'data-learning-capability="debug" data-state="NEEDS_PROJECT_EVIDENCE"'
+        in no_project
+    )
+    assert 'id="learning-explain-response"' in no_project
+    assert 'id="learning-trace-response"' not in no_project
+    assert "This is not a supported SoloScale checkout" not in no_project
+
+
+def test_learning_wrong_project_degrades_only_the_seed_case(tmp_path: Path) -> None:
+    repository = tmp_path / "another-project"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repository, check=True)
+    (repository / "README.md").write_text("another project\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "initial evidence",
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    page = _learning_page(tmp_path / "data", repository, {})
+
+    assert "当前项目已连接，但不适用于这个示例练习" in page
+    assert "这个项目没有找到此练习需要的代码锚点" in page
+    assert "This is not a supported SoloScale checkout" not in page
+    assert "pyproject.toml" not in page
+    assert "knowledge_store.py" not in page
+
+
+def test_learning_run_preflights_stale_project_evidence_before_build(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+
+    result = _run_learning_workspace(
+        {"target_requirement": "Build retrieval systems for AI context and memory."},
+        data_root,
+        REPOSITORY_ROOT,
+    )
+
+    assert result.return_code == 0
+    snapshot = EvidenceHub(data_root).git_repository_snapshot(REPOSITORY_ROOT)
+    assert snapshot is not None
 
 
 def test_parse_submission_reads_text_and_docx_upload() -> None:
@@ -741,7 +882,7 @@ def test_parse_submission_reads_text_and_docx_upload() -> None:
     assert submission.files["resume_template"].content == template
 
 
-def test_job_evidence_search_processes_every_normal_jd_term(
+def test_job_evidence_search_uses_one_bounded_high_signal_query(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     accepted_queries: list[str] = []
@@ -751,9 +892,8 @@ def test_job_evidence_search_processes_every_normal_jd_term(
             assert root == tmp_path
 
         def search(self, query: str, limit: int) -> list[RetrievalHit]:
-            assert limit == 3
-            if len(query.split()) > 4:
-                raise InvalidKnowledgeQueryError("query contains too many searchable terms")
+            assert limit == 8
+            assert len(query.split()) <= 8
             accepted_queries.append(query)
             return [
                 RetrievalHit(
@@ -781,11 +921,11 @@ def test_job_evidence_search_processes_every_normal_jd_term(
 
     hits = _search_job_evidence(job_description, tmp_path)
 
-    accepted_terms = {term for query in accepted_queries for term in query.split()}
-    assert set(terms).issubset(accepted_terms)
-    assert "line29" in accepted_terms
-    assert all(len(query.split()) <= 4 for query in accepted_queries)
-    assert len(hits) == len(accepted_queries)
+    expected_query = " ".join(
+        ["python", *(f"requirement{index}" for index in range(7))]
+    )
+    assert accepted_queries == [expected_query]
+    assert len(hits) == 1
 
 
 def test_create_resume_pdf_preview_uses_isolated_local_renderer(
@@ -812,6 +952,177 @@ def test_create_resume_pdf_preview_uses_isolated_local_renderer(
     assert _create_resume_pdf_preview(source, target) is True
     assert target.read_bytes().startswith(b"%PDF-")
     assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_desktop_resume_download_returns_exactly_one_docx_body(tmp_path: Path) -> None:
+    run_id = "resume-20260828T010101Z-aaaaaaaaaa"
+    run_dir = tmp_path / "resume-runs" / run_id
+    run_dir.mkdir(parents=True)
+    content = _uploaded_resume_docx()
+    (run_dir / "08_resume.docx").write_bytes(content)
+    _write_private_json(
+        run_dir / "09_user_ui.json",
+        {"output_filename": "Resume_LANG-JU_BeaconFire.docx"},
+    )
+
+    class FakeHandler:
+        def __init__(self) -> None:
+            self.status = 0
+            self.headers: dict[str, str] = {}
+            self.wfile = io.BytesIO()
+
+        def send_response(self, status: int) -> None:
+            self.status = status
+
+        def send_header(self, key: str, value: str) -> None:
+            self.headers[key] = value
+
+        def end_headers(self) -> None:
+            return
+
+        def send_error(self, status: int, message: str) -> None:
+            raise AssertionError((status, message))
+
+    handler = FakeHandler()
+    _serve_resume_download(  # type: ignore[arg-type]
+        handler,
+        tmp_path,
+        run_id,
+        desktop_mode=True,
+    )
+
+    assert handler.status == 200
+    assert handler.headers["Content-Type"].endswith("wordprocessingml.document")
+    assert handler.headers["Content-Disposition"].startswith("attachment;")
+    assert handler.wfile.getvalue() == content
+    assert b"<html" not in handler.wfile.getvalue()
+
+
+def test_codex_import_http_returns_immediately_and_exposes_polling_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    session = home / ".codex" / "sessions" / "2026" / "session.jsonl"
+    session.parent.mkdir(parents=True)
+    session.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-08-28T08:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "http-background-session"},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "timestamp": "2026-08-28T08:01:00Z",
+                "type": "response_item",
+                "payload": {
+                    "id": "http-message",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "private work"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    def slow_parse(path: Path) -> object:
+        time.sleep(0.25)
+        return parse_codex_session(path)
+
+    monkeypatch.setattr("soloscale.work_ui.parse_codex_session", slow_parse)
+    manager = CodexImportJobManager(parse_workers=1)
+    SoloScaleLocalUIHandler.ui_data_root = tmp_path / "data"
+    SoloScaleLocalUIHandler.desktop_session_token = None
+    SoloScaleLocalUIHandler.desktop_expected_host = None
+    SoloScaleLocalUIHandler.codex_import_job_manager = manager
+    server = HTTPServer(("127.0.0.1", 0), SoloScaleLocalUIHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+    try:
+        body = urllib.parse.urlencode({"approve": "yes", "ui_locale": "en"})
+        started = time.monotonic()
+        connection.request(
+            "POST",
+            "/work/import-codex",
+            body=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        response = connection.getresponse()
+        response.read()
+        elapsed = time.monotonic() - started
+        assert response.status == 303
+        assert elapsed < 0.5
+        location = response.getheader("Location") or ""
+        job_id = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)[
+            "codex_job"
+        ][0]
+
+        connection.request("GET", "/health")
+        health = connection.getresponse()
+        assert health.status == 200
+        health.read()
+
+        deadline = time.monotonic() + 5
+        payload: dict[str, object] = {}
+        while time.monotonic() < deadline:
+            connection.request("GET", f"/work/import-codex/jobs/{job_id}")
+            status = connection.getresponse()
+            payload = json.loads(status.read())
+            assert status.status == 200
+            if payload["phase"] in {"READY", "FAILED"}:
+                break
+            time.sleep(0.02)
+        assert payload["phase"] == "READY"
+        assert payload["processed"] == 1
+        assert payload["imported"] == 1
+        assert "private work" not in json.dumps(payload)
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        manager.shutdown()
+        SoloScaleLocalUIHandler.codex_import_job_manager = None
+
+
+def test_legacy_publishing_page_redirects_to_creator_publish_queue(
+    tmp_path: Path,
+) -> None:
+    previous_data_root = SoloScaleLocalUIHandler.ui_data_root
+    previous_token = SoloScaleLocalUIHandler.desktop_session_token
+    previous_host = SoloScaleLocalUIHandler.desktop_expected_host
+    SoloScaleLocalUIHandler.ui_data_root = tmp_path / "data"
+    SoloScaleLocalUIHandler.desktop_session_token = None
+    SoloScaleLocalUIHandler.desktop_expected_host = None
+    server = HTTPServer(("127.0.0.1", 0), SoloScaleLocalUIHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+    try:
+        connection.request(
+            "GET",
+            "/publishing?run_id=content-20260828T120000Z-aaaaaaaaaa&lang=en",
+        )
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 303
+        assert response.getheader("Location") == (
+            "/creator/publish?run_id=content-20260828T120000Z-aaaaaaaaaa&lang=en"
+        )
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        SoloScaleLocalUIHandler.ui_data_root = previous_data_root
+        SoloScaleLocalUIHandler.desktop_session_token = previous_token
+        SoloScaleLocalUIHandler.desktop_expected_host = previous_host
 
 
 def _wait_for_resume_job(
@@ -1288,7 +1599,7 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
         ]
         return result, run_dir, paragraphs
 
-    _, fde_run, fde = run(
+    fde_result, fde_run, fde = run(
         "FDE",
         "Forward Deployed Engineer\ncustomer-facing requirements translation "
         "stakeholder reliable agents",
@@ -1313,6 +1624,9 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
     assert unrelated_gaps["gaps"]
     unrelated_metadata = json.loads((unrelated_run / "09_user_ui.json").read_text())
     assert unrelated_metadata["unsupported_requirement_count"] == 1
+    assert {item["status"] for item in unrelated_metadata["evidence_requirements"]} == {
+        "GAP"
+    }
     rendered_unrelated = _user_page(
         unrelated_result, tmp_path / "data-Unrelated", {}
     )
@@ -1328,7 +1642,14 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
     }
     for run_dir in (fde_run, eir_run, unrelated_run):
         metadata = json.loads((run_dir / "09_user_ui.json").read_text())
+        assert metadata["composition_status"] == "CONTENT_READY"
+        assert metadata["truth_status"] == "VERIFIED"
+        assert metadata["docx_status"] == "DOCX_READY"
+        assert metadata["pdf_status"] == "NEEDS_ATTENTION"
+        assert metadata["pdf_failure_reason"] == "LOCAL_PDF_RENDER_UNAVAILABLE_OR_FAILED"
         assert metadata["model_call_performed"] is True
+        assert metadata["evidence_requirements"]
+        assert len(metadata["evidence_source_summary"]) == 9
         assert metadata["generation_mode"] == "ai"
         assert metadata["provider"] == "ollama"
         assert metadata["model_call_profile"]["model_call_count"] == 1
@@ -1388,6 +1709,161 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
             claim["final_text"] in paragraphs_by_run[run_dir]
             for claim in provenance["claims"]
         )
+    rendered_fde = _user_page(fde_result, tmp_path / "data-FDE", {})
+    assert "简历已经生成并可下载 DOCX" in rendered_fde
+    assert "PDF 预览未完成" in rendered_fde
+    assert "查看本次证据来源" in rendered_fde
+    assert "查看 JD 要求覆盖" in rendered_fde
+
+
+def test_resume_ui_generates_bilingual_variants_from_one_evidence_pack(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class EmptyStore:
+        def __init__(self, root: Path) -> None:
+            self.root = root
+
+        def search(self, query: str, limit: int) -> list[RetrievalHit]:
+            del query, limit
+            return []
+
+    def create_preview(_source: Path, target: Path) -> bool:
+        _write_private_bytes(target, b"%PDF-1.4\nsynthetic bilingual preview\n")
+        return True
+
+    monkeypatch.setattr("soloscale.local_ui.KnowledgeStore", EmptyStore)
+    monkeypatch.setattr(
+        "soloscale.local_ui._create_resume_pdf_preview", create_preview
+    )
+    gateway = RecordingResumeGateway()
+    data_root = tmp_path / "data-bilingual"
+    result = _run_user_resume(
+        {
+            "job_description": (
+                "Engineer in Residence\nrapid prototyping full-stack GenAI "
+                "AI-assisted coding agents RAG evals architecture"
+            ),
+            "generation_mode": "ollama",
+            "provider_model": "test-model",
+            "company_name": "BeaconFire",
+            "job_title": "AI Engineer",
+            "approve_resume_processing": "yes",
+            "resume_output_language": "both",
+        },
+        {
+            "resume_template": UploadedFile(
+                filename="Lang_Ju_Resume.docx",
+                content_type="application/octet-stream",
+                content=_role_resume_docx(),
+            )
+        },
+        data_root,
+        tmp_path / "repo",
+        gateway=gateway,
+    )
+
+    assert result.return_code == 0, result.stderr
+    run_dirs = _workspace_paths(result.stdout)
+    assert len(run_dirs) == 2
+    metadata = [
+        json.loads((run_dir / "09_user_ui.json").read_text())
+        for run_dir in run_dirs
+    ]
+    assert {item["output_locale"] for item in metadata} == {"en-US", "zh-CN"}
+    assert {item["source_resume_locale"] for item in metadata} == {"en-US"}
+    assert {item["target_locale"] for item in metadata} == {"en-US", "zh-CN"}
+    assert {item["docx_status"] for item in metadata} == {"DOCX_READY"}
+    assert {item["pdf_status"] for item in metadata} == {"PDF_READY"}
+    assert len({item["resume_project_id"] for item in metadata}) == 1
+    assert len({item["candidate_evidence_pack_sha256"] for item in metadata}) == 1
+    assert all((run_dir / "08_resume.docx").is_file() for run_dir in run_dirs)
+    assert all((run_dir / "10_resume_preview.pdf").is_file() for run_dir in run_dirs)
+    assert {Path(item["output_filename"]).stem.rsplit("_", 1)[-1] for item in metadata} == {
+        "en-US",
+        "zh-CN",
+    }
+    provenance = [
+        json.loads((run_dir / "12_resume_provenance.json").read_text())
+        for run_dir in run_dirs
+    ]
+    assert all(receipt["all_exported_claims_supported"] is True for receipt in provenance)
+    request_payloads = [json.loads(request) for request in gateway.requests]
+    assert request_payloads[0]["candidate_profile"]["atomic_facts"] == (
+        request_payloads[1]["candidate_profile"]["atomic_facts"]
+    )
+    request_locales = [payload["output_locale"] for payload in request_payloads]
+    assert request_locales == ["en-US", "zh-CN"]
+    rendered = _user_page(result, data_root, {})
+    assert "en-US" in rendered
+    assert "zh-CN" in rendered
+    chinese_dir = next(
+        run_dir
+        for run_dir, item in zip(run_dirs, metadata, strict=True)
+        if item["output_locale"] == "zh-CN"
+    )
+    chinese_paragraphs = [
+        item.text
+        for item in read_template_paragraphs(
+            (chinese_dir / "08_resume.docx").read_bytes()
+        )
+        if item.text
+    ]
+    assert "个人简介" in chinese_paragraphs
+    assert "项目经历" in chinese_paragraphs
+    assert any("快速构建 SoloScale" in item for item in chinese_paragraphs)
+
+
+def test_resume_ui_uses_confirmed_template_only_for_section_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "soloscale.local_ui._create_resume_pdf_preview", lambda _source, _target: False
+    )
+    receipt = inspect_template_html(
+        """
+        <h2>Skills</h2><p>Senior Java Engineer</p>
+        <h2>Summary</h2><p>Led a $10M customer platform.</p>
+        <h2>Projects</h2><h2>Experience</h2><h2>Education</h2>
+        """
+    )
+    data_root = tmp_path / "data-template"
+    result = _run_user_resume(
+        {
+            "job_description": "Required: Python, RAG, and agents.",
+            "generation_mode": "template",
+            "approve_resume_processing": "yes",
+            "resume_output_language": "en-US",
+            "resume_template_preview_id": receipt.preview_id,
+            "approve_layout_template": "yes",
+        },
+        {
+            "resume_template": UploadedFile(
+                filename="Lang_Ju_Resume.docx",
+                content_type="application/octet-stream",
+                content=_role_resume_docx(),
+            )
+        },
+        data_root,
+        tmp_path / "repo",
+        template_receipt=receipt,
+    )
+
+    assert result.return_code == 0, result.stderr
+    run_dir = _workspace_path(result.stdout)
+    assert run_dir is not None
+    paragraphs = [
+        item.text
+        for item in read_template_paragraphs((run_dir / "08_resume.docx").read_bytes())
+        if item.text
+    ]
+    assert paragraphs.index("TECHNICAL SKILLS") < paragraphs.index("SUMMARY")
+    assert "Senior Java Engineer" not in paragraphs
+    assert "Led a $10M customer platform." not in paragraphs
+    run_payload = json.loads((run_dir / "run.json").read_text())
+    template_receipt = run_payload["template_receipt"]
+    assert template_receipt["source_sha256"] == receipt.source_sha256
+    assert template_receipt["candidate_facts_imported"] is False
+    assert "Senior Java Engineer" not in json.dumps(template_receipt)
 
 
 def test_resume_ui_rejects_only_unsafe_rewrite_and_keeps_original_bullet(
@@ -1460,6 +1936,12 @@ def test_resume_ui_rejects_only_unsafe_rewrite_and_keeps_original_bullet(
     metadata = json.loads((run_dir / "09_user_ui.json").read_text())
     assert metadata["grounded_rewrites"] == 2
     assert metadata["rejected_rewrites"] == 1
+    adoption = metadata["evidence_adoption"]
+    assert any(item["proposed"] for item in adoption)
+    assert any(
+        "CLAIM_NEW_NUMBER" in item["rejection_rule_codes"] for item in adoption
+    )
+    assert any(item["accepted"] and item["rendered"] for item in adoption)
     paragraphs = {
         item.text
         for item in read_template_paragraphs((run_dir / "08_resume.docx").read_bytes())
@@ -1482,7 +1964,7 @@ def test_resume_ui_rejects_only_unsafe_rewrite_and_keeps_original_bullet(
     assert "Summary已重写" in rendered
 
 
-def test_resume_ui_persists_globally_rejected_candidate_before_validation(
+def test_resume_ui_uses_safe_strategy_after_global_truth_rejection(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     class GloballyRejectedGateway(RecordingResumeGateway):
@@ -1535,7 +2017,7 @@ def test_resume_ui_persists_globally_rejected_candidate_before_validation(
         gateway=GloballyRejectedGateway(),
     )
 
-    assert result.return_code == 1
+    assert result.return_code == 0, result.stderr
     assert candidate_statuses == ["PENDING_VALIDATION", "REJECTED"]
     candidate_paths = list((data_root / "resume-candidates").glob("*.json"))
     assert len(candidate_paths) == 1
@@ -1544,17 +2026,18 @@ def test_resume_ui_persists_globally_rejected_candidate_before_validation(
     assert candidate["status"] == "REJECTED"
     assert candidate["submission_status"] == "NOT_FOR_SUBMISSION"
     assert candidate["label"] == "REJECTED / NOT FOR SUBMISSION"
-    assert candidate["validation_diagnostics"]["validator_status"] == "rejected"
+    assert candidate["validation_diagnostics"]["validator_status"] == "fallback_pass"
     assert {
         failure["rule_code"]
         for failure in candidate["validation_diagnostics"]["failures"]
     } == {"GAP_NOT_SOURCE_GROUNDED"}
     assert candidate_path.stat().st_mode & 0o777 == 0o600
-    assert result.diagnostics is not None
-    assert result.diagnostics["structured_candidate_path"] == str(candidate_path)
-    assert str(candidate_path) in result.stderr
-    assert not (data_root / "resume-runs").exists()
-    assert not list(data_root.rglob("*.docx"))
+    run_dir = _workspace_path(result.stdout)
+    assert run_dir is not None
+    metadata = json.loads((run_dir / "09_user_ui.json").read_text())
+    assert metadata["role_strategy_fallback_applied"] is True
+    assert metadata["role_strategy_fallback_code"] == "ROLE_STRATEGY_TRUTH_REJECTED"
+    assert (run_dir / "08_resume.docx").is_file()
 
 
 def test_resume_optional_expert_review_returns_patches_and_reverifies_locally(
@@ -1615,7 +2098,7 @@ def test_resume_optional_expert_review_returns_patches_and_reverifies_locally(
     assert "再次通过事实校验" in rendered
 
 
-def test_resume_expert_review_new_fact_is_rejected_before_any_run_is_saved(
+def test_resume_expert_review_new_fact_is_discarded_and_base_resume_is_saved(
     tmp_path: Path,
 ) -> None:
     result = _run_user_resume(
@@ -1642,9 +2125,62 @@ def test_resume_expert_review_new_fact_is_rejected_before_any_run_is_saved(
         expert_gateway=RecordingExpertReviewGateway(propose_new_fact=True),
     )
 
-    assert result.return_code == 1
-    assert "unsupported factual claims" in result.stderr
-    assert not (tmp_path / "data" / "resume-runs").exists()
+    assert result.return_code == 0, result.stderr
+    run_dir = _workspace_path(result.stdout)
+    assert run_dir is not None
+    receipt = json.loads((run_dir / "13_expert_review.json").read_text())
+    assert receipt["status"] == "SKIPPED_UNSUPPORTED_FACT"
+    assert receipt["failure_code"] == "EXPERT_PATCH_UNSUPPORTED_FACT"
+    metadata = json.loads((run_dir / "09_user_ui.json").read_text())
+    assert metadata["expert_review_attempted"] is True
+    assert metadata["expert_review_performed"] is False
+    assert metadata["expert_review_skipped_code"] == "EXPERT_PATCH_UNSUPPORTED_FACT"
+    assert (run_dir / "08_resume.docx").is_file()
+
+
+def test_resume_expert_review_stale_patch_preserves_base_resume(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    result = _run_user_resume(
+        {
+            "job_description": (
+                "Engineer in Residence\nrapid prototyping full-stack GenAI "
+                "architecture"
+            ),
+            "generation_mode": "ollama",
+            "provider_model": "test-model",
+            "expert_review_mode": "openai_sol",
+            "approve_expert_review": "yes",
+            "approve_resume_processing": "yes",
+        },
+        {
+            "resume_template": UploadedFile(
+                filename="Synthetic.docx",
+                content_type="application/octet-stream",
+                content=_role_resume_docx(),
+            )
+        },
+        data_root,
+        tmp_path / "repo",
+        gateway=RecordingResumeGateway(),
+        expert_gateway=RecordingExpertReviewGateway(stale_patch=True),
+    )
+
+    assert result.return_code == 0, result.stderr
+    run_dir = _workspace_path(result.stdout)
+    assert run_dir is not None
+    receipt = json.loads((run_dir / "13_expert_review.json").read_text())
+    assert receipt["status"] == "SKIPPED_DRAFT_MISMATCH"
+    assert receipt["failure_code"] == "EXPERT_PATCH_SOURCE_MISMATCH"
+    candidates = [
+        json.loads(path.read_text())
+        for path in (data_root / "resume-candidates").glob("*.json")
+    ]
+    assert any(
+        candidate.get("candidate_kind") == "RESUME_EXPERT_REVIEW_PATCH"
+        and candidate["status"] == "REJECTED"
+        for candidate in candidates
+    )
+    assert (run_dir / "08_resume.docx").is_file()
 
 
 def test_resume_hosted_provider_unavailable_never_silently_saves_offline_draft(
@@ -1717,9 +2253,11 @@ def test_resume_graph_renders_clickable_native_svg(tmp_path: Path) -> None:
 
 
 def test_resume_workspace_defaults_to_documents_application_library(tmp_path: Path) -> None:
-    page = _page(None, tmp_path / ".soloscale", {})
     expected = Path.home() / "Documents" / "Resume Applications"
-    assert f'value="{expected}"' in page
+    advanced = _page(None, tmp_path / ".soloscale", {})
+    assert "resume_library_root" not in advanced
+    resume_page = _user_page(None, tmp_path / ".soloscale", {})
+    assert f'value="{expected}"' in resume_page
 
 
 def test_resume_workspace_rejects_unknown_mode_without_crashing(tmp_path: Path) -> None:
@@ -1841,3 +2379,47 @@ def test_resume_workspace_rejects_symlinked_application_library(
     assert result.return_code == 1
     assert result.stderr == "application library save failed; inspect delivery.json"
     assert list(outside.iterdir()) == []
+
+
+def test_create_learning_case_ui_archives_real_ci_evidence(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    workflow = repo / ".github/workflows"
+    workflow.mkdir(parents=True)
+    (workflow / "ci.yml").write_text("name: CI\n", encoding="utf-8")
+    data_root = tmp_path / ".soloscale"
+    result = _create_learning_case_ui(
+        {"target_requirement": "Automate verification with GitHub Actions"},
+        data_root,
+        repo,
+    )
+    assert result is not None
+    assert result.return_code == 0
+    from soloscale.casebook_store import CasebookStore
+
+    cases = CasebookStore(data_root).list_cases()
+    assert [case.id for case in cases] == ["ci-cd-automation"]
+
+
+def test_applications_section_truthfully_separates_drafts_and_applications(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "Resume Applications"
+    app_dir = library / "applications" / "app-one"
+    app_dir.mkdir(parents=True)
+    (app_dir / "application.json").write_text(
+        json.dumps(
+            {
+                "soloscale_run_id": "resume-run-1",
+                "company": "Faros",
+                "role": "AI-Native Builder",
+                "status": "DRAFT",
+                "resume_filename": "resume.docx",
+            }
+        ),
+        encoding="utf-8",
+    )
+    html = _applications_section_html(library, locale="zh-CN")
+    assert "申请与机会" in html
+    assert "更新状态" in html
+    assert "打开简历" in html
+    assert "准备面试 / 练习缺口" in html

@@ -136,8 +136,8 @@ def prepare_distribution_package(*, data_root: Path, run_id: str) -> Path:
             },
             "youtube": {
                 "metadata": _YOUTUBE_NAME,
-                "adapter": "manual-upload-package",
-                "direct_upload_enabled": False,
+                "adapter": "youtube-data-api-v3",
+                "direct_upload_enabled": True,
             },
         },
         "artifacts": {

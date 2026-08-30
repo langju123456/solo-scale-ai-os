@@ -29,6 +29,7 @@ from soloscale.evidence_capture import capture_assets
 from soloscale.evidence_hub import EvidenceHub
 from soloscale.model_gateway import (
     GatewayConfigurationState,
+    ModelCallProfile,
     ModelGateway,
     ModelGatewayInvalidResponse,
     ModelGatewayNotConfigured,
@@ -57,6 +58,33 @@ _SECRET = re.compile(
     r"Bearer\s+[A-Za-z0-9._~+/=-]{12,})"
 )
 _CLAIM_ID = re.compile(r"CLAIM-[0-9]{2}")
+_CLAIM_STATUS_NAME = r"(?:VERIFIED|OBSERVED|HYPOTHESIS|PLANNED)"
+_CLAIM_MARKER_TOKEN = re.compile(
+    rf"\[?{_CLAIM_STATUS_NAME} · CLAIM-[0-9]{{2}}\]?|\[CLAIM-[0-9]{{2}}\]"
+)
+_CLAIM_MARKER_LINE_PREFIX = re.compile(
+    rf"(?m)^[ \t]*{_CLAIM_STATUS_NAME} · CLAIM-[0-9]{{2}} — ?"
+)
+_INTERNAL_LABEL_LINE = re.compile(
+    r"(?m)^[ \t]*(?:- |\* )?(?:Claim anchors|Facts source|Reference pattern applied):[^\n]*[ \t]*$"
+)
+_CLAIM_MAP_LINE = re.compile(r"(?m)^[ \t]*(?:- |\* )?CLAIM-[0-9]{2}: [^\n]*$")
+_INTERNAL_LIMIT_INLINE = re.compile(
+    r"(?:^|[\s·•–—-]+)(?:Limit|边界)\s*:[^\n]*"
+)
+_INTERNAL_LIMIT_LABEL_LINE = re.compile(
+    r"(?m)^[ \t]*(?:- |\* )?(?:Limit|边界)\s*:[^\n]*[ \t]*$"
+)
+_INTERNAL_BOUNDARY_HEADING = re.compile(
+    r"(?m)^[ \t]*(?:Explicit boundaries?|明确边界)\s*:[ \t]*$"
+)
+_INTERNAL_EVIDENCE_MAP_HEADING = re.compile(
+    r"(?m)^[ \t]*(?:Evidence map|证据索引)[^\n]*[ \t]*$"
+)
+_INTERNAL_PROOF_LABEL_LINE = re.compile(
+    r"(?m)^[ \t]*(?:- |\* )?(?:Proof links?|证据链接)[^\n]*[ \t]*$"
+)
+_SEPARATOR_EDGE = re.compile(r"^[\s·•–—-]+|[\s·•–—-]+$")
 _OLLAMA_PROMPT_VERSION = "content-ollama-writer-v1"
 _OLLAMA_SYSTEM_PROMPT = """You are the SoloScale evidence-bound content writer.
 Return only JSON matching the supplied schema. Write one canonical story and derive a
@@ -304,8 +332,6 @@ def _render_linkedin(brief: ContentBrief) -> str:
             ClaimStatus.HYPOTHESIS: "仍需验证的假设：",
             ClaimStatus.PLANNED: "接下来会做的实验：",
         }
-        limit_title = "明确边界："
-        proof_title = "证据索引（发布前请换成可公开链接）："
     else:
         sections = [opening, "", f"I am documenting: {brief.topic}", ""]
         section_titles = {
@@ -314,8 +340,6 @@ def _render_linkedin(brief: ContentBrief) -> str:
             ClaimStatus.HYPOTHESIS: "What remains a hypothesis:",
             ClaimStatus.PLANNED: "What I will test next:",
         }
-        limit_title = "Explicit boundaries:"
-        proof_title = "Evidence map (replace private receipts with public links before posting):"
     for status in ClaimStatus:
         claims = grouped[status]
         if not claims:
@@ -329,12 +353,7 @@ def _render_linkedin(brief: ContentBrief) -> str:
         )
     limits = [claim for claim in brief.claims if claim.limits]
     if limits:
-        sections.extend([limit_title, *[f"- [{claim.id}] {claim.limits}" for claim in limits], ""])
-    receipts = [claim for claim in brief.claims if claim.receipt]
-    if receipts:
-        sections.extend(
-            [proof_title, *[f"- {claim.id}: {claim.receipt}" for claim in receipts], ""]
-        )
+        sections.extend([*[f"- [{claim.id}] {claim.limits}" for claim in limits], ""])
     sections.append(brief.call_to_action)
     return "\n".join(sections).strip() + "\n"
 
@@ -345,18 +364,14 @@ def _render_x_thread(brief: ContentBrief) -> list[str]:
     for claim in brief.claims[1:]:
         post = f"[{claim.status.value} · {claim.id}] {claim.text}"
         if claim.limits:
-            post += (
-                f"\nLimit: {claim.limits}"
-                if brief.language == "English"
-                else f"\n边界：{claim.limits}"
-            )
+            post += f"\n{claim.limits}"
         if len(post) > 280:
             raise ContentWorkspaceError(f"{claim.id} is too long for an X post")
         posts.append(post)
     proof_note = (
-        "Proof links: see the attached claim ledger. Human review is still required."
+        "Human review is still required before posting."
         if brief.language == "English"
-        else "证据链接见附带的 claim ledger；发布前仍需人工复核。"
+        else "发布前仍需人工复核。"
     )
     posts.extend([proof_note, brief.call_to_action])
     if any(len(post) > 280 for post in posts):
@@ -471,7 +486,7 @@ def _render_storyboard(brief: ContentBrief) -> list[StoryboardScene]:
             purpose = (
                 f"{pattern.structure.hook} · {progression}"
                 if index == 1
-                else f"{progression} · {_status_heading(claim.status, 'English')}"
+                else progression
             )
             visual = (
                 f"Reference-guided {pattern.video.shot_cadence} pacing"
@@ -479,7 +494,7 @@ def _render_storyboard(brief: ContentBrief) -> list[StoryboardScene]:
                 + "; use only operator-owned evidence visuals"
             )
         else:
-            purpose = "Hook" if index == 1 else _status_heading(claim.status, "English")
+            purpose = "Hook" if index == 1 else "Evidence"
             visual = (
                 "HookCard with SourceBadge"
                 if index == 1
@@ -623,7 +638,59 @@ def build_content_drafts(brief: ContentBrief) -> ContentDrafts:
         storyboard=storyboard,
     )
     _validate_generated_drafts(brief, drafts)
-    return drafts
+    return _strip_public_claim_markers(drafts)
+
+
+def _strip_claim_markers(value: str) -> str:
+    """Remove internal claim truth markers from public-facing text (A8 boundary)."""
+
+    stripped = _INTERNAL_LABEL_LINE.sub("", value)
+    stripped = _CLAIM_MAP_LINE.sub("", stripped)
+    stripped = _CLAIM_MARKER_LINE_PREFIX.sub("", stripped)
+    stripped = _INTERNAL_BOUNDARY_HEADING.sub("", stripped)
+    stripped = _INTERNAL_EVIDENCE_MAP_HEADING.sub("", stripped)
+    stripped = _INTERNAL_PROOF_LABEL_LINE.sub("", stripped)
+    stripped = _INTERNAL_LIMIT_LABEL_LINE.sub("", stripped)
+    stripped = _CLAIM_MARKER_TOKEN.sub("", stripped)
+    stripped = _INTERNAL_LIMIT_INLINE.sub("", stripped)
+    stripped = _SEPARATOR_EDGE.sub("", stripped)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    trailing_newline = "\n" if value.endswith(("\n", "\r\n")) else ""
+    return stripped.strip() + trailing_newline
+
+
+def _strip_public_claim_markers(drafts: ContentDrafts) -> ContentDrafts:
+    """Return a public copy of the drafts without internal provenance markers.
+
+    Validation has already proven every claim is present; the storyboard keeps its
+    claim_ids so lineage stays internal while the rendered text becomes publish-safe.
+    """
+
+    def stripped_scene(scene: StoryboardScene) -> StoryboardScene:
+        voiceover = _strip_claim_markers(scene.voiceover) or scene.voiceover
+        on_screen_text = _strip_claim_markers(scene.on_screen_text) or voiceover
+        purpose = _strip_claim_markers(scene.purpose) or "Evidence anchor"
+        return scene.model_copy(
+            update={
+                "purpose": purpose,
+                "visual": _strip_claim_markers(scene.visual) or scene.visual,
+                "voiceover": voiceover,
+                "on_screen_text": on_screen_text,
+            }
+        )
+
+    return drafts.model_copy(
+        update={
+            "canonical_story": _strip_claim_markers(drafts.canonical_story),
+            "linkedin": _strip_claim_markers(drafts.linkedin),
+            "x_thread": [_strip_claim_markers(post) for post in drafts.x_thread],
+            "x_post": _strip_claim_markers(drafts.x_post),
+            "blog": _strip_claim_markers(drafts.blog),
+            "youtube_script": _strip_claim_markers(drafts.youtube_script),
+            "video_script": _strip_claim_markers(drafts.video_script),
+            "storyboard": [stripped_scene(scene) for scene in drafts.storyboard],
+        }
+    )
 
 
 def _ground_ollama_drafts(
@@ -847,7 +914,7 @@ def generate_content_drafts_with_gateway(
         ) from exc
     drafts = _ground_ollama_drafts(brief, transport_drafts)
     _validate_generated_drafts(brief, drafts)
-    return drafts
+    return _strip_public_claim_markers(drafts)
 
 
 def generate_content_drafts_with_ollama(
@@ -885,6 +952,7 @@ def run_content_workspace_with_gateway(
     )
     drafts = generate_content_drafts_with_gateway(brief, gateway=gateway)
     descriptor = gateway.descriptor
+    model_call_profile = getattr(gateway, "last_call_profile", None)
     provider_kinds = {
         ModelProviderId.SOLOSCALE_HOSTED: ProviderKind.SOLOSCALE_HOSTED,
         ModelProviderId.OLLAMA: ProviderKind.OLLAMA,
@@ -909,6 +977,7 @@ def run_content_workspace_with_gateway(
         prompt_version=prompt_versions[descriptor.provider],
         network_used=True,
         reference_source_text=normalized_reference,
+        model_call_profile=model_call_profile,
     )
 
 
@@ -1014,6 +1083,43 @@ def _validate_generated_drafts(brief: ContentBrief, drafts: ContentDrafts) -> No
         raise ContentWorkspaceError("Storyboard must preserve the supplied CTA")
 
 
+def _validate_reviewed_drafts(brief: ContentBrief, drafts: ContentDrafts) -> None:
+    """Review-time contract for human-edited drafts.
+
+    Generated drafts are marker-free by A8, so review validation preserves the
+    invariants that still matter: no unknown claim IDs, no private output, the
+    supplied CTA stays intact, and X thread numbering remains exact.
+    """
+
+    allowed_ids = {claim.id for claim in brief.claims}
+    text_artifacts = {
+        "canonical story": drafts.canonical_story,
+        "LinkedIn draft": drafts.linkedin,
+        "X thread": "\n\n".join(drafts.x_thread),
+        "blog draft": drafts.blog,
+        "YouTube script": drafts.youtube_script,
+        "video script": drafts.video_script,
+    }
+    for field, value in text_artifacts.items():
+        _reject_private_output(value, field=field)
+        referenced = set(_CLAIM_ID.findall(value))
+        if referenced - allowed_ids:
+            raise ContentWorkspaceError(
+                f"{field} must not introduce unknown claim IDs"
+            )
+        if brief.call_to_action not in value:
+            raise ContentWorkspaceError(f"{field} must preserve the supplied CTA")
+
+    _reject_private_output(drafts.x_post, field="standalone X post")
+    if set(_CLAIM_ID.findall(drafts.x_post)) - allowed_ids:
+        raise ContentWorkspaceError("Standalone X post contains an unknown claim ID")
+
+    total = len(drafts.x_thread)
+    for index, post in enumerate(drafts.x_thread, start=1):
+        if not post.startswith(f"{index}/{total} "):
+            raise ContentWorkspaceError("X thread numbering must be consecutive and exact")
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
@@ -1076,6 +1182,8 @@ def run_content_workspace(
     prompt_version: str | None = None,
     network_used: bool = False,
     reference_source_text: str | None = None,
+    model_call_profile: ModelCallProfile | None = None,
+    fallback_used: bool = False,
 ) -> ContentRun:
     """Build one private content candidate without publishing it."""
 
@@ -1173,10 +1281,24 @@ def run_content_workspace(
             raise ContentWorkspaceError(
                 "Generated content drafts require a non-template provider identity"
             )
-        _validate_generated_drafts(brief, drafts)
+        _validate_reviewed_drafts(brief, drafts)
         selected_provider = provider
         selected_prompt_version = prompt_version or _OLLAMA_PROMPT_VERSION
         model_used = True
+    execution_state: Literal["AI_EXECUTED", "AI_NOT_EXECUTED"] = (
+        "AI_EXECUTED" if model_used else "AI_NOT_EXECUTED"
+    )
+    model_calls = 1 if model_used else 0
+    token_usage: dict[str, int] | None = None
+    if model_call_profile is not None:
+        usage: dict[str, int] = {}
+        if model_call_profile.prompt_eval_tokens is not None:
+            usage["prompt_eval_tokens"] = model_call_profile.prompt_eval_tokens
+        if model_call_profile.output_tokens is not None:
+            usage["output_tokens"] = model_call_profile.output_tokens
+        token_usage = usage or None
+    latency_ms = model_call_profile.wall_ms if model_call_profile is not None else None
+    cost_usd = None
     if normalized_reference is not None:
         generated_values = [
             drafts.canonical_story,
@@ -1258,12 +1380,18 @@ def run_content_workspace(
         },
         output_artifacts=output_artifacts,
         network_used=network_used,
-        token_usage=None,
-        cost_usd=0,
+        token_usage=token_usage,
+        cost_usd=cost_usd,
     )
     publish_pack = {
         "status": "DRAFT_REQUIRES_HUMAN_APPROVAL",
         "topic": brief.topic,
+        "execution_state": execution_state,
+        "model_calls": model_calls,
+        "token_usage": token_usage,
+        "latency_ms": latency_ms,
+        "cost_usd": cost_usd,
+        "fallback_used": fallback_used,
         "locale_variant": locale_variant_payload,
         "channels": [
             "Canonical story",
@@ -1305,6 +1433,12 @@ def run_content_workspace(
         "credential_shape_scan_passed": True,
         "network_used": network_used,
         "model_used": model_used,
+        "execution_state": execution_state,
+        "model_calls": model_calls,
+        "token_usage": token_usage,
+        "latency_ms": latency_ms,
+        "cost_usd": cost_usd,
+        "fallback_used": fallback_used,
         "editorial_provenance_recorded": True,
         "evidence_bundle_used": brief.evidence_bundle_id is not None,
         "evidence_item_count": len(brief.evidence_item_ids),
@@ -1332,6 +1466,12 @@ def run_content_workspace(
         editorial_provenance=[editorial_provenance],
         network_used=network_used,
         model_used=model_used,
+        execution_state=execution_state,
+        model_calls=model_calls,
+        token_usage=token_usage,
+        latency_ms=latency_ms,
+        cost_usd=cost_usd,
+        fallback_used=fallback_used,
         limitations=[
             (
                 "Drafts were generated by a local schema-constrained model and still require "
@@ -1589,8 +1729,9 @@ def save_content_review(
         )
     except ValidationError as exc:
         raise ContentWorkspaceError("Content review does not satisfy the output contract") from exc
-    _validate_generated_drafts(run.brief, reviewed_drafts)
-    values = _draft_review_values(reviewed_drafts)
+    _validate_reviewed_drafts(run.brief, reviewed_drafts)
+    values = _draft_review_values(_strip_public_claim_markers(reviewed_drafts))
+    values = {key: _normalize_review_text(value) for key, value in values.items()}
     selected_decision = ContentReviewDecision(decision)
     previous_revision = previous[0].revision if previous is not None else 0
     revision = previous_revision + 1

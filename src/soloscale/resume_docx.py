@@ -47,6 +47,8 @@ from soloscale.resume_models import (
     GroundedResumeBulletRewrite,
     JDPositioningBrief,
     ResumeAtomicFact,
+    ResumeEvidenceAdoptionTrace,
+    ResumeEvidenceRetrievalTrace,
     ResumeExpertReviewResult,
     RoleStrategy,
     build_resume_atomic_facts,
@@ -87,6 +89,32 @@ _SECTION_HEADINGS = {
     "EDUCATION",
     "TECHNICAL SKILLS",
     "WORK EXPERIENCE",
+}
+_CANONICAL_SECTION_HEADINGS = {
+    "SUMMARY": "SUMMARY",
+    "PROJECT HIGHLIGHTS": "PROJECT HIGHLIGHTS",
+    "EDUCATION": "EDUCATION",
+    "TECHNICAL SKILLS": "TECHNICAL SKILLS",
+    "WORK EXPERIENCE": "WORK EXPERIENCE",
+    "个人简介": "SUMMARY",
+    "职业概述": "SUMMARY",
+    "个人总结": "SUMMARY",
+    "项目": "PROJECT HIGHLIGHTS",
+    "项目经历": "PROJECT HIGHLIGHTS",
+    "教育": "EDUCATION",
+    "教育经历": "EDUCATION",
+    "技能": "TECHNICAL SKILLS",
+    "技术技能": "TECHNICAL SKILLS",
+    "专业技能": "TECHNICAL SKILLS",
+    "经历": "WORK EXPERIENCE",
+    "工作经历": "WORK EXPERIENCE",
+}
+_ZH_SECTION_HEADINGS = {
+    "SUMMARY": "个人简介",
+    "PROJECT HIGHLIGHTS": "项目经历",
+    "EDUCATION": "教育经历",
+    "TECHNICAL SKILLS": "技术技能",
+    "WORK EXPERIENCE": "工作经历",
 }
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#./-]{2,}")
 _STOP_WORDS = {
@@ -210,12 +238,19 @@ class TailoredDocx:
     generation_mode: str = "template"
     provider: str | None = None
     model: str | None = None
+    output_locale: Literal["en-US", "zh-CN"] = "en-US"
     model_call_profile: dict[str, object] | None = None
     validation_diagnostics: ResumeValidationDiagnostics | None = None
     role_strategy: RoleStrategy | None = None
     candidate_evidence_pack: CandidateEvidencePack | None = None
     positioning_brief: JDPositioningBrief | None = None
+    evidence_retrieval_trace: ResumeEvidenceRetrievalTrace | None = None
+    evidence_adoption: tuple[ResumeEvidenceAdoptionTrace, ...] = ()
+    role_strategy_fallback_applied: bool = False
+    role_strategy_fallback_code: str | None = None
     expert_review: ResumeExpertReviewResult | None = None
+    expert_review_attempted: bool = False
+    expert_review_skipped_code: str | None = None
     expert_rewrites: int = 0
     expert_provider: str | None = None
     expert_model: str | None = None
@@ -308,7 +343,97 @@ def read_template_paragraphs(template: bytes) -> list[TemplateParagraph]:
 
 
 def _heading(value: str) -> str:
-    return " ".join(value.upper().split())
+    normalized = " ".join(value.upper().rstrip(":：").split())
+    return _CANONICAL_SECTION_HEADINGS.get(normalized, normalized)
+
+
+def _canonical_section_heading(value: str) -> str | None:
+    normalized = " ".join(value.upper().rstrip(":：").split())
+    return _CANONICAL_SECTION_HEADINGS.get(normalized)
+
+
+def apply_resume_template_structure(
+    template: bytes, section_order: list[str]
+) -> bytes:
+    """Apply a confirmed section order without importing any template copy."""
+
+    requested: list[str] = []
+    for value in section_order:
+        if value in _SECTION_HEADINGS and value not in requested:
+            requested.append(value)
+    if not requested:
+        return template
+    members, document = _read_package(template)
+    root, body = _parse_document(document)
+    children = list(body)
+    section_markers = [
+        (index, _canonical_section_heading(_paragraph_text(child)))
+        for index, child in enumerate(children)
+        if child.tag == f"{_W}p"
+        and _canonical_section_heading(_paragraph_text(child)) is not None
+    ]
+    if not section_markers:
+        return template
+    first_section = section_markers[0][0]
+    section_end = next(
+        (
+            index
+            for index, child in enumerate(children[first_section:], start=first_section)
+            if child.tag == f"{_W}sectPr"
+        ),
+        len(children),
+    )
+    prefix = children[:first_section]
+    suffix = children[section_end:]
+    blocks: dict[str, list[ElementTree.Element]] = {}
+    current_order: list[str] = []
+    for marker_index, (start, canonical) in enumerate(section_markers):
+        if canonical is None or start >= section_end:
+            continue
+        end = (
+            section_markers[marker_index + 1][0]
+            if marker_index + 1 < len(section_markers)
+            else section_end
+        )
+        blocks[canonical] = children[start:end]
+        current_order.append(canonical)
+    final_order = [value for value in requested if value in blocks]
+    final_order.extend(value for value in current_order if value not in final_order)
+    replacement = prefix + [child for value in final_order for child in blocks[value]] + suffix
+    if replacement == children:
+        return template
+    for child in list(body):
+        body.remove(child)
+    for child in replacement:
+        body.append(child)
+    tailored_document = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+    target = io.BytesIO()
+    with zipfile.ZipFile(target, "w") as archive:
+        for info, content in members:
+            archive.writestr(
+                info, tailored_document if info.filename == _DOCUMENT_PART else content
+            )
+    return target.getvalue()
+
+
+def _localize_resume_headings(
+    body: ElementTree.Element, output_locale: Literal["en-US", "zh-CN"]
+) -> None:
+    if output_locale != "zh-CN":
+        return
+    for paragraph in body:
+        if paragraph.tag != f"{_W}p":
+            continue
+        canonical = _canonical_section_heading(_paragraph_text(paragraph))
+        replacement = _ZH_SECTION_HEADINGS.get(canonical or "")
+        if replacement is None:
+            continue
+        nodes = list(paragraph.iter(f"{_W}t"))
+        if not nodes:
+            continue
+        nodes[0].text = replacement
+        for node in nodes[1:]:
+            node.text = ""
 
 
 def _section_slice(
@@ -385,7 +510,7 @@ def _score(text: str, job_terms: set[str]) -> int:
 
 
 def _section_bounds(
-    children: list[ElementTree.Element], start_heading: str, end_heading: str
+    children: list[ElementTree.Element], start_heading: str
 ) -> tuple[int, int] | None:
     start = next(
         (
@@ -401,11 +526,15 @@ def _section_bounds(
         (
             index
             for index, child in enumerate(children[start + 1 :], start=start + 1)
-            if child.tag == f"{_W}p" and _heading(_paragraph_text(child)) == end_heading
+            if child.tag == f"{_W}sectPr"
+            or (
+                child.tag == f"{_W}p"
+                and _heading(_paragraph_text(child)) in _SECTION_HEADINGS
+            )
         ),
-        None,
+        len(children),
     )
-    return (start + 1, end) if end is not None else None
+    return start + 1, end
 
 
 def _replace_range(
@@ -424,7 +553,7 @@ def _replace_range(
 def _reorder_project_blocks(
     body: ElementTree.Element, children: list[ElementTree.Element], job_terms: set[str]
 ) -> int:
-    bounds = _section_bounds(children, "PROJECT HIGHLIGHTS", "EDUCATION")
+    bounds = _section_bounds(children, "PROJECT HIGHLIGHTS")
     if bounds is None:
         return 0
     start, end = bounds
@@ -463,7 +592,7 @@ def _reorder_project_blocks(
 def _reorder_skill_bullets(
     body: ElementTree.Element, children: list[ElementTree.Element], job_terms: set[str]
 ) -> int:
-    bounds = _section_bounds(children, "TECHNICAL SKILLS", "WORK EXPERIENCE")
+    bounds = _section_bounds(children, "TECHNICAL SKILLS")
     if bounds is None:
         return 0
     start, end = bounds
@@ -843,6 +972,38 @@ _FACT_ACTION_TERMS = {
 }
 _NUMBER_RE = re.compile(r"(?<!\w)\d+(?:[.,]\d+)?%?\+?(?!\w)")
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#./-]*")
+_ZH_INFLATION_TERMS: tuple[
+    tuple[tuple[str, ...], ResumeValidationRuleCode], ...
+] = (
+    (("主导", "领导", "带领", "全权负责"), ResumeValidationRuleCode.CLAIM_ROLE_INFLATION),
+    (("客户", "付费用户"), ResumeValidationRuleCode.CLAIM_CLIENT_INFLATION),
+    (
+        ("百万级", "大规模", "企业级", "生产级"),
+        ResumeValidationRuleCode.CLAIM_SCALE_INFLATION,
+    ),
+    (
+        ("显著提升", "大幅提升", "大幅降低", "收入增长", "节省成本"),
+        ResumeValidationRuleCode.CLAIM_OUTCOME_INFLATION,
+    ),
+)
+_ZH_FACT_ANCHOR_ALIASES: dict[str, tuple[str, ...]] = {
+    "architecture": ("架构",),
+    "client": ("客户",),
+    "customer": ("客户",),
+    "customer-facing": ("面向客户", "客户场景"),
+    "delivery": ("交付",),
+    "development": ("开发",),
+    "engineer": ("工程师",),
+    "evaluation": ("评估",),
+    "evidence-grounded": ("证据驱动", "证据支撑"),
+    "orchestration": ("编排",),
+    "improved": ("改进", "提升"),
+    "reliability": ("可靠性",),
+    "requirements": ("需求",),
+    "retrieval": ("检索",),
+    "stakeholder": ("利益相关方", "协作方"),
+    "workflow": ("工作流",),
+}
 
 
 def _normalized_words(text: str) -> set[str]:
@@ -858,6 +1019,47 @@ def _fact_anchor_terms(text: str) -> set[str]:
     terms = _terms(text)
     anchors = terms - _FACT_ACTION_TERMS - _GENERIC_JD_TERMS
     return anchors or terms
+
+
+def _cross_locale_fact_match(
+    *,
+    source_fact: str,
+    candidate_claim: str,
+    target_locale: Literal["en-US", "zh-CN"],
+    source_anchors: set[str],
+    candidate_terms: set[str],
+) -> bool:
+    """Match only curated semantic anchors when source and target languages differ."""
+
+    source_has_chinese = any(
+        "\u4e00" <= character <= "\u9fff" for character in source_fact
+    )
+    if target_locale == "zh-CN" and not source_has_chinese:
+        return any(
+            alias in candidate_claim
+            for anchor in source_anchors
+            for alias in _ZH_FACT_ANCHOR_ALIASES.get(anchor, ())
+        )
+    if target_locale == "en-US" and source_has_chinese:
+        return any(
+            anchor in candidate_terms
+            and any(alias in source_fact for alias in chinese_aliases)
+            for anchor, chinese_aliases in _ZH_FACT_ANCHOR_ALIASES.items()
+        )
+    return False
+
+
+def _source_terms_for_target_locale(
+    source_text: str, target_locale: Literal["en-US", "zh-CN"]
+) -> set[str]:
+    terms = _normalized_words(source_text) | _terms(source_text)
+    if target_locale == "en-US":
+        terms.update(
+            anchor
+            for anchor, chinese_aliases in _ZH_FACT_ANCHOR_ALIASES.items()
+            if any(alias in source_text for alias in chinese_aliases)
+        )
+    return terms
 
 
 def _protected_facts(text: str) -> set[str]:
@@ -897,6 +1099,7 @@ def _validate_role_strategy(
     profile: CandidateProfile,
     job_description: str,
     atomic_facts: list[ResumeAtomicFact] | None = None,
+    output_locale: Literal["en-US", "zh-CN"] = "en-US",
 ) -> dict[str, str]:
     entries = _profile_entries(profile)
     atomic_fact_by_id = {
@@ -1029,7 +1232,26 @@ def _validate_role_strategy(
                 )
                 break
         for fact in resolved_facts:
-            if not (_fact_anchor_terms(fact.text) & output_terms):
+            fact_anchors = _fact_anchor_terms(fact.text)
+            if output_locale == "zh-CN":
+                fact_anchors = {
+                    value
+                    for value in fact_anchors
+                    if value in _TECHNOLOGY_TERMS
+                    or any(character.isdigit() for character in value)
+                    or len(value) >= 4
+                }
+            cross_locale_anchor_present = _cross_locale_fact_match(
+                source_fact=fact.text,
+                candidate_claim=text,
+                target_locale=output_locale,
+                source_anchors=fact_anchors,
+                candidate_terms=output_terms,
+            )
+            if (
+                not (fact_anchors & output_terms)
+                and not cross_locale_anchor_present
+            ):
                 reject(
                     ResumeValidationRuleCode.CLAIM_NO_EVIDENCE,
                     f"{json_path}.text",
@@ -1038,15 +1260,29 @@ def _validate_role_strategy(
                 break
 
         source_union = " ".join(fact.text for fact in resolved_facts)
-        invented_protected = _protected_facts(text) - _protected_facts(source_union)
+        allowed_numbers = {
+            value.casefold() for fact in resolved_facts for value in fact.allowed_numbers
+        }
+        source_words = _source_terms_for_target_locale(source_union, output_locale)
+        localized_protected_allowlist: set[str] = set()
+        if output_locale == "zh-CN" and any(
+            value == "ai" or value.startswith("ai-") or value.endswith("ai")
+            for value in source_words
+        ):
+            localized_protected_allowlist.add("ai")
+        invented_protected = (
+            _protected_facts(text)
+            - _protected_facts(source_union)
+            - allowed_numbers
+            - localized_protected_allowlist
+        )
         invented_numbers = {
             match.group(0).casefold() for match in _NUMBER_RE.finditer(text)
         } - {
             match.group(0).casefold()
             for match in _NUMBER_RE.finditer(source_union)
-        }
+        } - allowed_numbers
         output_words = _normalized_words(text) | _terms(text)
-        source_words = _normalized_words(source_union) | _terms(source_union)
         introduced_words = output_words - source_words
         if invented_numbers:
             reject(
@@ -1060,7 +1296,7 @@ def _validate_role_strategy(
                 f"{json_path}.text",
                 claim_id=claim_id,
             )
-        if (_terms(text) & jd_terms) - _terms(source_union):
+        if (_terms(text) & jd_terms) - source_words:
             reject(
                 ResumeValidationRuleCode.CLAIM_ROLE_INFLATION,
                 f"{json_path}.text",
@@ -1078,6 +1314,10 @@ def _validate_role_strategy(
         ):
             if introduced_words & vocabulary:
                 reject(rule_code, f"{json_path}.text", claim_id=claim_id)
+        if output_locale == "zh-CN":
+            for phrases, rule_code in _ZH_INFLATION_TERMS:
+                if any(phrase in text and phrase not in source_union for phrase in phrases):
+                    reject(rule_code, f"{json_path}.text", claim_id=claim_id)
 
     for index, rewrite in enumerate(strategy.bullet_rewrites):
         entry_id = rewrite.profile_entry_id
@@ -1184,6 +1424,7 @@ def _select_safe_rewrites(
     profile: CandidateProfile,
     job_description: str,
     atomic_facts: list[ResumeAtomicFact] | None = None,
+    output_locale: Literal["en-US", "zh-CN"] = "en-US",
 ) -> tuple[RoleStrategy, dict[str, str], ResumeValidationDiagnostics]:
     """Keep each supported rewrite and restore only rejected claims to source."""
 
@@ -1194,6 +1435,7 @@ def _select_safe_rewrites(
             profile=profile,
             job_description=job_description,
             atomic_facts=atomic_facts,
+            output_locale=output_locale,
         )
     except ResumeTemplateError as error:
         diagnostics = error.validation_diagnostics
@@ -1238,13 +1480,13 @@ def _select_safe_rewrites(
             profile=profile,
             job_description=job_description,
             atomic_facts=atomic_facts,
+            output_locale=output_locale,
         )
         return (
             selected,
             entries,
             replace(diagnostics, validator_status="selective_pass"),
         )
-
     verified_count = sum(
         rewrite.text == entries[rewrite.profile_entry_id]
         for rewrite in strategy.bullet_rewrites
@@ -1269,12 +1511,106 @@ def _select_safe_rewrites(
     )
 
 
+def _deterministic_role_strategy_fallback(
+    *,
+    profile: CandidateProfile,
+    job_description: str,
+) -> RoleStrategy:
+    """Preserve the approved Resume when model positioning is globally unsafe."""
+
+    entries = _profile_entries(profile)
+    fact_ids_by_entry: dict[str, list[str]] = {}
+    for fact in build_resume_atomic_facts(profile):
+        fact_ids_by_entry.setdefault(fact.profile_entry_id, []).append(fact.fact_id)
+    signals = deterministic_hiring_signals(job_description)
+    strategy = RoleStrategy(
+        role_summary=signals[0],
+        top_hiring_signals=signals,
+        evidence_priority=list(entries),
+        skill_priority=list(profile.skills),
+        bullet_rewrites=[
+            GroundedResumeBulletRewrite(
+                profile_entry_id=entry_id,
+                kind="REWRITE",
+                text=text,
+                source_profile_entry_ids=[entry_id],
+                source_fact_ids=fact_ids_by_entry[entry_id],
+            )
+            for entry_id, text in entries.items()
+        ],
+        summary_rewrite=None,
+        unsupported_requirements=[],
+        rewrite_guidance=(
+            "Preserve every operator-approved claim and use exact JD signals only for "
+            "deterministic ordering."
+        ),
+    )
+    _validate_role_strategy(
+        strategy,
+        profile=profile,
+        job_description=job_description,
+    )
+    return strategy
+
+
+def _build_evidence_adoption_trace(
+    *,
+    facts: list[ResumeAtomicFact],
+    raw_strategy: RoleStrategy,
+    selected_strategy: RoleStrategy,
+    entries: dict[str, str],
+    diagnostics: ResumeValidationDiagnostics,
+    summary_rendered: bool,
+) -> tuple[ResumeEvidenceAdoptionTrace, ...]:
+    """Summarize fact adoption without retaining Resume or model-output bodies."""
+
+    raw_fact_ids_by_claim = {
+        rewrite.profile_entry_id: set(rewrite.source_fact_ids)
+        for rewrite in raw_strategy.bullet_rewrites
+    }
+    if raw_strategy.summary_rewrite is not None:
+        raw_fact_ids_by_claim["SUMMARY"] = set(
+            raw_strategy.summary_rewrite.source_fact_ids
+        )
+    proposed_fact_ids = (
+        set().union(*raw_fact_ids_by_claim.values())
+        if raw_fact_ids_by_claim
+        else set()
+    )
+    accepted_fact_ids: set[str] = set()
+    for rewrite in selected_strategy.bullet_rewrites:
+        if rewrite.text != entries[rewrite.profile_entry_id]:
+            accepted_fact_ids.update(rewrite.source_fact_ids)
+    if summary_rendered and selected_strategy.summary_rewrite is not None:
+        accepted_fact_ids.update(selected_strategy.summary_rewrite.source_fact_ids)
+    rejection_codes: dict[str, list[str]] = {}
+    for failure in diagnostics.failures:
+        if failure.claim_id is None:
+            continue
+        for fact_id in raw_fact_ids_by_claim.get(failure.claim_id, set()):
+            rejection_codes.setdefault(fact_id, []).append(failure.rule_code.value)
+    return tuple(
+        ResumeEvidenceAdoptionTrace(
+            fact_id=fact.fact_id,
+            admitted=True,
+            sent_to_model=True,
+            proposed=fact.fact_id in proposed_fact_ids,
+            accepted=fact.fact_id in accepted_fact_ids,
+            rendered=fact.fact_id in accepted_fact_ids,
+            rejection_rule_codes=list(
+                dict.fromkeys(rejection_codes.get(fact.fact_id, []))
+            ),
+        )
+        for fact in facts
+    )
+
+
 def _reorder_project_blocks_by_priority(
     body: ElementTree.Element,
     children: list[ElementTree.Element],
     priority_by_text: dict[str, int],
 ) -> int:
-    bounds = _section_bounds(children, "PROJECT HIGHLIGHTS", "EDUCATION")
+    bounds = _section_bounds(children, "PROJECT HIGHLIGHTS")
     if bounds is None:
         return 0
     start, end = bounds
@@ -1319,7 +1655,7 @@ def _reorder_skill_bullets_by_priority(
     children: list[ElementTree.Element],
     skill_priority: list[str],
 ) -> int:
-    bounds = _section_bounds(children, "TECHNICAL SKILLS", "WORK EXPERIENCE")
+    bounds = _section_bounds(children, "TECHNICAL SKILLS")
     if bounds is None:
         return 0
     start, end = bounds
@@ -1444,6 +1780,8 @@ def tailor_resume_docx_with_gateway(
     template_metadata: ResumeTemplateMetadata | None = None,
     support_upload: ExtractedResumeUpload | None = None,
     candidate_recorder: Callable[[dict[str, object]], None] | None = None,
+    candidate_evidence_pack: CandidateEvidencePack | None = None,
+    output_locale: Literal["en-US", "zh-CN"] = "en-US",
 ) -> TailoredDocx:
     """Use one explicit provider to rank and ground rewrites against approved bullets."""
     if not job_description.strip():
@@ -1453,7 +1791,9 @@ def tailor_resume_docx_with_gateway(
     skills = _profile_skills(profile)
     entry_ids = list(entries)
     skill_ids = list(skills)
-    candidate_evidence_pack = build_candidate_evidence_pack(profile)
+    candidate_evidence_pack = candidate_evidence_pack or build_candidate_evidence_pack(
+        profile
+    )
     atomic_facts = candidate_evidence_pack.atomic_facts
     fact_ids = [item.fact_id for item in atomic_facts]
     summary_paragraphs = [
@@ -1477,6 +1817,7 @@ def tailor_resume_docx_with_gateway(
         support_upload=support_upload,
         output_schema=response_schema,
         candidate_evidence_pack=candidate_evidence_pack,
+        output_locale=output_locale,
     )
     if [
         item.fact_id for item in prepared.payload.candidate_profile.atomic_facts
@@ -1521,7 +1862,19 @@ def tailor_resume_docx_with_gateway(
         "context; do not return or restate them. Unsupported requirements must be exact "
         "quotes from the JD. Preserve every __SS_PRIVATE_*__ placeholder exactly. "
         "The positioning_brief in the user payload is deterministic, read-only targeting "
-        "context. Deterministic hiring signals: "
+        "context. Follow composition_evidence_plan: use primary facts first, then "
+        "secondary facts only when they add a distinct supported component. Do not "
+        "force facts into a requirement with no allocation. Every factual number must "
+        "appear in a cited fact's text, metric, or allowed_numbers. "
+        "Write all editable narrative fields in "
+        + (
+            "natural professional Chinese"
+            if output_locale == "zh-CN"
+            else "natural professional US English"
+        )
+        + ". Keep proper nouns and technical names when translation would reduce precision. "
+        "This is editorial composition from the same immutable FACT identities, not a "
+        "translation of another locale variant. Deterministic hiring signals: "
         + json.dumps(deterministic_signals, ensure_ascii=False)
     )
     model_started = time.perf_counter()
@@ -1574,30 +1927,46 @@ def tailor_resume_docx_with_gateway(
                 diagnostics=None,
             )
         )
+    role_strategy_fallback_applied = False
+    role_strategy_fallback_code: str | None = None
     try:
         strategy, validated_entries, validation_diagnostics = _select_safe_rewrites(
             raw_strategy,
             profile=profile,
             job_description=job_description,
             atomic_facts=atomic_facts,
+            output_locale=output_locale,
         )
     except ResumeTemplateError as error:
-        if candidate_recorder is not None:
-            candidate_recorder(
-                _structured_candidate_artifact(
-                    raw_strategy,
-                    status="REJECTED",
-                    diagnostics=error.validation_diagnostics,
+        if error.validation_diagnostics is None:
+            if candidate_recorder is not None:
+                candidate_recorder(
+                    _structured_candidate_artifact(
+                        raw_strategy,
+                        status="REJECTED",
+                        diagnostics=None,
+                    )
                 )
-            )
-        raise
+            raise
+        strategy = _deterministic_role_strategy_fallback(
+            profile=profile,
+            job_description=job_description,
+        )
+        validated_entries = entries
+        validation_diagnostics = replace(
+            error.validation_diagnostics,
+            validator_status="fallback_pass",
+        )
+        role_strategy_fallback_applied = True
+        role_strategy_fallback_code = "ROLE_STRATEGY_TRUTH_REJECTED"
     if candidate_recorder is not None:
         candidate_recorder(
             _structured_candidate_artifact(
                 raw_strategy,
                 status=(
                     "REJECTED"
-                    if validation_diagnostics.rejected_count
+                    if role_strategy_fallback_applied
+                    or validation_diagnostics.rejected_count
                     else "VALIDATED"
                 ),
                 diagnostics=validation_diagnostics,
@@ -1639,6 +2008,7 @@ def tailor_resume_docx_with_gateway(
             source_text=source_text,
             replacement_text=rewrite_by_id[entry_id],
         )
+    _localize_resume_headings(body, output_locale)
     _remove_trailing_empty_paragraphs(body)
     if len(source_paragraphs) != sum(
         1 for child in body if child.tag == f"{_W}p" and _paragraph_text(child)
@@ -1652,6 +2022,14 @@ def tailor_resume_docx_with_gateway(
                 info, tailored_document if info.filename == _DOCUMENT_PART else content
             )
     output = target.getvalue()
+    evidence_adoption = _build_evidence_adoption_trace(
+        facts=atomic_facts,
+        raw_strategy=raw_strategy,
+        selected_strategy=strategy,
+        entries=entries,
+        diagnostics=validation_diagnostics,
+        summary_rendered=summary_rewritten,
+    )
     return TailoredDocx(
         content=output,
         template_sha256=hashlib.sha256(template).hexdigest(),
@@ -1671,11 +2049,15 @@ def tailor_resume_docx_with_gateway(
         generation_mode="ai",
         provider=gateway.descriptor.provider.value,
         model=gateway.descriptor.model,
+        output_locale=output_locale,
         model_call_profile=model_call_profile,
         validation_diagnostics=validation_diagnostics,
         role_strategy=strategy,
         candidate_evidence_pack=candidate_evidence_pack,
         positioning_brief=positioning_brief,
+        evidence_adoption=evidence_adoption,
+        role_strategy_fallback_applied=role_strategy_fallback_applied,
+        role_strategy_fallback_code=role_strategy_fallback_code,
     )
 
 
@@ -1694,7 +2076,12 @@ def request_resume_expert_review(
         )
     approved_entries = _profile_entries(profile)
     atomic_fact_by_id = {
-        item.fact_id: item for item in build_resume_atomic_facts(profile)
+        item.fact_id: item
+        for item in (
+            tailored.candidate_evidence_pack.atomic_facts
+            if tailored.candidate_evidence_pack is not None
+            else build_resume_atomic_facts(profile)
+        )
     }
     rewrite_by_id = {
         rewrite.profile_entry_id: rewrite for rewrite in strategy.bullet_rewrites
@@ -1796,6 +2183,11 @@ def apply_resume_expert_review(
         reviewed_strategy,
         profile=profile,
         job_description=job_description,
+        atomic_facts=(
+            tailored.candidate_evidence_pack.atomic_facts
+            if tailored.candidate_evidence_pack is not None
+            else None
+        ),
     )
 
     members, document = _read_package(tailored.content)
@@ -1831,6 +2223,8 @@ def apply_resume_expert_review(
         grounded_rewrites=len(reviewed_strategy.bullet_rewrites),
         role_strategy=reviewed_strategy,
         expert_review=review,
+        expert_review_attempted=True,
+        expert_review_skipped_code=None,
         expert_rewrites=len(review.patches),
         expert_provider=expert_provider,
         expert_model=expert_model,

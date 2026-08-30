@@ -73,3 +73,15 @@ python -m build
 - no unrelated changes
 - development record updated
 - remaining risks stated honestly
+
+## Autonomous thread bootstrap
+
+When a thread starts with the SoloScale bootstrap prompt (or says "Execute the
+SoloScale autonomous thread bootstrap"), first read:
+
+- `.codex/SOLOSCALE_AGENT_OPERATING_CONTRACT.md` — the operating contract;
+- `.codex/handoffs/SOLOSCALE_CURRENT_HANDOFF.md` — current branch/HEAD, dirty-work
+  ownership, known issues, and next candidate slices.
+
+Then choose exactly one bounded slice, execute, verify, checkpoint, update the
+handoff, and stop.

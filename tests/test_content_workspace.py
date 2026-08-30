@@ -174,8 +174,8 @@ def test_ready_month_one_story_produces_grounded_multiformat_bundle(
     run = run_content_workspace(data_root=tmp_path / ".soloscale", brief=brief)
     run_dir = tmp_path / ".soloscale" / "content-runs" / run.run_id
     assert (run_dir / "20_youtube_script.md").is_file()
-    assert "CLAIM-01" in run.drafts.youtube_script
-    assert "CLAIM-08" in run.drafts.youtube_script
+    assert "CLAIM-" not in run.drafts.youtube_script
+    assert "VERIFIED · CLAIM" not in run.drafts.youtube_script
 
     with pytest.raises(ContentCanonError, match="needs evidence or owner input"):
         content_brief_from_month_one_story("M1-23", language="中文")
@@ -237,14 +237,14 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
     x_thread = (run_dir / "03_x_thread.md").read_text(encoding="utf-8")
     video = (run_dir / "04_video_script.md").read_text(encoding="utf-8")
     verification = json.loads((run_dir / "08_verification.json").read_text())
-    assert "CLAIM-01" in linkedin
+    assert "CLAIM-" not in linkedin
     assert (run_dir / "15_canonical_story.md").is_file()
     assert (run_dir / "16_blog.md").is_file()
     assert run.drafts.x_post.strip() == (run_dir / "03_x_post.md").read_text().strip()
     assert 60 <= run.drafts.storyboard[-1].end_second <= 120
     assert "This does not prove production readiness" in linkedin
     assert "1/5" in x_thread
-    assert "Claim anchors: CLAIM-01" in video
+    assert "Claim anchors" not in video
     assert run.locale_variant is not None
     assert verification == {
         "claim_count": 3,
@@ -254,15 +254,21 @@ def test_content_workspace_writes_private_reviewable_multichannel_pack(
         "evidence_bundle_used": False,
         "evidence_gap_count": 0,
         "evidence_item_count": 0,
+        "execution_state": "AI_NOT_EXECUTED",
         "fact_contract_sha256": run.locale_variant.fact_contract_sha256,
+        "fallback_used": False,
+        "latency_ms": None,
         "locale": "en-US",
+        "model_calls": 0,
         "model_used": False,
         "network_used": False,
         "private_path_scan_passed": True,
         "publication_performed": False,
         "status": "PASS",
+        "token_usage": None,
         "verified_and_observed_have_receipts": True,
         "variant_group_id": run.locale_variant.variant_group_id,
+        "cost_usd": None,
     }
 
     loaded = load_content_run(data_root, run.run_id)
@@ -333,9 +339,9 @@ def test_content_workspace_uses_local_ollama_and_rejects_unanchored_output(
     )
     for claim in brief.claims:
         marker = f"{claim.status.value} · {claim.id}"
-        assert marker in repaired.drafts.linkedin
-        assert marker in "\n".join(repaired.drafts.x_thread)
-        assert marker in repaired.drafts.video_script
+        assert marker not in repaired.drafts.linkedin
+        assert marker not in "\n".join(repaired.drafts.x_thread)
+        assert marker not in repaired.drafts.video_script
     assert all(
         post.startswith(f"{index}/{len(repaired.drafts.x_thread)} ")
         for index, post in enumerate(repaired.drafts.x_thread, start=1)
@@ -661,7 +667,8 @@ def test_distribution_package_requires_approval_and_seals_exact_media(
     assert package["variant_group_id"].startswith("fact-contract:")
     assert package["review_revision"] == review.revision
     assert package["media_quality_review"]["revision"] == quality.revision  # type: ignore[index]
-    assert package["channels"]["youtube"]["direct_upload_enabled"] is False  # type: ignore[index]
+    assert package["channels"]["youtube"]["direct_upload_enabled"] is True  # type: ignore[index]
+    assert package["channels"]["youtube"]["adapter"] == "youtube-data-api-v3"  # type: ignore[index]
     artifacts = package["artifacts"]
     assert artifacts["video"]["filename"] == "21_creator_video_youtube.mp4"  # type: ignore[index]
     assert artifacts["video"]["download_path"].endswith("/youtube-video.mp4")  # type: ignore[index]
@@ -793,3 +800,59 @@ def test_content_review_is_versioned_and_regenerates_only_one_adaptation(
         for path in review_dirs
         for artifact in path.iterdir()
     )
+
+
+def test_public_projections_strip_internal_provenance_labels(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    brief = ContentBrief(
+        topic="A grounded engineering story",
+        audience="AI engineers",
+        language="English",
+        call_to_action="Share a similar trade-off.",
+        source_label="git:abc123",
+        claims=[
+            ContentClaim(
+                id="CLAIM-01",
+                text="A focused test passed.",
+                status=ClaimStatus.VERIFIED,
+                receipt="git:abc123",
+                limits="This does not prove production readiness.",
+            ),
+            ContentClaim(
+                id="CLAIM-02",
+                text="I observed this behavior.",
+                status=ClaimStatus.OBSERVED,
+                receipt="git:abc123",
+                limits="Keep this local.",
+            ),
+        ],
+    )
+    run = run_content_workspace(data_root=data_root, brief=brief)
+    public_blob = "\n".join(
+        [
+            run.drafts.linkedin,
+            run.drafts.x_post,
+            "\n".join(run.drafts.x_thread),
+            run.drafts.canonical_story,
+            run.drafts.blog,
+            run.drafts.youtube_script,
+            run.drafts.video_script,
+            *[scene.on_screen_text for scene in run.drafts.storyboard],
+            *[scene.voiceover for scene in run.drafts.storyboard],
+            *[scene.purpose for scene in run.drafts.storyboard],
+        ]
+    )
+    for banned in (
+        "VERIFIED",
+        "OBSERVED",
+        "HYPOTHESIS",
+        "PLANNED",
+        "CLAIM-",
+        "Limit:",
+        "Facts source:",
+        "Reference pattern applied:",
+        "Explicit boundaries:",
+        "Evidence map",
+        "Proof links:",
+    ):
+        assert banned not in public_blob, banned

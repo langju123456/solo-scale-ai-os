@@ -4,13 +4,20 @@
 from __future__ import annotations
 
 import html
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from soloscale.evidence_hub import EvidenceHub
-from soloscale.evidence_hub_models import EvidenceHubStatus, SyncReceipt
+from soloscale.evidence_hub import EvidenceHub, EvidenceHubError, inspect_git_repository
+from soloscale.evidence_hub_models import EvidenceHubStatus, ReceiptStatus, SyncReceipt
 from soloscale.knowledge_store import KnowledgeStore
-from soloscale.ui_shell import DEFAULT_UI_LOCALE, UILocale, render_app_shell, ui_text
+from soloscale.ui_shell import (
+    DEFAULT_UI_LOCALE,
+    UILocale,
+    render_app_shell,
+    ui_display_value,
+    ui_text,
+)
 
 
 def refresh_evidence_catalog(
@@ -33,6 +40,50 @@ def refresh_evidence_catalog(
         buildlog_roots=selected_buildlog_roots,
         git_root=repository_root,
     )
+
+
+def refresh_local_project_evidence(
+    data_root: Path,
+    *,
+    repository_root: Path,
+) -> SyncReceipt:
+    """Incrementally refresh only the Git project explicitly selected by the user."""
+
+    return EvidenceHub(Path(data_root)).sync_git_repository(repository_root)
+
+
+def ensure_local_project_evidence(
+    data_root: Path,
+    *,
+    repository_root: Path,
+    timing: Callable[[str, int], None] | None = None,
+) -> bool:
+    """Refresh a selected project only when its deterministic fingerprint changed."""
+
+    root = Path(data_root)
+    freshness_started = time.perf_counter()
+    current_source, current_items = inspect_git_repository(repository_root)
+    if timing is not None:
+        timing(
+            "freshness_check_ms",
+            int((time.perf_counter() - freshness_started) * 1000),
+        )
+    if EvidenceHub.catalog_exists(root):
+        stored = EvidenceHub(root).git_repository_snapshot(repository_root)
+        if stored is not None and stored[0].content_sha256 == current_source.content_sha256:
+            if timing is not None:
+                timing("local_git_refresh_ms", 0)
+            return False
+    refresh_started = time.perf_counter()
+    receipt = EvidenceHub(root).sync_source(current_source, items=current_items)
+    if timing is not None:
+        timing(
+            "local_git_refresh_ms",
+            int((time.perf_counter() - refresh_started) * 1000),
+        )
+    if receipt.status is not ReceiptStatus.SUCCEEDED:
+        raise EvidenceHubError("local project evidence refresh failed")
+    return True
 
 
 def evidence_page(
@@ -108,38 +159,42 @@ def _status_html(
             f'{html.escape(ui_text(locale, "刷新证据目录。", "Refresh evidence catalog."))}</p></section>'
         )
     counts = [
-        ("Sources", status.source_count),
-        ("Evidence", status.evidence_count),
-        ("Bundles", status.bundle_count),
-        ("Cases", status.case_count),
-        ("Assets", status.asset_count),
-        ("Outcomes", status.outcome_count),
+        (ui_text(locale, "来源", "Sources"), status.source_count),
+        (ui_text(locale, "证据", "Evidence"), status.evidence_count),
+        (ui_text(locale, "证据包", "Bundles"), status.bundle_count),
+        (ui_text(locale, "案例", "Cases"), status.case_count),
+        (ui_text(locale, "资产", "Assets"), status.asset_count),
+        (ui_text(locale, "结果", "Outcomes"), status.outcome_count),
     ]
     truth_counts = "".join(
-        f"<li>{html.escape(key)}: {value}</li>"
+        f"<li>{html.escape(ui_display_value(locale, key))}: {value}</li>"
         for key, value in sorted(status.truth_class_counts.items())
-    ) or "<li>None</li>"
+    ) or f"<li>{html.escape(ui_text(locale, '无', 'None'))}</li>"
     source_counts = "".join(
-        f"<li>{html.escape(key)}: {value}</li>"
+        f"<li>{html.escape(ui_display_value(locale, key))}: {value}</li>"
         for key, value in sorted(status.source_counts.items())
-    ) or "<li>None</li>"
-    last_refresh = status.last_receipt.completed_at.isoformat() if status.last_receipt else "Never"
+    ) or f"<li>{html.escape(ui_text(locale, '无', 'None'))}</li>"
+    last_refresh = (
+        status.last_receipt.completed_at.isoformat()
+        if status.last_receipt
+        else ui_text(locale, "从未", "Never")
+    )
     next_action = (
-        "Review the failed refresh, then refresh evidence catalog."
+        ui_text(locale, "查看刷新失败原因，再次刷新证据目录。", "Review the failed refresh, then refresh evidence catalog.")
         if status.last_receipt and status.last_receipt.status.value == "failed"
-        else "Refresh evidence catalog after adding sources."
+        else ui_text(locale, "添加来源后刷新证据目录。", "Refresh evidence catalog after adding sources.")
         if status.source_count == 0
-        else "Review evidence metadata before creating a bundle."
+        else ui_text(locale, "创建证据包前先检查证据元数据。", "Review evidence metadata before creating a bundle.")
     )
     metrics = "".join(
         f"<div class=\"metric\"><small>{label}</small><br><strong>{value}</strong></div>"
         for label, value in counts
     )
-    return f"""<section class=\"panel\"><h2>Catalog status</h2>
-<p>Last refresh: {html.escape(last_refresh)}</p><div class=\"grid\">{metrics}</div>
-<h3>Source types</h3><ul>{source_counts}</ul>
-<h3>Truth classes</h3><ul>{truth_counts}</ul>
-<p><strong>Next action:</strong> {html.escape(next_action)}</p></section>"""
+    return f"""<section class=\"panel\"><h2>{html.escape(ui_text(locale, '目录状态', 'Catalog status'))}</h2>
+<p>{html.escape(ui_text(locale, '上次刷新：', 'Last refresh:'))} {html.escape(last_refresh)}</p><div class=\"grid\">{metrics}</div>
+<h3>{html.escape(ui_text(locale, '来源类型', 'Source types'))}</h3><ul>{source_counts}</ul>
+<h3>{html.escape(ui_text(locale, '事实分类', 'Truth classes'))}</h3><ul>{truth_counts}</ul>
+<p><strong>{html.escape(ui_text(locale, '下一步：', 'Next action:'))}</strong> {html.escape(next_action)}</p></section>"""
 
 
 def _list_html(

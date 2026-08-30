@@ -117,10 +117,10 @@ def test_reference_pattern_guides_a_private_original_video_script(
 
     assert run.network_used is False
     assert run.model_used is False
-    assert "Reference pattern applied: contrarian contrast" in run.drafts.video_script
-    assert "operator claim ledger only" in run.drafts.video_script
+    assert "Reference pattern applied:" not in run.drafts.video_script
+    assert "Facts source:" not in run.drafts.video_script
     assert "screen recording" in run.drafts.storyboard[0].visual
-    assert "CLAIM-01" in run.drafts.video_script
+    assert "CLAIM-" not in run.drafts.video_script
     assert _DISTINCTIVE_REFERENCE_PHRASE not in run.drafts.video_script
     assert (run_dir / "17_reference_asset.json").stat().st_mode & 0o777 == 0o600
     assert (run_dir / "18_content_pattern.json").stat().st_mode & 0o777 == 0o600

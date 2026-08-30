@@ -24,16 +24,21 @@ from soloscale.learning_models import (
     MasteryAction,
     MasteryLevel,
     MasteryState,
+    OwnershipConfidence,
     ReasoningArtifact,
     SourceRecord,
     TechnicalConcept,
+    TruthStage,
     VerificationAnchor,
 )
 from soloscale.learning_traceability import (
     ARTIFACT_FILES,
     CASE_ID,
+    LearningFixtureAnchorError,
     LearningTraceabilityError,
+    inspect_learning_project,
     load_interview_anchor_pack,
+    missing_learning_case_anchors,
     run_learning_traceability,
     save_learning_response,
 )
@@ -98,6 +103,55 @@ def test_required_contracts_are_public_and_mastery_is_separate() -> None:
             interview_ready=True,
         )
 
+    claim_ready_without_mastery = ClaimEligibility(
+        case_id=CASE_ID,
+        target_requirement="Build retrieval systems for AI context and memory.",
+        engineering_truth_stage=TruthStage.APPROVED_CLAIM,
+        ownership_confidence=OwnershipConfidence.CONFIRMED,
+        mastery_level=MasteryLevel.L0_SEEN,
+        interview_ready=False,
+        resume_eligible=True,
+        approved_claim="Implemented bounded retrieval with stable chunk identity.",
+        safe_verbs=["Implemented"],
+        prohibited_phrasing=[],
+        rationale="Truth and ownership are proven; personal mastery remains unproven.",
+    )
+    assert claim_ready_without_mastery.resume_eligible is True
+    assert claim_ready_without_mastery.interview_ready is False
+
+    with pytest.raises(
+        ValidationError,
+        match="resume_eligible must match truth and ownership gates",
+    ):
+        ClaimEligibility(
+            case_id=CASE_ID,
+            target_requirement="Build retrieval systems for AI context and memory.",
+            engineering_truth_stage=TruthStage.APPROVED_CLAIM,
+            ownership_confidence=OwnershipConfidence.UNKNOWN,
+            mastery_level=MasteryLevel.L5_DEFEND,
+            interview_ready=True,
+            resume_eligible=True,
+            approved_claim="Implemented bounded retrieval.",
+            safe_verbs=["Implemented"],
+            prohibited_phrasing=[],
+            rationale="Mastery alone cannot prove personal ownership.",
+        )
+
+    with pytest.raises(ValidationError, match="interview_ready requires L5 Defend"):
+        ClaimEligibility(
+            case_id=CASE_ID,
+            target_requirement="Build retrieval systems for AI context and memory.",
+            engineering_truth_stage=TruthStage.VERIFIED_EVIDENCE,
+            ownership_confidence=OwnershipConfidence.UNKNOWN,
+            mastery_level=MasteryLevel.L0_SEEN,
+            interview_ready=True,
+            resume_eligible=False,
+            approved_claim=None,
+            safe_verbs=[],
+            prohibited_phrasing=[],
+            rationale="Interview readiness cannot exist at L0.",
+        )
+
 
 def test_repository_identity_accepts_only_verified_detached_github_ref(
     monkeypatch: pytest.MonkeyPatch,
@@ -135,6 +189,8 @@ def test_golden_case_writes_private_grounded_traceability_packet(tmp_path: Path)
     run_dir = Path(run.private_run_path)
 
     assert run.case_id == CASE_ID
+    assert run.case_kind == "SEED_CASE"
+    assert run.project_source_id.startswith("source-")
     assert run.branch == _expected_repository_ref()
     assert run.commit == _git("rev-parse", "HEAD")
     assert run.engineering_state == "ENGINEERING_VERIFIED"
@@ -157,6 +213,8 @@ def test_golden_case_writes_private_grounded_traceability_packet(tmp_path: Path)
     ]
     input_payload = _read_json(run_dir / "00_input.json")
     assert input_payload["private_source_bodies_read"] is False
+    assert input_payload["project_binding"]["project_source_id"] == run.project_source_id
+    assert case["project_binding"]["project_source_id"] == run.project_source_id
 
     anchors = _read_json(run_dir / "03_code_anchors.json")
     code_anchors = anchors["code_anchors"]
@@ -208,10 +266,55 @@ def test_golden_case_writes_private_grounded_traceability_packet(tmp_path: Path)
     assert mastery["interview_ready"] is False
     assert claim["engineering_truth_stage"] == "VERIFIED_EVIDENCE"
     assert claim["resume_eligible"] is False
+    assert claim["interview_ready"] is False
     assert claim["approved_claim"] is None
+    assert "personal contribution is not proven" in claim["rationale"]
+    assert "personal contribution and L5" not in claim["rationale"]
     assert verification["tests_executed_by_learning_run"] is False
     assert verification["approved_claim_created"] is False
     assert EvidenceHub(data_root).status().asset_count == len(ARTIFACT_FILES)
+
+
+@pytest.mark.parametrize("filename", ["main.py", "package.json"])
+def test_generic_git_project_is_accepted_but_seed_case_owns_its_anchors(
+    tmp_path: Path, filename: str
+) -> None:
+    repository = tmp_path / filename.replace(".", "-")
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repository, check=True)
+    (repository / filename).write_text("project evidence\n", encoding="utf-8")
+    subprocess.run(["git", "add", filename], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "project evidence",
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    binding = inspect_learning_project(repository)
+
+    assert binding.commit == subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert binding.branch == "main"
+    assert "src/soloscale/knowledge_store.py" in missing_learning_case_anchors(
+        repository
+    )
+    with pytest.raises(LearningFixtureAnchorError):
+        run_learning_traceability(data_root=tmp_path / "data", repository_root=repository)
 
 
 def test_learning_material_is_cached_by_evidence_hash(tmp_path: Path) -> None:

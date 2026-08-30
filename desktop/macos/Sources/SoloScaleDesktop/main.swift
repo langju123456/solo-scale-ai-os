@@ -16,13 +16,16 @@ private enum StartupDestination {
     case home
     case workProjectConnected
     case workChatGPTSelected
+    case workGitHubConnected
+    case workGitHubDisconnected
     case aiSettings(String?)
     case heyGenSettings(String?)
 
     var path: String {
         switch self {
         case .home: "/"
-        case .workProjectConnected, .workChatGPTSelected: "/work"
+        case .workProjectConnected, .workChatGPTSelected, .workGitHubDisconnected: "/work"
+        case .workGitHubConnected: "/work/github"
         case .aiSettings: "/settings/ai/openai"
         case .heyGenSettings: "/settings/media/heygen"
         }
@@ -33,6 +36,8 @@ private enum StartupDestination {
         case .home: nil
         case .workProjectConnected: "project-connected"
         case .workChatGPTSelected: "chatgpt-selected"
+        case .workGitHubDisconnected: "github-disconnected"
+        case .workGitHubConnected: nil
         case .aiSettings, .heyGenSettings: nil
         }
     }
@@ -45,7 +50,6 @@ private enum StartupDestination {
         return components.queryItems ?? []
     }
 }
-private let repositoryPreferenceKey = "SoloScaleRepositoryRoot"
 private let workspacePreferenceKey = "SoloScaleWorkspaceRoot"
 private let localePreferenceKey = "SoloScaleUILocale"
 private let releasesURL = URL(
@@ -110,6 +114,10 @@ private final class BackendController: NSObject, ObservableObject {
             if let selectedExport = pendingChatGPTExport {
                 desktopEnvironment["SOLOSCALE_PENDING_CHATGPT_EXPORT"] = selectedExport.path
             }
+            if githubAppClientID() != nil {
+                desktopEnvironment["SOLOSCALE_GITHUB_CONNECT_AVAILABLE"] = "1"
+                desktopEnvironment["SOLOSCALE_GITHUB_NATIVE_AVAILABLE"] = "1"
+            }
             process.environment = ProcessInfo.processInfo.environment.merging(
                 desktopEnvironment
             ) { _, new in new }
@@ -126,6 +134,7 @@ private final class BackendController: NSObject, ObservableObject {
                 try credentialWriter.write(
                     desktopCredentialEnvelopeFrame(
                         openAIKey: try DesktopOpenAIKeychain.read(),
+                        githubAccessToken: try DesktopGitHubKeychain.read(),
                         heygenAPIKey: try DesktopHeyGenKeychain.read()
                     )
                 )
@@ -163,30 +172,79 @@ private final class BackendController: NSObject, ObservableObject {
         try DesktopHeyGenKeychain.delete()
         restart(destination: .heyGenSettings(whitelistedHeyGenSettingsReturnPath(returnPath)))
     }
-    func failWebSession(_ message: String) { failStart(message) }
-    func chooseRepository() {
-        let panel = NSOpenPanel()
-        panel.title = "Choose a SoloScale source checkout"
-        panel.prompt = "Choose"
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let selected = panel.url else { return }
-        guard isSupportedRepository(selected) else {
-            let alert = NSAlert()
-            alert.alertStyle = .warning
-            alert.messageText = "This is not a supported SoloScale checkout"
-            alert.informativeText = "Choose a Git checkout containing pyproject.toml and src/soloscale/knowledge_store.py."
-            alert.runModal()
+    func connectGitHub() {
+        guard let clientID = githubAppClientID() else {
+            showGitHubAlert(
+                title: "GitHub Connect is not configured",
+                detail: "This build does not include a GitHub App client ID."
+            )
             return
         }
-        UserDefaults.standard.set(selected.path, forKey: repositoryPreferenceKey)
-        restart()
+        let flow = GitHubDeviceFlowClient()
+        flow.requestAuthorization(clientID: clientID) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .failure(let error):
+                    self.showGitHubAlert(
+                        title: "SoloScale could not connect GitHub",
+                        detail: error.localizedDescription
+                    )
+                case .success(let authorization):
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(
+                        authorization.userCode,
+                        forType: .string
+                    )
+                    NSWorkspace.shared.open(authorization.verificationURL)
+                    let alert = NSAlert()
+                    alert.alertStyle = .informational
+                    alert.messageText = "Authorize SoloScale on GitHub"
+                    alert.informativeText = "Code \(authorization.userCode) was copied. Complete GitHub authorization in your browser, then return here."
+                    alert.addButton(withTitle: "I authorized SoloScale")
+                    alert.addButton(withTitle: "Cancel")
+                    guard alert.runModal() == .alertFirstButtonReturn else { return }
+                    flow.pollForToken(
+                        clientID: clientID,
+                        authorization: authorization
+                    ) { [weak self] tokenResult in
+                        DispatchQueue.main.async {
+                            guard let self else { return }
+                            do {
+                                let token = try tokenResult.get()
+                                try DesktopGitHubKeychain.save(token)
+                                self.restart(destination: .workGitHubConnected)
+                            } catch {
+                                self.showGitHubAlert(
+                                    title: "SoloScale could not connect GitHub",
+                                    detail: error.localizedDescription
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
-    func forgetRepository() {
-        UserDefaults.standard.removeObject(forKey: repositoryPreferenceKey)
-        restart()
+    func disconnectGitHub() {
+        do {
+            try DesktopGitHubKeychain.delete()
+            let support = try applicationSupportDirectory()
+            let state = support
+                .appendingPathComponent("github", isDirectory: true)
+                .appendingPathComponent("connection.json", isDirectory: false)
+            if FileManager.default.fileExists(atPath: state.path) {
+                try FileManager.default.removeItem(at: state)
+            }
+            restart(destination: .workGitHubDisconnected)
+        } catch {
+            showGitHubAlert(
+                title: "SoloScale could not disconnect GitHub",
+                detail: error.localizedDescription
+            )
+        }
     }
+    func failWebSession(_ message: String) { failStart(message) }
     func chooseWorkRepository() {
         let panel = NSOpenPanel()
         panel.title = "Choose a local Git project"
@@ -416,9 +474,7 @@ private final class BackendController: NSObject, ObservableObject {
            !environmentRoot.isEmpty {
             return environmentRoot
         }
-        guard let stored = UserDefaults.standard.string(forKey: repositoryPreferenceKey),
-              isSupportedRepository(URL(fileURLWithPath: stored)) else { return nil }
-        return stored
+        return nil
     }
     private func configuredWorkspaceRoot() -> String? {
         if let environmentRoot = ProcessInfo.processInfo.environment["SOLOSCALE_WORKSPACE_ROOT"],
@@ -430,16 +486,18 @@ private final class BackendController: NSObject, ObservableObject {
               isRegularLocalGitRepository(URL(fileURLWithPath: stored)) else { return nil }
         return stored
     }
-    private func isSupportedRepository(_ root: URL) -> Bool {
-        let manager = FileManager.default
-        return manager.fileExists(atPath: root.appendingPathComponent(".git").path)
-            && manager.fileExists(atPath: root.appendingPathComponent("pyproject.toml").path)
-            && manager.fileExists(
-                atPath: root
-                    .appendingPathComponent("src")
-                    .appendingPathComponent("soloscale")
-                    .appendingPathComponent("knowledge_store.py").path
-            )
+    private func githubAppClientID() -> String? {
+        guard let raw = Bundle.main.object(
+            forInfoDictionaryKey: "SoloScaleGitHubAppClientID"
+        ) as? String else { return nil }
+        return validatedGitHubAppClientID(raw)
+    }
+    private func showGitHubAlert(title: String, detail: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = detail
+        alert.runModal()
     }
     private func isRegularLocalGitRepository(_ root: URL) -> Bool {
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
@@ -600,12 +658,14 @@ private struct LocalWebView: NSViewRepresentable {
                 decisionHandler(.cancel)
                 DispatchQueue.main.async { [weak self] in
                     switch components.host {
-                    case "choose-source-checkout":
-                        self?.backend.chooseRepository()
                     case "choose-work-repository":
                         self?.backend.chooseWorkRepository()
                     case "choose-chatgpt-export":
                         self?.backend.chooseChatGPTExport()
+                    case "connect-github":
+                        self?.backend.connectGitHub()
+                    case "disconnect-github":
+                        self?.backend.disconnectGitHub()
                     default:
                         break
                     }
@@ -754,16 +814,8 @@ private struct LocalWebView: NSViewRepresentable {
             panel.prompt = "Choose"
             panel.allowsMultipleSelection = parameters.allowsMultipleSelection
             panel.canChooseDirectories = parameters.allowsDirectories
-            panel.canChooseFiles = !parameters.allowsDirectories
-            if panel.canChooseFiles {
-                panel.allowedContentTypes = [
-                    UTType(filenameExtension: "docx"),
-                    UTType.pdf,
-                    UTType.plainText,
-                    UTType(filenameExtension: "md"),
-                    UTType.mpeg4Movie,
-                ].compactMap { $0 }
-            }
+            panel.canChooseFiles = true
+            panel.allowsOtherFileTypes = true
             completionHandler(panel.runModal() == .OK ? panel.urls : nil)
         }
     }
@@ -786,13 +838,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
                 CommandMenu("Project") {
-                    Button("Choose SoloScale Source Checkout…") {
-                        appDelegate.backend.chooseRepository()
-                    }
-                    Button("Forget Source Checkout") {
-                        appDelegate.backend.forgetRepository()
-                    }
-                    Divider()
                     Button("Choose Work Project…") {
                         appDelegate.backend.chooseWorkRepository()
                     }

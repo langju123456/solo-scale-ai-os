@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from soloscale.content_workspace import load_content_run
 from soloscale.resume_workspace import (
     _atomic_private_write,
     _ensure_private_directory,
@@ -61,7 +62,7 @@ class _StrictModel(BaseModel):
 
 class VideoStoryEvidence(_StrictModel):
     evidence_id: str
-    kind: Literal["git_commit", "resume_run_receipt"]
+    kind: Literal["git_commit", "resume_run_receipt", "content_claim"]
     locator: str
     sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
     verified_facts: list[str]
@@ -89,6 +90,7 @@ class EngineeringStoryScene(_StrictModel):
         "metrics",
         "bottleneck",
         "evolution",
+        "content",
     ]
     voiceover: str
     on_screen_text: str
@@ -100,19 +102,20 @@ class EngineeringStory(_StrictModel):
     story_id: str
     title: str
     subtitle: str
-    language: Literal["zh-CN"] = "zh-CN"
+    language: Literal["zh-CN", "en-US"] = "zh-CN"
     width: Literal[1080] = 1080
     height: Literal[1920] = 1920
     fps: Literal[30] = 30
-    duration_seconds: int = Field(ge=70, le=90)
+    duration_seconds: int = Field(ge=10, le=180)
     layers: SixLayerStory
     evidence: list[VideoStoryEvidence]
-    scenes: list[EngineeringStoryScene] = Field(min_length=7, max_length=7)
+    scenes: list[EngineeringStoryScene] = Field(min_length=1, max_length=12)
 
 
 class LocalVideoJobRecord(_StrictModel):
     job_id: str
     story_id: str
+    content_run_id: str | None = None
     phase: VideoStoryPhase
     created_at: str
     updated_at: str
@@ -411,6 +414,63 @@ def build_resume_latency_story(*, data_root: Path, repository_root: Path) -> Eng
     )
 
 
+def build_content_run_story(*, data_root: Path, content_run_id: str) -> EngineeringStory:
+    """Build one local render blueprint from an existing ContentProject run.
+
+    Facts are consumed from the canonical ContentRun (claims, storyboard, and
+    evidence references) instead of being re-entered by a second video product.
+    """
+
+    run = load_content_run(data_root, content_run_id)
+    scenes: list[EngineeringStoryScene] = []
+    for index, scene in enumerate(run.drafts.storyboard, start=1):
+        scenes.append(
+            EngineeringStoryScene(
+                id=f"SCENE-{index:02d}",
+                start_second=scene.start_second,
+                end_second=scene.end_second,
+                purpose=scene.purpose,
+                visual_kind="content",
+                voiceover=scene.voiceover,
+                on_screen_text=scene.on_screen_text,
+                detail_lines=[line for line in (scene.visual, scene.purpose) if line],
+                evidence_ids=scene.claim_ids,
+            )
+        )
+    if not scenes:
+        raise VideoStoryError("Content run has no storyboard scenes to render")
+    duration_seconds = max(10, min(180, int(scenes[-1].end_second)))
+    evidence = [
+        VideoStoryEvidence(
+            evidence_id=claim.id,
+            kind="content_claim",
+            locator=f"run:{run.run_id}:claim:{claim.id}",
+            sha256=hashlib.sha256(claim.text.encode("utf-8")).hexdigest(),
+            verified_facts=[claim.text],
+        )
+        for claim in run.brief.claims
+    ]
+    canonical_preview = " ".join(run.drafts.canonical_story.split())
+    layers = SixLayerStory(
+        fact="; ".join(claim.text for claim in run.brief.claims),
+        architecture="Canonical ContentProject narrative consumed downstream.",
+        decision="Facts and storyboard stay owned by the ContentProject.",
+        implementation="Local Remotion renders this run's video script and storyboard.",
+        failure_and_surprise="No second story entry; video is a downstream projection.",
+        evolution="Rendered artifacts flow to the Publish Queue with trace receipts.",
+    )
+    return EngineeringStory(
+        story_id=f"content-{run.run_id}",
+        title=run.brief.topic,
+        subtitle=canonical_preview[:200],
+        language="en-US" if run.brief.language == "English" else "zh-CN",
+        duration_seconds=duration_seconds,
+        layers=layers,
+        evidence=evidence,
+        scenes=scenes,
+    )
+
+
 def _srt_timestamp(seconds: int) -> str:
     hours, remainder = divmod(seconds, 3600)
     minutes, secs = divmod(remainder, 60)
@@ -664,14 +724,25 @@ class LocalVideoJobManager:
         self._jobs: dict[str, _LiveVideoJob] = {}
         self._max_retained_jobs = max(1, max_retained_jobs)
 
-    def submit(self, *, data_root: Path, repository_root: Path) -> str:
+    def submit(
+        self,
+        *,
+        data_root: Path,
+        repository_root: Path,
+        content_run_id: str | None = None,
+    ) -> str:
         now = datetime.now(UTC)
         job_id = f"video-story-{now.strftime('%Y%m%dT%H%M%SZ')}-{uuid4().hex[:10]}"
         job_dir = local_video_job_directory(data_root, job_id)
         _ensure_private_directory(job_dir, parents=True)
         record = LocalVideoJobRecord(
             job_id=job_id,
-            story_id=_STORY_ID,
+            story_id=(
+                f"content-{content_run_id}"
+                if content_run_id is not None
+                else _STORY_ID
+            ),
+            content_run_id=content_run_id,
             phase="QUEUED",
             created_at=now.isoformat(),
             updated_at=now.isoformat(),
@@ -685,7 +756,9 @@ class LocalVideoJobManager:
         with self._lock:
             self._prune_locked()
             self._jobs[job_id] = live
-        self._executor.submit(self._execute, data_root, repository_root, job_id)
+        self._executor.submit(
+            self._execute, data_root, repository_root, job_id, content_run_id
+        )
         return job_id
 
     def get(self, data_root: Path, job_id: str) -> LocalVideoJobSnapshot | None:
@@ -745,11 +818,25 @@ class LocalVideoJobManager:
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def _execute(self, data_root: Path, repository_root: Path, job_id: str) -> None:
+    def _execute(
+        self,
+        data_root: Path,
+        repository_root: Path,
+        job_id: str,
+        content_run_id: str | None,
+    ) -> None:
         try:
             self._transition(data_root, job_id, "PREPARING_STORY")
             story_started = time.perf_counter()
-            story = build_resume_latency_story(data_root=data_root, repository_root=repository_root)
+            story = (
+                build_content_run_story(
+                    data_root=data_root, content_run_id=content_run_id
+                )
+                if content_run_id is not None
+                else build_resume_latency_story(
+                    data_root=data_root, repository_root=repository_root
+                )
+            )
             job_dir = local_video_job_directory(data_root, job_id)
             _write_story_sources(job_dir, story)
             self._record_timing(data_root, job_id, "story_ms", story_started)

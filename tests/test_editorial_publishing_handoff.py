@@ -14,6 +14,9 @@ from soloscale.editorial_publishing_handoff import (
     preview_editorial_day,
     publish_editorial_preview,
 )
+from soloscale.platform_accounts import ConnectedIdentity, save_connected_identity
+
+_X_ACCOUNT_REFERENCE = hashlib.sha256(b"123").hexdigest()[:20]
 
 
 def _png() -> bytes:
@@ -55,6 +58,23 @@ def _sealed_day(tmp_path: Path, *, x_thread: str = "1/2 First\n\nline\n\n2/2 Sec
     return day
 
 
+def _connect_x(data_root: Path) -> None:
+    save_connected_identity(
+        data_root,
+        ConnectedIdentity(
+            platform="x",
+            external_account_id="123",
+            display_name="Solo Builder",
+            handle="solo_builder",
+            avatar_url=None,
+            scopes=("tweet.read", "users.read", "tweet.write", "offline.access"),
+            token_reference="pending",
+            connected_at="2026-08-28T00:00:00+00:00",
+        ),
+        token_payload={"access_token": "synthetic"},
+    )
+
+
 class _Gateway:
     def __init__(self) -> None:
         self.published: dict[str, object] | None = None
@@ -69,7 +89,7 @@ class _Gateway:
         return SimpleNamespace(
             plan_id=plan_id,
             plan_hash="a" * 64,
-            account_reference="x:user:123",
+            account_reference=_X_ACCOUNT_REFERENCE,
             account_display_name="Solo Builder",
             parts=["1/2 First\n\nline", "2/2 Second"],
             image=SimpleNamespace(
@@ -83,7 +103,7 @@ class _Gateway:
     def publish(self, plan_id: str, **kwargs: object) -> SimpleNamespace:
         self.published = {"plan_id": plan_id, **kwargs}
         return SimpleNamespace(
-            plan_id=plan_id, plan_hash="a" * 64, platform="x", account_reference="x:user:123",
+            plan_id=plan_id, plan_hash="a" * 64, platform="x", account_reference=_X_ACCOUNT_REFERENCE,
             post_receipt_ids=["receipt-1", "receipt-2"], external_post_ids=["post-1", "post-2"],
             status="succeeded",
         )
@@ -96,6 +116,7 @@ def test_editorial_day_handoff_preserves_sealed_package_and_uses_server_preview(
     original = {path: path.read_bytes() for path in day.rglob("*") if path.is_file()}
     gateway = _Gateway()
     monkeypatch.setattr("soloscale.editorial_publishing_handoff._gateway", lambda *_: gateway)
+    _connect_x(tmp_path / ".soloscale")
 
     preview = preview_editorial_day(data_root=tmp_path / ".soloscale", day_directory=day, channel="x")
     result = publish_editorial_preview(data_root=tmp_path / ".soloscale", channel="x", confirmation="PUBLISH")
@@ -106,7 +127,7 @@ def test_editorial_day_handoff_preserves_sealed_package_and_uses_server_preview(
     assert result["status"] == "succeeded"
     assert gateway.published == {
         "plan_id": "plan-1", "confirmation": "PUBLISH", "approved_plan_hash": "a" * 64,
-        "approved_account_reference": "x:user:123",
+        "approved_account_reference": _X_ACCOUNT_REFERENCE,
     }
     assert {path: path.read_bytes() for path in day.rglob("*") if path.is_file()} == original
     assert editorial_publishing_status(tmp_path / ".soloscale", "linkedin") == (None, None)
@@ -164,7 +185,7 @@ def test_editorial_handoff_rejects_tampered_receipt_and_nonconsecutive_thread(tm
         )
 
 
-def test_failed_publish_is_terminal_and_old_receipt_does_not_hide_new_plan(
+def test_failed_publish_is_terminal_and_legacy_buildlog_retry_is_removed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -176,6 +197,7 @@ def test_failed_publish_is_terminal_and_old_receipt_does_not_hide_new_plan(
         day_directory=_sealed_day(tmp_path),
         channel="x",
     )
+    _connect_x(data_root)
 
     def fail(*args: object, **kwargs: object) -> None:
         raise TimeoutError("ambiguous provider outcome")
@@ -190,4 +212,39 @@ def test_failed_publish_is_terminal_and_old_receipt_does_not_hide_new_plan(
 
     receipt["plan_id"] = "plan-from-an-older-preview"
     (data_root / "editorial-publishing" / "x-receipt.json").write_text(json.dumps(receipt))
-    assert "PUBLISH X" in editorial_publishing_page(data_root=data_root)
+    assert "PUBLISH X" not in editorial_publishing_page(data_root=data_root)
+
+
+def test_publish_rejects_preview_bound_to_a_different_connected_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    gateway = _Gateway()
+    monkeypatch.setattr(
+        "soloscale.editorial_publishing_handoff._gateway", lambda *_: gateway
+    )
+    preview_editorial_day(
+        data_root=data_root,
+        day_directory=_sealed_day(tmp_path),
+        channel="x",
+    )
+    save_connected_identity(
+        data_root,
+        ConnectedIdentity(
+            platform="x",
+            external_account_id="999",
+            display_name="Different Account",
+            handle="different",
+            avatar_url=None,
+            scopes=("tweet.read", "users.read", "tweet.write", "offline.access"),
+            token_reference="pending",
+            connected_at="2026-08-28T00:00:00+00:00",
+        ),
+        token_payload={"access_token": "synthetic"},
+    )
+
+    with pytest.raises(EditorialPublishingError, match="does not match"):
+        publish_editorial_preview(
+            data_root=data_root, channel="x", confirmation="PUBLISH"
+        )
+    assert gateway.published is None
