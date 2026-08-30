@@ -71,6 +71,7 @@ from soloscale.deepseek_provider import (
     DEEPSEEK_BASE_URL,
     DEEPSEEK_DISPLAY_NAME,
     DEEPSEEK_MODEL_IDS,
+    DeepSeekErrorCategory,
     DeepSeekReasoningEffort,
     DeepSeekStatus,
     check_deepseek_connection,
@@ -806,6 +807,84 @@ def _save_ai_provider_preference(
         + "\n",
     )
     return preference
+
+
+def _deepseek_failure_outcome(
+    category: DeepSeekErrorCategory | None,
+) -> str:
+    selected = category or DeepSeekErrorCategory.PROVIDER_UNAVAILABLE
+    return f"deepseek-{selected.value.replace('_', '-')}"
+
+
+def _apply_deepseek_settings_action(
+    form: dict[str, str],
+    data_root: Path,
+    *,
+    desktop_mode: bool,
+) -> str:
+    """Apply one explicit DeepSeek settings action through the canonical provider."""
+
+    action = form.get("action", "")
+    if action == "prepare" and not desktop_mode:
+        return "unavailable"
+    thinking_enabled = form.get("deepseek_thinking", "") == "true"
+    api_key_configured = deepseek_api_key_is_configured()
+    current_settings = load_deepseek_settings(
+        data_root, api_key_configured=api_key_configured
+    )
+    preference = _save_ai_provider_preference(
+        data_root,
+        provider=ModelProviderId.DEEPSEEK.value,
+        deepseek_model=form.get("deepseek_model", DEEPSEEK_MODEL_IDS[0]),
+        deepseek_reasoning_effort=form.get(
+            "deepseek_reasoning_effort",
+            DeepSeekReasoningEffort.HIGH.value,
+        ),
+        deepseek_thinking=thinking_enabled,
+        set_default=action == "prepare",
+    )
+    settings_changed = (
+        preference.deepseek_model != current_settings.model_id
+        or preference.deepseek_reasoning_effort
+        != current_settings.reasoning_effort.value
+        or preference.deepseek_thinking != current_settings.thinking_enabled
+    )
+    preserved_status = (
+        current_settings.status
+        if action == "use_default" and not settings_changed
+        else DeepSeekStatus.CONFIGURED_NOT_TESTED
+    )
+    save_deepseek_settings(
+        data_root,
+        model_id=preference.deepseek_model,
+        reasoning_effort=preference.deepseek_reasoning_effort,
+        thinking_enabled=preference.deepseek_thinking,
+        api_key_configured=api_key_configured,
+        status=preserved_status,
+    )
+    if action == "prepare":
+        return "prepared"
+    if action == "test":
+        status, category = check_deepseek_connection(data_root)
+        if status is DeepSeekStatus.READY:
+            return "deepseek-ready"
+        if status is DeepSeekStatus.NOT_CONFIGURED:
+            return "not-configured"
+        return _deepseek_failure_outcome(category)
+    if action == "use_default":
+        if not api_key_configured:
+            return "not-configured"
+        _save_ai_provider_preference(
+            data_root,
+            provider=ModelProviderId.DEEPSEEK.value,
+            deepseek_model=preference.deepseek_model,
+            deepseek_reasoning_effort=preference.deepseek_reasoning_effort,
+            deepseek_thinking=preference.deepseek_thinking,
+        )
+        return "saved"
+    if action in {"", "save"}:
+        return "deepseek-settings-saved"
+    return "invalid"
 
 
 def _apply_ai_provider_preference(form: dict[str, str], data_root: Path) -> None:
@@ -6124,6 +6203,142 @@ def _control_tower_section(
     )
 
 
+def _ai_settings_notice(outcome: str, locale: UILocale) -> str | None:
+    notices = {
+        "saved": ui_text(
+            locale,
+            "已保存为默认 AI 服务。简历和内容会自动使用它。",
+            "Saved as the default AI service. Resume and Content now use it automatically.",
+        ),
+        "prepared": ui_text(
+            locale,
+            "模型设置已保存，正在交给 macOS 安全保存密钥。",
+            "Model settings are saved. macOS is now storing the key securely.",
+        ),
+        "deepseek-key-saved": ui_text(
+            locale,
+            "DeepSeek API key 已保存。当前状态：已配置，未测试。",
+            "The DeepSeek API key was saved. Current status: configured, not tested.",
+        ),
+        "deepseek-settings-saved": ui_text(
+            locale,
+            "DeepSeek 模型设置已保存；刷新后会保留当前模型、推理强度和 Thinking 选择。",
+            "DeepSeek model settings were saved. The model, reasoning effort, and Thinking selection will persist after refresh.",
+        ),
+        "deepseek-ready": ui_text(
+            locale,
+            "DeepSeek 已就绪。连接测试成功。",
+            "DeepSeek is ready. The connection test succeeded.",
+        ),
+        "deepseek-authentication-failed": ui_text(
+            locale,
+            "DeepSeek 连接失败：API key 被拒绝。请更换密钥后重试。",
+            "DeepSeek connection failed: the API key was rejected. Replace it and try again.",
+        ),
+        "deepseek-rate-limited": ui_text(
+            locale,
+            "DeepSeek 连接失败：服务暂时限流。请稍后手动重试。",
+            "DeepSeek connection failed: the service is rate limited. Try again manually later.",
+        ),
+        "deepseek-model-unavailable": ui_text(
+            locale,
+            "DeepSeek 连接失败：所选模型当前不可用。请检查模型设置。",
+            "DeepSeek connection failed: the selected model is unavailable. Check the model setting.",
+        ),
+        "deepseek-request-invalid": ui_text(
+            locale,
+            "DeepSeek 连接失败：服务拒绝了能力检查请求。请稍后重试。",
+            "DeepSeek connection failed: the service rejected the capability check. Try again later.",
+        ),
+        "deepseek-output-limit": ui_text(
+            locale,
+            "DeepSeek 连接失败：服务返回了输出限制错误。请稍后重试。",
+            "DeepSeek connection failed: the service returned an output-limit error. Try again later.",
+        ),
+        "deepseek-model-timeout": ui_text(
+            locale,
+            "DeepSeek 连接失败：能力检查超时。请检查网络后手动重试。",
+            "DeepSeek connection failed: the capability check timed out. Check the network and retry manually.",
+        ),
+        "deepseek-provider-unavailable": ui_text(
+            locale,
+            "DeepSeek 连接失败：当前无法访问服务。请检查网络后手动重试。",
+            "DeepSeek connection failed: the service is currently unreachable. Check the network and retry manually.",
+        ),
+        "removed": ui_text(
+            locale,
+            "OpenAI API key 已从 macOS Keychain 移除。",
+            "The OpenAI API key was removed from macOS Keychain.",
+        ),
+        "deepseek-removed": ui_text(
+            locale,
+            "DeepSeek API key 已从 macOS Keychain 移除。",
+            "The DeepSeek API key was removed from macOS Keychain.",
+        ),
+        "ready": ui_text(
+            locale,
+            "连接测试通过，可以设为默认服务。",
+            "Connection test passed. This service can be used as the default.",
+        ),
+        "not-ready": ui_text(
+            locale,
+            "服务尚未准备好；请先完成页面上标出的步骤。",
+            "This service is not ready yet. Complete the steps shown on this page first.",
+        ),
+        "starting": ui_text(
+            locale,
+            "已请求启动 Ollama。等待几秒后再测试。",
+            "Ollama was asked to start. Wait a few seconds, then test again.",
+        ),
+        "download-started": ui_text(
+            locale,
+            "模型下载已开始。完成后再点一次测试。",
+            "The model download has started. Test again after it completes.",
+        ),
+        "download-unavailable": ui_text(
+            locale,
+            "找不到可用的 Ollama 命令；请先启动或重新安装 Ollama。",
+            "The Ollama command is unavailable. Start or reinstall Ollama first.",
+        ),
+        "unavailable": ui_text(
+            locale,
+            "这个服务当前不可用；默认选择没有改变。",
+            "This service is currently unavailable. The default selection was not changed.",
+        ),
+        "not-configured": ui_text(
+            locale,
+            "请先在 Desktop App 中保存 API key。",
+            "Save an API key in the Desktop App first.",
+        ),
+        "unauthorized": ui_text(
+            locale,
+            "OpenAI 拒绝了这个密钥；请更换后重试。",
+            "OpenAI rejected this key. Replace it and try again.",
+        ),
+        "model-unavailable": ui_text(
+            locale,
+            "这个 OpenAI 模型对当前项目不可用。",
+            "This OpenAI model is not available to the current project.",
+        ),
+        "test-failed": ui_text(
+            locale,
+            "连接测试未完成；密钥和默认选择保持不变。",
+            "The connection test did not complete. The key and default selection are unchanged.",
+        ),
+        "invalid": ui_text(
+            locale,
+            "设置无效，没有保存任何更改。",
+            "The settings are invalid. No changes were saved.",
+        ),
+        "moved": ui_text(
+            locale,
+            "AI 服务现在在这个页面集中管理。",
+            "AI services are now managed from this page.",
+        ),
+    }
+    return notices.get(outcome)
+
+
 def _ai_settings_page(
     data_root: Path,
     *,
@@ -6336,13 +6551,19 @@ if(remove) remove.addEventListener('click',()=>window.webkit.messageHandlers.sol
             data_root, api_key_configured=deepseek_ready
         )
         status_labels = {
-            DeepSeekStatus.NOT_CONFIGURED: ui_text(locale, "未配置", "Not configured"),
-            DeepSeekStatus.CONFIGURED_NOT_TESTED: ui_text(
-                locale, "已配置，未测试", "Configured, not tested"
+            DeepSeekStatus.NOT_CONFIGURED: ui_text(
+                locale, "DeepSeek · 未配置", "DeepSeek · Not configured"
             ),
-            DeepSeekStatus.READY: ui_text(locale, "已就绪", "Ready"),
+            DeepSeekStatus.CONFIGURED_NOT_TESTED: ui_text(
+                locale,
+                "DeepSeek · 已配置，未测试",
+                "DeepSeek · Configured, not tested",
+            ),
+            DeepSeekStatus.READY: ui_text(
+                locale, "DeepSeek · 已就绪", "DeepSeek · Ready"
+            ),
             DeepSeekStatus.CONNECTION_FAILED: ui_text(
-                locale, "连接失败", "Connection failed"
+                locale, "DeepSeek · 连接失败", "DeepSeek · Connection failed"
             ),
         }
         desktop_note = ui_text(
@@ -6375,8 +6596,14 @@ if(remove) remove.addEventListener('click',()=>window.webkit.messageHandlers.sol
             for effort in DeepSeekReasoningEffort
         )
         thinking_checked = "checked" if preference.deepseek_thinking else ""
+        thinking_label = ui_text(locale, "已启用", "Enabled") if preference.deepseek_thinking else ui_text(locale, "已禁用", "Disabled")
+        selected_settings = ui_text(
+            locale,
+            f"{deepseek_display_name(preference.deepseek_model)} · 推理强度：{preference.deepseek_reasoning_effort.title()} · Thinking：{thinking_label}",
+            f"{deepseek_display_name(preference.deepseek_model)} · Reasoning: {preference.deepseek_reasoning_effort.title()} · Thinking: {thinking_label}",
+        )
         body = f"""<a class="back-link" href="{ui_url('/settings/ai', locale)}">← {_escape(ui_text(locale, 'AI 服务', 'AI Service'))}</a>{notice_html}{unavailable}
-<section class="setup-card"><span class="kicker">DeepSeek</span><h2>{_escape(status_labels[deepseek_settings.status])}</h2><p>{_escape(desktop_note)}</p>
+<section class="setup-card" data-provider-status="{deepseek_settings.status.value}"><span class="kicker">DeepSeek</span><h2>{_escape(status_labels[deepseek_settings.status])}</h2><p class="service-state">{_escape(selected_settings)}</p><p>{_escape(desktop_note)}</p>
 <form id="deepseek-setup"><input type="hidden" id="deepseek-locale" value="{locale}" />
 <label>API Key<input id="deepseek-api-key" type="password" maxlength="512" autocomplete="new-password" value="" placeholder="sk-…"{save_disabled} /></label>
 <div class="button-row"><button id="save-deepseek-key" type="submit"{save_disabled}>{_escape(ui_text(locale, '保存并使用 DeepSeek', 'Save & use DeepSeek'))}</button>{delete_button}</div></form>
@@ -6404,7 +6631,7 @@ if(setup) setup.addEventListener('submit',async(event)=>{{
   const response=await fetch('/settings/ai/deepseek',{{method:'POST',headers:{{'Content-Type':'application/x-www-form-urlencoded'}},body:new URLSearchParams({{ui_locale:document.getElementById('deepseek-locale').value,action:'prepare',deepseek_model:(model?model.value:'{DEEPSEEK_MODEL_IDS[0]}'),deepseek_reasoning_effort:effort.value,deepseek_thinking:String(thinking.checked)}})}});
   if(!response.ok){{status.textContent={json.dumps(ui_text(locale, '模型设置无法保存。', 'The model setting could not be saved.'))};return;}}
   const secret=key.value; key.value='';
-  bridge.postMessage({{action:'saveDeepSeekKey',apiKey:secret,returnPath:{json.dumps(ui_url('/settings/ai/deepseek', locale, provider='saved'))}}});
+  bridge.postMessage({{action:'saveDeepSeekKey',apiKey:secret,returnPath:{json.dumps(ui_url('/settings/ai/deepseek', locale, provider='deepseek-key-saved'))}}});
 }});
 const remove=document.getElementById('delete-deepseek-key');
 if(remove) remove.addEventListener('click',()=>window.webkit.messageHandlers.soloscaleCredentials.postMessage({{action:'deleteDeepSeekKey',returnPath:{json.dumps(ui_url('/settings/ai/deepseek', locale, provider='deepseek-removed'))}}}));
@@ -7055,93 +7282,11 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         detail: str | None = None,
         outcome: str | None = None,
     ) -> None:
-        notices = {
-            "saved": ui_text(
-                self.ui_locale,
-                "已保存为默认 AI 服务。简历和内容会自动使用它。",
-                "Saved as the default AI service. Resume and Content now use it automatically.",
-            ),
-            "prepared": ui_text(
-                self.ui_locale,
-                "模型设置已保存，正在交给 macOS 安全保存密钥。",
-                "Model settings are saved. macOS is now storing the key securely.",
-            ),
-            "removed": ui_text(
-                self.ui_locale,
-                "OpenAI API key 已从 macOS Keychain 移除。",
-                "The OpenAI API key was removed from macOS Keychain.",
-            ),
-            "deepseek-removed": ui_text(
-                self.ui_locale,
-                "DeepSeek API key 已从 macOS Keychain 移除。",
-                "The DeepSeek API key was removed from macOS Keychain.",
-            ),
-            "ready": ui_text(
-                self.ui_locale,
-                "连接测试通过，可以设为默认服务。",
-                "Connection test passed. This service can be used as the default.",
-            ),
-            "not-ready": ui_text(
-                self.ui_locale,
-                "服务尚未准备好；请先完成页面上标出的步骤。",
-                "This service is not ready yet. Complete the steps shown on this page first.",
-            ),
-            "starting": ui_text(
-                self.ui_locale,
-                "已请求启动 Ollama。等待几秒后再测试。",
-                "Ollama was asked to start. Wait a few seconds, then test again.",
-            ),
-            "download-started": ui_text(
-                self.ui_locale,
-                "模型下载已开始。完成后再点一次测试。",
-                "The model download has started. Test again after it completes.",
-            ),
-            "download-unavailable": ui_text(
-                self.ui_locale,
-                "找不到可用的 Ollama 命令；请先启动或重新安装 Ollama。",
-                "The Ollama command is unavailable. Start or reinstall Ollama first.",
-            ),
-            "unavailable": ui_text(
-                self.ui_locale,
-                "这个服务当前不可用；默认选择没有改变。",
-                "This service is currently unavailable. The default selection was not changed.",
-            ),
-            "not-configured": ui_text(
-                self.ui_locale,
-                "请先在 Desktop App 中保存 API key。",
-                "Save an API key in the Desktop App first.",
-            ),
-            "unauthorized": ui_text(
-                self.ui_locale,
-                "OpenAI 拒绝了这个密钥；请更换后重试。",
-                "OpenAI rejected this key. Replace it and try again.",
-            ),
-            "model-unavailable": ui_text(
-                self.ui_locale,
-                "这个 OpenAI 模型对当前项目不可用。",
-                "This OpenAI model is not available to the current project.",
-            ),
-            "test-failed": ui_text(
-                self.ui_locale,
-                "连接测试未完成；密钥和默认选择保持不变。",
-                "The connection test did not complete. The key and default selection are unchanged.",
-            ),
-            "invalid": ui_text(
-                self.ui_locale,
-                "设置无效，没有保存任何更改。",
-                "The settings are invalid. No changes were saved.",
-            ),
-            "moved": ui_text(
-                self.ui_locale,
-                "AI 服务现在在这个页面集中管理。",
-                "AI services are now managed from this page.",
-            ),
-        }
         page = _ai_settings_page(
             self.ui_data_root.absolute(),
             locale=self.ui_locale,
             detail=detail,
-            notice=notices.get(outcome or ""),
+            notice=_ai_settings_notice(outcome or "", self.ui_locale),
             desktop_mode=self.desktop_session_token is not None,
         )
         body = page.encode("utf-8")
@@ -8638,68 +8783,11 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     elif action == "use_default":
                         outcome = "unavailable"
                 elif path == "/settings/ai/deepseek":
-                    deepseek_thinking = form.get("deepseek_thinking", "") == "true"
-                    if action == "prepare":
-                        if self.desktop_session_token is None:
-                            outcome = "unavailable"
-                        else:
-                            _save_ai_provider_preference(
-                                data_root,
-                                provider=ModelProviderId.DEEPSEEK.value,
-                                deepseek_model=form.get(
-                                    "deepseek_model", DEEPSEEK_MODEL_IDS[0]
-                                ),
-                                deepseek_reasoning_effort=form.get(
-                                    "deepseek_reasoning_effort",
-                                    DeepSeekReasoningEffort.HIGH.value,
-                                ),
-                                deepseek_thinking=deepseek_thinking,
-                            )
-                            outcome = "prepared"
-                    else:
-                        preference = _save_ai_provider_preference(
-                            data_root,
-                            provider=ModelProviderId.DEEPSEEK.value,
-                            deepseek_model=form.get(
-                                "deepseek_model", DEEPSEEK_MODEL_IDS[0]
-                            ),
-                            deepseek_reasoning_effort=form.get(
-                                "deepseek_reasoning_effort",
-                                DeepSeekReasoningEffort.HIGH.value,
-                            ),
-                            deepseek_thinking=deepseek_thinking,
-                            set_default=False,
-                        )
-                        save_deepseek_settings(
-                            data_root,
-                            model_id=preference.deepseek_model,
-                            reasoning_effort=preference.deepseek_reasoning_effort,
-                            thinking_enabled=preference.deepseek_thinking,
-                            api_key_configured=deepseek_api_key_is_configured(),
-                        )
-                        if action == "test":
-                            status, _category = check_deepseek_connection(data_root)
-                            outcome = {
-                                DeepSeekStatus.READY: "ready",
-                                DeepSeekStatus.NOT_CONFIGURED: "not-configured",
-                                DeepSeekStatus.CONNECTION_FAILED: "test-failed",
-                            }.get(status, "not-ready")
-                        elif action == "use_default":
-                            if deepseek_api_key_is_configured():
-                                _save_ai_provider_preference(
-                                    data_root,
-                                    provider=ModelProviderId.DEEPSEEK.value,
-                                    deepseek_model=preference.deepseek_model,
-                                    deepseek_reasoning_effort=(
-                                        preference.deepseek_reasoning_effort
-                                    ),
-                                    deepseek_thinking=preference.deepseek_thinking,
-                                )
-                                outcome = "saved"
-                            else:
-                                outcome = "not-configured"
-                        elif action in {"", "save"}:
-                            outcome = "saved"
+                    outcome = _apply_deepseek_settings_action(
+                        form,
+                        data_root,
+                        desktop_mode=self.desktop_session_token is not None,
+                    )
                 else:
                     if action == "prepare":
                         if self.desktop_session_token is None:

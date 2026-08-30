@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import urllib.error
+from email.message import Message
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,9 @@ from soloscale.deepseek_provider import (
 )
 from soloscale.desktop_credentials import _clear_for_tests
 from soloscale.local_ui import (
+    _ai_settings_notice,
     _ai_settings_page,
+    _apply_deepseek_settings_action,
     _load_ai_provider_preference,
     _save_ai_provider_preference,
 )
@@ -86,6 +89,21 @@ class _FailingDeepSeekTransport:
     def send(self, request: DeepSeekResponsesRequest) -> DeepSeekProviderResponse:
         self.requests.append(request)
         raise DeepSeekProviderError("provider unavailable", category=self.category)
+
+
+def _settings_form(
+    action: str,
+    *,
+    model: str = "deepseek-v4-pro",
+    effort: str = "high",
+    thinking: bool = True,
+) -> dict[str, str]:
+    return {
+        "action": action,
+        "deepseek_model": model,
+        "deepseek_reasoning_effort": effort,
+        "deepseek_thinking": "true" if thinking else "",
+    }
 
 
 def _settings(
@@ -408,3 +426,186 @@ def test_deepseek_selection_persists_after_reload(
     overview = _ai_settings_page(tmp_path, locale="en")
     assert "DeepSeek V4 Pro" in overview
     assert 'href="/settings/ai/deepseek?lang=en"' in overview
+
+
+def test_key_save_resets_readiness_and_renders_configured_not_tested(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_for_tests()
+    monkeypatch.setattr(
+        "soloscale.local_ui.deepseek_api_key_is_configured", lambda: True
+    )
+    monkeypatch.setattr(
+        "soloscale.local_ui._ollama_readiness",
+        lambda preference: type("Readiness", (), {"ready": False})(),
+    )
+    save_deepseek_settings(
+        tmp_path,
+        model_id="deepseek-v4-pro",
+        reasoning_effort="high",
+        thinking_enabled=True,
+        api_key_configured=True,
+        status=DeepSeekStatus.READY,
+    )
+
+    outcome = _apply_deepseek_settings_action(
+        _settings_form("prepare"), tmp_path, desktop_mode=True
+    )
+
+    assert outcome == "prepared"
+    assert (
+        load_deepseek_settings(tmp_path, api_key_configured=True).status
+        is DeepSeekStatus.CONFIGURED_NOT_TESTED
+    )
+    page = _ai_settings_page(
+        tmp_path,
+        locale="en",
+        detail="deepseek",
+        notice=_ai_settings_notice("deepseek-key-saved", "en"),
+        desktop_mode=True,
+    )
+    assert 'data-provider-status="configured_not_tested"' in page
+    assert "DeepSeek · Configured, not tested" in page
+    assert "DeepSeek · Ready" not in page
+    assert "provider=deepseek-key-saved" in page
+    assert "configured, not tested" in (
+        _ai_settings_notice("deepseek-key-saved", "en") or ""
+    )
+
+
+def test_model_settings_save_persists_and_renders_explicit_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_for_tests()
+    monkeypatch.setattr(
+        "soloscale.local_ui.deepseek_api_key_is_configured", lambda: True
+    )
+    monkeypatch.setattr(
+        "soloscale.local_ui._ollama_readiness",
+        lambda preference: type("Readiness", (), {"ready": False})(),
+    )
+
+    outcome = _apply_deepseek_settings_action(
+        _settings_form("save"), tmp_path, desktop_mode=True
+    )
+
+    assert outcome == "deepseek-settings-saved"
+    preference = _load_ai_provider_preference(tmp_path)
+    assert preference.deepseek_model == "deepseek-v4-pro"
+    assert preference.deepseek_reasoning_effort == "high"
+    assert preference.deepseek_thinking is True
+    detail = _ai_settings_page(
+        tmp_path,
+        locale="en",
+        detail="deepseek",
+        notice=_ai_settings_notice(outcome, "en"),
+        desktop_mode=True,
+    )
+    assert 'value="deepseek-v4-pro" checked' in detail
+    assert 'value="high" selected' in detail
+    assert 'name="deepseek_thinking" value="true" checked' in detail
+    assert "DeepSeek V4 Pro · Reasoning: High · Thinking: Enabled" in detail
+    assert "will persist after refresh" in detail
+    assert "will persist after refresh" in (
+        _ai_settings_notice("deepseek-settings-saved", "en") or ""
+    )
+
+
+def test_explicit_connection_success_persists_ready_and_renders_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_for_tests()
+    opener = _FakeOpener(200)
+    monkeypatch.setattr(
+        "soloscale.local_ui.deepseek_api_key_is_configured", lambda: True
+    )
+    monkeypatch.setattr(
+        "soloscale.local_ui.check_deepseek_connection",
+        lambda data_root: check_deepseek_connection(
+            data_root, credential="sk-test", opener=opener
+        ),
+    )
+    monkeypatch.setattr(
+        "soloscale.local_ui._ollama_readiness",
+        lambda preference: type("Readiness", (), {"ready": False})(),
+    )
+
+    outcome = _apply_deepseek_settings_action(
+        _settings_form("test"), tmp_path, desktop_mode=True
+    )
+
+    assert outcome == "deepseek-ready"
+    assert len(opener.calls) == 1
+    assert getattr(opener.calls[0], "full_url", "") == "https://api.deepseek.com/models"
+    assert (
+        load_deepseek_settings(tmp_path, api_key_configured=True).status
+        is DeepSeekStatus.READY
+    )
+    detail = _ai_settings_page(
+        tmp_path,
+        locale="en",
+        detail="deepseek",
+        notice=_ai_settings_notice(outcome, "en"),
+        desktop_mode=True,
+    )
+    assert 'data-provider-status="ready"' in detail
+    assert "DeepSeek · Ready" in detail
+    assert "DeepSeek V4 Pro" in detail
+    assert "connection test succeeded" in detail
+    assert "connection test succeeded" in (
+        _ai_settings_notice("deepseek-ready", "en") or ""
+    )
+    raw = (tmp_path / "settings" / "deepseek-provider.json").read_text(
+        encoding="utf-8"
+    )
+    assert "sk-test" not in raw
+
+
+def test_explicit_connection_failure_persists_status_and_actionable_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_for_tests()
+    unauthorized = urllib.error.HTTPError(
+        "https://api.deepseek.com/models",
+        401,
+        "Unauthorized",
+        Message(),
+        io.BytesIO(b"{}"),
+    )
+    opener = _FakeOpener(error=unauthorized)
+    monkeypatch.setattr(
+        "soloscale.local_ui.deepseek_api_key_is_configured", lambda: True
+    )
+    monkeypatch.setattr(
+        "soloscale.local_ui.check_deepseek_connection",
+        lambda data_root: check_deepseek_connection(
+            data_root, credential="sk-test", opener=opener
+        ),
+    )
+    monkeypatch.setattr(
+        "soloscale.local_ui._ollama_readiness",
+        lambda preference: type("Readiness", (), {"ready": False})(),
+    )
+
+    outcome = _apply_deepseek_settings_action(
+        _settings_form("test"), tmp_path, desktop_mode=True
+    )
+
+    assert outcome == "deepseek-authentication-failed"
+    assert (
+        load_deepseek_settings(tmp_path, api_key_configured=True).status
+        is DeepSeekStatus.CONNECTION_FAILED
+    )
+    detail = _ai_settings_page(
+        tmp_path,
+        locale="en",
+        detail="deepseek",
+        notice=_ai_settings_notice(outcome, "en"),
+        desktop_mode=True,
+    )
+    assert 'data-provider-status="connection_failed"' in detail
+    assert "DeepSeek · Connection failed" in detail
+    assert "API key was rejected" in detail
+    notice = _ai_settings_notice(outcome, "en") or ""
+    assert "API key was rejected" in notice
+    assert "sk-test" not in notice
