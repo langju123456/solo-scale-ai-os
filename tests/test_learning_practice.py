@@ -21,7 +21,6 @@ from soloscale.learning_practice import (
     PracticeCompletionReceipt,
     PracticeLanguage,
     TutorEscalation,
-    _evaluate_ci_cd_acceptance,
     create_practice_workspace,
     exercise_to_practice_stage,
     generate_practice_exercise,
