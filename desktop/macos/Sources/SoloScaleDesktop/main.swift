@@ -135,7 +135,8 @@ private final class BackendController: NSObject, ObservableObject {
                     desktopCredentialEnvelopeFrame(
                         openAIKey: try DesktopOpenAIKeychain.read(),
                         githubAccessToken: try DesktopGitHubKeychain.read(),
-                        heygenAPIKey: try DesktopHeyGenKeychain.read()
+                        heygenAPIKey: try DesktopHeyGenKeychain.read(),
+                        deepseekAPIKey: try DesktopDeepSeekKeychain.read()
                     )
                 )
                 credentialWriter.closeFile()
@@ -162,6 +163,14 @@ private final class BackendController: NSObject, ObservableObject {
     }
     func deleteOpenAIKey(returnPath: String?) throws {
         try DesktopOpenAIKeychain.delete()
+        restart(destination: .aiSettings(whitelistedAISettingsReturnPath(returnPath)))
+    }
+    func saveDeepSeekKey(_ apiKey: String, returnPath: String?) throws {
+        try DesktopDeepSeekKeychain.save(apiKey)
+        restart(destination: .aiSettings(whitelistedAISettingsReturnPath(returnPath)))
+    }
+    func deleteDeepSeekKey(returnPath: String?) throws {
+        try DesktopDeepSeekKeychain.delete()
         restart(destination: .aiSettings(whitelistedAISettingsReturnPath(returnPath)))
     }
     func saveHeyGenKey(_ apiKey: String, returnPath: String?) throws {
@@ -532,6 +541,7 @@ private final class BackendController: NSObject, ObservableObject {
               components.user == nil,
               components.password == nil,
               components.path == "/settings/ai/openai"
+              || components.path == "/settings/ai/deepseek"
         else { return nil }
         return returnPath
     }
@@ -624,6 +634,11 @@ private struct LocalWebView: NSViewRepresentable {
                     try backend.saveOpenAIKey(apiKey, returnPath: returnPath)
                 case "deleteOpenAIKey":
                     try backend.deleteOpenAIKey(returnPath: returnPath)
+                case "saveDeepSeekKey":
+                    guard let apiKey = body["apiKey"] as? String else { return }
+                    try backend.saveDeepSeekKey(apiKey, returnPath: returnPath)
+                case "deleteDeepSeekKey":
+                    try backend.deleteDeepSeekKey(returnPath: returnPath)
                 case "saveHeyGenKey":
                     guard let apiKey = body["apiKey"] as? String else { return }
                     try backend.saveHeyGenKey(apiKey, returnPath: returnPath)

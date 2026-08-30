@@ -52,6 +52,21 @@ def test_desktop_credential_frame_supports_empty_and_process_memory_values() -> 
     assert deepseek_api_key() == "synthetic-deepseek-key"
     _clear_for_tests()
 
+    envelope_without_deepseek = json.dumps(
+        {
+            "schema_version": "1.0",
+            "openai_api_key": "synthetic-openai-key",
+        },
+        sort_keys=True,
+    ).encode()
+    configure_desktop_credentials_from_stdin(
+        _frame_for_tests(envelope_without_deepseek)
+    )
+    assert openai_api_key_is_configured() is True
+    assert deepseek_api_key_is_configured() is False
+    assert deepseek_api_key() is None
+    _clear_for_tests()
+
 
 @pytest.mark.parametrize(
     "raw",
