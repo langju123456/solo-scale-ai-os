@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -7,7 +8,13 @@ from soloscale.content_models import ContentReviewDecision
 from soloscale.content_ui import content_page, editorial_publishing_page, run_content_form
 from soloscale.content_workspace import save_content_review
 from soloscale.creator_accounts import normalize_account, save_creator_account
-from soloscale.creator_production import create_run_artifacts
+from soloscale.creator_production import (
+    CreatorProductionJob,
+    CreatorProductionJobManager,
+    CreatorProductionRequest,
+    create_run_artifacts,
+    wait_for_creator_job,
+)
 from soloscale.creator_workspace import creator_history_page, creator_overview_page
 from soloscale.platform_accounts import ConnectedIdentity, save_connected_identity
 
@@ -328,3 +335,139 @@ def test_publish_center_selector_falls_back_to_run_id_label(
     )
 
     assert f"{run_id} · DRAFT · {run_id}" in page
+
+
+def _persist_history_job(
+    data_root: Path,
+    job: CreatorProductionJob,
+) -> None:
+    root = data_root / "creator-projects" / job.job_id
+    root.mkdir(parents=True)
+    (root / "project.json").write_text(
+        json.dumps(job.model_dump(mode="json"), ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def test_history_job_card_shows_template_execution_truth(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    job = CreatorProductionJob(
+        job_id="creator-job-template-history",
+        content_project_id="project-template-history",
+        request=CreatorProductionRequest(
+            source_kind="CREATE",
+            outputs=["ARTICLE"],
+            language="中文",
+            ai_editorial=False,
+        ),
+        phase="READY",
+        created_at="2026-08-29T12:00:00+00:00",
+        updated_at="2026-08-29T12:00:07+00:00",
+        stage="Artifacts sealed",
+        provider="template",
+        model=None,
+        model_calls=0,
+    )
+    _persist_history_job(data_root, job)
+
+    first = creator_history_page(data_root, locale="zh-CN")
+    second = creator_history_page(data_root, locale="zh-CN")
+
+    for page in (first, second):
+        assert "离线模板" in page
+        assert "模型调用: 0" in page
+        assert "已用时: 7s" in page
+
+
+def test_history_job_card_shows_human_readable_ai_provider(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    job = CreatorProductionJob(
+        job_id="creator-job-ai-history",
+        content_project_id="project-ai-history",
+        request=CreatorProductionRequest(
+            source_kind="CREATE",
+            outputs=["ARTICLE"],
+            language="English",
+            ai_editorial=True,
+        ),
+        phase="READY",
+        created_at="2026-08-29T12:00:00+00:00",
+        updated_at="2026-08-29T12:00:07+00:00",
+        stage="Artifacts sealed",
+        provider="openai_compatible",
+        model="gpt-5.6-sol",
+        model_calls=2,
+    )
+    _persist_history_job(data_root, job)
+
+    page = creator_history_page(data_root, locale="en")
+
+    assert "OpenAI API" in page
+    assert "gpt-5.6-sol" in page
+    assert "Model calls: 2" in page
+    assert "Elapsed: 7s" in page
+
+
+def test_history_video_ready_uses_canonical_render_outputs(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    video_run = run_content_form(_content_form(), data_root).run_id
+    empty_run = run_content_form(_content_form(), data_root).run_id
+    legacy_run = run_content_form(_content_form(), data_root).run_id
+    assert video_run and empty_run and legacy_run
+
+    (data_root / "content-runs" / video_run / "21_creator_video_youtube.mp4").write_bytes(
+        b"rendered"
+    )
+    (data_root / "content-runs" / video_run / "10_creator_video.mp4").write_bytes(
+        b"rendered"
+    )
+    (data_root / "content-runs" / legacy_run / "youtube-video.mp4").write_bytes(
+        b"rendered"
+    )
+    (data_root / "content-runs" / legacy_run / "creator-video.mp4").write_bytes(
+        b"rendered"
+    )
+
+    page = creator_history_page(data_root, locale="zh-CN")
+
+    def flags_for(run_id: str) -> list[str]:
+        for match in re.finditer(
+            r'<article class="history-card">.*?</article>', page, re.S
+        ):
+            card = match.group(0)
+            if run_id in card:
+                return re.findall(r"<strong>([^<]*)</strong>", card)
+        return []
+
+    assert flags_for(video_run) == ["视频已就绪", "发布包未就绪"]
+    assert flags_for(empty_run) == ["暂无视频", "发布包未就绪"]
+    assert flags_for(legacy_run) == ["视频已就绪", "发布包未就绪"]
+
+
+def test_history_card_shows_template_provider_and_zero_model_calls(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / ".soloscale"
+    result = run_content_form(_content_form(), data_root)
+    assert result.run_id is not None
+
+    manager = CreatorProductionJobManager()
+    job = manager.submit(
+        data_root=data_root,
+        request=CreatorProductionRequest(
+            source_kind="STORY",
+            source_story_id="M1-13",
+            outputs=["ARTICLE"],
+            language="English",
+            ai_editorial=False,
+        ),
+        runner=lambda: result.run_id,
+        provider="template",
+        model=None,
+    )
+    wait_for_creator_job(manager, data_root, job.job_id)
+    manager.shutdown()
+
+    history = creator_history_page(data_root, locale="en")
+    assert "Offline template" in history
+    assert "Model calls: 0" in history
