@@ -69,6 +69,22 @@ _INTERNAL_LABEL_LINE = re.compile(
     r"(?m)^[ \t]*(?:- |\* )?(?:Claim anchors|Facts source|Reference pattern applied):[^\n]*[ \t]*$"
 )
 _CLAIM_MAP_LINE = re.compile(r"(?m)^[ \t]*(?:- |\* )?CLAIM-[0-9]{2}: [^\n]*$")
+_INTERNAL_LIMIT_INLINE = re.compile(
+    r"(?:^|[\s·•–—-]+)(?:Limit|边界)\s*:[^\n]*"
+)
+_INTERNAL_LIMIT_LABEL_LINE = re.compile(
+    r"(?m)^[ \t]*(?:- |\* )?(?:Limit|边界)\s*:[^\n]*[ \t]*$"
+)
+_INTERNAL_BOUNDARY_HEADING = re.compile(
+    r"(?m)^[ \t]*(?:Explicit boundaries?|明确边界)\s*:[ \t]*$"
+)
+_INTERNAL_EVIDENCE_MAP_HEADING = re.compile(
+    r"(?m)^[ \t]*(?:Evidence map|证据索引)[^\n]*[ \t]*$"
+)
+_INTERNAL_PROOF_LABEL_LINE = re.compile(
+    r"(?m)^[ \t]*(?:- |\* )?(?:Proof links?|证据链接)[^\n]*[ \t]*$"
+)
+_SEPARATOR_EDGE = re.compile(r"^[\s·•–—-]+|[\s·•–—-]+$")
 _OLLAMA_PROMPT_VERSION = "content-ollama-writer-v1"
 _OLLAMA_SYSTEM_PROMPT = """You are the SoloScale evidence-bound content writer.
 Return only JSON matching the supplied schema. Write one canonical story and derive a
@@ -316,8 +332,6 @@ def _render_linkedin(brief: ContentBrief) -> str:
             ClaimStatus.HYPOTHESIS: "仍需验证的假设：",
             ClaimStatus.PLANNED: "接下来会做的实验：",
         }
-        limit_title = "明确边界："
-        proof_title = "证据索引（发布前请换成可公开链接）："
     else:
         sections = [opening, "", f"I am documenting: {brief.topic}", ""]
         section_titles = {
@@ -326,8 +340,6 @@ def _render_linkedin(brief: ContentBrief) -> str:
             ClaimStatus.HYPOTHESIS: "What remains a hypothesis:",
             ClaimStatus.PLANNED: "What I will test next:",
         }
-        limit_title = "Explicit boundaries:"
-        proof_title = "Evidence map (replace private receipts with public links before posting):"
     for status in ClaimStatus:
         claims = grouped[status]
         if not claims:
@@ -341,12 +353,7 @@ def _render_linkedin(brief: ContentBrief) -> str:
         )
     limits = [claim for claim in brief.claims if claim.limits]
     if limits:
-        sections.extend([limit_title, *[f"- [{claim.id}] {claim.limits}" for claim in limits], ""])
-    receipts = [claim for claim in brief.claims if claim.receipt]
-    if receipts:
-        sections.extend(
-            [proof_title, *[f"- {claim.id}: {claim.receipt}" for claim in receipts], ""]
-        )
+        sections.extend([*[f"- [{claim.id}] {claim.limits}" for claim in limits], ""])
     sections.append(brief.call_to_action)
     return "\n".join(sections).strip() + "\n"
 
@@ -357,18 +364,14 @@ def _render_x_thread(brief: ContentBrief) -> list[str]:
     for claim in brief.claims[1:]:
         post = f"[{claim.status.value} · {claim.id}] {claim.text}"
         if claim.limits:
-            post += (
-                f"\nLimit: {claim.limits}"
-                if brief.language == "English"
-                else f"\n边界：{claim.limits}"
-            )
+            post += f"\n{claim.limits}"
         if len(post) > 280:
             raise ContentWorkspaceError(f"{claim.id} is too long for an X post")
         posts.append(post)
     proof_note = (
-        "Proof links: see the attached claim ledger. Human review is still required."
+        "Human review is still required before posting."
         if brief.language == "English"
-        else "证据链接见附带的 claim ledger；发布前仍需人工复核。"
+        else "发布前仍需人工复核。"
     )
     posts.extend([proof_note, brief.call_to_action])
     if any(len(post) > 280 for post in posts):
@@ -483,7 +486,7 @@ def _render_storyboard(brief: ContentBrief) -> list[StoryboardScene]:
             purpose = (
                 f"{pattern.structure.hook} · {progression}"
                 if index == 1
-                else f"{progression} · {_status_heading(claim.status, 'English')}"
+                else progression
             )
             visual = (
                 f"Reference-guided {pattern.video.shot_cadence} pacing"
@@ -491,7 +494,7 @@ def _render_storyboard(brief: ContentBrief) -> list[StoryboardScene]:
                 + "; use only operator-owned evidence visuals"
             )
         else:
-            purpose = "Hook" if index == 1 else _status_heading(claim.status, "English")
+            purpose = "Hook" if index == 1 else "Evidence"
             visual = (
                 "HookCard with SourceBadge"
                 if index == 1
@@ -644,7 +647,13 @@ def _strip_claim_markers(value: str) -> str:
     stripped = _INTERNAL_LABEL_LINE.sub("", value)
     stripped = _CLAIM_MAP_LINE.sub("", stripped)
     stripped = _CLAIM_MARKER_LINE_PREFIX.sub("", stripped)
+    stripped = _INTERNAL_BOUNDARY_HEADING.sub("", stripped)
+    stripped = _INTERNAL_EVIDENCE_MAP_HEADING.sub("", stripped)
+    stripped = _INTERNAL_PROOF_LABEL_LINE.sub("", stripped)
+    stripped = _INTERNAL_LIMIT_LABEL_LINE.sub("", stripped)
     stripped = _CLAIM_MARKER_TOKEN.sub("", stripped)
+    stripped = _INTERNAL_LIMIT_INLINE.sub("", stripped)
+    stripped = _SEPARATOR_EDGE.sub("", stripped)
     stripped = re.sub(r"\n{3,}", "\n\n", stripped)
     trailing_newline = "\n" if value.endswith(("\n", "\r\n")) else ""
     return stripped.strip() + trailing_newline

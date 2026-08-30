@@ -23,8 +23,10 @@ from soloscale.content_workspace import (
     load_content_review,
     load_content_run,
 )
+from soloscale.media_profile import MediaProfileError
 from soloscale.platform_accounts import eligible_publish_identities
 from soloscale.resume_workspace import ResumeWorkspaceStorageError, _atomic_private_write
+from soloscale.voice_provider import VoiceProviderError
 
 ArtifactType = Literal["ARTICLE", "THREAD", "VIDEO"]
 ArtifactPlatform = Literal["linkedin", "x", "youtube", "douyin"]
@@ -38,6 +40,7 @@ ProductionPhase = Literal[
     "FAILED",
 ]
 QueueStatus = Literal["DRAFT", "READY", "PUBLISHED", "FAILED"]
+_RUNNING_PHASES = frozenset({"QUEUED", "GENERATING_CONTENT", "RENDERING_VIDEO"})
 
 _PROJECT_ROOT = "creator-projects"
 _ARTIFACT_ROOT = "creator-artifacts"
@@ -69,7 +72,12 @@ class CreatorProductionJob(_StrictModel):
     artifact_ids: list[str] = Field(default_factory=list)
     queue_item_ids: list[str] = Field(default_factory=list)
     model_calls: int = Field(default=0, ge=0)
+    provider: str | None = None
+    model: str | None = None
+    stage: str | None = None
+    timeout_seconds: int | None = Field(default=None, ge=0)
     error_code: str | None = None
+    error_cause: str | None = None
 
 
 class PublicationArtifact(_StrictModel):
@@ -108,6 +116,44 @@ class CreatorProductionError(ValueError):
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def job_elapsed_seconds(job: CreatorProductionJob, *, now: datetime | None = None) -> int:
+    """Return whole elapsed seconds for a persisted production job.
+
+    A running job uses a live clock from its creation time. A terminal job uses
+    its last persisted transition (``updated_at``) so its displayed duration is
+    stable across refresh, navigation, and history rendering.
+    """
+
+    try:
+        started = datetime.fromisoformat(job.created_at)
+    except ValueError:
+        return 0
+    if job.phase in _RUNNING_PHASES:
+        reference = now or datetime.now(UTC)
+    else:
+        try:
+            reference = datetime.fromisoformat(job.updated_at)
+        except ValueError:
+            reference = started
+    elapsed = (reference - started).total_seconds()
+    return max(0, int(elapsed))
+
+
+def _creator_error_cause(exc: BaseException) -> str | None:
+    """Normalize one safe, actionable cause from a Creator execution failure.
+
+    The raw internal code stays on ``error_code``; this adds only the narrow
+    causes the user can act on (currently: missing voice configuration).
+    """
+
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, (MediaProfileError, VoiceProviderError)):
+            return "VOICE_NOT_CONFIGURED"
+        current = current.__cause__
+    return None
 
 
 def _private_root(data_root: Path, name: str) -> Path:
@@ -305,40 +351,43 @@ def load_publish_queue(data_root: Path) -> tuple[PublishQueueItem, ...]:
     )
 
 
-def list_creator_jobs(data_root: Path) -> tuple[CreatorProductionJob, ...]:
-    """Return persisted production jobs, most recently created first."""
+def load_creator_production_job(
+    data_root: Path, job_id: str
+) -> CreatorProductionJob | None:
+    """Load one persisted ContentProject job without requiring the live manager."""
+
+    path = data_root.absolute() / _PROJECT_ROOT / job_id / "project.json"
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        return CreatorProductionJob.model_validate(_load_model(path, CreatorProductionJob))
+    except CreatorProductionError:
+        return None
+
+
+def load_creator_production_jobs(
+    data_root: Path, *, limit: int = 12
+) -> tuple[CreatorProductionJob, ...]:
+    """Return recent persisted ContentProject jobs, newest first."""
 
     root = data_root.absolute() / _PROJECT_ROOT
     if root.is_symlink() or not root.is_dir():
         return ()
     jobs: list[CreatorProductionJob] = []
-    for directory in root.iterdir():
-        if directory.is_symlink() or not directory.is_dir():
+    for job_dir in root.iterdir():
+        if job_dir.is_symlink() or not job_dir.is_dir():
             continue
-        project_path = directory / "project.json"
-        if project_path.is_symlink() or not project_path.is_file():
+        path = job_dir / "project.json"
+        if path.is_symlink() or not path.is_file():
             continue
         try:
             jobs.append(
-                CreatorProductionJob.model_validate(
-                    _load_model(project_path, CreatorProductionJob)
-                )
+                CreatorProductionJob.model_validate(_load_model(path, CreatorProductionJob))
             )
         except CreatorProductionError:
             continue
-    jobs.sort(key=lambda item: item.created_at, reverse=True)
-    return tuple(jobs)
-
-
-def latest_job_for_story(
-    data_root: Path, story_id: str
-) -> CreatorProductionJob | None:
-    """Return the most recent production job submitted for one Story origin."""
-
-    for job in list_creator_jobs(data_root):
-        if job.request.source_story_id == story_id:
-            return job
-    return None
+    jobs.sort(key=lambda item: item.updated_at, reverse=True)
+    return tuple(jobs[:limit])
 
 
 def assign_artifact_to_account(
@@ -403,6 +452,9 @@ class CreatorProductionJobManager:
         request: CreatorProductionRequest,
         runner: Callable[[], str],
         renderer: Callable[[str], None] | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> CreatorProductionJob:
         job_id = f"creator-job-{uuid4().hex[:16]}"
         job = CreatorProductionJob(
@@ -410,6 +462,10 @@ class CreatorProductionJobManager:
             content_project_id=f"project-{uuid4().hex[:16]}",
             request=request,
             phase="QUEUED",
+            stage="Queued",
+            provider=provider,
+            model=model,
+            timeout_seconds=timeout_seconds,
             created_at=_now(),
             updated_at=_now(),
         )
@@ -460,7 +516,16 @@ class CreatorProductionJobManager:
         if job is None:
             return
         try:
-            job = self._transition(data_root, job, "GENERATING_CONTENT")
+            job = self._transition(
+                data_root,
+                job,
+                "GENERATING_CONTENT",
+                stage=(
+                    "AI generation"
+                    if job.request.ai_editorial
+                    else "Template generation"
+                ),
+            )
             run_id = runner()
             run = load_content_run(data_root, run_id)
             model_calls = int(run.model_used)
@@ -484,7 +549,9 @@ class CreatorProductionJobManager:
             if "VIDEO" in job.request.outputs:
                 if renderer is None:
                     raise CreatorProductionError("Video renderer is unavailable")
-                job = self._transition(data_root, job, "RENDERING_VIDEO")
+                job = self._transition(
+                    data_root, job, "RENDERING_VIDEO", stage="Video rendering"
+                )
                 renderer(run_id)
             artifacts = create_run_artifacts(
                 data_root=data_root,
@@ -509,6 +576,7 @@ class CreatorProductionJobManager:
                 data_root,
                 job,
                 "READY",
+                stage="Artifacts sealed",
                 artifact_ids=[item.artifact_id for item in artifacts],
                 queue_item_ids=queue_ids,
             )
@@ -518,12 +586,15 @@ class CreatorProductionJobManager:
                 if str(exc) == "AI_NOT_EXECUTED"
                 else type(exc).__name__.upper()
             )
+            error_cause = _creator_error_cause(exc)
             current = self.get(data_root, job_id) or job
             self._transition(
                 data_root,
                 current,
                 "AI_NOT_EXECUTED" if error_code == "AI_NOT_EXECUTED" else "FAILED",
+                stage="AI generation" if error_code == "AI_NOT_EXECUTED" else "Failed",
                 error_code=error_code,
+                error_cause=error_cause,
             )
 
 

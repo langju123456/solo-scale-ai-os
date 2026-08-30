@@ -1,12 +1,14 @@
 import json
 import os
-from datetime import UTC, datetime
+import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from soloscale.content_models import ContentReviewDecision
 from soloscale.content_scan import scan_recent_work
 from soloscale.content_ui import ContentFormStatus, content_page, run_content_form
 from soloscale.content_workspace import load_content_run, save_content_review
+from soloscale.creator_production import CreatorProductionJob, CreatorProductionRequest
 from soloscale.media_quality import MediaQualityChecklist, save_media_quality_review
 
 
@@ -257,3 +259,142 @@ def test_content_page_scans_metadata_and_prefills_selected_candidate(
     assert "14 unsupported job requirements" in page
     assert 'name="generation_mode" value="template"' in page
     assert str(tmp_path) not in page
+
+
+def test_creator_page_shares_canonical_work_project_context(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    project = tmp_path / "selected-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    (project / "feature.txt").write_text("verified feature", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "feature.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(project),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "feat: add verified local project evidence",
+        ],
+        check=True,
+    )
+
+    connected = content_page(
+        data_root=data_root,
+        repository_root=project,
+        workspace_view="create",
+        locale="zh-CN",
+    )
+    assert "1 个本地项目" in connected
+
+    disconnected = content_page(
+        data_root=data_root,
+        repository_root=None,
+        workspace_view="create",
+        locale="zh-CN",
+    )
+    assert "1 个本地项目" not in disconnected
+
+
+def test_creator_page_uses_singular_english_project_copy(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    project = tmp_path / "selected-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    (project / "feature.txt").write_text("verified feature", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "feature.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(project),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "feat: add verified local project evidence",
+        ],
+        check=True,
+    )
+
+    page = content_page(
+        data_root=data_root,
+        repository_root=project,
+        workspace_view="create",
+        locale="en",
+    )
+    assert "1 local project" in page
+    assert "1 local projects" not in page
+
+
+def test_template_job_displays_zero_model_calls_and_stable_elapsed(
+    tmp_path: Path,
+) -> None:
+    created = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
+    job = CreatorProductionJob(
+        job_id="creator-job-display",
+        content_project_id="project-display",
+        request=CreatorProductionRequest(
+            source_kind="STORY",
+            source_story_id="M1-13",
+            outputs=["ARTICLE"],
+            language="中文",
+            ai_editorial=False,
+        ),
+        phase="READY",
+        created_at=created.isoformat(),
+        updated_at=(created + timedelta(seconds=7)).isoformat(),
+        stage="Artifacts sealed",
+        provider="template",
+        model=None,
+        model_calls=0,
+    )
+    page = content_page(
+        data_root=tmp_path / ".soloscale",
+        creator_job=job,
+        workspace_view="create",
+        locale="zh-CN",
+    )
+    assert "模型调用: 0" in page
+    assert "已用时: 7s" in page
+
+
+def test_creator_job_error_cause_shows_actionable_voice_message(
+    tmp_path: Path,
+) -> None:
+    created = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
+    job = CreatorProductionJob(
+        job_id="creator-job-voice",
+        content_project_id="project-voice",
+        request=CreatorProductionRequest(
+            source_kind="STORY",
+            source_story_id="M1-13",
+            outputs=["VIDEO"],
+            language="中文",
+            ai_editorial=False,
+        ),
+        phase="FAILED",
+        created_at=created.isoformat(),
+        updated_at=created.isoformat(),
+        stage="Failed",
+        provider="template",
+        model=None,
+        model_calls=0,
+        error_code="CREATORVIDEOERROR",
+        error_cause="VOICE_NOT_CONFIGURED",
+    )
+    page = content_page(
+        data_root=tmp_path / ".soloscale",
+        creator_job=job,
+        workspace_view="create",
+        locale="zh-CN",
+    )
+    assert "未配置可用的语音服务" in page
+    assert "CREATORVIDEOERROR" not in page

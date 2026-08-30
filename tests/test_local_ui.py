@@ -30,7 +30,9 @@ from soloscale.local_ui import (
     UIActionResult,
     UploadedFile,
     _ai_settings_page,
+    _applications_section_html,
     _apply_ai_provider_preference,
+    _create_learning_case_ui,
     _create_resume_pdf_preview,
     _finalize_resume_preview,
     _heygen_settings_page,
@@ -2377,3 +2379,47 @@ def test_resume_workspace_rejects_symlinked_application_library(
     assert result.return_code == 1
     assert result.stderr == "application library save failed; inspect delivery.json"
     assert list(outside.iterdir()) == []
+
+
+def test_create_learning_case_ui_archives_real_ci_evidence(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    workflow = repo / ".github/workflows"
+    workflow.mkdir(parents=True)
+    (workflow / "ci.yml").write_text("name: CI\n", encoding="utf-8")
+    data_root = tmp_path / ".soloscale"
+    result = _create_learning_case_ui(
+        {"target_requirement": "Automate verification with GitHub Actions"},
+        data_root,
+        repo,
+    )
+    assert result is not None
+    assert result.return_code == 0
+    from soloscale.casebook_store import CasebookStore
+
+    cases = CasebookStore(data_root).list_cases()
+    assert [case.id for case in cases] == ["ci-cd-automation"]
+
+
+def test_applications_section_truthfully_separates_drafts_and_applications(
+    tmp_path: Path,
+) -> None:
+    library = tmp_path / "Resume Applications"
+    app_dir = library / "applications" / "app-one"
+    app_dir.mkdir(parents=True)
+    (app_dir / "application.json").write_text(
+        json.dumps(
+            {
+                "soloscale_run_id": "resume-run-1",
+                "company": "Faros",
+                "role": "AI-Native Builder",
+                "status": "DRAFT",
+                "resume_filename": "resume.docx",
+            }
+        ),
+        encoding="utf-8",
+    )
+    html = _applications_section_html(library, locale="zh-CN")
+    assert "申请与机会" in html
+    assert "更新状态" in html
+    assert "打开简历" in html
+    assert "准备面试 / 练习缺口" in html

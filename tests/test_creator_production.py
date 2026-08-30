@@ -17,18 +17,27 @@ from soloscale.content_workspace import (
 )
 from soloscale.creator_production import (
     CreatorProductionError,
+    CreatorProductionJob,
     CreatorProductionJobManager,
     CreatorProductionRequest,
+    ProductionPhase,
+    _creator_error_cause,
     assign_artifact_to_account,
     create_run_artifacts,
+    job_elapsed_seconds,
+    load_creator_production_job,
+    load_creator_production_jobs,
     load_publication_artifacts,
     load_publish_queue,
     wait_for_creator_job,
 )
+from soloscale.media_profile import MediaProfileError
 from soloscale.platform_accounts import (
     ConnectedIdentity,
     save_connected_identity,
 )
+from soloscale.video_factory import CreatorVideoError
+from soloscale.voice_provider import VoiceProviderError
 
 
 def _brief() -> ContentBrief:
@@ -250,6 +259,40 @@ def test_creator_production_job_lifecycle(tmp_path: Path) -> None:
         manager.shutdown()
 
 
+def test_creator_production_jobs_are_persisted_and_listed(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    run = run_content_workspace(data_root=data_root, brief=_brief())
+    manager = CreatorProductionJobManager()
+    try:
+        first = manager.submit(
+            data_root=data_root,
+            request=CreatorProductionRequest(
+                source_kind="CREATE",
+                outputs=["ARTICLE"],
+                language="English",
+                ai_editorial=False,
+            ),
+            runner=lambda: run.run_id,
+        )
+        second = manager.submit(
+            data_root=data_root,
+            request=CreatorProductionRequest(
+                source_kind="CREATE",
+                outputs=["VIDEO"],
+                language="English",
+                ai_editorial=False,
+            ),
+            runner=lambda: run.run_id,
+            renderer=lambda _run_id: None,
+        )
+        jobs = load_creator_production_jobs(data_root)
+        assert [job.job_id for job in jobs][:2] == [second.job_id, first.job_id]
+        assert load_creator_production_job(data_root, first.job_id).job_id == first.job_id
+        assert load_creator_production_job(data_root, "missing") is None
+    finally:
+        manager.shutdown()
+
+
 def test_generate_and_queue_auto_assigns_the_single_eligible_account(
     tmp_path: Path,
 ) -> None:
@@ -283,3 +326,98 @@ def test_generate_and_queue_auto_assigns_the_single_eligible_account(
         assert queue[0].platform == "linkedin"
     finally:
         manager.shutdown()
+
+
+def test_production_job_persists_observable_state(tmp_path: Path) -> None:
+    data_root = tmp_path / ".soloscale"
+    run = run_content_workspace(data_root=data_root, brief=_brief())
+    manager = CreatorProductionJobManager()
+    try:
+        job = manager.submit(
+            data_root=data_root,
+            request=CreatorProductionRequest(
+                source_kind="CREATE",
+                outputs=["ARTICLE"],
+                language="English",
+                ai_editorial=False,
+            ),
+            runner=lambda: run.run_id,
+            provider="template",
+            model=None,
+        )
+        finished = wait_for_creator_job(manager, data_root, job.job_id)
+        assert finished.phase == "READY"
+        assert finished.stage == "Artifacts sealed"
+        assert finished.provider == "template"
+        assert job_elapsed_seconds(finished) >= 0
+        persisted = load_creator_production_job(data_root, job.job_id)
+        assert persisted is not None
+        assert persisted.provider == "template"
+        assert persisted.stage == "Artifacts sealed"
+    finally:
+        manager.shutdown()
+
+
+def _persisted_job(
+    phase: ProductionPhase,
+    *,
+    created: datetime,
+    updated: datetime,
+    provider: str = "template",
+    model_calls: int = 0,
+) -> CreatorProductionJob:
+    return CreatorProductionJob(
+        job_id="creator-job-elapsed",
+        content_project_id="project-elapsed",
+        request=CreatorProductionRequest(
+            source_kind="CREATE",
+            outputs=["ARTICLE"],
+            language="English",
+            ai_editorial=False,
+        ),
+        phase=phase,
+        created_at=created.isoformat(),
+        updated_at=updated.isoformat(),
+        stage="Artifacts sealed" if phase == "READY" else "AI generation",
+        provider=provider,
+        model=None,
+        model_calls=model_calls,
+    )
+
+
+def test_job_elapsed_is_live_while_running_and_stable_after_terminal() -> None:
+    base = datetime(2026, 8, 29, 12, 0, 0, tzinfo=UTC)
+
+    running = _persisted_job(
+        "GENERATING_CONTENT", created=base, updated=base + timedelta(seconds=2)
+    )
+    assert job_elapsed_seconds(running, now=base + timedelta(seconds=5)) == 5
+    assert job_elapsed_seconds(running, now=base + timedelta(seconds=30)) == 30
+
+    ready = _persisted_job(
+        "READY", created=base, updated=base + timedelta(seconds=7)
+    )
+    assert job_elapsed_seconds(ready, now=base + timedelta(seconds=8)) == 7
+    assert job_elapsed_seconds(ready, now=base + timedelta(seconds=99)) == 7
+
+    failed = _persisted_job(
+        "FAILED",
+        created=base,
+        updated=base + timedelta(seconds=12),
+    )
+    assert job_elapsed_seconds(failed, now=base + timedelta(seconds=60)) == 12
+
+
+def test_creator_error_cause_normalizes_missing_voice_configuration() -> None:
+    media = MediaProfileError("Your local Qwen voice is not configured")
+    voice = VoiceProviderError(str(media))
+    voice.__cause__ = media
+    video = CreatorVideoError("Could not complete the local Creator Video render")
+    video.__cause__ = voice
+
+    assert _creator_error_cause(video) == "VOICE_NOT_CONFIGURED"
+
+
+def test_creator_error_cause_ignores_unrelated_failures() -> None:
+    assert _creator_error_cause(CreatorVideoError("render failed")) is None
+    assert _creator_error_cause(CreatorProductionError("storage failed")) is None

@@ -31,7 +31,13 @@ from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import uuid4
 
-from soloscale.casebook_store import CasebookStore
+from soloscale.application_record import (
+    ApplicationStatus,
+    list_application_records,
+    update_application_status,
+)
+from soloscale.casebook_models import EvidenceKind, LearningCase
+from soloscale.casebook_store import CasebookError, CasebookStore
 from soloscale.content_canon import load_month_one_canon
 from soloscale.content_distribution import (
     ContentDistributionError,
@@ -106,6 +112,7 @@ from soloscale.learning_practice import (
     ExerciseType,
     LearningExercise,
     PracticeLanguage,
+    capability_requirement,
     create_practice_workspace,
     generate_practice_exercise,
     ingest_practice_completion,
@@ -820,6 +827,48 @@ def _gateway_from_preference(preference: AIProviderPreference) -> ModelGateway:
     return model_gateway_for(preference.provider)
 
 
+def _preference_provider_configured(preference: AIProviderPreference) -> bool:
+    if preference.provider is ModelProviderId.OLLAMA:
+        return _ollama_readiness(preference).ready
+    if preference.provider is ModelProviderId.OPENAI_COMPATIBLE:
+        return openai_api_key_is_configured()
+    return (
+        model_gateway_for(ModelProviderId.SOLOSCALE_HOSTED).descriptor.configuration_state
+        is GatewayConfigurationState.CONFIGURED
+    )
+
+
+def _creator_generation_mode(
+    preference: AIProviderPreference, form: dict[str, str], source_kind: str
+) -> str:
+    """Resolve one truthful generation mode for a Creator production request.
+
+    A Story/Canon action has no inline mode selector, so when the saved provider is
+    not configured we fall back to the deterministic template instead of showing a
+    confusing AI_NOT_EXECUTED with no durable package.
+    """
+
+    explicit = form.get("generation_mode", "").strip()
+    if explicit:
+        return explicit
+    if source_kind == "STORY" and not _preference_provider_configured(preference):
+        return "template"
+    return preference.provider.value
+
+
+def _creator_job_provider_metadata(
+    preference: AIProviderPreference, generation_mode: str
+) -> tuple[str | None, str | None]:
+    if generation_mode == "template":
+        return "template", None
+    if generation_mode == ModelProviderId.OLLAMA.value:
+        return ModelProviderId.OLLAMA.value, preference.ollama_model
+    if generation_mode == ModelProviderId.OPENAI_COMPATIBLE.value:
+        return ModelProviderId.OPENAI_COMPATIBLE.value, preference.openai_model
+    hosted_model = model_gateway_for(ModelProviderId.SOLOSCALE_HOSTED).descriptor.model
+    return ModelProviderId.SOLOSCALE_HOSTED.value, hosted_model
+
+
 def _ollama_cli_path() -> str | None:
     discovered = shutil.which("ollama")
     if discovered:
@@ -963,9 +1012,24 @@ def _video_page(
     *,
     local_job: LocalVideoJobSnapshot | None = None,
     local_video_available: bool = False,
+    content_run_id: str | None = None,
+    content_data_root: Path | None = None,
 ) -> str:
     job = load_job(data_root, job_id) if job_id else None
     configuration = provider_status()
+    downstream_run = None
+    downstream_notice = ""
+    if content_run_id and content_data_root is not None:
+        try:
+            downstream_run = load_content_run(content_data_root, content_run_id)
+        except ContentWorkspaceError:
+            downstream_run = None
+    topic_value = ""
+    script_value = ""
+    if downstream_run is not None:
+        topic_value = downstream_run.brief.topic
+        script_value = downstream_run.drafts.video_script
+        downstream_notice = f'''<p class="notice" role="status">{_escape(ui_text(locale, '这是下游视频生产页；主题与分镜已从上游内容包带入，无需重新录入。', 'This is the downstream video production page; topic and storyboard are carried over from the upstream content package and do not need to be re-entered.'))} <a href="{ui_url('/creator/create', locale, run_id=content_run_id or '')}">{_escape(ui_text(locale, '打开上游内容包', 'Open upstream package'))} →</a></p>'''
     detail = ""
     if job:
         outgoing = html.escape(json.dumps(job.request.external_payload(), indent=2), quote=True)
@@ -1005,15 +1069,17 @@ def _video_page(
 <section class="card">
   <div class="provider-row"><span>Google Vertex AI · Veo</span><span class="status-badge">{_escape(configuration)}</span></div>
   {message}
+  {downstream_notice}
   <form method="post" action="/video/prepare">
     <input type="hidden" name="ui_locale" value="{locale}" />
-    <label>{_escape(ui_text(locale, '主题', 'Topic'))}<input name="topic" required></label>
-    <label>{_escape(ui_text(locale, '脚本或视频设计文档', 'Script or video design document'))}<textarea name="script" required></textarea></label>
+    <input type="hidden" name="content_run_id" value="{_escape(content_run_id or '')}" />
+    <label>{_escape(ui_text(locale, '主题', 'Topic'))}<input name="topic" value="{_escape(topic_value)}" required></label>
+    <label>{_escape(ui_text(locale, '脚本或视频设计文档', 'Script or video design document'))}<textarea name="script" required>{_escape(script_value)}</textarea></label>
     <details>
       <summary>{_escape(ui_text(locale, '可选：证据与来源', 'Optional: evidence and source'))}</summary>
       <label>{_escape(ui_text(locale, '证据 ID（每行一个）', 'Evidence IDs (one per line)'))}<textarea name="evidence_ids"></textarea></label>
       <label>{_escape(ui_text(locale, '明确选择的证据摘录（每行一个）', 'Explicitly selected evidence excerpts (one per line)'))}<textarea name="evidence_excerpts"></textarea></label>
-      <label>SoloScale content run ID<input name="content_run_id"></label>
+      <label>SoloScale content run ID<input name="content_run_id" value="{_escape(content_run_id or '')}"></label>
     </details>
     <div class="video-settings">
       <label>{_escape(ui_text(locale, '平台', 'Platform'))}<input name="platform" value="Short video"></label>
@@ -3569,6 +3635,35 @@ def _run_action(form: dict[str, str], data_root: Path, repo_root: Path) -> UIAct
     return None
 
 
+def _human_duration(locale: UILocale, elapsed_ms: int) -> str:
+    """Render a primary duration without leaking raw adapter latency."""
+
+    seconds = max(0, int(elapsed_ms)) / 1000
+    if seconds < 1:
+        return ui_text(locale, f"{max(0, int(elapsed_ms))} 毫秒", f"{max(0, int(elapsed_ms))} ms")
+    return ui_text(locale, f"{seconds:.1f} 秒", f"{seconds:.1f}s")
+
+
+def _human_ai_service_label(
+    locale: UILocale, provider: str, model: str | None = None
+) -> str:
+    """Map internal provider vocabulary to human product truth."""
+
+    provider_key = (provider or "").strip().lower()
+    model_label = (model or "").strip()
+    if provider_key in {"openai_compatible", "openai", "openai_sol"}:
+        base = ui_text(locale, "OpenAI 兼容服务", "OpenAI-compatible service")
+    elif provider_key == "ollama":
+        base = ui_text(locale, "本地 Ollama", "Local Ollama")
+    elif provider_key == "soloscale_hosted":
+        base = ui_text(locale, "SoloScale 托管 AI", "SoloScale Hosted AI")
+    elif provider_key == "template":
+        return ui_text(locale, "安全离线模板", "Safe offline template")
+    else:
+        base = ui_text(locale, "已配置服务", "Configured service")
+    return f"{base} · {model_label}" if model_label else base
+
+
 def _result_card(
     result: UIActionResult | None, locale: UILocale = DEFAULT_UI_LOCALE
 ) -> str:
@@ -3595,7 +3690,7 @@ def _result_card(
   <p>{_escape(body)}</p>
   <details class="technical-details">
     <summary>{_escape(ui_text(locale, '查看技术详情', 'View technical details'))}</summary>
-    <p>{_escape(ui_text(locale, '耗时', 'Duration'))}: {result.elapsed_ms}ms</p>
+    <p>{_escape(ui_text(locale, '耗时', 'Duration'))}: {_escape(_human_duration(locale, result.elapsed_ms))}</p>
     <p>{_escape(ui_text(locale, '命令', 'Command'))}: <code>{_escape(result.command)}</code></p>
   </details>
   {workspace}
@@ -4178,6 +4273,9 @@ def _user_result_card(
     )
     generation_mode = str(user_metadata.get("generation_mode", "template"))
     provider = str(user_metadata.get("provider", "template"))
+    ai_service_label = _human_ai_service_label(
+        locale, provider, str(user_metadata.get("model") or "")
+    )
     if generation_mode == "ai":
         result_summary = ui_text(
             locale,
@@ -4186,8 +4284,8 @@ def _user_result_card(
         )
         privacy_note = ui_text(
             locale,
-            f"本次使用 {provider}。本地检索到 {retrieved_count} 条资料线索，最终只准入并提交 {admitted_count} 条已验证事实；原始对话、项目文件和未选资料未发送。",
-            f"This run used {provider}. Local retrieval found {retrieved_count} discovery clues; only {admitted_count} verified facts were admitted and sent. Raw conversations, project files, and unselected material were not sent.",
+            f"AI 服务：{ai_service_label}。本地检索到 {retrieved_count} 条资料线索，最终只准入并提交 {admitted_count} 条已验证事实；原始对话、项目文件和未选资料未发送。",
+            f"AI service: {ai_service_label}. Local retrieval found {retrieved_count} discovery clues; only {admitted_count} verified facts were admitted and sent. Raw conversations, project files, and unselected material were not sent.",
         )
         if user_metadata.get("role_strategy_fallback_applied") is True:
             result_summary += ui_text(
@@ -4321,7 +4419,7 @@ def _user_result_card(
     return f"""<section class="result-card success-state" aria-live="polite">
   <div class="result-header">
     <div>
-      <span class="result-kicker">{_escape(result_kicker)} · {display_elapsed_ms} ms</span>
+      <span class="result-kicker">{_escape(result_kicker)} · {_escape(_human_duration(locale, display_elapsed_ms))}</span>
       <h2>{_escape(result_heading)}</h2>
       <p>{_escape(result_summary)}</p>
     </div>
@@ -4690,8 +4788,67 @@ def _home_page(
         body=body,
         extra_css="""
 .work-context-strip{display:grid;grid-template-columns:minmax(230px,.8fr) minmax(260px,1.2fr) auto;gap:18px;align-items:center;margin-bottom:20px;padding:17px 20px;border:1px solid #d9e2dc;border-radius:17px;background:linear-gradient(110deg,rgba(255,255,255,.96),rgba(239,248,244,.92));box-shadow:0 10px 28px rgb(35 45 70 / 6%)}.work-context-strip>div{display:grid;gap:4px}.work-context-strip strong{font-size:14px}.work-context-strip p{margin:0;color:var(--text-muted)}.work-context-strip a{display:flex;align-items:center;gap:10px;white-space:nowrap;font-weight:850;text-decoration:none}.outcome-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;align-items:stretch}.outcome-card{position:relative;overflow:hidden;display:flex;flex-direction:column;min-height:360px;padding:26px;border:1px solid #fff;border-radius:var(--radius-xl);box-shadow:var(--shadow-card);background:linear-gradient(160deg,#fff 0%,#f7f8ff 100%);cursor:pointer;transition:transform .16s ease,box-shadow .16s ease}.outcome-card:hover,.outcome-card:focus-within{transform:translateY(-3px);box-shadow:0 20px 52px rgb(35 45 70 / 13%),0 1px 2px rgb(35 45 70 / 6%)}.outcome-card::after{content:"";position:absolute;width:150px;height:150px;border-radius:50%;right:-55px;top:-55px;background:rgb(64 86 180 / 8%)}.outcome-hitbox{position:absolute;inset:0;z-index:2;border-radius:inherit}.outcome-hitbox:focus-visible{outline:3px solid var(--focus);outline-offset:-4px}.defend-card{background:linear-gradient(160deg,#fff 0%,#f2faf6 100%)}.defend-card::after{background:rgb(24 119 92 / 9%)}.visibility-card{background:linear-gradient(160deg,#fff 0%,#fbf6ff 100%)}.visibility-card::after{background:rgb(114 87 173 / 9%)}.outcome-number{color:var(--text-muted);font-size:12px;font-weight:850;letter-spacing:.12em}.outcome-card .kicker{margin-top:28px}.outcome-card h2{margin:10px 0 11px;font-size:25px;line-height:1.2;letter-spacing:-.035em}.outcome-card p{margin:0 0 24px;color:var(--text-muted)}.outcome-action{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:auto;padding:13px 15px;border-radius:13px;background:var(--brand);color:#fff;text-decoration:none;font-weight:850}.defend-card .outcome-action{background:var(--success)}.visibility-card .outcome-action{background:var(--brand-secondary)}.secondary-actions{position:relative;z-index:3;display:flex;gap:12px;flex-wrap:wrap;margin-top:13px}.secondary-actions a{font-size:12px;font-weight:750;text-decoration:none}.today-activity{margin-top:22px;padding:22px;border:1px solid var(--border);border-radius:20px;background:rgb(255 255 255 / 76%)}.today-activity h2{margin:5px 0 14px}.activity-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.activity-card{display:grid;gap:8px;padding:16px;border:1px solid var(--border);border-radius:15px;background:#fff}.activity-card strong{font-size:15px}.activity-card p{margin:0;color:var(--text-muted);font-size:13px}.activity-card a{justify-self:start;font-size:13px;font-weight:850;text-decoration:none}.activity-state{justify-self:start;padding:4px 8px;border-radius:999px;background:var(--success-soft);color:var(--success);font-size:11px;font-weight:850}.home-promise{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:22px;padding:16px 20px;border:1px solid var(--border);border-radius:16px;background:rgb(255 255 255 / 72%);color:var(--text-muted)}.home-promise strong{color:var(--text)}
+.work-context-strip .context-note{color:var(--text-muted);font-size:12px}
 @media(max-width:940px){.work-context-strip{grid-template-columns:1fr}.outcome-grid,.activity-grid{grid-template-columns:1fr}.outcome-card{min-height:280px}.home-promise{align-items:flex-start;flex-direction:column}}""",
     )
+
+
+def _applications_section_html(
+    resume_library_root: Path, *, locale: UILocale
+) -> str:
+    try:
+        records = list_application_records(resume_library_root)
+    except (OSError, ValueError):
+        records = []
+    if not records:
+        return f'''<section class="applications-overview" id="applications"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, "申请与机会", "Applications / Opportunities"))}</span><h2>{_escape(ui_text(locale, "还没有申请记录", "No applications yet"))}</h2><p>{_escape(ui_text(locale, "生成并保存第一份针对性简历后，这里会显示申请状态、面试就绪与下一步。简历草稿不会被误当作投递记录。", "After you generate and save your first tailored resume, this area will show application status, interview readiness, and next actions. Resume drafts are never mistaken for applications."))}</p></div></div><a class="text-link" href="{ui_url('/resume#resume-form', locale)}">{_escape(ui_text(locale, "生成第一份简历", "Generate your first resume"))} →</a></section>'''
+    status_labels = {
+        ApplicationStatus.DRAFT: ui_text(locale, "草稿", "Draft"),
+        ApplicationStatus.READY_TO_APPLY: ui_text(locale, "可投递", "Ready to apply"),
+        ApplicationStatus.APPLIED: ui_text(locale, "已投递", "Applied"),
+        ApplicationStatus.INTERVIEW: ui_text(locale, "面试中", "Interview"),
+        ApplicationStatus.OFFER: ui_text(locale, "Offer", "Offer"),
+        ApplicationStatus.REJECTED: ui_text(locale, "未通过", "Rejected"),
+        ApplicationStatus.WITHDRAWN: ui_text(locale, "已撤回", "Withdrawn"),
+    }
+    cards: list[str] = []
+    for record in records:
+        status_options = "".join(
+            f'<option value="{status.value}" {"selected" if status is record.status else ""}>{_escape(status_labels[status])}</option>'
+            for status in ApplicationStatus
+        )
+        company = _escape(record.company or ui_text(locale, "未记录公司", "Company not recorded"))
+        role = _escape(record.role or ui_text(locale, "未记录职位", "Role not recorded"))
+        resume_action = (
+            f'<a class="text-link" href="{ui_url(f"/downloads/{record.soloscale_run_id}/resume.docx", locale)}">{_escape(ui_text(locale, "打开简历", "Open resume"))} →</a>'
+            if record.soloscale_run_id
+            else ""
+        )
+        interview = (
+            ui_text(locale, "是", "Yes")
+            if record.interview_ready is True
+            else ui_text(locale, "否", "No")
+            if record.interview_ready is False
+            else ui_text(locale, "未评估", "Not assessed")
+        )
+        next_action = _escape(record.next_action or ui_text(locale, "下一步由你决定", "Next action is yours to decide"))
+        cards.append(
+            f'''<article class="application-card"><div><span class="status-badge">{_escape(status_labels[record.status])}</span><h3>{role} · {company}</h3><p>{_escape(record.job_id or ui_text(locale, "无 JD 标识", "No JD identity"))}{(" · " + _escape(record.source_url)) if record.source_url else ""}</p><div class="application-truth"><span>{_escape(ui_text(locale, "面试就绪", "Interview ready"))}: <strong>{interview}</strong></span><span>{_escape(ui_text(locale, "下一步", "Next action"))}: <strong>{next_action}</strong></span></div></div><div class="application-actions">{resume_action}<form method="post" action="/applications/status"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="resume_library_root" value="{_escape(str(resume_library_root))}" /><input type="hidden" name="directory_name" value="{_escape(record.directory_name)}" /><select name="status">{status_options}</select><input name="note" placeholder="{_escape(ui_text(locale, "备注（可选）", "Note (optional)"))}" /><input name="next_action" placeholder="{_escape(ui_text(locale, "下一步（可选）", "Next action (optional)"))}" /><button type="submit">{_escape(ui_text(locale, "更新状态", "Update status"))}</button></form><a class="text-link" href="{ui_url('/learning', locale)}">{_escape(ui_text(locale, "准备面试 / 练习缺口", "Prepare interview / practice gap"))} →</a></div></article>'''
+        )
+    return f'''<section class="applications-overview" id="applications"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, "申请与机会", "Applications / Opportunities"))}</span><h2>{_escape(ui_text(locale, "追踪每一次申请，而不是把简历草稿误当作投递记录。", "Track each application instead of mistaking resume drafts for applications."))}</h2><p>{_escape(ui_text(locale, "状态只在你记录真实外部结果后更新；SoloScale 不会替你发明投递或 Offer。", "Status updates only after you record a real external result; SoloScale never invents an application or offer."))}</p></div></div><div class="application-list">{''.join(cards)}</div></section>'''
+
+
+def _localized_file_input(
+    *,
+    name: str,
+    accept: str,
+    required: bool,
+    locale: UILocale,
+    button_label: str,
+    placeholder: str,
+) -> str:
+    required_attr = " required" if required else ""
+    return f'''<span class="file-control"><input class="file-native" type="file" name="{_escape(name)}" accept="{_escape(accept)}"{required_attr} data-file-placeholder="{_escape(placeholder)}" /><span class="file-button" aria-hidden="true">{_escape(button_label)}</span><span class="file-name" data-file-name-for="{_escape(name)}">{_escape(placeholder)}</span></span>'''
 
 
 def _user_page(
@@ -4792,7 +4949,10 @@ def _user_page(
     if language_value not in {"en-US", "zh-CN", "both"}:
         language_value = "en-US"
     job_panel = _resume_job_panel(resume_job, locale) if resume_job is not None else ""
-    body = f"""{work_summary}{job_panel}<div class="{workspace_class}">
+    applications_section = _applications_section_html(
+        resume_library_root, locale=locale
+    )
+    body = f"""{work_summary}{applications_section}{job_panel}<div class="{workspace_class}">
       <section class="input-card">
         <span class="result-kicker">{_escape(ui_text(locale, '输入', 'Input'))}</span>
         <h2>{_escape(ui_text(locale, '简历 + Job Description', 'Resume + Job Description'))}</h2>
@@ -4804,7 +4964,7 @@ def _user_page(
           <form method="post" action="/resume/template-preview" enctype="multipart/form-data">
             <input type="hidden" name="ui_locale" value="{locale}" />
             <label>{_escape(ui_text(locale, '上传模板文件', 'Upload template file'))}
-              <input type="file" name="layout_template_file" accept=".docx,.html,.htm,.pdf,.txt,.md" />
+              {_localized_file_input(name="layout_template_file", accept=".docx,.html,.htm,.pdf,.txt,.md", required=False, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
             </label>
             <label>{_escape(ui_text(locale, '或模板网页 URL', 'Or template webpage URL'))}
               <input type="url" name="layout_template_url" placeholder="https://example.com/resume-template" />
@@ -4831,9 +4991,7 @@ def _user_page(
           {f'<label><input type="checkbox" name="approve_layout_template" value="yes" required />{_escape(ui_text(locale, "我已预览并确认使用这个结构模板；模板正文不会作为我的经历。", "I reviewed and approve this structure template. Its body copy is not my experience."))}</label>' if template_receipt is not None else ''}
           <label>{_escape(ui_text(locale, '现有简历', 'Current resume'))}
             <span class="hint">{_escape(ui_text(locale, '支持 PDF、DOCX、TXT、MD；每个文件最大 5 MB。DOCX 会保留原版式，其他格式会生成简洁 Word 版。', 'PDF, DOCX, TXT, and MD are supported, up to 5 MB each. DOCX keeps its layout; other formats produce a clean Word version.'))}</span>
-            <input
-              type="file" name="resume_template" accept=".pdf,.docx,.txt,.md" required
-            />
+            {_localized_file_input(name="resume_template", accept=".pdf,.docx,.txt,.md", required=True, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
           </label>
           <label>{_escape(ui_text(locale, '职位描述（JD）', 'Job Description'))}
             <span class="hint">{_escape(ui_text(locale, '粘贴完整 JD，或在下方上传一个文件；两者选一个。', 'Paste the complete JD, or upload one file below. Choose one method.'))}</span>
@@ -4843,11 +5001,11 @@ def _user_page(
             >{job_description}</textarea>
           </label>
           <label>{_escape(ui_text(locale, '或者上传 JD（可选）', 'Or upload the JD (optional)'))}
-            <input type="file" name="job_description_file" accept=".pdf,.docx,.txt,.md" />
+            {_localized_file_input(name="job_description_file", accept=".pdf,.docx,.txt,.md", required=False, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
           </label>
           <label>{_escape(ui_text(locale, '补充材料（可选，最多一份）', 'Supporting document (optional, one file)'))}
             <span class="hint">{_escape(ui_text(locale, '只提取与本次简历相关的摘要；不会上传原始文件、文件名或本地路径。', 'Only a task-relevant summary is prepared. The raw file, filename, and local path never enter the gateway payload.'))}</span>
-            <input type="file" name="support_document" accept=".pdf,.docx,.txt,.md" />
+            {_localized_file_input(name="support_document", accept=".pdf,.docx,.txt,.md", required=False, locale=locale, button_label=ui_text(locale, "选择文件", "Choose file"), placeholder=ui_text(locale, "未选择文件", "No file selected"))}
           </label>
           <label>{_escape(ui_text(locale, '针对性说明（可选）', 'Tailoring instructions (optional)'))}
             <span class="hint">{_escape(ui_text(locale, '例如：突出 RAG、后端工程和产品交付。说明只影响已有内容的排序，不会新增经历。', 'For example: prioritize RAG, backend engineering, and product delivery. Instructions only affect ordering and never add experience.'))}</span>
@@ -4916,6 +5074,12 @@ def _user_page(
     }};
     document.querySelectorAll('input[name="expert_review_mode"]').forEach((item)=>item.addEventListener('change',syncExpertApproval));
     syncExpertApproval();
+    document.querySelectorAll('input.file-native[type="file"]').forEach((input)=>{{
+      const name=document.querySelector(`[data-file-name-for="${{input.name}}"]`);
+      const update=()=>{{ if(name) name.textContent = input.files && input.files.length ? Array.from(input.files).map(f=>f.name).join(', ') : (input.dataset.filePlaceholder || ''); }};
+      input.addEventListener('change',update);
+      update();
+    }});
     if(resumeForm) resumeForm.addEventListener('submit',()=>{{
       const progress=document.getElementById('progress');
       const button=document.getElementById('generate-button');
@@ -4951,7 +5115,9 @@ def _user_page(
 .result-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(180px,.55fr);gap:18px}.preview-heading{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:10px}.preview-heading h3{margin:0}.preview-link{font-size:12px;font-weight:700;text-decoration:none}
 .resume-pdf-shell{height:680px;overflow:hidden;border:1px solid var(--border);border-radius:14px;background:#dfe3ea}.resume-pdf-preview{width:100%;height:100%;border:0;background:white}.preview-note{margin:9px 0 0;font-size:12px}.resume-preview{max-height:450px;overflow:auto}.gap-list{padding-left:20px;color:var(--text-muted);font-size:13px}.result-card details{margin-top:18px;border-top:1px solid var(--border);padding-top:15px;font-size:13px}.result-card summary{cursor:pointer;font-weight:700}code{word-break:break-all}
 .resume-provenance>p{color:var(--text-muted)}.provenance-summary{display:flex;align-items:baseline;gap:7px;margin:12px 0}.provenance-summary strong{font-size:26px;color:var(--success)}.provenance-claims{display:grid;gap:9px}.provenance-claim{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding:12px;border:1px solid var(--border);border-radius:12px;background:#f8fbf9}.provenance-claim strong{font-size:13px;line-height:1.45}.provenance-claim p{margin:6px 0 0;color:var(--text-muted);font-size:11px}.provenance-claim .status-badge{flex:none;padding:5px 8px;border-radius:999px;background:#e5f5ed;color:#166044;font-size:10px;font-weight:800}
-@media(max-width:900px){.use-my-work,.workspace,.workspace.has-result,.result-grid{grid-template-columns:1fr}.resume-job-steps{grid-template-columns:repeat(3,1fr)}.job-timings ul{grid-template-columns:repeat(2,1fr)}}@media(max-width:560px){.metadata,.metrics{grid-template-columns:1fr 1fr}.result-header,.resume-job-header,.resume-job-actions{display:block}.download{display:block;margin-top:16px}.resume-pdf-shell{height:560px}.resume-job-steps,.job-timings ul{grid-template-columns:1fr 1fr}}
+.applications-overview{margin-bottom:20px;padding:20px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.applications-overview h2{margin:7px 0}.applications-overview p{color:var(--text-muted)}.application-list{display:grid;gap:12px;margin-top:16px}.application-card{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:start;padding:16px;border:1px solid var(--border);border-radius:15px;background:#fff}.application-card h3{margin:7px 0 5px}.application-card p{margin:0;color:var(--text-muted);font-size:12px}.application-truth{display:grid;gap:4px;margin-top:10px;font-size:12px;color:var(--text-muted)}.application-truth strong{color:var(--text)}.application-actions{display:grid;gap:10px;align-items:start}.application-actions form{display:grid;grid-template-columns:auto 1fr 1fr auto;gap:7px}.application-actions input,.application-actions select{min-width:0}.application-actions button{white-space:nowrap}
+.file-control{position:relative;display:inline-flex;align-items:center;gap:10px;min-width:220px;padding:10px 12px;border:1px dashed var(--border);border-radius:12px;background:#fafbff}.file-native{position:absolute;inset:0;opacity:0;width:100%;height:100%;cursor:pointer;z-index:2}.file-button{padding:7px 11px;border-radius:9px;background:var(--brand);color:#fff;font-weight:800;font-size:12px;pointer-events:none}.file-name{color:var(--text-muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px}.file-control:focus-within{outline:3px solid var(--focus);outline-offset:2px}
+@media(max-width:900px){.use-my-work,.workspace,.workspace.has-result,.result-grid,.application-card{grid-template-columns:1fr}.resume-job-steps{grid-template-columns:repeat(3,1fr)}.job-timings ul{grid-template-columns:repeat(2,1fr)}.application-actions form{grid-template-columns:1fr}}@media(max-width:560px){.metadata,.metrics{grid-template-columns:1fr 1fr}.result-header,.resume-job-header,.resume-job-actions{display:block}.download{display:block;margin-top:16px}.resume-pdf-shell{height:560px}.resume-job-steps,.job-timings ul{grid-template-columns:1fr 1fr}}
 """,
     )
 
@@ -5302,6 +5468,21 @@ def _anchor_pack_html(pack: dict[str, object], locale: UILocale) -> str:
 """
 
 
+def _active_learning_case(data_root: Path) -> LearningCase | None:
+    try:
+        cases = CasebookStore(data_root).list_cases()
+    except (OSError, ValueError):
+        return None
+    return max(cases, key=lambda case: case.created_at) if cases else None
+
+
+def _learning_default_requirement(data_root: Path) -> str:
+    active = _active_learning_case(data_root)
+    if active is not None:
+        return capability_requirement(active)
+    return DEFAULT_TARGET_REQUIREMENT
+
+
 def _practice_panel_html(data_root: Path, form: dict[str, str], locale: UILocale) -> str:
     try:
         cases = CasebookStore(data_root).list_cases()
@@ -5310,14 +5491,14 @@ def _practice_panel_html(data_root: Path, form: dict[str, str], locale: UILocale
     if not cases:
         return f"""<section class="panel practice-panel" id="practice">
   <h2>{_escape(ui_text(locale, '编码练习（VS Code）', 'Coding practice (VS Code)'))}</h2>
-  <p class="muted">{_escape(ui_text(locale, '先创建一个学习案例（CLI：soloscale case-create …），这里会把案例缺口变成可练习的编码任务。', 'Create a Learning case first (CLI: soloscale case-create …) to turn the case gap into a bounded coding task.'))}</p>
+  <p class="muted">{_escape(ui_text(locale, '先在下方生产就绪地图中创建学习案例，无需命令行；之后即可把案例缺口变成可练习、可回填掌握度的编码任务。', 'Create a Learning case from the Production Readiness Map below (no command line required); then turn the case gap into a bounded, testable practice task.'))}</p>
 </section>"""
     latest = max(cases, key=lambda case: case.created_at)
     exercises = [
         item for item in list_exercises(data_root) if item.case_id == latest.id
     ]
     target_requirement = _escape(
-        form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT)
+        form.get("target_requirement", _learning_default_requirement(data_root))
     )
     type_options = "".join(
         f'<option value="{item.value}" {"selected" if item is ExerciseType.IMPLEMENT else ""}>{item.value}</option>'
@@ -5351,6 +5532,105 @@ def _practice_panel_html(data_root: Path, form: dict[str, str], locale: UILocale
 </section>"""
 
 
+def _production_readiness_map_html(
+    data_root: Path, repo_root: Path | None, form: dict[str, str], locale: UILocale
+) -> str:
+    """Surface the capability-domain x maturity map without inventing mastery."""
+
+    try:
+        cases = CasebookStore(data_root).list_cases()
+    except (OSError, ValueError):
+        cases = []
+    latest = max(cases, key=lambda case: case.created_at) if cases else None
+    has_case = latest is not None
+    exercises = (
+        [item for item in list_exercises(data_root) if item.case_id == latest.id]
+        if latest is not None
+        else []
+    )
+    has_project = repo_root is not None
+    has_ci = bool(
+        repo_root is not None
+        and (repo_root / ".github/workflows/ci.yml").is_file()
+        and not (repo_root / ".github/workflows/ci.yml").is_symlink()
+    )
+    domains = (
+        "AI Application",
+        "Software Engineering",
+        "Cloud / DevOps",
+        "Observability / Evaluation",
+        "System Design",
+        "Security / Enterprise",
+    )
+    maturities = (
+        "UNDERSTAND",
+        "BUILD",
+        "TEST",
+        "DEPLOY",
+        "OBSERVE",
+        "RECOVER",
+        "SECURE",
+        "EXPLAIN / DEFEND",
+    )
+    domain_rows = "".join(
+        f'''<div class="readiness-domain"><strong>{_escape(domain)}</strong><div class="maturity-row">{"".join(f'<span class="maturity-chip {"ready" if has_case or (dim in {"TEST", "DEPLOY"} and has_ci) else "needs"}">{_escape(dim)}</span>' for dim in maturities)}</div></div>'''
+        for domain in domains
+    )
+    if not has_project:
+        gap_type = ui_text(locale, "NO_EVIDENCE", "NO_EVIDENCE")
+        gap_title = ui_text(locale, "连接一个真实项目", "Connect a real project")
+        gap_note = ui_text(
+            locale,
+            "没有项目证据时无法生成有边界的练习；先在工作页选择本地 Git 项目。",
+            "A bounded practice cannot be generated without project evidence; choose a local Git project first.",
+        )
+    elif not has_ci:
+        gap_type = ui_text(locale, "NO_PRODUCTION_PROOF", "NO_PRODUCTION_PROOF")
+        gap_title = ui_text(locale, "把验证命令固化为 GitHub Actions CI", "Automate verification with GitHub Actions")
+        gap_note = ui_text(
+            locale,
+            "项目已在本地反复运行 pytest、ruff、mypy 与构建，但仍需把这条验证流水线作为生产证据自动化并讲清楚。",
+            "The project already runs pytest, Ruff, mypy, and build locally, but this verification loop still needs to be automated and explained as production evidence.",
+        )
+    elif latest is None:
+        gap_type = ui_text(locale, "UNDERSTANDING_GAP", "UNDERSTANDING_GAP")
+        gap_title = ui_text(locale, "创建第一个 CI/CD 学习案例", "Create the first CI/CD learning case")
+        gap_note = ui_text(
+            locale,
+            "仓库已有 CI workflow，但还没有把它沉淀为可练习、可复核的学习案例。",
+            "The repository already has a CI workflow, but it has not been turned into a practiceable, reviewable learning case yet.",
+        )
+    elif not exercises:
+        gap_type = ui_text(locale, "INTERVIEW_GAP", "INTERVIEW_GAP")
+        gap_title = ui_text(locale, "生成并完成一次 CI/CD 练习", "Generate and complete one CI/CD exercise")
+        gap_note = ui_text(
+            locale,
+            "已有案例；下一步是生成有边界的练习工作区并在 VS Code 中完成。",
+            "A case exists; the next step is to generate a bounded practice workspace and complete it in VS Code.",
+        )
+    else:
+        gap_type = ui_text(locale, "INTERVIEW_GAP", "INTERVIEW_GAP")
+        gap_title = ui_text(locale, "提交证据并复核掌握", "Submit evidence and review mastery")
+        gap_note = ui_text(
+            locale,
+            "练习工作区已生成；完成编码后提交结果，掌握等级仍需你确认，不会自动授予。",
+            "A practice workspace exists; after coding, submit your result. Mastery still requires your confirmation and is never auto-granted.",
+        )
+    if latest is not None:
+        action = f'''<form method="post" action="/learning/practice/create"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="case_id" value="{_escape(latest.id)}" /><input type="hidden" name="target_requirement" value="{_escape(form.get("target_requirement", _learning_default_requirement(data_root)))}" /><input type="hidden" name="exercise_type" value="IMPLEMENT" /><input type="hidden" name="practice_language" value="python" /><input type="hidden" name="difficulty" value="2" /><button class="primary" type="submit">{_escape(ui_text(locale, "生成练习", "Generate practice"))}</button></form>'''
+    elif has_project:
+        action = f'''<form method="post" action="/learning/case/create"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="target_requirement" value="{_escape(form.get("target_requirement", _learning_default_requirement(data_root)))}" /><button class="primary" type="submit">{_escape(ui_text(locale, "创建学习案例并继续", "Create learning case"))}</button></form>'''
+    else:
+        action = f'<a class="button-link" href="{ui_url("/work", locale)}">{_escape(ui_text(locale, "选择项目", "Choose project"))}</a>'
+    return f"""<section class="panel readiness-map" id="readiness-map">
+  <span class="kicker">{_escape(ui_text(locale, "生产就绪地图", "Production readiness map"))}</span>
+  <h2>{_escape(ui_text(locale, "能力域 × 工程成熟度", "Capability domain x engineering maturity"))}</h2>
+  <p class="muted">{_escape(ui_text(locale, "这里用定性状态标记证据，不伪造单一精确百分比；掌握证据仍需你复核。", "This map uses qualitative evidence states and never fabricates one precise mastery percentage; mastery still needs your review."))}</p>
+  <div class="readiness-domains">{domain_rows}</div>
+  <div class="highest-gap"><div><span class="status-badge">{_escape(gap_type)}</span><h3>{_escape(gap_title)}</h3><p>{_escape(gap_note)}</p></div>{action}</div>
+</section>"""
+
+
 def _render_practice_exercise_row(item: LearningExercise, locale: UILocale) -> str:
     actions: list[str] = []
     if item.status is not ExerciseStatus.COMPLETED:
@@ -5363,7 +5643,7 @@ def _render_practice_exercise_row(item: LearningExercise, locale: UILocale) -> s
         actions.append(
             f"""<form class="practice-complete" method="post" action="/learning/practice/complete" enctype="multipart/form-data">
   <input type="hidden" name="exercise_id" value="{_escape(item.id)}" />
-  <label>{_escape(ui_text(locale, '证据文件（通过需要非空文件）', 'Evidence file (required for pass)'))}
+  <label>{_escape(ui_text(locale, '证据文件（完成状态由练习的验收条件决定）', 'Evidence file (completion is decided by the exercise acceptance criteria)'))}
     <input type="file" name="evidence" accept=".py,.md,.txt,.ts,.sql,.sh,.json,.log" />
   </label>
   <label>{_escape(ui_text(locale, '通过', 'Passed'))}<input type="number" name="tests_passed" value="0" min="0" /></label>
@@ -5382,6 +5662,113 @@ def _render_practice_exercise_row(item: LearningExercise, locale: UILocale) -> s
   <p class="muted"><code>{_escape(item.workspace_path or '')}</code></p>
   <div class="practice-actions">{"".join(actions)}</div>
 </article>"""
+
+
+def _create_learning_case_ui(
+    fields: dict[str, str], data_root: Path, repo_root: Path | None
+) -> UIActionResult:
+    if repo_root is None:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            1,
+            "",
+            "这个练习需要一个已连接的代码项目。请先选择项目。",
+            0,
+        )
+    requirement = fields.get("target_requirement", "").strip()
+    if not requirement:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            1,
+            "",
+            "请填写目标 JD 要求。",
+            0,
+        )
+    evidence_candidates = (
+        repo_root / ".github/workflows/ci.yml",
+        repo_root / "pyproject.toml",
+        repo_root / "README.md",
+    )
+    evidence_file = next(
+        (path for path in evidence_candidates if path.is_file() and not path.is_symlink()),
+        None,
+    )
+    if evidence_file is None:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            1,
+            "",
+            "没有找到可归档的本地证据文件（CI workflow / pyproject / README）。",
+            0,
+        )
+    repository_name = repo_root.name
+    try:
+        from soloscale.learning_traceability import _repository_identity
+
+        repository_name = _repository_identity(repo_root).name
+    except Exception:
+        pass
+    store = CasebookStore(data_root)
+    case_id = "ci-cd-automation"
+    try:
+        store.load_case(case_id)
+    except CasebookError:
+        pass
+    else:
+        return UIActionResult(
+            "learning-case",
+            "create learning case",
+            0,
+            "CI/CD 学习案例已存在；现在可以在下方生成练习工作区。",
+            "",
+            0,
+        )
+    try:
+        store.create_case(
+            title="Automate SoloScale verification with GitHub Actions",
+            project=repository_name,
+            problem=(
+                "The repository already runs pytest, Ruff, mypy, and package build, "
+                "but the verification loop still needs to be understood and owned as "
+                "automated CI/CD."
+            ),
+            expected_behavior=(
+                "A GitHub Actions workflow runs lint, type-check, tests, and package "
+                "build on push and pull requests."
+            ),
+            actual_behavior=(
+                "A workflow file exists, but the operator still needs to practice "
+                "explaining, rebuilding, and defending it."
+            ),
+            root_cause=(
+                "Verification was historically orchestrated manually; CI automation "
+                "needs deliberate practice and ownership."
+            ),
+            resolution=(
+                "Complete a bounded exercise: read the workflow, rebuild a minimal "
+                "local version, run it, and record evidence."
+            ),
+            verification=["ruff check .", "mypy src tests", "pytest -q", "python -m build"],
+            concepts=["CI/CD", "GitHub Actions", "test automation", "verification gates"],
+            evidence_sources=[(EvidenceKind.CI, evidence_file)],
+            case_id=case_id,
+            repository=repository_name,
+        )
+    except (ValueError, OSError, KeyError, CasebookError) as exc:
+        return UIActionResult(
+            "learning-case", "create learning case", 1, "", str(exc), 0
+        )
+    return UIActionResult(
+        "learning-case",
+        "create learning case",
+        0,
+        f"学习案例已创建：{case_id}。现在可以在下方生成练习工作区。",
+        "",
+        0,
+    )
 
 
 def _create_practice_exercise_ui(fields: dict[str, str], data_root: Path) -> UIActionResult:
@@ -5534,7 +5921,9 @@ def _learning_page(
     if run_dir is not None and (run_dir.is_symlink() or not run_dir.is_dir()):
         run_dir = None
     response_saved_stage = form.get("response_saved_stage", "")
-    target_requirement = _escape(form.get("target_requirement", DEFAULT_TARGET_REQUIREMENT))
+    target_requirement = _escape(
+        form.get("target_requirement", _learning_default_requirement(data_root))
+    )
     result_html = ""
     if result is not None:
         class_name = "success" if result.return_code == 0 else "error"
@@ -5712,7 +6101,10 @@ def _learning_page(
     <a class="button-link secondary" href="#exercise-trace">{_escape(ui_text(locale, '开始追踪', 'Start Trace'))}</a>
   </div>
 </section>
-{_learning_graph(run_dir, locale)}
+<details class="panel">
+  <summary>{_escape(ui_text(locale, '查看证据图（进阶）', 'View Evidence Graph (advanced)'))}</summary>
+  {_learning_graph(run_dir, locale)}
+</details>
 {backlink}
 <section class="panel">
   <h2>{_escape(ui_text(locale, '目标 JD 相关性', 'Target JD relevance'))}</h2>
@@ -5822,10 +6214,28 @@ def _learning_page(
   <article data-learning-capability="debug" data-state="{debug_state}"><span>DEBUG</span><strong>{_escape(capability_state_labels[debug_state])}</strong></article>
 </section>"""
     practice_panel = _practice_panel_html(data_root, form, locale)
+    readiness_map = _production_readiness_map_html(
+        data_root, repo_root, form, locale
+    )
+    active_case = _active_learning_case(data_root)
+    active_case_panel = ""
+    seed_case_note = ""
+    if active_case is not None and active_case.id != "conversation-rag-chunking-retrieval":
+        active_case_panel = f"""<section class="panel active-case">
+  <span class="kicker">{_escape(ui_text(locale, '当前学习案例', 'Active Learning Case'))}</span>
+  <h2>{_escape(active_case.title)}</h2>
+  <p>{_escape(active_case.problem)}</p>
+  <p class="muted">{_escape(", ".join(active_case.concepts))}</p>
+</section>"""
+        seed_case_note = f"""<section class="notice warning" role="status">
+  <strong>{_escape(ui_text(locale, '下方是独立的历史参考案例（Conversation RAG），不是当前活动案例。', 'The section below is a separate historical reference case (Conversation RAG), not the active case.'))}</strong>
+</section>"""
     body = f"""
     {work_summary}
+    {active_case_panel}
     {repository_notice}
     {capabilities}
+    {readiness_map}
     <form class="panel build-form" method="post" action="/learning/run">
       <input type="hidden" name="ui_locale" value="{locale}" />
       <label>{_escape(ui_text(locale, '当前目标 JD 要求', 'Current target-JD requirement'))}
@@ -5834,6 +6244,7 @@ def _learning_page(
       {build_button}
     </form>
     {result_html}
+    {seed_case_note}
     {dashboard}
     {practice_panel}
     """
@@ -5861,7 +6272,8 @@ def _learning_page(
 .learning-capabilities{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.learning-capabilities article{display:grid;gap:6px;border:1px solid var(--border);border-radius:13px;padding:14px;background:var(--surface-subtle)}.learning-capabilities span{font-size:.75rem;letter-spacing:.08em;color:var(--text-muted)}.learning-capabilities strong{font-size:.78rem;color:var(--brand)}.learning-capabilities [data-state="NEEDS_PROJECT_EVIDENCE"] strong,.learning-capabilities [data-state="NEEDS_CASE_EVIDENCE"] strong,.learning-capabilities [data-state="NEEDS_CASE_STAGE"] strong{color:var(--warning)}
 .status-grid,.truth-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.status-card,.truth-grid div{border:1px solid var(--border);border-radius:14px;padding:16px;background:var(--surface-subtle);display:grid;gap:7px}.status-card span,.truth-grid span{color:var(--text-muted);text-transform:uppercase;letter-spacing:.09em;font-size:.75rem}.status-card strong{font-size:1.15rem}.verified strong{color:var(--success)}.warning strong,.warning-text{color:var(--warning)}.action strong{color:var(--brand)}
 .hero-copy p:not(.eyebrow){max-width:820px;font-size:1.08rem;line-height:1.7}.graph-scroll{overflow:auto;background:#f7f9fc;border:1px solid var(--border);border-radius:12px}#learning-graph{width:1060px;display:block}.panel pre{background:#f7f9fc;color:#2c3548}.panel details summary,details.panel summary{cursor:pointer;font-size:1.05rem;font-weight:750}.hidden{display:none}.footnote span{color:var(--text-muted)}
-@media(max-width:760px){.use-my-work,.learning-capabilities,.status-grid,.truth-grid,.build-form{grid-template-columns:1fr}}
+.readiness-map{background:linear-gradient(145deg,#fff,var(--brand-soft))}.readiness-map h2{margin:7px 0}.readiness-map .muted{color:var(--text-muted)}.readiness-domains{display:grid;gap:12px;margin-top:16px}.readiness-domain{display:grid;gap:8px;padding:13px;border:1px solid var(--border);border-radius:13px;background:#fff}.readiness-domain>strong{font-size:13px}.maturity-row{display:flex;gap:6px;flex-wrap:wrap}.maturity-chip{padding:4px 8px;border-radius:999px;background:var(--surface-subtle);color:var(--text-muted);font-size:10px;font-weight:800}.maturity-chip.ready{background:var(--success-soft);color:var(--success)}.maturity-chip.needs{background:var(--warning-soft);color:var(--warning)}.highest-gap{display:grid;grid-template-columns:1fr auto;gap:18px;align-items:center;margin-top:18px;padding:16px;border:1px solid var(--brand);border-radius:14px;background:var(--brand-soft)}.highest-gap h3{margin:8px 0 5px}.highest-gap p{margin:0;color:var(--text-muted)}.highest-gap form,.highest-gap .button-link{align-self:center;white-space:nowrap}
+@media(max-width:760px){.use-my-work,.learning-capabilities,.status-grid,.truth-grid,.build-form,.highest-gap{grid-template-columns:1fr}.highest-gap form,.highest-gap .button-link{justify-self:start}}
 """,
     )
 
@@ -5959,13 +6371,13 @@ def _ai_settings_page(
             ),
             "LinkedIn": ui_text(
                 locale,
-                "由 BuildLog 管理授权、精确预览、去重和发布回执。",
-                "BuildLog owns authorization, exact preview, duplicate checks, and receipts.",
+                "已审核 Artifact 经发布队列绑定精确账号后执行；BuildLog 只提供历史与回执投影。",
+                "Approved artifacts run through the Publish Queue against an exact account; BuildLog provides history and receipt projection only.",
             ),
             "X": ui_text(
                 locale,
-                "由 BuildLog 管理授权、单帖或 Thread 发布和回执。",
-                "BuildLog owns authorization, post or thread publishing, and receipts.",
+                "单帖或 Thread 由发布队列选择精确 ChannelAccount；BuildLog 保留溯源与回执投影。",
+                "Posts and threads use the Publish Queue with an exact ChannelAccount; BuildLog retains provenance and receipt projection.",
             ),
             "YouTube": ui_text(
                 locale,
@@ -7094,6 +7506,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
         job_id: str | None = None,
         error: str | None = None,
         local_job_id: str | None = None,
+        content_run_id: str | None = None,
     ) -> None:
         local_job = None
         manager = self.video_story_job_manager
@@ -7115,6 +7528,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.ui_locale,
                 local_job=local_job,
                 local_video_available=local_available,
+                content_run_id=content_run_id,
+                content_data_root=self.ui_data_root.absolute(),
             )
         except VideoGenerationError:
             page = _video_page(
@@ -7128,6 +7543,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 self.ui_locale,
                 local_job=local_job,
                 local_video_available=local_available,
+                content_run_id=content_run_id,
+                content_data_root=self.ui_data_root.absolute(),
             )
         body = page.encode("utf-8")
         self.send_response(200)
@@ -7304,8 +7721,14 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             elif mining_notice == "empty":
                 notice = ui_text(
                     self.ui_locale,
-                    "没有新的已批准证据；先刷新工作资料。",
-                    "No new approved evidence yet; refresh work sources first.",
+                    "扫描完成，没有发现新的可用故事。",
+                    "Scan complete; no new usable stories were found.",
+                )
+            elif mining_notice == "error":
+                notice = ui_text(
+                    self.ui_locale,
+                    "故事挖掘未能完成；请检查已批准的工作证据后重试。",
+                    "Story mining could not complete; check approved work evidence and try again.",
                 )
             self._send_content_page(workspace_view="stories", notice=notice)
             return
@@ -7385,8 +7808,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 "saved": ui_text(self.ui_locale, "修改已保存。", "Edits saved."),
                 "approved": ui_text(
                     self.ui_locale,
-                    "内容包已批准；仍需在 BuildLog 精确预览中输入 PUBLISH 才会发布。",
-                    "Bundle approved. Publication still requires PUBLISH in the exact BuildLog preview.",
+                    "内容包已批准；仍需在发布队列的精确预览中输入 PUBLISH 才会发布。",
+                    "Bundle approved. Publication still requires PUBLISH in the exact Publish Queue preview.",
                 ),
                 "rejected": ui_text(
                     self.ui_locale, "内容包已拒绝；没有发布。", "Bundle rejected; nothing was published."
@@ -7499,6 +7922,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self._send_video_page(
                 query.get("job_id", [None])[0],
                 local_job_id=query.get("local_job_id", [None])[0],
+                content_run_id=query.get("content_run_id", [None])[0],
             )
             return
         if path == "/publishing":
@@ -8554,6 +8978,7 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 story.story_id for story in load_month_one_canon().stories
             ] + [candidate.candidate_id for candidate in load_story_candidates(data_root)]
             mined: tuple[StoryCandidate, ...] = ()
+            mining_notice = "empty"
             try:
                 mined = mine_story_candidates(
                     data_root,
@@ -8561,15 +8986,16 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                     existing_story_ids=existing_ids,
                     limit=5,
                 )
+                mining_notice = "ok" if mined else "empty"
             except StoryMiningError:
-                mined = ()
+                mining_notice = "error"
             self.send_response(303)
             self.send_header(
                 "Location",
                 ui_url(
                     "/creator/stories",
                     self.ui_locale,
-                    mining_notice="ok" if mined else "empty",
+                    mining_notice=mining_notice,
                 ),
             )
             self.send_header("Content-Length", "0")
@@ -8607,9 +9033,10 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 "中文" if form.get("language") == "中文" else "English"
             )
             preference = _load_ai_provider_preference(self.ui_data_root.absolute())
-            generation_mode = form.get("generation_mode", preference.provider_id.value)
+            generation_mode = _creator_generation_mode(preference, form, source_kind)
             ai_editorial = generation_mode != "template"
             gateway = _gateway_from_preference(preference) if ai_editorial else None
+            provider, model = _creator_job_provider_metadata(preference, generation_mode)
             data_root = self.ui_data_root.absolute()
             if source_kind == "STORY":
                 story_id = form.get("source_story_id", "")
@@ -8690,6 +9117,8 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
                 )
                 if "VIDEO" in outputs
                 else None,
+                provider=provider,
+                model=model,
             )
             self.send_response(303)
             self.send_header(
@@ -9281,6 +9710,54 @@ class SoloScaleLocalUIHandler(BaseHTTPRequestHandler):
             self.send_header("Location", ui_url("/creator/publish", self.ui_locale))
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if path == "/applications/status":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            application_form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(application_form)
+            library_value = application_form.get("resume_library_root", "").strip()
+            library_root = Path(
+                library_value
+                or (
+                    self.ui_data_root.absolute() / "resume-applications"
+                    if self.desktop_session_token is not None
+                    else Path.home() / "Documents" / "Resume Applications"
+                )
+            )
+            directory_name = application_form.get("directory_name", "").strip()
+            try:
+                status = ApplicationStatus(application_form.get("status", "").strip())
+                application_dir = library_root / "applications" / directory_name
+                if not application_dir.is_dir() or application_dir.is_symlink():
+                    raise ValueError("application directory not found")
+                update_application_status(
+                    application_dir=application_dir,
+                    status=status,
+                    note=application_form.get("note", ""),
+                    next_action=application_form.get("next_action", ""),
+                )
+            except (OSError, ValueError) as exc:
+                self.send_error(422, str(exc))
+                return
+            self.send_response(303)
+            self.send_header(
+                "Location", ui_url("/resume#applications", self.ui_locale)
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == "/learning/case/create":
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            case_form = _parse_form(self.rfile.read(length))
+            self._adopt_ui_locale(case_form)
+            self.latest_learning_form = dict(case_form)
+            self._send_learning_page(
+                _create_learning_case_ui(
+                    case_form,
+                    self.ui_data_root.absolute(),
+                    self.workspace_root,
+                )
+            )
             return
         if path == "/learning/practice/create":
             length = int(self.headers.get("Content-Length", "0") or 0)

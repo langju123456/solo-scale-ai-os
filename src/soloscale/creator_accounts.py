@@ -215,8 +215,13 @@ def _capability_copy(capability: Capability, locale: UILocale) -> str:
         "repo_write": ui_text(locale, "仓库写入", "Repository write"),
         "refresh_token": ui_text(locale, "长期连接", "Refresh access"),
     }
-    marker = "✓" if capability.state == "AVAILABLE" else "—"
-    return f"{labels[capability.key]} {marker}"
+    if capability.state == "AVAILABLE":
+        return f"{labels[capability.key]} ✓"
+    if capability.state == "MISSING_SCOPE":
+        return f"{labels[capability.key]} · {ui_text(locale, '当前账号未授权', 'Current account not authorized')}"
+    if capability.state == "UNAVAILABLE":
+        return f"{labels[capability.key]} · {ui_text(locale, '平台不支持', 'Platform unavailable')}"
+    return f"{labels[capability.key]} · {ui_text(locale, '需要设置', 'Setup required')}"
 
 
 def _identity_row(identity: ConnectedIdentity, locale: UILocale) -> str:

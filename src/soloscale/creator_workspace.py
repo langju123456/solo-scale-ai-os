@@ -14,13 +14,14 @@ from soloscale.content_distribution import (
     recent_distribution_packages,
 )
 from soloscale.content_models import ContentReviewDecision, ContentRun
+from soloscale.content_ui import _creator_job_state_detail
 from soloscale.content_workspace import (
     ContentWorkspaceError,
     load_content_review,
     load_content_run,
 )
 from soloscale.creator_accounts import load_creator_accounts
-from soloscale.creator_production import list_creator_jobs
+from soloscale.creator_production import load_creator_production_jobs
 from soloscale.media_cost import MediaCostError, load_cost_receipts
 from soloscale.ui_shell import (
     UILocale,
@@ -39,6 +40,20 @@ class CreatorRunSummary:
     review_status: str
     distribution_ready: bool
     video_ready: bool
+
+
+def _video_ready(run_dir: Path) -> bool:
+    """Detect a completed Creator Video render from the canonical output contract."""
+
+    canonical = (
+        (run_dir / "21_creator_video_youtube.mp4").is_file()
+        and (run_dir / "10_creator_video.mp4").is_file()
+    )
+    legacy = (
+        (run_dir / "youtube-video.mp4").is_file()
+        and (run_dir / "creator-video.mp4").is_file()
+    )
+    return canonical or legacy
 
 
 def _recent_runs(data_root: Path, *, limit: int = 12) -> list[CreatorRunSummary]:
@@ -70,8 +85,7 @@ def _recent_runs(data_root: Path, *, limit: int = 12) -> list[CreatorRunSummary]
                 run=run,
                 review_status=decision,
                 distribution_ready=run.run_id in distributed,
-                video_ready=(candidate / "youtube-video.mp4").is_file()
-                and (candidate / "creator-video.mp4").is_file(),
+                video_ready=_video_ready(candidate),
             )
         )
         if len(summaries) >= limit:
@@ -160,39 +174,30 @@ def creator_overview_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str
     )
 
 
-def _creator_job_phase_label(
-    locale: UILocale, phase: str, error_code: str | None = None
-) -> str:
-    label = {
-        "QUEUED": ui_text(locale, "已排队", "Queued"),
-        "GENERATING_CONTENT": ui_text(locale, "生成中", "Generating"),
-        "RENDERING_VIDEO": ui_text(locale, "渲染视频中", "Rendering video"),
-        "READY": ui_text(locale, "已就绪", "Ready"),
-        "AI_NOT_EXECUTED": "AI_NOT_EXECUTED",
-        "FAILED": ui_text(locale, "失败", "Failed"),
-    }.get(phase, ui_display_value(locale, phase))
-    if error_code:
-        label = f"{label} · {error_code}"
-    return label
-
-
 def creator_history_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str:
     """Render recent content/video state and locally recorded cost receipts."""
     runs = _recent_runs(data_root)
+    jobs = load_creator_production_jobs(data_root)
+    job_phase_copy = {
+        "QUEUED": ui_text(locale, "已加入后台队列", "Queued in background"),
+        "GENERATING_CONTENT": ui_text(locale, "正在生成内容", "Generating content"),
+        "RENDERING_VIDEO": ui_text(locale, "正在后台渲染视频", "Rendering video in background"),
+        "READY": ui_text(locale, "成品已就绪", "Artifacts ready"),
+        "AI_NOT_EXECUTED": "AI_NOT_EXECUTED",
+        "FAILED": ui_text(locale, "制作失败", "Production failed"),
+    }
+    output_copy = {
+        "ARTICLE": ui_text(locale, "文章", "Article"),
+        "VIDEO": ui_text(locale, "视频", "Video"),
+    }
+    job_cards = "".join(
+        f'''<article class="history-job" data-phase="{job.phase}"><span class="status-badge">{html.escape(job_phase_copy.get(job.phase, job.phase))}</span><div><strong>{html.escape(" + ".join(output_copy.get(item, item) for item in job.request.outputs))}</strong><p>{html.escape(job.request.source_story_id or ui_text(locale, "自由创作", "Free create"))}{(" · " + html.escape(job.content_run_id)) if job.content_run_id else ""}{(" · " + html.escape(job.error_code)) if job.error_code else ""}{(" · " + _creator_job_state_detail(job, locale))}</p></div><a href="{ui_url('/creator/create', locale, creator_job=job.job_id) if job.phase in {'QUEUED', 'GENERATING_CONTENT', 'RENDERING_VIDEO'} else (ui_url('/creator/publish', locale, run_id=job.content_run_id or '') if job.phase == 'READY' else ui_url('/settings/ai', locale) if job.phase == 'AI_NOT_EXECUTED' else ui_url('/creator/stories', locale))}">{html.escape(ui_text(locale, "查看", "Open"))} →</a></article>'''
+        for job in jobs
+    )
     cards = "".join(
         f'''<article class="history-card"><div><span>{html.escape(ui_display_value(locale, item.review_status))}</span><h2>{html.escape(item.run.brief.topic)}</h2><p>{html.escape(item.run.run_id)}</p></div><div class="history-flags"><strong>{ui_text(locale, '视频已就绪', 'Video ready') if item.video_ready else ui_text(locale, '暂无视频', 'No video')}</strong><strong>{ui_text(locale, '发布包已就绪', 'Package ready') if item.distribution_ready else ui_text(locale, '发布包未就绪', 'Package not ready')}</strong></div><a href="{ui_url('/creator/create', locale, run_id=item.run.run_id)}">{ui_text(locale, '打开', 'Open')} →</a></article>'''
         for item in runs
     ) or f'<section class="empty"><h2>{ui_text(locale, "还没有创作历史", "No Creator history yet")}</h2></section>'
-    jobs = list_creator_jobs(data_root)
-    job_cards = "".join(
-        f'''<article class="history-card production-job" data-phase="{html.escape(item.phase)}"><div><span>{html.escape(_creator_job_phase_label(locale, item.phase, item.error_code))}</span><h2>{html.escape(item.request.source_story_id or item.content_project_id)}</h2><p>{html.escape(item.job_id)}</p></div><a href="{ui_url('/creator/create', locale, creator_job=item.job_id)}">{ui_text(locale, '打开任务', 'Open job')} →</a></article>'''
-        for item in jobs
-    )
-    production_section = (
-        f'''<section class="production-jobs"><div class="result-head"><span class="kicker">{ui_text(locale, "生产任务", "Production jobs")}</span><h2>{ui_text(locale, "后台生产生命周期", "Background production lifecycle")}</h2></div><div class="history-list">{job_cards}</div></section>'''
-        if jobs
-        else ""
-    )
     try:
         receipts = load_cost_receipts(data_root)
     except MediaCostError:
@@ -201,7 +206,12 @@ def creator_history_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str:
         (receipt.actual_cost_usd or receipt.estimated_cost_usd or Decimal(0) for receipt in receipts),
         Decimal(0),
     )
-    body = f'''{render_creator_nav(active="history", locale=locale)}<section class="history-summary"><strong>{len(runs)}</strong><span>{ui_text(locale, '最近内容任务', 'recent content runs')}</span><strong>{len(receipts)}</strong><span>{ui_text(locale, '成本回执', 'cost receipts')}</span><strong>${total:.3f}</strong><span>{ui_text(locale, '记录成本', 'recorded cost')}</span></section>{production_section}<section class="history-list">{cards}</section>'''
+    production_section = (
+        f'<section class="production-history"><span class="kicker">ContentProject</span><h2>{ui_text(locale, "内容生产任务", "Content production jobs")}</h2><div class="history-jobs">{job_cards or ui_text(locale, "还没有后台生产任务。", "No background production jobs yet.")}</div></section>'
+        if jobs
+        else ""
+    )
+    body = f'''{render_creator_nav(active="history", locale=locale)}<section class="history-summary"><strong>{len(runs)}</strong><span>{ui_text(locale, '最近内容任务', 'recent content runs')}</span><strong>{len(jobs)}</strong><span>{ui_text(locale, '生产任务', 'production jobs')}</span><strong>${total:.3f}</strong><span>{ui_text(locale, '记录成本', 'recorded cost')}</span></section>{production_section}<section class="history-list">{cards}</section>'''
     return render_app_shell(
         active="content",
         locale=locale,
@@ -213,6 +223,6 @@ def creator_history_page(data_root: Path, *, locale: UILocale = "zh-CN") -> str:
         body=body,
         compact_hero=True,
         extra_css="""
-.history-summary{display:grid;grid-template-columns:repeat(3,auto 1fr);gap:8px 12px;align-items:baseline;margin-bottom:18px;padding:18px;border:1px solid var(--border);border-radius:16px;background:var(--surface-subtle)}.history-summary strong{font-size:24px}.history-summary span{color:var(--text-muted)}.history-list{display:grid;gap:12px}.history-card{display:grid;grid-template-columns:1fr auto auto;gap:18px;align-items:center;padding:18px;border:1px solid var(--border);border-radius:16px;background:#fff}.history-card span,.history-flags strong{color:var(--brand);font-size:10px;font-weight:900}.history-card h2{margin:5px 0;font-size:18px}.history-card p{margin:0;color:var(--text-muted);font-size:11px}.history-flags{display:grid;gap:5px}.history-card>a{font-weight:800;text-decoration:none}@media(max-width:700px){.history-summary{grid-template-columns:auto 1fr}.history-card{grid-template-columns:1fr}.history-flags{display:flex;gap:8px}}
+.history-summary{display:grid;grid-template-columns:repeat(3,auto 1fr);gap:8px 12px;align-items:baseline;margin-bottom:18px;padding:18px;border:1px solid var(--border);border-radius:16px;background:var(--surface-subtle)}.history-summary strong{font-size:24px}.history-summary span{color:var(--text-muted)}.history-list{display:grid;gap:12px}.history-card{display:grid;grid-template-columns:1fr auto auto;gap:18px;align-items:center;padding:18px;border:1px solid var(--border);border-radius:16px;background:#fff}.history-card span,.history-flags strong{color:var(--brand);font-size:10px;font-weight:900}.history-card h2{margin:5px 0;font-size:18px}.history-card p{margin:0;color:var(--text-muted);font-size:11px}.history-flags{display:grid;gap:5px}.history-card>a{font-weight:800;text-decoration:none}.production-history{margin-bottom:18px;padding:18px;border:1px solid var(--border);border-radius:16px;background:var(--surface-subtle)}.production-history h2{margin:8px 0 14px}.history-jobs{display:grid;gap:10px}.history-job{display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center;padding:13px 14px;border:1px solid var(--border);border-radius:13px;background:#fff}.history-job strong{display:block;font-size:14px}.history-job p{margin:3px 0 0;color:var(--text-muted);font-size:12px}.history-job a{font-weight:800;text-decoration:none;white-space:nowrap}@media(max-width:700px){.history-summary{grid-template-columns:auto 1fr}.history-card,.history-job{grid-template-columns:1fr}.history-flags{display:flex;gap:8px}.history-job a{justify-self:start}}
 """,
     )

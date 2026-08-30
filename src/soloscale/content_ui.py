@@ -18,7 +18,11 @@ from soloscale.content_canon_pipeline import (
     content_brief_from_month_one_story,
     content_brief_from_story_candidate,
 )
-from soloscale.content_distribution import recent_distribution_packages
+from soloscale.content_distribution import (
+    ContentDistributionError,
+    load_distribution_package,
+    recent_distribution_packages,
+)
 from soloscale.content_models import ContentBrief, ContentReviewDecision, ContentRun
 from soloscale.content_scan import RecentWorkScan, ScanRange, scan_recent_work
 from soloscale.content_workspace import (
@@ -33,7 +37,8 @@ from soloscale.content_workspace import (
 from soloscale.creator_production import (
     CreatorProductionError,
     CreatorProductionJob,
-    latest_job_for_story,
+    job_elapsed_seconds,
+    load_creator_production_jobs,
     load_publication_artifacts,
     load_publish_queue,
     sync_distribution_artifacts,
@@ -129,6 +134,63 @@ class ContentFormResult:
 
 def _escape(value: str) -> str:
     return html.escape(value or "", quote=True)
+
+
+def _provider_display_label(provider: str | None, locale: UILocale) -> str:
+    """Human-readable service label for a Creator production job."""
+
+    if provider == "template":
+        return ui_text(locale, "离线模板", "Offline template")
+    if provider == ModelProviderId.SOLOSCALE_HOSTED.value:
+        return ui_text(locale, "SoloScale 托管 AI", "SoloScale Hosted AI")
+    if provider == ModelProviderId.OLLAMA.value:
+        return ui_text(locale, "本地 Ollama", "Local Ollama")
+    if provider == ModelProviderId.OPENAI_COMPATIBLE.value:
+        return "OpenAI API"
+    return _escape(provider or ui_text(locale, "未知", "Unknown"))
+
+
+def _creator_error_cause_message(cause: str | None, locale: UILocale) -> str | None:
+    """Return the actionable primary message for a normalized job error cause."""
+
+    if cause == "VOICE_NOT_CONFIGURED":
+        return ui_text(
+            locale,
+            "未配置可用的语音服务；请配置 Qwen 参考音频，或选择 macOS 系统语音。",
+            "No usable voice service configured; configure Qwen reference audio or select macOS system voice.",
+        )
+    return None
+
+
+def _creator_job_state_detail(job: CreatorProductionJob, locale: UILocale) -> str:
+    """Concise observable state for a running/finished Creator production job."""
+
+    parts: list[str] = []
+    if job.stage:
+        parts.append(
+            f"{_escape(ui_text(locale, '阶段', 'Stage'))}: {_escape(job.stage)}"
+        )
+    if job.provider:
+        parts.append(
+            f"{_escape(ui_text(locale, '服务', 'Service'))}: {_provider_display_label(job.provider, locale)}"
+        )
+    if job.model:
+        parts.append(f"{_escape(ui_text(locale, '模型', 'Model'))}: {_escape(job.model)}")
+    elapsed = job_elapsed_seconds(job)
+    parts.append(
+        f"{_escape(ui_text(locale, '已用时', 'Elapsed'))}: {elapsed}s"
+    )
+    parts.append(
+        f"{_escape(ui_text(locale, '模型调用', 'Model calls'))}: {job.model_calls}"
+    )
+    cause_message = _creator_error_cause_message(job.error_cause, locale)
+    if cause_message is not None:
+        parts.append(cause_message)
+    if job.timeout_seconds is not None:
+        parts.append(
+            f"{_escape(ui_text(locale, '超时', 'Timeout'))}: {job.timeout_seconds}s"
+        )
+    return " · ".join(parts)
 
 
 def _grounded_lines(raw: str, status: str) -> list[str]:
@@ -946,7 +1008,7 @@ def _result_html(
         <div class="storyboard">{scenes}</div>
         {cost_panel}
         <div class="creator-video-result">
-          <p><a href="{ui_url('/video', locale)}">{_escape(ui_text(locale, '使用 Google Vertex AI 生成云端视频', 'Generate a cloud video with Google Vertex AI'))}</a></p>
+          <p><a href="{ui_url('/video', locale, content_run_id=run_id)}">{_escape(ui_text(locale, '在下游视频页使用 Google Vertex AI 生成云端视频', 'Generate a cloud video with Google Vertex AI on the downstream video page'))}</a></p>
           <details><summary>{_escape(ui_text(locale, '实验性本地 Remotion 渲染器', 'Experimental local Remotion renderer'))}</summary>
             {video_action}
           </details>
@@ -1007,6 +1069,43 @@ def _connected_account_states(
     return states
 
 
+def _content_package_entries(data_root: Path) -> list[dict[str, str]]:
+    """Ordered, deduplicated Content Packages from the canonical artifact store.
+
+    A Content Package is selectable as soon as it has persisted PublicationArtifacts,
+    before any approved DistributionPackage exists. Its displayed status remains
+    truthful: DRAFT until a distribution package seals it.
+    """
+
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    try:
+        artifacts = load_publication_artifacts(data_root)
+    except CreatorProductionError:
+        return entries
+    for artifact in artifacts:
+        run_id = artifact.source_run_id
+        if run_id in seen:
+            continue
+        seen.add(run_id)
+        try:
+            topic = load_content_run(data_root, run_id).brief.topic
+        except ContentWorkspaceError:
+            topic = ""
+        try:
+            ready = load_distribution_package(data_root, run_id) is not None
+        except (ContentDistributionError, ContentWorkspaceError):
+            ready = False
+        entries.append(
+            {
+                "run_id": run_id,
+                "topic": topic.strip() or run_id,
+                "status": "READY" if ready else "DRAFT",
+            }
+        )
+    return entries
+
+
 def _creator_publish_queue_html(
     data_root: Path,
     *,
@@ -1022,6 +1121,9 @@ def _creator_publish_queue_html(
             sync_distribution_artifacts(data_root, run_id)
         except (CreatorProductionError, ContentWorkspaceError):
             continue
+    if selected_run_id is None:
+        empty = f'''<article class="publish-queue-row empty"><strong>{_escape(ui_text(locale, '请选择一个 Content Package', 'Please select a Content Package'))}</strong><span>{_escape(ui_text(locale, '选择内容包后，这里只显示该包的 artifacts 与发布上下文。', 'After selecting a content package, only its artifacts and publication context are shown here.'))}</span></article>'''
+        return f'''<section class="panel canonical-publish-queue"><span class="kicker">Publish Queue</span><h2>{_escape(ui_text(locale, 'Artifact + 精确账号 = 发布任务', 'Artifact + exact account = publication task'))}</h2><p>{_escape(ui_text(locale, '队列不重新生成内容；只有已审核 Artifact 才能绑定真实 ChannelAccount。', 'The queue never regenerates content; only approved artifacts can bind to a real ChannelAccount.'))}</p><div class="publish-queue-head"><span>{_escape(ui_text(locale, '内容', 'Content'))}</span><span>{_escape(ui_text(locale, '类型', 'Type'))}</span><span>{_escape(ui_text(locale, '平台', 'Platform'))}</span><span>{_escape(ui_text(locale, '账号', 'Account'))}</span><span>{_escape(ui_text(locale, '状态', 'Status'))}</span></div>{empty}</section>'''
     artifacts = load_publication_artifacts(data_root, run_id=selected_run_id)
     queue_by_artifact = {item.artifact_id: item for item in load_publish_queue(data_root)}
     identities = eligible_publish_identities(data_root)
@@ -1041,7 +1143,8 @@ def _creator_publish_queue_html(
                     f'''<option value="{_escape(item.external_account_id)}">{_escape(item.display_name)} · {_escape(item.external_account_id)}</option>'''
                     for item in accounts
                 )
-                destination = f'''<form method="post" action="/creator/publish/queue"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="artifact_id" value="{_escape(artifact.artifact_id)}" /><select name="channel_account_id" aria-label="{_escape(ui_text(locale, '发布账号', 'Publishing account'))}">{options}</select><button type="submit">{_escape(ui_text(locale, '确认账号', 'Assign account'))}</button></form>'''
+                placeholder = f'''<option value="" disabled selected>{_escape(ui_text(locale, '选择账号…', 'Choose account…'))}</option>'''
+                destination = f'''<form method="post" action="/creator/publish/queue"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="artifact_id" value="{_escape(artifact.artifact_id)}" /><select name="channel_account_id" aria-label="{_escape(ui_text(locale, '发布账号', 'Publishing account'))}" required>{placeholder}{options}</select><button type="submit">{_escape(ui_text(locale, '确认账号', 'Assign account'))}</button></form>'''
                 action = f'''<span class="status-badge">{_escape(ui_text(locale, '等待账号', 'Destination required'))}</span>'''
             else:
                 connected = _connected_account_states(
@@ -1080,15 +1183,24 @@ def editorial_publishing_page(
 
     publish_identities = eligible_publish_identities(data_root)
     packages = recent_distribution_packages(data_root)
+    content_packages = _content_package_entries(data_root)
     selection_notice = ""
+    draft_notice = ""
     if selected_run_id:
-        packages = [
+        distribution_packages = [
             package
             for package in packages
             if str(package.get("run_id", "")) == selected_run_id
         ]
-        if packages:
+        has_artifacts = any(
+            entry["run_id"] == selected_run_id for entry in content_packages
+        )
+        if distribution_packages:
+            packages = distribution_packages
             selection_notice = f'''<p class="notice" role="status" data-approved-artifact="{_escape(selected_run_id)}">{_escape(ui_text(locale, '将发布已审核版本；编辑页中未保存的内容不会进入本次发布。', 'Using the approved version; unsaved editor changes will not enter this publication.'))}</p>'''
+        elif has_artifacts:
+            packages = []
+            draft_notice = f'''<p class="notice warning" role="status">{_escape(ui_text(locale, 'DRAFT · 需要审核后才能发布。', 'DRAFT · Review is required before publishing.'))}</p>'''
         elif error is None:
             error = ui_text(
                 locale,
@@ -1099,7 +1211,7 @@ def editorial_publishing_page(
     package_cards = "".join(
         f'''<article class="package-history-card" data-approved-artifact="{_escape(str(package['run_id']))}"><span class="status-badge">{_escape(ui_text(locale, '预览就绪', 'Preview ready'))}</span>
         <strong>{_escape(str(package['run_id']))}</strong>
-        <p>{_escape(ui_text(locale, 'LinkedIn / X / YouTube 通过 Publish Queue 绑定精确 ChannelAccount；只有已审核 Artifact 才能进入发布任务。', 'LinkedIn / X / YouTube publish through the Publish Queue with an exact ChannelAccount; only approved artifacts enter a publication task.'))}</p>
+        <p>{_escape(ui_text(locale, 'LinkedIn / X 经发布队列绑定精确 ChannelAccount；YouTube 可选择已授权频道上传。', 'LinkedIn / X run through the Publish Queue against an exact ChannelAccount; YouTube can upload to a selected authorized channel.'))}</p>
         <a href="{ui_url('/creator/create' if creator_mode else '/content', locale, run_id=str(package['run_id']))}">{_escape(ui_text(locale, '打开完整内容包', 'Open full content package'))} →</a></article>'''
         for package in packages
     ) or f'''<article class="package-history-card empty"><strong>{_escape(ui_text(locale, '还没有统一发布包', 'No unified distribution package yet'))}</strong>
@@ -1118,7 +1230,19 @@ def editorial_publishing_page(
         selected_run_id=selected_run_id,
     )
     creator_nav = render_creator_nav(active="publish", locale=locale) if creator_mode else ""
-    body = f"""{creator_nav}{selection_notice}{error_html}{queue_panel}<section class="panel package-history"><span class="kicker">{_escape(ui_text(locale, 'SoloScale 内容历史', 'SoloScale content history'))}</span>
+    package_options = "".join(
+        f'<option value="{_escape(entry["run_id"])}" {"selected" if selected_run_id == entry["run_id"] else ""}>{_escape(entry["topic"])} · {_escape(entry["status"])} · {_escape(entry["run_id"])}</option>'
+        for entry in content_packages
+    )
+    package_selector = (
+        f'''<section class="panel package-selector"><span class="kicker">{_escape(ui_text(locale, '内容包', 'Content Packages'))}</span>
+<h2>{_escape(ui_text(locale, '选择要准备发布的内容包', 'Select a content package to prepare'))}</h2>
+<p class="muted">{_escape(ui_text(locale, '先明确选择内容包，再查看其可发布 Artifact 与精确 ChannelAccount；系统不会自动推断要发布哪一个。', 'Choose a content package explicitly before viewing its publishable artifacts and exact ChannelAccount; the system never infers which one to publish.'))}</p>
+<form method="get" action="{ui_url('/creator/publish' if creator_mode else '/publishing', locale)}" class="package-select-form"><select name="run_id" aria-label="{_escape(ui_text(locale, '选择内容包', 'Select content package'))}"><option value="">{_escape(ui_text(locale, 'Select content package…', 'Select content package…'))}</option>{package_options}</select><button type="submit">{_escape(ui_text(locale, '选择', 'Select'))}</button></form></section>'''
+        if content_packages
+        else ""
+    )
+    body = f"""{creator_nav}{selection_notice}{draft_notice}{error_html}{package_selector}{queue_panel}<section class="panel package-history"><span class="kicker">{_escape(ui_text(locale, 'SoloScale 内容历史', 'SoloScale content history'))}</span>
 <h2>{_escape(ui_text(locale, '已批准、可继续处理的发布包', 'Approved packages ready for the next action'))}</h2>
 <div class="package-history-grid">{package_cards}</div></section>{youtube_panel}"""
     return render_app_shell(
@@ -1128,10 +1252,11 @@ def editorial_publishing_page(
         title=f"SoloScale · {ui_text(locale, '发布中心', 'Publishing Center')}",
         eyebrow=ui_text(locale, "发布中心", "Publishing center"),
         heading=ui_text(locale, "把发布前的每一步，放在你手里。", "Keep every pre-publish decision in your hands."),
-        description=ui_text(locale, "先校验、再看精确预览，只有你明确确认后平台才会被调用。", "Verify first, inspect the exact preview, and a platform is called only after your explicit confirmation."),
+        description=ui_text(locale, "先校验、再看精确预览，只有你明确确认后，发布队列才会把已审核 Artifact 交给精确 ChannelAccount 执行。", "Verify first, inspect the exact preview, and only after your explicit confirmation does the Publish Queue hand an approved artifact to an exact ChannelAccount."),
         body=body,
         extra_css="""
 .canonical-publish-queue{margin-bottom:22px}.publish-queue-head,.publish-queue-row{display:grid;grid-template-columns:minmax(190px,1.4fr) .55fr .6fr minmax(220px,1.3fr) .7fr;gap:12px;align-items:center}.publish-queue-head{padding:0 14px 8px;color:var(--text-muted);font-size:11px;font-weight:900}.publish-queue-row{padding:14px;border-top:1px solid var(--border)}.publish-queue-row small,.queue-destination small{display:block;color:var(--text-muted)}.queue-destination form{display:grid;grid-template-columns:1fr auto;gap:7px}.queue-destination button{padding:8px 10px}.package-history{margin-bottom:22px}.package-history h2{margin:10px 0 16px}.package-history-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.package-history-card{display:grid;gap:8px;padding:16px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.package-history-card p{margin:0;color:var(--text-muted)}.package-history-card a{font-weight:800;text-decoration:none}
+.package-selector{margin-bottom:18px;padding:18px;border:1px solid var(--border);border-radius:16px;background:var(--surface-subtle)}.package-selector h2{margin:8px 0 8px}.package-selector .muted{margin:0 0 12px}.package-select-form{display:grid;grid-template-columns:1fr auto;gap:9px;max-width:640px}.package-select-form select{min-width:0}.package-select-form button{padding:9px 14px}
 .youtube-publish{margin-bottom:22px}.youtube-publish-head{display:flex;justify-content:space-between;gap:16px;align-items:start}.youtube-publish-head h2{margin:8px 0}.youtube-upload-list{display:grid;gap:14px;margin-top:16px}.youtube-upload-card{padding:17px;border:1px solid var(--border);border-radius:14px;background:var(--surface-subtle)}.youtube-upload-card form{display:grid;grid-template-columns:1fr 1fr;gap:10px}.youtube-upload-card label{display:grid;gap:5px}.youtube-upload-card .wide{grid-column:1/-1}.youtube-upload-card textarea{min-height:110px}.youtube-upload-card button{justify-self:start}.youtube-job{padding:12px 14px;border-radius:12px;background:var(--brand-soft);color:var(--brand);font-weight:800}.youtube-receipt{padding:10px 12px;border-radius:10px;background:var(--success-soft);color:var(--success)}
 @media(max-width:900px){.publish-queue-head{display:none}.publish-queue-row,.package-history-grid{grid-template-columns:1fr}}
 """,
@@ -1171,6 +1296,7 @@ def _youtube_publishing_html(
         f'<option value="{_escape(item.external_account_id)}">{_escape(item.display_name)} · {_escape(item.external_account_id)}</option>'
         for item in accounts
     )
+    account_select_placeholder = f'<option value="" disabled selected>{_escape(ui_text(locale, "选择频道…", "Choose channel…"))}</option>'
     cards: list[str] = []
     for package in packages:
         run_id = str(package.get("run_id", ""))
@@ -1192,7 +1318,7 @@ def _youtube_publishing_html(
                 )
         title = _escape(str(defaults.get("title", "")))
         description = _escape(str(defaults.get("description", "")))
-        cards.append(f'''<article class="youtube-upload-card"><strong>{_escape(run_id)}</strong>{"".join(receipts)}<form method="post" action="/publishing/youtube/upload"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="run_id" value="{_escape(run_id)}" /><label>{_escape(ui_text(locale, '目标频道', 'Target channel'))}<select name="channel_id">{account_options}</select></label><label>{_escape(ui_text(locale, '可见性', 'Privacy'))}<select name="privacy_status"><option value="private">{_escape(ui_text(locale, '私密', 'Private'))}</option><option value="unlisted">{_escape(ui_text(locale, '不公开列出', 'Unlisted'))}</option><option value="public">{_escape(ui_text(locale, '公开', 'Public'))}</option></select></label><label class="wide">{_escape(ui_text(locale, '标题', 'Title'))}<input name="title" maxlength="100" value="{title}" required /></label><label class="wide">{_escape(ui_text(locale, '描述', 'Description'))}<textarea name="description" maxlength="5000">{description}</textarea></label><label class="wide">{_escape(ui_text(locale, '标签（逗号分隔）', 'Tags (comma-separated)'))}<input name="tags" maxlength="2000" /></label><label class="wide">{_escape(ui_text(locale, '输入 UPLOAD 才会真正上传', 'Type UPLOAD to perform the real upload'))}<input name="confirmation" autocomplete="off" required /></label><button type="submit">{_escape(ui_text(locale, '上传到所选频道', 'Upload to selected channel'))}</button></form></article>''')
+        cards.append(f'''<article class="youtube-upload-card"><strong>{_escape(run_id)}</strong>{"".join(receipts)}<form method="post" action="/publishing/youtube/upload"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="run_id" value="{_escape(run_id)}" /><label>{_escape(ui_text(locale, '目标频道', 'Target channel'))}<select name="channel_id" required>{account_select_placeholder}{account_options}</select></label><label>{_escape(ui_text(locale, '可见性', 'Privacy'))}<select name="privacy_status"><option value="private">{_escape(ui_text(locale, '私密', 'Private'))}</option><option value="unlisted">{_escape(ui_text(locale, '不公开列出', 'Unlisted'))}</option><option value="public">{_escape(ui_text(locale, '公开', 'Public'))}</option></select></label><label class="wide">{_escape(ui_text(locale, '标题', 'Title'))}<input name="title" maxlength="100" value="{title}" required /></label><label class="wide">{_escape(ui_text(locale, '描述', 'Description'))}<textarea name="description" maxlength="5000">{description}</textarea></label><label class="wide">{_escape(ui_text(locale, '标签（逗号分隔）', 'Tags (comma-separated)'))}<input name="tags" maxlength="2000" /></label><label class="wide">{_escape(ui_text(locale, '输入 UPLOAD 才会真正上传', 'Type UPLOAD to perform the real upload'))}<input name="confirmation" autocomplete="off" required /></label><button type="submit">{_escape(ui_text(locale, '上传到所选频道', 'Upload to selected channel'))}</button></form></article>''')
     empty = f'<p>{_escape(ui_text(locale, "还没有可上传的 Distribution Package。", "No Distribution Package is ready for upload."))}</p>'
     return f'''<section class="panel youtube-publish"><div class="youtube-publish-head"><div><span class="status-badge">YouTube</span><h2>{_escape(ui_text(locale, '选择频道并上传', 'Select a channel and upload'))}</h2><p>{_escape(ui_text(locale, '上传在独立后台任务中执行；不会自动重试。', 'Upload runs in a bounded background job with no automatic retry.'))}</p></div><a class="secondary-button" href="{ui_url('/creator/accounts', locale)}">{_escape(ui_text(locale, '管理频道', 'Manage channels'))}</a></div>{job_html}<div class="youtube-upload-list">{"".join(cards) or empty}</div></section>{refresh_script}'''
 
@@ -1247,7 +1373,7 @@ def _editorial_channel_html(
     plan_hash = _escape(str(preview.get("plan_hash", "")))
     blocked = preview.get("duplicate") is True or preview.get("indeterminate") is True
     receipt_html = (
-        f"<p><strong>{_escape(ui_text(locale, 'BuildLog 结果：', 'BuildLog result:'))}</strong> {_escape(ui_display_value(locale, receipt.get('status', 'UNKNOWN')))} · "
+        f"<p><strong>{_escape(ui_text(locale, '发布回执（BuildLog 投影）：', 'Publication receipt (BuildLog projection):'))}</strong> {_escape(ui_display_value(locale, receipt.get('status', 'UNKNOWN')))} · "
         f"{_escape(ui_text(locale, '计划', 'plan'))} {_escape(str(receipt.get('plan_id', '')))}</p>"
         if receipt is not None
         else (
@@ -1312,38 +1438,9 @@ def _scan_html(
       <div class="candidate-grid">{''.join(cards)}</div></section>'''
 
 
-def _creator_story_job_status(
-    data_root: Path, story_id: str, locale: UILocale
+def _story_mining_html(
+    data_root: Path, locale: UILocale, notice: str | None = None
 ) -> str:
-    """Render the durable status of the latest production job for one Story."""
-
-    job = latest_job_for_story(data_root, story_id)
-    if job is None:
-        return ""
-    phase_copy = {
-        "QUEUED": ui_text(locale, "已排队", "Queued"),
-        "GENERATING_CONTENT": ui_text(locale, "生成中", "Generating"),
-        "RENDERING_VIDEO": ui_text(locale, "渲染视频中", "Rendering video"),
-        "READY": ui_text(locale, "已就绪", "Ready"),
-        "AI_NOT_EXECUTED": "AI_NOT_EXECUTED",
-        "FAILED": ui_text(locale, "失败", "Failed"),
-    }
-    label = phase_copy.get(job.phase, ui_display_value(locale, job.phase))
-    if job.error_code:
-        label = f"{label} · {job.error_code}"
-    target = (
-        ui_url("/creator/publish", locale, run_id=job.content_run_id or "")
-        if job.phase == "READY"
-        else ui_url("/creator/create", locale, creator_job=job.job_id)
-    )
-    return (
-        f'<a class="creator-job-status" data-phase="{_escape(job.phase)}" '
-        f'href="{target}">{_escape(ui_text(locale, "任务", "Job"))}: '
-        f"{_escape(label)} →</a>"
-    )
-
-
-def _story_mining_html(data_root: Path, locale: UILocale) -> str:
     """Live Story Bank action: mine a small batch from approved evidence."""
 
     try:
@@ -1351,10 +1448,15 @@ def _story_mining_html(data_root: Path, locale: UILocale) -> str:
     except StoryMiningError:
         candidates = ()
     candidate_cards = "".join(
-        f'''<article class="mined-candidate"><strong>{_escape(candidate.working_title_cn if locale == 'zh-CN' else candidate.working_title_en)}</strong><p>{_escape(candidate.one_sentence_thesis)}</p><small>{_escape(candidate.generated_by)} · {len(candidate.source_evidence_ids)} {_escape(ui_text(locale, '条证据', 'evidence items'))} · {_escape(ui_text(locale, '确定性草稿', 'Deterministic draft'))}</small>{_creator_story_job_status(data_root, candidate.candidate_id, locale)}<form method="post" action="/creator/production/start" class="canon-direct-form"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="source_kind" value="STORY" /><input type="hidden" name="source_story_id" value="{candidate.candidate_id}" /><label>{_escape(ui_text(locale, '语言', 'Language'))}<select name="language"><option value="中文">中文</option><option value="English">English</option></select></label><button type="submit" name="production_action" value="article">{_escape(ui_text(locale, '生成文章', 'Generate article'))}</button><button class="secondary-button" type="submit" name="production_action" value="video">{_escape(ui_text(locale, '生成视频', 'Generate video'))}</button><button class="secondary-button" type="submit" name="production_action" value="queue">{_escape(ui_text(locale, '生成并加入队列', 'Generate and queue'))}</button></form></article>'''
+        f'''<article class="mined-candidate"><strong>{_escape(candidate.working_title_cn if locale == 'zh-CN' else candidate.working_title_en)}</strong><p>{_escape(candidate.one_sentence_thesis)}</p><small>{_escape(candidate.generated_by)} · {len(candidate.source_evidence_ids)} {_escape(ui_text(locale, '条证据', 'evidence items'))} · {_escape(ui_text(locale, '确定性草稿', 'Deterministic draft'))}</small><form method="post" action="/creator/production/start" class="canon-direct-form"><input type="hidden" name="ui_locale" value="{locale}" /><input type="hidden" name="source_kind" value="STORY" /><input type="hidden" name="source_story_id" value="{candidate.candidate_id}" /><label>{_escape(ui_text(locale, '语言', 'Language'))}<select name="language"><option value="中文">中文</option><option value="English">English</option></select></label><button type="submit" name="production_action" value="article">{_escape(ui_text(locale, '生成文章', 'Generate article'))}</button><button class="secondary-button" type="submit" name="production_action" value="video">{_escape(ui_text(locale, '生成视频', 'Generate video'))}</button><button class="secondary-button" type="submit" name="production_action" value="queue">{_escape(ui_text(locale, '生成并加入队列', 'Generate and queue'))}</button></form></article>'''
         for candidate in candidates
     ) or f'''<p class="hint">{_escape(ui_text(locale, '还没有挖掘出的候选故事。', 'No mined story candidates yet.'))}</p>'''
-    form = f'''<form method="post" action="/creator/stories/mine"><input type="hidden" name="ui_locale" value="{locale}" /><button class="secondary-button" type="submit">{_escape(ui_text(locale, '从最新工作生成更多故事', 'Generate More Stories'))}</button></form>'''
+    notice_html = (
+        f'<p class="notice" role="status">{_escape(notice)}</p>'
+        if notice
+        else ""
+    )
+    form = f'''<form method="post" action="/creator/stories/mine" data-loading-label="{_escape(ui_text(locale, '正在扫描…', 'Scanning…'))}"><input type="hidden" name="ui_locale" value="{locale}" /><button class="secondary-button" type="submit" data-loading-label="{_escape(ui_text(locale, '正在扫描…', 'Scanning…'))}">{_escape(ui_text(locale, '从最新工作生成更多故事', 'Generate More Stories'))}</button></form>'''
     note = _escape(
         ui_text(
             locale,
@@ -1362,7 +1464,64 @@ def _story_mining_html(data_root: Path, locale: UILocale) -> str:
             "Candidates are deterministic drafts from approved evidence with no model call (model_calls=0); real semantic mining requires a separately authorized model run.",
         )
     )
-    return f'''<section class="story-mining"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, '活的故事库', 'Live Story Bank'))}</span><h2>{_escape(ui_text(locale, '从最新工作生成更多故事', 'Generate More Stories'))}</h2><p>{note}</p></div>{form}</div><div class="mined-grid">{candidate_cards}</div></section>'''
+    return f'''<section class="story-mining"><div class="result-head"><div><span class="kicker">{_escape(ui_text(locale, '活的故事库', 'Live Story Bank'))}</span><h2>{_escape(ui_text(locale, '从最新工作生成更多故事', 'Generate More Stories'))}</h2><p>{note}</p></div>{form}</div>{notice_html}<div class="mined-grid">{candidate_cards}</div></section>'''
+
+
+def _creator_production_jobs_html(data_root: Path, locale: UILocale) -> str:
+    """Persist one production lifecycle strip across Story Bank and Create views."""
+
+    try:
+        jobs = load_creator_production_jobs(data_root, limit=10)
+    except CreatorProductionError:
+        jobs = ()
+    if not jobs:
+        return ""
+    phase_copy = {
+        "QUEUED": ui_text(locale, "已加入后台队列", "Queued in background"),
+        "GENERATING_CONTENT": ui_text(locale, "正在生成内容", "Generating content"),
+        "RENDERING_VIDEO": ui_text(locale, "正在后台渲染视频", "Rendering video in background"),
+        "READY": ui_text(locale, "成品已就绪", "Artifacts ready"),
+        "AI_NOT_EXECUTED": "AI_NOT_EXECUTED",
+        "FAILED": ui_text(locale, "制作失败", "Production failed"),
+    }
+    output_copy = {
+        "ARTICLE": ui_text(locale, "文章", "Article"),
+        "VIDEO": ui_text(locale, "视频", "Video"),
+    }
+    active = False
+    rows: list[str] = []
+    for job in jobs:
+        phase = job.phase
+        if phase in {"QUEUED", "GENERATING_CONTENT", "RENDERING_VIDEO"}:
+            active = True
+            action = f'<a class="text-link" href="{ui_url("/creator/create", locale, creator_job=job.job_id)}">{_escape(ui_text(locale, "查看进度", "View progress"))} →</a>'
+        elif phase == "READY":
+            action = f'<a class="text-link" href="{ui_url("/creator/publish", locale, run_id=job.content_run_id or "")}">{_escape(ui_text(locale, "打开发布队列", "Open Publish Queue"))} →</a>'
+        elif phase == "AI_NOT_EXECUTED":
+            action = f'<a class="text-link" href="{ui_url("/settings/ai", locale)}">{_escape(ui_text(locale, "配置 AI 服务", "Configure AI service"))} →</a>'
+        else:
+            action = f'<a class="text-link" href="{ui_url("/creator/stories", locale)}">{_escape(ui_text(locale, "重新生成", "Retry"))} →</a>'
+        source = job.request.source_story_id or ui_text(locale, "自由创作", "Free create")
+        outputs = " + ".join(output_copy.get(item, item) for item in job.request.outputs)
+        meta = source
+        if job.content_run_id:
+            meta += f' · {_escape(job.content_run_id)}'
+        if job.error_code:
+            meta += f' · {_escape(job.error_code)}'
+        state_detail = _creator_job_state_detail(job, locale)
+        rows.append(
+            f'''<article class="creator-production-job" data-phase="{phase}"><span class="status-badge">{_escape(phase_copy.get(phase, phase))}</span><div><strong>{_escape(outputs)}</strong><small>{_escape(meta)}</small><small class="job-state">{state_detail}</small></div>{action}</article>'''
+        )
+    refresh = (
+        "<script>setTimeout(()=>location.reload(),1500)</script>" if active else ""
+    )
+    heading = ui_text(locale, "内容生产进度", "Content production progress")
+    note = ui_text(
+        locale,
+        "任务在后台持续运行；刷新或离开页面后仍会保留进度、失败原因和下一步。",
+        "Jobs keep running in the background; progress, failure reasons, and next steps survive refresh and navigation.",
+    )
+    return f'''<section class="creator-production-lifecycle" aria-label="{_escape(heading)}"><div class="result-head"><div><span class="kicker">ContentProject</span><h2>{_escape(heading)}</h2><p>{_escape(note)}</p></div></div><div class="creator-production-jobs">{''.join(rows)}</div></section>{refresh}'''
 
 
 def _month_one_canon_html(
@@ -1435,7 +1594,7 @@ def _month_one_canon_html(
                 <div class="six-layers">{layers}</div>
                 <div class="canon-meta"><div><h4>{_escape(ui_text(locale, '证据候选', 'Evidence candidates'))}</h4><ul>{evidence}</ul></div><div><h4>{_escape(ui_text(locale, '已核验指标', 'Verified metrics'))}</h4><ul>{metrics}</ul></div><div><h4>{_escape(ui_text(locale, '防止过度表达', 'Overclaim guardrails'))}</h4><ul>{guardrails}</ul></div></div>
                 <div class="canon-production"><span>{_escape(ui_text(locale, '主格式', 'Primary'))}: {_escape(story.primary_format)}</span><span>{_escape(ui_text(locale, '可复用', 'Repurpose'))}: {_escape(secondary)}</span></div>
-                <div class="canon-actions">{production_actions}{_creator_story_job_status(data_root, story.story_id, locale)}<button class="secondary-button" type="button" data-canon-select="{story.story_id}" data-canon-format="blog">{_escape(ui_text(locale, '打开并编辑输入', 'Open and edit input'))}</button></div></div></details>'''
+                <div class="canon-actions">{production_actions}<button class="secondary-button" type="button" data-canon-select="{story.story_id}" data-canon-format="blog">{_escape(ui_text(locale, '打开并编辑输入', 'Open and edit input'))}</button></div></div></details>'''
             )
             story_payload[story.story_id] = {
                 "title": story.title_cn if locale == "zh-CN" else story.working_title_en,
@@ -1603,7 +1762,8 @@ def content_page(
             if creator_job.phase in {"QUEUED", "GENERATING_CONTENT", "RENDERING_VIDEO"}
             else ""
         )
-        job_notice = f'''<div class="notice creator-production-status" role="status" data-phase="{creator_job.phase}"><strong>{_escape(phase_copy[creator_job.phase])}</strong><span>{_escape(creator_job.job_id)}</span>{f'<a href="{target}">{_escape(ui_text(locale, "打开发布队列", "Open Publish Queue"))} →</a>' if creator_job.phase == 'READY' else ''}</div>{refresh}'''
+        job_detail = _creator_job_state_detail(creator_job, locale)
+        job_notice = f'''<div class="notice creator-production-status" role="status" data-phase="{creator_job.phase}"><strong>{_escape(phase_copy[creator_job.phase])}</strong><span>{_escape(creator_job.job_id)}</span><span class="job-state">{job_detail}</span>{f'<a href="{target}">{_escape(ui_text(locale, "打开发布队列", "Open Publish Queue"))} →</a>' if creator_job.phase == 'READY' else ''}</div>{refresh}'''
     notice_html = (
         f'<div class="notice" role="status">{_escape(notice)}</div>' if notice else ""
     )
@@ -1675,7 +1835,7 @@ def content_page(
     }
     provider_label, provider_note = provider_copy[generation_mode]
     work_summary = render_use_my_work(
-        load_work_context(data_root),
+        load_work_context(data_root, workspace_root=repository_root),
         locale,
         boundary=ui_text(
             locale,
@@ -1688,6 +1848,16 @@ def content_page(
     )
     canon_section, canon_script = _month_one_canon_html(
         locale, creator_story_bank=workspace_view == "stories", data_root=data_root
+    )
+    story_mining_section = (
+        _story_mining_html(data_root, locale, notice=notice)
+        if workspace_view == "stories"
+        else ""
+    )
+    production_lifecycle = (
+        _creator_production_jobs_html(data_root, locale)
+        if workspace_view in {"stories", "create"}
+        else ""
     )
     reference_videos = recent_reference_videos(data_root)
     selected_reference_id = values.get("reference_id", "")
@@ -1705,7 +1875,7 @@ def content_page(
         <label>{_escape(ui_text(locale, '选择 MP4（最多 200 MB）', 'Choose an MP4 (up to 200 MB)'))}<input type="file" name="reference_video" accept="video/mp4,.mp4" required /></label>
         <button class="secondary" type="submit">{_escape(ui_text(locale, '本地分析并加入参考库', 'Analyze locally and add to library'))}</button>
       </form></section>'''
-    body = f"""{job_notice}{work_summary}{canon_section}{scan_section}{reference_upload}<div class="grid">
+    body = f"""{production_lifecycle}{job_notice}{work_summary}{story_mining_section}{canon_section}{scan_section}{reference_upload}<div class="grid">
 <section class="form-card">
 <span class="kicker">{_escape(ui_text(locale, '输入', 'Input'))}</span><h2>{_escape(ui_text(locale, '证据 + 受众 + CTA', 'Evidence + audience + CTA'))}</h2>
 <p class="hint">{_escape(ui_text(locale, '第一条已验证事实会成为开头。数字、结果和结论都应附证据。', 'The first verified fact becomes the opening. Numbers, outcomes, and conclusions should include evidence.'))}</p>
@@ -1885,5 +2055,6 @@ if(document.querySelector('[data-video-job-active="true"]')){{
 .media-cost-panel,.media-quality-review,.distribution-package{margin-top:18px;padding:18px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.media-cost-panel h3,.media-quality-review h2{margin:6px 0}.media-quality-form{display:grid;gap:14px}.quality-checklist{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.quality-checklist label{display:flex;align-items:flex-start;gap:8px;padding:11px;border:1px solid var(--border);border-radius:12px;background:#fff}.quality-checklist input{width:auto;margin-top:2px}.media-quality-form textarea{min-height:82px}.media-quality-form button{width:auto;justify-self:start}.distribution-package.locked,.media-cost-panel.locked{opacity:.82}
 .month-one-canon{margin-bottom:22px;padding:22px;border:1px solid var(--border);border-radius:20px;background:linear-gradient(145deg,#fff,#f4f8ff)}.month-one-canon h2{margin:7px 0}.month-one-canon p{color:var(--text-muted)}.canon-filter{min-width:220px}.canon-week-nav{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0}.canon-week-nav a{padding:7px 11px;border-radius:999px;background:var(--brand-soft);font-size:12px;font-weight:800;text-decoration:none}.canon-week{margin-top:22px}.canon-week-title{display:flex;align-items:baseline;gap:10px}.canon-week-title span{color:var(--brand);font-size:11px;font-weight:900;letter-spacing:.1em}.canon-week-title h3{margin:0}.canon-stories{display:grid;gap:10px;margin-top:11px}.canon-story{border:1px solid var(--border);border-radius:14px;background:#fff}.canon-story>summary{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;padding:14px;cursor:pointer;list-style:none}.canon-story>summary::-webkit-details-marker{display:none}.canon-story summary strong,.canon-story summary small{display:block}.canon-story summary small{margin-top:3px;color:var(--text-muted);font-size:11px}.canon-sequence{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:var(--brand-soft);color:var(--brand);font-weight:900}.canon-status{padding:5px 8px;border-radius:999px;background:var(--surface-subtle);font-size:10px;font-style:normal;font-weight:850}.canon-status.ready_for_production{background:var(--success-soft);color:var(--success)}.canon-status.needs_evidence,.canon-status.needs_user_input{background:var(--warning-soft);color:var(--warning)}.canon-story-body{padding:0 16px 16px}.canon-thesis{font-weight:700;color:var(--text)!important}.six-layers{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.six-layers>div,.canon-meta>div{padding:11px;border:1px solid var(--border);border-radius:11px;background:var(--surface-subtle)}.six-layers span{color:var(--brand);font-size:11px;font-weight:900}.six-layers p{margin:5px 0 0;font-size:12px}.canon-meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:9px}.canon-meta h4{margin:0 0 6px}.canon-meta ul{margin:0;padding-left:18px;color:var(--text-muted);font-size:12px}.canon-production{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px;color:var(--text-muted);font-size:12px}.canon-actions{display:flex;gap:8px;margin-top:12px}.canon-actions button{width:auto}.canon-actions .secondary-button{background:var(--surface-subtle);color:var(--brand)}
 @media(max-width:900px){.use-my-work,.grid{grid-template-columns:1fr}.scan-work{align-items:flex-start;flex-direction:column}.result-head{display:block}.downloads{justify-content:flex-start;margin-top:12px}}@media(max-width:580px){.two,.reference-pattern-grid,.quality-checklist{grid-template-columns:1fr}}
+.creator-production-lifecycle{margin:0 0 18px;padding:16px 18px;border:1px solid var(--border);border-radius:18px;background:linear-gradient(145deg,#fff,var(--brand-soft))}.creator-production-lifecycle .result-head{align-items:start}.creator-production-lifecycle h2{margin:6px 0}.creator-production-lifecycle p{margin:0;color:var(--text-muted)}.creator-production-jobs{display:grid;gap:9px;margin-top:14px}.creator-production-job{display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center;padding:12px 14px;border:1px solid var(--border);border-radius:13px;background:#fff}.creator-production-job .status-badge{white-space:nowrap}.creator-production-job strong{display:block;font-size:14px}.creator-production-job small{display:block;color:var(--text-muted);font-size:12px}.creator-production-job .text-link{white-space:nowrap}
 """,
     )

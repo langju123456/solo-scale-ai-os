@@ -5,13 +5,19 @@ from typing import TypedDict
 
 import pytest
 
-from soloscale.casebook_models import EvidenceKind, LearningCase, PracticeStage
+from soloscale.casebook_models import (
+    AttemptOutcome,
+    EvidenceKind,
+    LearningCase,
+    PracticeStage,
+)
 from soloscale.casebook_store import CasebookStore, SequentialPracticeError
 from soloscale.learning_models import MasteryAction, MasteryLevel
 from soloscale.learning_practice import (
     TUTOR_MODE_CONTRACT,
     ExerciseStatus,
     ExerciseType,
+    LearningExercise,
     PracticeCompletionReceipt,
     PracticeLanguage,
     TutorEscalation,
@@ -261,3 +267,212 @@ def test_list_exercises_roundtrip(tmp_path: Path) -> None:
 
     exercises = list_exercises(tmp_path / "data")
     assert [item.id for item in exercises] == [exercise.id]
+
+
+def test_ci_cd_case_generates_capability_specific_workflow_practice(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "ci evidence.txt"
+    source.write_bytes(b"ci evidence bytes")
+    data_root = tmp_path / "data"
+    store = CasebookStore(data_root)
+    case = store.create_case(
+        case_id="ci-cd-automation",
+        title="Automate SoloScale verification with GitHub Actions",
+        project="SoloScale AI OS",
+        problem="The repository runs verification locally but still needs owned CI/CD.",
+        expected_behavior="A GitHub Actions workflow runs lint, type-check, tests, and build.",
+        actual_behavior="The workflow exists but still needs deliberate practice.",
+        root_cause="Verification was historically orchestrated manually.",
+        resolution="Complete a bounded CI/CD workflow exercise and run local validation.",
+        verification=["ruff check .", "mypy src tests", "pytest -q", "python -m build"],
+        concepts=["CI/CD", "GitHub Actions", "test automation", "verification gates"],
+        repository="example/soloscale",
+        alternatives_considered=["Manual verification."],
+        trade_offs=["Automation adds pipeline maintenance."],
+        unknowns=["Cross-platform runner timing."],
+        evidence_sources=[(EvidenceKind.CI, source)],
+    )
+    exercise = generate_practice_exercise(
+        case=case,
+        jd_requirement=(
+            "Automate software verification with CI/CD: run lint, type-check, "
+            "tests, and build gates on push and pull requests."
+        ),
+        exercise_type=ExerciseType.IMPLEMENT,
+        practice_language=PracticeLanguage.PYTHON,
+    )
+    assert exercise.practice_language is PracticeLanguage.YAML
+    assert exercise.capability_domain == "CI_CD"
+    assert "GitHub Actions" in exercise.objective
+    assert ".github/workflows/ci.yml" in exercise.bounded_task
+
+    workspace = create_practice_workspace(exercise, data_root)
+    assert (workspace / ".github/workflows/ci.yml").is_file()
+    assert (workspace / "validate.py").is_file()
+    assert not (workspace / "starter.py").exists()
+    assert not (workspace / "test_task.py").exists()
+    assert "python validate.py" in (workspace / "README.md").read_text(encoding="utf-8")
+
+
+def _ci_cd_exercise(tmp_path: Path) -> tuple[CasebookStore, LearningExercise, Path]:
+    source = tmp_path / "ci evidence.txt"
+    source.write_bytes(b"ci evidence bytes")
+    data_root = tmp_path / "data"
+    store = CasebookStore(data_root)
+    case = store.create_case(
+        case_id="ci-cd-automation",
+        title="Automate SoloScale verification with GitHub Actions",
+        project="SoloScale AI OS",
+        problem="The repository runs verification locally but still needs owned CI/CD.",
+        expected_behavior="A GitHub Actions workflow runs lint, type-check, tests, and build.",
+        actual_behavior="The workflow exists but still needs deliberate practice.",
+        root_cause="Verification was historically orchestrated manually.",
+        resolution="Complete a bounded CI/CD workflow exercise and run local validation.",
+        verification=["ruff check .", "mypy src tests", "pytest -q", "python -m build"],
+        concepts=["CI/CD", "GitHub Actions", "test automation", "verification gates"],
+        repository="example/soloscale",
+        alternatives_considered=["Manual verification."],
+        trade_offs=["Automation adds pipeline maintenance."],
+        unknowns=["Cross-platform runner timing."],
+        evidence_sources=[(EvidenceKind.CI, source)],
+    )
+    exercise = generate_practice_exercise(
+        case=case,
+        jd_requirement=(
+            "Automate software verification with CI/CD: run lint, type-check, "
+            "tests, and build gates on push and pull requests."
+        ),
+        exercise_type=ExerciseType.IMPLEMENT,
+        practice_language=PracticeLanguage.PYTHON,
+    )
+    workspace = create_practice_workspace(exercise, data_root)
+    return store, load_exercise(exercise.id, data_root), workspace
+
+
+def test_ci_cd_completion_rejects_arbitrary_evidence(tmp_path: Path) -> None:
+    store, exercise, workspace = _ci_cd_exercise(tmp_path)
+    evidence = workspace / "random.txt"
+    evidence.write_text("this is not a workflow", encoding="utf-8")
+
+    receipt, result = ingest_practice_completion(
+        store=store,
+        exercise=exercise,
+        evidence_path=evidence,
+        note="attempted",
+    )
+
+    assert receipt.completed is False
+    assert result.mastery.passed_stages == []
+
+
+def test_ci_cd_completion_rejects_workflow_missing_gate(tmp_path: Path) -> None:
+    store, exercise, workspace = _ci_cd_exercise(tmp_path)
+    workflow = workspace / ".github" / "workflows" / "ci.yml"
+    workflow.write_text(
+        "on: [push, pull_request]\n"
+        "jobs:\n"
+        "  verify:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: pytest\n"
+        "      - run: ruff check .\n"
+        "      - run: python -m build\n",
+        encoding="utf-8",
+    )
+    evidence = workspace / "evidence.md"
+    evidence.write_text("completed workflow", encoding="utf-8")
+
+    receipt, result = ingest_practice_completion(
+        store=store,
+        exercise=exercise,
+        evidence_path=evidence,
+        note="attempted",
+    )
+
+    assert receipt.completed is False
+    assert result.mastery.passed_stages == []
+
+
+def test_ci_cd_completion_passes_with_valid_workflow_without_auto_mastery(
+    tmp_path: Path,
+) -> None:
+    store, exercise, workspace = _ci_cd_exercise(tmp_path)
+    for stage, name in (
+        (PracticeStage.EXPLAIN, "explain"),
+        (PracticeStage.TRACE, "trace"),
+    ):
+        receipt = workspace / f"{name}.md"
+        receipt.write_text(f"{name} evidence", encoding="utf-8")
+        store.record_attempt(
+            case_id=exercise.case_id,
+            stage=stage,
+            outcome=AttemptOutcome.PASS,
+            receipt_path=receipt,
+        )
+    workflow = workspace / ".github" / "workflows" / "ci.yml"
+    workflow.write_text(
+        "name: SoloScale verification\n"
+        "on:\n"
+        "  push:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  verify:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: pip install -e '.[dev]'\n"
+        "      - run: pytest -q\n"
+        "      - run: ruff check .\n"
+        "      - run: mypy src tests\n"
+        "      - run: python -m build\n",
+        encoding="utf-8",
+    )
+    evidence = workspace / "evidence.md"
+    evidence.write_text("completed CI/CD workflow", encoding="utf-8")
+
+    receipt, result = ingest_practice_completion(
+        store=store,
+        exercise=exercise,
+        evidence_path=evidence,
+        note=None,
+    )
+
+    assert receipt.completed is True
+    assert result.mastery.passed_stages == [
+        PracticeStage.EXPLAIN,
+        PracticeStage.TRACE,
+        PracticeStage.REBUILD,
+    ]
+    assert result.mastery.interview_ready is False
+    assert receipt.mastery_after is MasteryLevel.L3_REBUILD
+
+
+def test_ci_cd_completion_rejects_failing_validator(tmp_path: Path) -> None:
+    store, exercise, workspace = _ci_cd_exercise(tmp_path)
+    workflow = workspace / ".github" / "workflows" / "ci.yml"
+    workflow.write_text(
+        "name: SoloScale verification\n"
+        "on:\n"
+        "  push:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  verify:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: pytest -q\n"
+        "      - run: ruff check .\n"
+        "      - run: mypy src tests\n"
+        "      - run: python -m build\n",
+        encoding="utf-8",
+    )
+    (workspace / "validate.py").write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+
+    receipt, result = ingest_practice_completion(
+        store=store,
+        exercise=exercise,
+        note="attempted",
+    )
+
+    assert receipt.completed is False
+    assert result.mastery.passed_stages == []
