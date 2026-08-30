@@ -5643,7 +5643,7 @@ def _render_practice_exercise_row(item: LearningExercise, locale: UILocale) -> s
         actions.append(
             f"""<form class="practice-complete" method="post" action="/learning/practice/complete" enctype="multipart/form-data">
   <input type="hidden" name="exercise_id" value="{_escape(item.id)}" />
-  <label>{_escape(ui_text(locale, '证据文件（通过需要非空文件）', 'Evidence file (required for pass)'))}
+  <label>{_escape(ui_text(locale, '证据文件（完成状态由练习的验收条件决定）', 'Evidence file (completion is decided by the exercise acceptance criteria)'))}
     <input type="file" name="evidence" accept=".py,.md,.txt,.ts,.sql,.sh,.json,.log" />
   </label>
   <label>{_escape(ui_text(locale, '通过', 'Passed'))}<input type="number" name="tests_passed" value="0" min="0" /></label>

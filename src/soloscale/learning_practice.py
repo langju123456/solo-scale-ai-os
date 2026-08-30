@@ -11,6 +11,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Sequence
 from datetime import datetime
@@ -461,6 +462,83 @@ def list_exercises(data_root: Path) -> list[LearningExercise]:
     return exercises
 
 
+_CI_CD_WORKFLOW_TOKENS = (
+    "push",
+    "pull_request",
+    "runs-on",
+    "pytest",
+    "ruff",
+    "mypy",
+    "build",
+)
+
+
+def _evaluate_exercise_acceptance(
+    exercise: LearningExercise,
+    workspace: Path,
+    evidence: Path | None,
+) -> tuple[AttemptOutcome, str | None]:
+    """Evaluate the exercise-specific acceptance contract.
+
+    Capability-specific exercises use their own contract; generic exercises
+    preserve the original evidence-presence semantics.
+    """
+
+    if exercise.capability_domain == "CI_CD":
+        return _evaluate_ci_cd_acceptance(workspace)
+    outcome = AttemptOutcome.PASS if evidence is not None else AttemptOutcome.NEEDS_WORK
+    return outcome, None
+
+
+def _evaluate_ci_cd_acceptance(workspace: Path) -> tuple[AttemptOutcome, str | None]:
+    """Evaluate the CI/CD exercise acceptance contract from its workspace."""
+
+    workflow = workspace / ".github" / "workflows" / "ci.yml"
+    if not workflow.is_file():
+        return (
+            AttemptOutcome.NEEDS_WORK,
+            "CI workflow validation failed — .github/workflows/ci.yml is missing",
+        )
+    try:
+        text = workflow.read_text(encoding="utf-8")
+    except OSError:
+        return (
+            AttemptOutcome.NEEDS_WORK,
+            "CI workflow validation failed — could not read the workflow",
+        )
+    missing = [token for token in _CI_CD_WORKFLOW_TOKENS if token not in text]
+    if missing:
+        return (
+            AttemptOutcome.NEEDS_WORK,
+            f"CI workflow validation failed — missing gates: {', '.join(missing)}",
+        )
+    validator = workspace / "validate.py"
+    if not validator.is_file():
+        return (
+            AttemptOutcome.NEEDS_WORK,
+            "CI workflow validation failed — validate.py is missing",
+        )
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(validator)],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return (
+            AttemptOutcome.NEEDS_WORK,
+            "CI workflow validation failed — validate.py could not run",
+        )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"exit code {completed.returncode}"
+        return AttemptOutcome.NEEDS_WORK, f"CI workflow validation failed — {reason}"
+    return AttemptOutcome.PASS, None
+
+
 def ingest_practice_completion(
     *,
     store: CasebookStore,
@@ -474,10 +552,11 @@ def ingest_practice_completion(
     note: str | None = None,
     git_commit: str | None = None,
 ) -> tuple[PracticeCompletionReceipt, AttemptRecordResult]:
-    """Record one self-assessed practice result and advance case mastery.
+    """Record one practice result and advance case mastery.
 
-    A passing completion requires a nonempty practice artifact. A needs-work
-    completion requires a note. Mastery advances through the canonical
+    Capability-specific exercises use their own acceptance contract (CI/CD
+    requires a valid workflow with the expected gates); generic exercises still
+    require a nonempty practice artifact. Mastery advances through the canonical
     sequential Casebook gate; Resume truth is never touched.
     """
 
@@ -489,19 +568,38 @@ def ingest_practice_completion(
     evidence = Path(evidence_path) if evidence_path is not None else None
     if evidence is not None and not _nonempty_regular_file(evidence):
         raise ValueError("practice evidence must be a nonempty regular file")
-    outcome = AttemptOutcome.PASS if evidence is not None else AttemptOutcome.NEEDS_WORK
-    if outcome is AttemptOutcome.NEEDS_WORK and not (note and note.strip()):
-        raise ValueError("a needs-work practice completion requires a note")
+
+    workspace = (
+        Path(exercise.workspace_path)
+        if exercise.workspace_path
+        else practice_workspace_root(store.root) / exercise.id
+    )
+    outcome, failure_reason = _evaluate_exercise_acceptance(exercise, workspace, evidence)
+    receipt_path = evidence
+    if exercise.capability_domain == "CI_CD" and outcome is AttemptOutcome.PASS:
+        workflow = workspace / ".github" / "workflows" / "ci.yml"
+        if workflow.is_file():
+            receipt_path = workflow
+    if outcome is AttemptOutcome.NEEDS_WORK:
+        if failure_reason:
+            trimmed_note = note.strip() if note else ""
+            note = (
+                f"{trimmed_note} — {failure_reason}".strip()
+                if trimmed_note
+                else failure_reason
+            )
+        elif not (note and note.strip()):
+            raise ValueError("a needs-work practice completion requires a note")
 
     mastery_before = store.mastery(exercise.case_id)
     result = store.record_attempt(
         case_id=exercise.case_id,
         stage=_EXERCISE_STAGE[exercise.exercise_type],
         outcome=outcome,
-        receipt_path=evidence,
+        receipt_path=receipt_path,
         note=note,
     )
-    user_code_sha256 = _sha256_file(evidence) if evidence is not None else None
+    user_code_sha256 = _sha256_file(receipt_path) if receipt_path is not None else None
     receipt = PracticeCompletionReceipt(
         id=f"receipt-{uuid4().hex[:12]}",
         exercise_id=exercise.id,
@@ -697,8 +795,9 @@ def _render_readme(exercise: LearningExercise) -> str:
         + "\n\n"
         "## Submit\n\n"
         "In the SoloScale app: Learning → Coding practice → submit your evidence file, test "
-        "counts, and a note. Passing requires a nonempty practice artifact; mastery only "
-        "advances through the canonical casebook gate and never rewrites Resume truth.\n"
+        "counts, and a note. Completion is decided by this exercise's acceptance criteria; "
+        "mastery only advances through the canonical casebook gate and never rewrites "
+        "Resume truth.\n"
     )
 
 
