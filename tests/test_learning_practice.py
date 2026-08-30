@@ -446,3 +446,33 @@ def test_ci_cd_completion_passes_with_valid_workflow_without_auto_mastery(
     ]
     assert result.mastery.interview_ready is False
     assert receipt.mastery_after is MasteryLevel.L3_REBUILD
+
+
+def test_ci_cd_completion_rejects_failing_validator(tmp_path: Path) -> None:
+    store, exercise, workspace = _ci_cd_exercise(tmp_path)
+    workflow = workspace / ".github" / "workflows" / "ci.yml"
+    workflow.write_text(
+        "name: SoloScale verification\n"
+        "on:\n"
+        "  push:\n"
+        "  pull_request:\n"
+        "jobs:\n"
+        "  verify:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: pytest -q\n"
+        "      - run: ruff check .\n"
+        "      - run: mypy src tests\n"
+        "      - run: python -m build\n",
+        encoding="utf-8",
+    )
+    (workspace / "validate.py").write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+
+    receipt, result = ingest_practice_completion(
+        store=store,
+        exercise=exercise,
+        note="attempted",
+    )
+
+    assert receipt.completed is False
+    assert result.mastery.passed_stages == []
