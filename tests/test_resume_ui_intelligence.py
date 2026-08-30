@@ -145,10 +145,10 @@ def test_intelligence_page_separates_application_and_target(
     page = _resume_intelligence_page(
         "en", tmp_path, job_description=_JD, state=state
     )
-    assert "READY_FOR_REAL_DEEPSEEK_GENERATION" in page
+    assert "NOT_CONFIGURED" in page
     assert "provider=deepseek" in page
     assert "model=deepseek-v4-flash" in page
-    assert "Recommended for resume generation" in page
+    assert "DeepSeek · DeepSeek V4 Flash · High" in page
     assert "intended_calls=1" in page
     assert "automatic_retries=0" in page
     assert "APPLICATION RESUME" in page

@@ -390,7 +390,7 @@ class RecordingExpertReviewGateway:
         reasoning_effort: Literal["none", "low"] = "low",
     ) -> ResponseModelT:
         assert "Return patches only" in system
-        assert reasoning_effort == "low"
+        assert reasoning_effort == "none"
         payload = json.loads(user)
         self.requests.append(payload)
         draft = payload["draft_resume_bullets"]
@@ -527,7 +527,8 @@ def test_home_keeps_three_outcomes_visible_and_resume_flow_intact(
     assert 'name="approve_candidate_claims"' not in page
     assert 'name="approve_model_context"' not in page
     assert "不会静默改用其他服务" in page
-    assert "使用当前 AI 服务生成" in page
+    assert "使用本次选择生成" in page
+    assert 'name="resume_ai_selection"' in page
     assert 'href="/?lang=zh-CN"' in page
     assert 'href="/resume?lang=zh-CN"' in page
     assert 'href="/advanced?lang=zh-CN"' in page
@@ -1650,6 +1651,9 @@ def test_resume_ui_generation_is_jd_conditioned_and_keeps_unrelated_gaps_visible
         assert len(metadata["evidence_source_summary"]) == 9
         assert metadata["generation_mode"] == "ai"
         assert metadata["provider"] == "ollama"
+        assert metadata["generation_receipt"]["provider"] == "ollama"
+        assert metadata["generation_receipt"]["model"] == "test-model"
+        assert metadata["generation_receipt"]["real_call"] is False
         assert metadata["model_call_profile"]["model_call_count"] == 1
         assert (
             metadata["model_call_profile"]["output_contract"]
@@ -2054,7 +2058,7 @@ def test_resume_optional_expert_review_returns_patches_and_reverifies_locally(
             ),
             "generation_mode": "ollama",
             "provider_model": "test-model",
-            "expert_review_mode": "openai_sol",
+            "expert_review_mode": "ai",
             "approve_expert_review": "yes",
             "approve_resume_processing": "yes",
         },
@@ -2106,7 +2110,7 @@ def test_resume_expert_review_new_fact_is_discarded_and_base_resume_is_saved(
             ),
             "generation_mode": "ollama",
             "provider_model": "test-model",
-            "expert_review_mode": "openai_sol",
+            "expert_review_mode": "ai",
             "approve_expert_review": "yes",
             "approve_resume_processing": "yes",
         },
@@ -2146,7 +2150,7 @@ def test_resume_expert_review_stale_patch_preserves_base_resume(tmp_path: Path) 
             ),
             "generation_mode": "ollama",
             "provider_model": "test-model",
-            "expert_review_mode": "openai_sol",
+            "expert_review_mode": "ai",
             "approve_expert_review": "yes",
             "approve_resume_processing": "yes",
         },

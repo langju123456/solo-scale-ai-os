@@ -267,8 +267,12 @@ def test_call_receipt_records_actual_provider_and_model() -> None:
     gateway = DeepSeekModelGateway(
         settings=settings, credential="sk-test", transport=transport
     )
-    result = gateway.complete(_Answer, system="system", user="user")
+    result = gateway.complete(
+        _Answer, system="system", user="user", reasoning_effort="none"
+    )
     assert result.text == "ok"
+    assert gateway.descriptor.provider is ModelProviderId.DEEPSEEK
+    assert gateway.descriptor.model == "deepseek-v4-pro"
     receipt = gateway.last_receipt
     assert receipt is not None
     assert receipt.provider == "deepseek"
@@ -279,6 +283,7 @@ def test_call_receipt_records_actual_provider_and_model() -> None:
     assert receipt.output_tokens == 5
     assert receipt.cache_tokens == 3
     assert receipt.status == "SUCCEEDED"
+    assert receipt.real_call is False
     assert transport.requests[0].model == "deepseek-v4-pro"
 
 

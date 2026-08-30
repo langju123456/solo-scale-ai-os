@@ -844,7 +844,7 @@ def _receipt_from_gateway(
                 if deepseek_receipt.error_category is not None
                 else None
             ),
-            real_call=real_call,
+            real_call=deepseek_receipt.real_call,
         )
     return GenerationReceipt(
         provider="unknown",

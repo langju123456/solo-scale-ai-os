@@ -28,6 +28,7 @@ from pydantic import (
     model_validator,
 )
 
+from soloscale.deepseek_provider import DeepSeekCallReceipt
 from soloscale.model_gateway import ModelCallProfile, ModelGateway
 from soloscale.resume_evidence_pack import (
     build_candidate_evidence_pack,
@@ -1916,6 +1917,22 @@ def tailor_resume_docx_with_gateway(
         model_call_profile["provider_metrics"] = provider_profile.model_dump(
             mode="json"
         )
+    deepseek_receipt = getattr(gateway, "last_receipt", None)
+    if isinstance(deepseek_receipt, DeepSeekCallReceipt):
+        model_call_profile.update(
+            {
+                "provider": deepseek_receipt.provider,
+                "model": deepseek_receipt.model,
+                "reasoning_effort": deepseek_receipt.reasoning_effort.value,
+                "thinking_enabled": deepseek_receipt.thinking_enabled,
+                "real_call": deepseek_receipt.real_call,
+                "latency_ms": deepseek_receipt.latency_ms,
+                "input_tokens": deepseek_receipt.input_tokens,
+                "output_tokens": deepseek_receipt.output_tokens,
+                "cache_tokens": deepseek_receipt.cache_tokens,
+                "status": deepseek_receipt.status,
+            }
+        )
     validate_role_strategy_placeholders(strategy, prepared)
     strategy = restore_role_strategy(strategy, prepared.private_replacements)
     raw_strategy = strategy
@@ -2066,6 +2083,7 @@ def request_resume_expert_review(
     *,
     profile: CandidateProfile,
     gateway: ModelGateway,
+    reasoning_effort: Literal["none", "low"] = "low",
 ) -> ResumeExpertReviewResult:
     """Send only hiring signals, source fragments, and the current draft."""
 
@@ -2125,7 +2143,7 @@ def request_resume_expert_review(
             ensure_ascii=False,
             sort_keys=True,
         ),
-        reasoning_effort="low",
+        reasoning_effort=reasoning_effort,
     )
 
 

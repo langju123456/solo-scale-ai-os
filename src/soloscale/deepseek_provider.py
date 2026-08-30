@@ -23,6 +23,7 @@ from typing import Literal, Protocol, TypeVar
 
 from pydantic import BaseModel, Field, model_validator
 
+from soloscale.model_gateway import ModelGatewayTransportError
 from soloscale.models import ContractModel
 
 ResponseModelT = TypeVar("ResponseModelT", bound=BaseModel)
@@ -63,7 +64,7 @@ class DeepSeekErrorCategory(StrEnum):
     MODEL_TIMEOUT = "model_timeout"
 
 
-class DeepSeekProviderError(RuntimeError):
+class DeepSeekProviderError(ModelGatewayTransportError):
     """Sanitized DeepSeek failure. Credentials are never part of the message."""
 
     def __init__(self, message: str, *, category: DeepSeekErrorCategory) -> None:
@@ -499,6 +500,7 @@ class DeepSeekCallReceipt(ContractModel):
     cache_tokens: int | None = Field(default=None, ge=0)
     status: Literal["SUCCEEDED", "FAILED"]
     error_category: DeepSeekErrorCategory | None = None
+    real_call: bool = False
 
 
 class DeepSeekModelGateway:
@@ -522,7 +524,25 @@ class DeepSeekModelGateway:
         self.settings = settings
         self._credential = selected
         self._transport = transport or DeepSeekResponsesHTTPTransport(selected)
+        self._real_call = transport is None
         self.last_receipt: DeepSeekCallReceipt | None = None
+        # Imported lazily to keep the canonical provider independent at module import
+        # time while still satisfying the shared product ModelGateway contract.
+        from soloscale.model_gateway import (
+            GatewayConfigurationState,
+            GatewayDescriptor,
+            GatewayTransportScope,
+            ModelProviderId,
+        )
+
+        self.descriptor = GatewayDescriptor(
+            provider=ModelProviderId.DEEPSEEK,
+            display_name=DEEPSEEK_DISPLAY_NAME,
+            configuration_state=GatewayConfigurationState.CONFIGURED,
+            transport_scope=GatewayTransportScope.EXTERNAL,
+            model=settings.model_id,
+            base_url=DEEPSEEK_BASE_URL,
+        )
 
     def complete(
         self,
@@ -534,9 +554,9 @@ class DeepSeekModelGateway:
         thinking_enabled: bool | None = None,
     ) -> ResponseModelT:
         selected_effort = (
-            normalize_reasoning_effort(reasoning_effort)
-            if reasoning_effort is not None
-            else self.settings.reasoning_effort
+            self.settings.reasoning_effort
+            if reasoning_effort in {None, "none"}
+            else normalize_reasoning_effort(reasoning_effort)
         )
         selected_thinking = (
             self.settings.thinking_enabled
@@ -568,6 +588,7 @@ class DeepSeekModelGateway:
                 latency_ms=max(0, int((time.monotonic() - wall_started) * 1000)),
                 status="FAILED",
                 error_category=exc.category,
+                real_call=self._real_call,
             )
             raise
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -580,6 +601,7 @@ class DeepSeekModelGateway:
                 latency_ms=max(0, int((time.monotonic() - wall_started) * 1000)),
                 status="FAILED",
                 error_category=DeepSeekErrorCategory.REQUEST_INVALID,
+                real_call=self._real_call,
             )
             raise DeepSeekProviderError(
                 "DeepSeek returned output outside the required schema",
@@ -596,6 +618,7 @@ class DeepSeekModelGateway:
             output_tokens=response.output_tokens,
             cache_tokens=response.cache_tokens,
             status="SUCCEEDED",
+            real_call=self._real_call,
         )
         return result
 
