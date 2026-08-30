@@ -1162,10 +1162,12 @@ def render_use_my_work(
                 if snapshot.project_state == "STALE"
                 else " Local Git evidence is current.",
             )
+        project_count = 1 if snapshot.project_connected else 0
+        project_label = "local project" if project_count == 1 else "local projects"
         summary = ui_text(
             locale,
-            f"已添加 {snapshot.knowledge_documents} 份资料、{snapshot.resume_runs} 份简历记录和 {1 if snapshot.project_connected else 0} 个本地项目。",
-            f"Available: {snapshot.knowledge_documents} records, {snapshot.resume_runs} resume runs, and {1 if snapshot.project_connected else 0} local projects.",
+            f"已添加 {snapshot.knowledge_documents} 份资料、{snapshot.resume_runs} 份简历记录和 {project_count} 个本地项目。",
+            f"Available: {snapshot.knowledge_documents} records, {snapshot.resume_runs} resume runs, and {project_count} {project_label}.",
         ) + project_status
     else:
         summary = ui_text(

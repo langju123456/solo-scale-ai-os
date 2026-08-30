@@ -21,6 +21,7 @@ from soloscale.creator_production import (
     CreatorProductionJobManager,
     CreatorProductionRequest,
     ProductionPhase,
+    _creator_error_cause,
     assign_artifact_to_account,
     create_run_artifacts,
     job_elapsed_seconds,
@@ -30,10 +31,13 @@ from soloscale.creator_production import (
     load_publish_queue,
     wait_for_creator_job,
 )
+from soloscale.media_profile import MediaProfileError
 from soloscale.platform_accounts import (
     ConnectedIdentity,
     save_connected_identity,
 )
+from soloscale.video_factory import CreatorVideoError
+from soloscale.voice_provider import VoiceProviderError
 
 
 def _brief() -> ContentBrief:
@@ -402,3 +406,18 @@ def test_job_elapsed_is_live_while_running_and_stable_after_terminal() -> None:
         updated=base + timedelta(seconds=12),
     )
     assert job_elapsed_seconds(failed, now=base + timedelta(seconds=60)) == 12
+
+
+def test_creator_error_cause_normalizes_missing_voice_configuration() -> None:
+    media = MediaProfileError("Your local Qwen voice is not configured")
+    voice = VoiceProviderError(str(media))
+    voice.__cause__ = media
+    video = CreatorVideoError("Could not complete the local Creator Video render")
+    video.__cause__ = voice
+
+    assert _creator_error_cause(video) == "VOICE_NOT_CONFIGURED"
+
+
+def test_creator_error_cause_ignores_unrelated_failures() -> None:
+    assert _creator_error_cause(CreatorVideoError("render failed")) is None
+    assert _creator_error_cause(CreatorProductionError("storage failed")) is None

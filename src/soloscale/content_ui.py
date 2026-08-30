@@ -150,6 +150,18 @@ def _provider_display_label(provider: str | None, locale: UILocale) -> str:
     return _escape(provider or ui_text(locale, "未知", "Unknown"))
 
 
+def _creator_error_cause_message(cause: str | None, locale: UILocale) -> str | None:
+    """Return the actionable primary message for a normalized job error cause."""
+
+    if cause == "VOICE_NOT_CONFIGURED":
+        return ui_text(
+            locale,
+            "未配置可用的语音服务；请配置 Qwen 参考音频，或选择 macOS 系统语音。",
+            "No usable voice service configured; configure Qwen reference audio or select macOS system voice.",
+        )
+    return None
+
+
 def _creator_job_state_detail(job: CreatorProductionJob, locale: UILocale) -> str:
     """Concise observable state for a running/finished Creator production job."""
 
@@ -171,6 +183,9 @@ def _creator_job_state_detail(job: CreatorProductionJob, locale: UILocale) -> st
     parts.append(
         f"{_escape(ui_text(locale, '模型调用', 'Model calls'))}: {job.model_calls}"
     )
+    cause_message = _creator_error_cause_message(job.error_cause, locale)
+    if cause_message is not None:
+        parts.append(cause_message)
     if job.timeout_seconds is not None:
         parts.append(
             f"{_escape(ui_text(locale, '超时', 'Timeout'))}: {job.timeout_seconds}s"

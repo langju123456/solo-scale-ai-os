@@ -23,8 +23,10 @@ from soloscale.content_workspace import (
     load_content_review,
     load_content_run,
 )
+from soloscale.media_profile import MediaProfileError
 from soloscale.platform_accounts import eligible_publish_identities
 from soloscale.resume_workspace import ResumeWorkspaceStorageError, _atomic_private_write
+from soloscale.voice_provider import VoiceProviderError
 
 ArtifactType = Literal["ARTICLE", "THREAD", "VIDEO"]
 ArtifactPlatform = Literal["linkedin", "x", "youtube", "douyin"]
@@ -75,6 +77,7 @@ class CreatorProductionJob(_StrictModel):
     stage: str | None = None
     timeout_seconds: int | None = Field(default=None, ge=0)
     error_code: str | None = None
+    error_cause: str | None = None
 
 
 class PublicationArtifact(_StrictModel):
@@ -136,6 +139,21 @@ def job_elapsed_seconds(job: CreatorProductionJob, *, now: datetime | None = Non
             reference = started
     elapsed = (reference - started).total_seconds()
     return max(0, int(elapsed))
+
+
+def _creator_error_cause(exc: BaseException) -> str | None:
+    """Normalize one safe, actionable cause from a Creator execution failure.
+
+    The raw internal code stays on ``error_code``; this adds only the narrow
+    causes the user can act on (currently: missing voice configuration).
+    """
+
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, (MediaProfileError, VoiceProviderError)):
+            return "VOICE_NOT_CONFIGURED"
+        current = current.__cause__
+    return None
 
 
 def _private_root(data_root: Path, name: str) -> Path:
@@ -568,6 +586,7 @@ class CreatorProductionJobManager:
                 if str(exc) == "AI_NOT_EXECUTED"
                 else type(exc).__name__.upper()
             )
+            error_cause = _creator_error_cause(exc)
             current = self.get(data_root, job_id) or job
             self._transition(
                 data_root,
@@ -575,6 +594,7 @@ class CreatorProductionJobManager:
                 "AI_NOT_EXECUTED" if error_code == "AI_NOT_EXECUTED" else "FAILED",
                 stage="AI generation" if error_code == "AI_NOT_EXECUTED" else "Failed",
                 error_code=error_code,
+                error_cause=error_cause,
             )
 
 
