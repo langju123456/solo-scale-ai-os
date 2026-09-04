@@ -1,5 +1,10 @@
 # SoloScale AI OS
 
+> [!IMPORTANT]
+> This repository is a historical development snapshot and is no longer canonical.
+> Active repository: [langju123456/soloscale-ai-os](https://github.com/langju123456/soloscale-ai-os).
+> For current documentation and the Hero Demo, start there.
+
 > **Working title:** a human-controlled AI operating system for routing reasoning, cloud plugins, local coding, and runtime agents.
 
 **One strong reasoning core. Many execution surfaces. Deterministic evidence.**
